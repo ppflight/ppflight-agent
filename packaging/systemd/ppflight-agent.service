@@ -1,0 +1,37 @@
+[Unit]
+Description=PPFlight Proxmox metering and monitoring agent
+Documentation=https://github.com/ppflight/ppflight-agent
+Wants=network-online.target
+After=network-online.target pve-cluster.service
+ConditionPathExists=/etc/ppflight-agent/agent.yaml
+
+[Service]
+Type=simple
+User=ppflight-agent
+Group=ppflight-agent
+EnvironmentFile=-/etc/ppflight-agent/agent.env
+ExecStart=/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+ReadWritePaths=/var/lib/ppflight-agent
+ReadOnlyPaths=/etc/ppflight-agent
+
+[Install]
+WantedBy=multi-user.target

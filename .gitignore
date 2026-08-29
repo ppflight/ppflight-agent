@@ -1,0 +1,12 @@
+/bin/
+/dist/
+/.cache/
+*.log
+*.pid
+*.test
+coverage.out
+config.json
+assignments.json
+state/
+secrets/
+test-output/

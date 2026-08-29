@@ -1,0 +1,31 @@
+[Unit]
+Description=PPFlight private node_exporter
+Documentation=https://github.com/prometheus/node_exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ppflight-nodeexp
+Group=ppflight-nodeexp
+ExecStart=/usr/local/lib/ppflight-agent/node_exporter --web.listen-address=127.0.0.1:9100 --collector.systemd --collector.processes
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=PPFlight private smartctl_exporter
+Documentation=https://github.com/prometheus-community/smartctl_exporter
+After=local-fs.target
+ConditionPathExists=/usr/sbin/smartctl
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/lib/ppflight-agent/smartctl_exporter --web.listen-address=127.0.0.1:9633 --smartctl.path=/usr/sbin/smartctl
+Restart=on-failure
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectHome=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+
+[Install]
+WantedBy=multi-user.target

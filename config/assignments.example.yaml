@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "revision": "example-001",
+  "issuedAt": "2026-08-29T00:00:00Z",
+  "assignments": [
+    {
+      "serviceRef": "subscription-example-01",
+      "clusterRef": "cluster-example-01",
+      "nodeRef": "pve-example-01",
+      "vmid": 101,
+      "generation": 1,
+      "instanceUuid": "instance-example-01",
+      "guestType": "qemu",
+      "billingState": "shadow"
+    }
+  ]
+}

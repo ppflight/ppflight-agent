@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "mode": "test",
+  "identity": {
+    "agentRef": "agent-example-01",
+    "collectorRef": "collector-example-01",
+    "sourceRef": "pve-agent-v1",
+    "clusterRef": "cluster-example-01",
+    "nodeRef": "auto",
+    "site": "primary"
+  },
+  "runtime": {
+    "stateDirectory": "/var/lib/ppflight-agent",
+    "listenAddress": "127.0.0.1:9745",
+    "shutdownGrace": "15s",
+    "logLevel": "info"
+  },
+  "collection": {
+    "sampleInterval": "10s",
+    "monitoringInterval": "30s",
+    "meteringInterval": "1m",
+    "inventoryInterval": "5m",
+    "guestInterval": "2m",
+    "smartInterval": "5m",
+    "requestConcurrency": 8,
+    "guestRequestConcurrency": 4
+  },
+  "pve": {
+    "source": "simulator",
+    "endpoint": "https://127.0.0.1:8006",
+    "tokenIdEnv": "PVE_READ_TOKEN_ID",
+    "tokenSecretEnv": "PVE_READ_TOKEN_SECRET",
+    "caFile": "/etc/ppflight-agent/pve-root-ca.pem",
+    "insecureSkipTls": false,
+    "timeout": "10s",
+    "maxResponseBytes": 8388608,
+    "localNode": "auto",
+    "collectClusterWide": false
+  },
+  "exporters": {
+    "node": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9100/metrics",
+      "timeout": "5s",
+      "maxResponseBytes": 16777216
+    },
+    "smart": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9633/metrics",
+      "timeout": "15s",
+      "maxResponseBytes": 33554432
+    }
+  },
+  "assignments": {
+    "file": "/etc/ppflight-agent/assignments.json",
+    "refreshUrl": "",
+    "refreshInterval": "5m"
+  },
+  "destinations": {
+    "websiteMetering": {
+      "enabled": false,
+      "url": "",
+      "auth": { "mode": "none" },
+      "timeout": "15s",
+      "maxResponseBytes": 2097152,
+      "maxQueueBytes": 67108864,
+      "compression": "none",
+      "payloadFormat": "usage-v1"
+    },
+    "websiteTelemetry": {
+      "enabled": false,
+      "url": "",
+      "auth": { "mode": "none" },
+      "timeout": "15s",
+      "maxResponseBytes": 2097152,
+      "maxQueueBytes": 268435456,
+      "compression": "none",
+      "payloadFormat": "telemetry-v1"
+    },
+    "monitoring": {
+      "enabled": false,
+      "url": "",
+      "auth": { "mode": "none" },
+      "timeout": "15s",
+      "maxResponseBytes": 2097152,
+      "maxQueueBytes": 536870912,
+      "compression": "none",
+      "payloadFormat": "legacy-ingest-v1"
+    }
+  },
+  "control": {
+    "enabled": true,
+    "pollUrl": "",
+    "resultUrl": "",
+    "auth": { "mode": "hmac-sha256", "keyIdEnv": "CONTROL_API_KEY_ID", "secretEnv": "CONTROL_API_SECRET" },
+    "pollInterval": "30s",
+    "requestTimeout": "10s",
+    "commandSecretEnv": "CONTROL_COMMAND_SECRET",
+    "pveTokenIdEnv": "PVE_CONTROL_TOKEN_ID",
+    "pveTokenSecretEnv": "PVE_CONTROL_TOKEN_SECRET",
+    "maxCommandsPerPoll": 20,
+    "allowedActions": ["vm.start", "vm.shutdown", "vm.reboot"],
+    "productionExecution": false
+  }
+}
