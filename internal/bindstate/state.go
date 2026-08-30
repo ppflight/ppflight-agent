@@ -62,6 +62,33 @@ type Identity struct {
 	Site         string `json:"site"`
 }
 
+// storedNetworkPolicy accepts the retired destination allowlist only while
+// reading an existing RC binding-state file. New state marshaling and all bind
+// responses use the exact one-field netpolicy.NetworkPolicy shape.
+type storedNetworkPolicy struct {
+	AgentObservedIPv4   string   `json:"agentObservedIPv4"`
+	ServerIPv4Allowlist []string `json:"serverIPv4Allowlist,omitempty"`
+}
+
+func (s *State) UnmarshalJSON(raw []byte) error {
+	type stateAlias State
+	value := struct {
+		*stateAlias
+		NetworkPolicy storedNetworkPolicy `json:"networkPolicy"`
+	}{stateAlias: (*stateAlias)(s)}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("binding state must contain one JSON object")
+	}
+	s.NetworkPolicy = netpolicy.NetworkPolicy{AgentObservedIPv4: value.NetworkPolicy.AgentObservedIPv4}
+	return nil
+}
+
 // Directory returns the controlled binding-state directory below the general
 // agent state root. The service may write elsewhere in the state root, but is
 // intended to have read-only access to this subtree in production.
@@ -109,7 +136,7 @@ func (s State) Response() enrollment.Response {
 }
 
 func cloneNetworkPolicy(value netpolicy.NetworkPolicy) netpolicy.NetworkPolicy {
-	return netpolicy.NetworkPolicy{AgentObservedIPv4: value.AgentObservedIPv4, ServerIPv4Allowlist: append([]string(nil), value.ServerIPv4Allowlist...)}
+	return netpolicy.NetworkPolicy{AgentObservedIPv4: value.AgentObservedIPv4}
 }
 
 // Validate verifies the state using the enrollment response contract.  It

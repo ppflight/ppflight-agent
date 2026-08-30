@@ -27,6 +27,25 @@ type MonitoringState struct {
 	IssuedAt           time.Time                           `json:"issuedAt"`
 }
 
+func (s *MonitoringState) UnmarshalJSON(raw []byte) error {
+	type stateAlias MonitoringState
+	value := struct {
+		*stateAlias
+		NetworkPolicy storedNetworkPolicy `json:"networkPolicy"`
+	}{stateAlias: (*stateAlias)(s)}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("monitoring binding state must contain one JSON object")
+	}
+	s.NetworkPolicy = netpolicy.NetworkPolicy{AgentObservedIPv4: value.NetworkPolicy.AgentObservedIPv4}
+	return nil
+}
+
 func MonitoringPath(stateDirectory string) string {
 	return filepath.Join(Directory(stateDirectory), "monitoring-binding-state.json")
 }

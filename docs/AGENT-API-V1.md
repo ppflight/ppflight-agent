@@ -19,24 +19,23 @@ PVE Token 由节点上的凭据 bootstrap 自动创建并保存在 root-only 本
 
 官网是业务资产、IPAM、套餐、容量、审批、`generation` 和操作线程的权威方；Agent 是 PVE 读取与受控执行方。VMID 不能单独作为客户资产身份。
 
-### 1.1 IPv4-only 外连与双向白名单
+### 1.1 IPv4-only 外连与服务端来源白名单
 
-Agent 到官网、监控站和 PVE 的所有连接必须显式使用 IPv4：DNS 名只接受获准的 A 记录，dial network 固定为 `tcp4`，不得尝试 AAAA、IPv4 失败后的 IPv6 fallback 或 IPv6 literal。PVE 固定访问 `https://127.0.0.1:8006`；`localhost`、`::1` 或节点对外地址不能代替。IPv4-only 是部署安全策略，不影响 guest 的 IPv6 网络配置能力。
+Agent 到官网、监控站和 PVE 的所有连接必须显式使用 IPv4：dial network 固定为 `tcp4`，不得尝试 IPv4 失败后的 IPv6 fallback 或 IPv6 literal。PVE 固定访问 `https://127.0.0.1:8006`；`localhost`、`::1` 或节点对外地址不能代替。IPv4-only 是部署安全策略，不影响 guest 的 IPv6 网络配置能力。
 
-官网绑定成功后形成 website trust domain 的 mutual whitelist：官网只接受该 binding 获准的 Agent 出口 IPv4，Agent 只连接绑定 origin 及其受控 IPv4 集合。monitoring 绑定独立形成另一份 whitelist，不能复制、合并或由 website bind/replace 覆盖。NAT 后以服务端实际观察并经管理员确认的出口 IPv4 为准；地址增删/漂移必须走各自 trust domain 的显式审批与轮换，不能自动学习。IP allowlist 只是附加门槛，绝不能取代 TLS、绑定身份、HMAC/Ed25519、epoch 或 nonce/time 校验。
+官网绑定成功后，website trust domain 从可信连接元数据冻结该 Agent 的公网出口 IPv4/32；monitoring 绑定独立冻结另一份来源白名单，不能由 website bind/replace 覆盖。Agent 不固定 Cloudflare DNS A/Anycast 地址，只连接绑定 origin hostname。来源 IP 只是附加门槛，绝不能取代 TLS、绑定身份、HMAC/Ed25519、epoch 或 nonce/time 校验。
 
 两种 bind response 都必须包含且只能以严格 schema 解码以下 `networkPolicy`：
 
 ```json
 {
-  "agentObservedIPv4": "198.51.100.24",
-  "serverIPv4Allowlist": ["203.0.113.10", "203.0.113.11"]
+  "agentObservedIPv4": "198.51.100.24"
 }
 ```
 
-`agentObservedIPv4` 是**对应服务端**在该 bind 请求上观察到、经管理员确认后签发的 canonical IPv4；它不是 Agent 本地自报/探测值，也不是 destination。`serverIPv4Allowlist` 是该服务端允许 Agent 使用的完整 destination 集合，必须为 1..16 个互不重复的 canonical IPv4，拒绝 unspecified、multicast、broadcast、IPv6 和非 canonical 拼写。DNS endpoint 只解析 A 记录并直拨 `A ∩ allowlist` 的 `tcp4` 地址，交集为空即拒绝；URL hostname 不变，继续执行 Host、TLS SNI 和证书 hostname 校验。ambient proxy、redirect、跨 origin credential、AAAA/IPv6 literal/fallback 一律拒绝。该 policy 与 binding state 同步原子保存，并由网站/监控运行时、上传器、assignment 和 status client 使用；两域有各自 credential epoch 与 policy，不能共享。Agent 侧 strict response 校验和 pinning 已实现；官网与监控服务端的 source-IP 记录、policy issuance/rotation、持久化和部署仍由各自任务交付。
+`agentObservedIPv4` 是**对应服务端**在该 bind 请求上从可信连接元数据观察并签发的 canonical IPv4；它不是 Agent 本地自报/探测值，也不是 destination。`serverIPv4Allowlist` 已删除，继续返回会触发 strict unknown-field 拒绝。Agent 对 endpoint hostname 使用系统 A 解析并固定 `tcp4`，保留 URL hostname 执行 Host、TLS SNI 和系统 CA 证书校验；ambient proxy、redirect、跨 origin credential、IPv6 literal/fallback 一律拒绝。该来源 policy 与 binding state 原子保存，两域有各自 credential epoch 与 policy，不能共享。
 
-`ag-pve monitoring preflight --endpoint HTTPS_URL` 是绑定前、仅在目标 PVE 本机执行的只读证据生成器。它对一次 DNS A 快照中的每个地址逐个进行直接 tcp4 与原 hostname/SNI 的系统 CA TLS 校验，输出 `resolvedAt`、`resolvedA`、`checks`、`eligibleServerIPv4Allowlist` 与 `readyForOperatorApproval`。任一 A 未通过时 readiness 为 false、进程非零退出。它不发送 HTTP 请求、不持久化 policy、不读取/消费绑定码，也不替代服务端审批或 bind response。
+`ag-pve monitoring preflight --endpoint HTTPS_URL` 是可选只读诊断。它对一次 DNS A 快照逐个进行 tcp4 与原 hostname/SNI 的系统 CA TLS 检查，只输出 `resolvedAt`、`resolvedA` 和 `checks`；不再输出 `eligibleServerIPv4Allowlist`/`readyForOperatorApproval`，也不作为绑定前置。它不发送 HTTP 请求、不持久化 policy、不读取/消费绑定码。
 
 默认忽略 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 等环境代理。若未来支持代理，只能使用显式配置、受控 CA/认证和固定链路的代理，并继续在最终 origin、目标 IPv4、证书、重定向与 credential scope 上 fail closed；不能因代理解析 DNS 而绕过 IPv4 whitelist。
 
@@ -159,8 +158,7 @@ Content-Type: application/json
     "maxUncompressedBytes": 33554432
   },
   "networkPolicy": {
-    "agentObservedIPv4": "198.51.100.24",
-    "serverIPv4Allowlist": ["203.0.113.20"]
+    "agentObservedIPv4": "198.51.100.24"
   },
   "credentialEpoch": 1,
   "issuedAt": "2026-08-30T00:00:00Z"
@@ -516,7 +514,7 @@ payment_authorized
 | --- | --- | --- |
 | PVE 本地专用 Token / prepare | installer 以 root-only `0700` 安装 `/usr/local/lib/ppflight-agent/create-pve-tokens.sh`；其 `--write-env` 流程自动创建独立 read/control Token，control 默认无 ACL，`--acl-only` 可在不触碰 secret 的情况下给既有 dedicated user/token 增加已审核非根 scope。`ag-pve pve prepare/status` 已接入 root-only PVE env、安全 read/control 探测和脱敏 readiness；prepare 仅在 test/productionExecution=false 时将 TCP `127.0.0.1:8006` 与证书 DNS `pve.tlsServerName` 分离写入。 | 是独立本地 bootstrap/readiness 步骤；不会改 mode/production gate、授予 control ACL 或启动服务，仍需按资源审查 ACL。它不能证明官网/监控服务端、production mutation 或真实 PVE 破坏性验收已经完成；卸载 helper 也不自动删除 PVE identity/ACL。 |
 | 安装发布物 | tag `vX.Y.Z` release workflow 已分别构建 Linux amd64/arm64、运行 Go/packaging 测试，并用 `scripts/package-release.sh` 生成离线、可复现 tarball 和 `SHA256SUMS`；脚本只打包已构建 binary 与显式 allowlist 内容、二次验证 bundle，拒绝网络下载、symlink、secret/queue material 和输出覆盖。manual dispatch 只生成 artifact，不发布。installer 继续校验包内 binary SHA-256、cloud-init bundle、依赖、权限、systemd unit 和 assignment 迁移。 | 发布物应先离线校验 `SHA256SUMS` 再解压，不能 `curl | bash`。当前 workflow 的完整性机制是 SHA-256；如需发布签名/来源审批，仍须由组织发布流程另行完成。 |
-| 官网 bind / networkPolicy | `internal/enrollment`、`internal/bindstate`、运行时 private-state credential overlay、`networkPolicy` strict decoder/persistence 及 `ag-pve bind` 已有实现；绑定码不进 argv，Agent 以 DNS `A ∩ allowlist` 的 tcp4 direct dial 使用 website policy。 | 不修改 PVE source/mode/ACL/service；官网 server-observed IPv4、allowlist issuance/rotation 与 endpoint 部署仍需官网任务完成，不能仅凭 Agent 代码称已上线。 |
+| 官网 bind / networkPolicy | `internal/enrollment`、`internal/bindstate`、运行时 private-state credential overlay、exact `networkPolicy={agentObservedIPv4}` strict decoder/persistence 及 `ag-pve bind` 已有实现；绑定码不进 argv，Agent 使用 hostname + tcp4 direct dial。 | 不修改 PVE source/mode/ACL/service；官网可信来源 IPv4/32 冻结、轮换与 endpoint 部署仍需官网任务完成，不能仅凭 Agent 代码称已上线。 |
 | assignment | `internal/assignment` 已有 HMAC `wait<=25s`、Ed25519 bundle 验签、revision/cursor 防回滚；runtime 主循环已接客户端并原子保存 assignment/cursor，安装器已接 service-owned 路径与 legacy 首次迁移。 | Agent 侧读写/权限闭环已接；官网服务仍需联调，不能据此宣称服务已上线。 |
 | discovery | `internal/discovery` 和 `pve.discover` Executor 分支已有 typed phase、分页与安全错误码；API 模式 runtime 已注入本地 PVE read client/Discovery。 | 仍须在 PVE 8/9 fixture 和真实非生产节点验收，不等于官网向导已上线。 |
 | 本地模板 bootstrap | cloud-init bundle 已在同一 Agent 包的 `bundles/ppflight-cloudinit` 落仓；installer 验证依赖/两次校验 bundle、strict IPv4/HTTPS redirect policy 并原子切换版本 symlink；`internal/templatebootstrap` 每次调用复验 manifest/运行文件摘要并用隔离 Python 入口执行，`ag-pve template init|catalog|discover|bootstrap` 已接本地 plan/显式确认流程。 | 不在远程 action registry；真实 PVE 上创建模板/备份的 plan/execute 破坏性验收完成前不可称模板业务上线，更不等于 `vm.reinstall`。 |

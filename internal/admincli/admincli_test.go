@@ -89,7 +89,7 @@ func TestMonitoringPreflightProducesExplicitTLSVerifiedIPv4Evidence(t *testing.T
 		t.Fatal(err)
 	}
 	want := []string{"104.21.27.23", "172.67.140.237"}
-	if !result.ReadyForOperatorApproval || !slices.Equal(result.ResolvedA, want) || !slices.Equal(result.EligibleServerIPv4Allowlist, want) {
+	if !slices.Equal(result.ResolvedA, want) {
 		t.Fatalf("result=%#v", result)
 	}
 	if !slices.Equal(dialed, []string{"104.21.27.23:443", "172.67.140.237:443"}) {
@@ -102,7 +102,7 @@ func TestMonitoringPreflightProducesExplicitTLSVerifiedIPv4Evidence(t *testing.T
 	}
 }
 
-func TestMonitoringPreflightFailsClosedWhenAnyResolvedAFailsTLS(t *testing.T) {
+func TestMonitoringPreflightRecordsPerAddressTLSErrorWithoutApprovalGate(t *testing.T) {
 	resolver := preflightResolver(func(context.Context, string, string) ([]net.IP, error) {
 		return []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}, nil
 	})
@@ -116,7 +116,7 @@ func TestMonitoringPreflightFailsClosedWhenAnyResolvedAFailsTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ReadyForOperatorApproval || !slices.Equal(result.EligibleServerIPv4Allowlist, []string{"192.0.2.1"}) || result.Checks[1].ErrorCode != "TCP4_TLS_VERIFICATION_FAILED" {
+	if len(result.Checks) != 2 || result.Checks[0].Status != "verified" || result.Checks[1].ErrorCode != "TCP4_TLS_VERIFICATION_FAILED" {
 		t.Fatalf("result=%#v", result)
 	}
 }
@@ -172,6 +172,20 @@ func TestTemplateStorageDisplayUsesReadableCapacityAndLabels(t *testing.T) {
 	}
 	if got := humanStorageContentCSV("backup,iso,snippets,vztmpl"); got != "备份 (backup)、ISO 镜像 (iso)、Cloud-Init 配置 (snippets)、LXC 模板 (vztmpl)" {
 		t.Fatalf("content=%q", got)
+	}
+}
+
+func TestPromptYesNoRejectsInvalidAndControlCharacterInput(t *testing.T) {
+	for _, input := range []string{"b^H\ny\n", "b\x08\nY\n"} {
+		var output bytes.Buffer
+		instance := &cli{out: &output, errOut: io.Discard}
+		answer, err := instance.promptYesNo(bufio.NewReader(strings.NewReader(input)), "确认？[Y/n]: ", true)
+		if err != nil || !answer {
+			t.Fatalf("input=%q answer=%t err=%v", input, answer, err)
+		}
+		if !strings.Contains(output.String(), "输入无效") || strings.Count(output.String(), "确认？") != 2 {
+			t.Fatalf("invalid input was not rejected and reprompted: %q", output.String())
+		}
 	}
 }
 

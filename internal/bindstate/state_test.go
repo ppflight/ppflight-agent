@@ -73,6 +73,33 @@ func TestSaveLoadAndStableDeviceID(t *testing.T) {
 	}
 }
 
+func TestLoadMigratesRetiredStoredServerIPv4Allowlist(t *testing.T) {
+	directory := t.TempDir()
+	state := testState("https://service.example")
+	if err := Save(directory, state); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(Path(directory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(raw), `"agentObservedIPv4": "127.0.0.1"`, `"agentObservedIPv4": "127.0.0.1", "serverIPv4Allowlist": ["192.0.2.1"]`, 1)
+	if legacy == string(raw) {
+		t.Fatal("failed to create legacy state fixture")
+	}
+	if err := os.WriteFile(Path(directory), []byte(legacy), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(directory)
+	if err != nil {
+		t.Fatalf("legacy state was not migrated: %v", err)
+	}
+	encoded, err := json.Marshal(loaded.NetworkPolicy)
+	if err != nil || strings.Contains(string(encoded), "serverIPv4Allowlist") {
+		t.Fatalf("retired field survived migration: %s err=%v", encoded, err)
+	}
+}
+
 func TestPathsStayInsideControlledBindingDirectory(t *testing.T) {
 	stateDirectory := filepath.Join("root", "state")
 	wantDirectory := filepath.Join(stateDirectory, "bindings")

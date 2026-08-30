@@ -77,7 +77,7 @@ func NewStatusClient(cfg StatusClientConfig) (*StatusClient, error) {
 	if err := netpolicy.ValidateNetworkPolicy(cfg.NetworkPolicy); err != nil {
 		return nil, errors.New("monitoring status network policy is invalid")
 	}
-	client, err := secureClientWithAllowlist(cfg.HTTPClient, cfg.Timeout, cfg.NetworkPolicy.ServerIPv4Allowlist)
+	client, err := secureClient(cfg.HTTPClient, cfg.Timeout)
 	if err != nil {
 		return nil, err
 	}

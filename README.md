@@ -28,7 +28,7 @@ AG
 
 先从 `AG` 菜单查看和调整；在完成本地 PVE Token、API source、双绑定、IPv4 白名单及配置校验前，不要手工启动服务。该一行命令用于当前 `main` 联调分支；生产环境仍应采用安装文档中的离线校验流程。
 
-官网、监控站和 PVE 外连的目标合同是 IPv4-only：DNS 仅使用获准 A 记录，dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网绑定和 monitoring 绑定分别返回并持久化独立 `networkPolicy={agentObservedIPv4,serverIPv4Allowlist}`：两者均为 canonical IPv4，allowlist 为 1..16 项。对 DNS endpoint，Agent 只直拨 `A 记录 ∩ allowlist`，保留 URL hostname 作 HTTP Host/TLS SNI 与证书校验；禁代理和 redirect，绝不把解析结果改写成 URL hostname。`agentObservedIPv4` 是各服务端观察到的本次绑定出口地址，只作该 trust domain 的服务端元数据，不能从本地网络学习或当作目的地。IP 命中只是 TLS、绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、time、action allowlist 和审计可用性之外的附加门槛，不能替代加密身份。Agent 的严格 response 校验、private-state 保存及 tcp4 pinning 已接线；官网/监控服务端生成、持久化和部署这两套 policy 仍待各自任务完成。
+官网、监控站和 PVE 外连的目标合同是 IPv4-only：dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网和 monitoring bind response 分别返回 exact `networkPolicy={agentObservedIPv4}`；该值是对应服务端从可信连接元数据观察并冻结的 Agent 公网出口 canonical IPv4，只用于服务端 `/32` 来源白名单，不是 Agent 自报值或拨号目的地。Agent 不再固定 Cloudflare DNS A/Anycast 地址，始终保留 endpoint hostname 作 HTTP Host、TLS SNI 和系统 CA 证书校验，并禁环境代理、redirect 与跨 origin credential。来源 IP 命中不能替代绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、nonce/time、action allowlist 和审计校验。
 
 > 上线状态：Agent 侧绑定、发现、assignment、受控执行和 UPID 恢复所需的代码与资源原语已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
 
@@ -57,7 +57,7 @@ sudo ag-pve bind \
 
 监控站采用另一套一次性绑定码和独立信任域。Agent 已提供严格客户端、独立 `<stateDirectory>/bindings/monitoring-binding-state.json`、运行时 private-state credential overlay 和 `ag-pve monitoring bind`；响应只签发 monitoring `bindingId/deviceId/monitoringAgentRef`、ingest endpoint、`hmac-sha256` credential、`telemetry-v1` 传输上限、独立 `networkPolicy` 和 `credentialEpoch`。该 key 只能按服务端逐路由 scope 用于 `monitoring:telemetry.write`、`monitoring:audit.write` 和固定同源的 `monitoring:status.read`，不能授权官网 API 或 PVE mutation。官网 bind/replace 不得创建、覆盖、轮换或复用监控站凭据/`networkPolicy`。监控服务端路由和其 networkPolicy 发放/持久化由另一交付任务实现；没有已部署 endpoint 时样例保持 `enabled=false`，不能据此宣称监控站服务已经上线。
 
-首台真实 PVE 在 monitoring bind 前运行 `sudo ag-pve monitoring preflight --endpoint https://<监控域名>/internal/v1/monitoring/agents/bind`。该只读命令从当前 PVE 解析全部 A 记录，并逐个直接执行 `tcp4` 与原 hostname/SNI 的系统 CA TLS 验证，输出 `resolvedA`、逐地址结果及 `eligibleServerIPv4Allowlist`。只有 `readyForOperatorApproval=true` 时输出才可交给操作员审批；命令不会访问 HTTP 路由、写配置、自动批准地址或执行绑定。
+`sudo ag-pve monitoring preflight --endpoint https://<监控域名>/internal/v1/monitoring/agents/bind` 现在只是可选诊断：它输出当前 `resolvedA` 和逐地址 tcp4/TLS 检查，不再输出 `eligibleServerIPv4Allowlist` 或 `readyForOperatorApproval`，也不是绑定前置条件。命令不会访问 HTTP 路由、写配置、读取绑定码或执行绑定。
 
 生产安装将 `<stateDirectory>/bindings` 建为 `root:ppflight-agent`、`0750`，状态文件为 `0640`；root 管理命令原子更新，systemd 服务只有组读取权限，并通过 `ReadOnlyPaths` 禁止写入。远端 assignment 则写入独立的 `<stateDirectory>/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`，不能通过放宽 binding 目录权限来实现 refresh。
 

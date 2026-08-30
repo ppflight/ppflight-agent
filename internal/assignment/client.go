@@ -52,17 +52,19 @@ type State struct {
 // deliberately separate from the command-signing credential: deployments may
 // rotate these keys independently.
 type Config struct {
-	Endpoint            string
-	AgentRef            string
-	DeviceID            string
-	ClusterRef          string
-	Credential          enrollment.HMACCredential
-	SigningKeyID        string
-	SigningPublicKey    ed25519.PublicKey
-	Wait                time.Duration
-	Timeout             time.Duration
-	MaxClockSkew        time.Duration
-	HTTPClient          *http.Client
+	Endpoint         string
+	AgentRef         string
+	DeviceID         string
+	ClusterRef       string
+	Credential       enrollment.HMACCredential
+	SigningKeyID     string
+	SigningPublicKey ed25519.PublicKey
+	Wait             time.Duration
+	Timeout          time.Duration
+	MaxClockSkew     time.Duration
+	HTTPClient       *http.Client
+	// ServerIPv4Allowlist is a deprecated no-op kept only for source
+	// compatibility with local RC callers. It is never stored or dialed.
 	ServerIPv4Allowlist []string
 	Now                 func() time.Time
 	// AllowLoopbackHTTP exists only for hermetic test-mode Agent runs. Public
@@ -165,10 +167,7 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.MaxClockSkew > time.Hour {
 		return nil, errors.New("assignment clock skew is too large")
 	}
-	if err := netpolicy.ValidateNetworkPolicy(netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: cfg.ServerIPv4Allowlist}); err != nil {
-		return nil, errors.New("assignment server IPv4 allowlist is invalid")
-	}
-	client, err := hardenedHTTPClient(cfg.HTTPClient, cfg.Timeout, cfg.ServerIPv4Allowlist)
+	client, err := hardenedHTTPClient(cfg.HTTPClient, cfg.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +284,7 @@ func (c *Client) verify(bundle Bundle, previous State) (Result, error) {
 	return Result{Document: document, DocumentRaw: append(json.RawMessage(nil), bundle.AssignmentDocument...), State: State{Revision: bundle.Revision, Cursor: bundle.Cursor}, IssuedAt: bundle.IssuedAt, ExpiresAt: bundle.ExpiresAt}, nil
 }
 
-func hardenedHTTPClient(provided *http.Client, timeout time.Duration, allowlist []string) (*http.Client, error) {
+func hardenedHTTPClient(provided *http.Client, timeout time.Duration) (*http.Client, error) {
 	if provided == nil {
 		provided = &http.Client{}
 	}
@@ -303,12 +302,6 @@ func hardenedHTTPClient(provided *http.Client, timeout time.Duration, allowlist 
 		}
 		transport = netpolicy.ApplyIPv4Only(transport.Clone())
 	}
-	var policyErr error
-	transport, policyErr = netpolicy.ApplyIPv4Allowlist(transport, allowlist)
-	if policyErr != nil {
-		return nil, errors.New("assignment server IPv4 allowlist is invalid")
-	}
-	transport.Proxy = nil
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	} else {

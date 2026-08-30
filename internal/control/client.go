@@ -31,15 +31,16 @@ type Poller interface {
 }
 
 type ClientConfig struct {
-	Endpoint            string
-	AgentRef            string
-	Limit               int
-	AuthMode            uploader.AuthMode
-	KeyID               string
-	Secret              []byte
-	BearerToken         string
-	Timeout             time.Duration
-	HTTPClient          *http.Client
+	Endpoint    string
+	AgentRef    string
+	Limit       int
+	AuthMode    uploader.AuthMode
+	KeyID       string
+	Secret      []byte
+	BearerToken string
+	Timeout     time.Duration
+	HTTPClient  *http.Client
+	// ServerIPv4Allowlist is deprecated and ignored. Transport is tcp4-only.
 	ServerIPv4Allowlist []string
 	Now                 func() time.Time
 }
@@ -80,17 +81,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
 	}
-	if err := netpolicy.ValidateNetworkPolicy(netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: cfg.ServerIPv4Allowlist}); err != nil {
-		return nil, errors.New("control server IPv4 allowlist is invalid")
-	}
 	if cfg.HTTPClient == nil {
 		transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
-		var policyErr error
-		transport, policyErr = netpolicy.ApplyIPv4Allowlist(transport, cfg.ServerIPv4Allowlist)
-		if policyErr != nil {
-			return nil, errors.New("control server IPv4 allowlist is invalid")
-		}
-		transport.Proxy = nil
 		if transport.TLSClientConfig == nil {
 			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		} else {
@@ -104,12 +96,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		}
 	} else if transport, ok := cfg.HTTPClient.Transport.(*http.Transport); ok {
 		clone := netpolicy.ApplyIPv4Only(transport.Clone())
-		var policyErr error
-		clone, policyErr = netpolicy.ApplyIPv4Allowlist(clone, cfg.ServerIPv4Allowlist)
-		if policyErr != nil {
-			return nil, errors.New("control server IPv4 allowlist is invalid")
-		}
-		clone.Proxy = nil
 		client := *cfg.HTTPClient
 		client.Timeout = cfg.Timeout
 		client.Transport = clone
@@ -117,12 +103,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg.HTTPClient = &client
 	} else if cfg.HTTPClient.Transport == nil {
 		clone := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
-		var policyErr error
-		clone, policyErr = netpolicy.ApplyIPv4Allowlist(clone, cfg.ServerIPv4Allowlist)
-		if policyErr != nil {
-			return nil, errors.New("control server IPv4 allowlist is invalid")
-		}
-		clone.Proxy = nil
 		client := *cfg.HTTPClient
 		client.Timeout = cfg.Timeout
 		client.Transport = clone

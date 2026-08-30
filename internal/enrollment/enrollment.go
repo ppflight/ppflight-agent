@@ -238,10 +238,6 @@ func (r Response) Validate(bindingEndpoint *url.URL) error {
 }
 
 func securedClient(provided *http.Client, timeout time.Duration) (*http.Client, error) {
-	return securedClientWithAllowlist(provided, timeout, nil)
-}
-
-func securedClientWithAllowlist(provided *http.Client, timeout time.Duration, allowlist []string) (*http.Client, error) {
 	if provided == nil {
 		provided = &http.Client{}
 	}
@@ -250,14 +246,6 @@ func securedClientWithAllowlist(provided *http.Client, timeout time.Duration, al
 	result.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	if transport, ok := provided.Transport.(*http.Transport); ok {
 		cloned := netpolicy.ApplyIPv4Only(transport.Clone())
-		if len(allowlist) != 0 {
-			var policyErr error
-			cloned, policyErr = netpolicy.ApplyIPv4Allowlist(cloned, allowlist)
-			if policyErr != nil {
-				return nil, errors.New("invalid IPv4 allowlist")
-			}
-		}
-		cloned.Proxy = nil
 		if cloned.TLSClientConfig == nil {
 			cloned.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		} else {
@@ -269,14 +257,6 @@ func securedClientWithAllowlist(provided *http.Client, timeout time.Duration, al
 		result.Transport = cloned
 	} else if provided.Transport == nil {
 		transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
-		if len(allowlist) != 0 {
-			var policyErr error
-			transport, policyErr = netpolicy.ApplyIPv4Allowlist(transport, allowlist)
-			if policyErr != nil {
-				return nil, errors.New("invalid IPv4 allowlist")
-			}
-		}
-		transport.Proxy = nil
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		result.Transport = transport
 	} else {

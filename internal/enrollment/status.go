@@ -79,7 +79,7 @@ func NewStatusClient(cfg StatusClientConfig) (*StatusClient, error) {
 	if err := netpolicy.ValidateNetworkPolicy(cfg.NetworkPolicy); err != nil {
 		return nil, errors.New("website status network policy is invalid")
 	}
-	client, err := securedClientWithAllowlist(cfg.HTTPClient, cfg.Timeout, cfg.NetworkPolicy.ServerIPv4Allowlist)
+	client, err := securedClient(cfg.HTTPClient, cfg.Timeout)
 	if err != nil {
 		return nil, err
 	}

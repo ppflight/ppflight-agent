@@ -54,7 +54,7 @@ func TestIndependentMonitoringBind(t *testing.T) {
 	}
 }
 
-func TestMonitoringResponseRequiresItsOwnCanonicalNetworkPolicy(t *testing.T) {
+func TestMonitoringResponseRequiresCanonicalObservedIPv4(t *testing.T) {
 	endpoint, err := secureURL("https://monitor.example/internal/v1/monitoring/agents/bind")
 	if err != nil {
 		t.Fatal(err)
@@ -63,9 +63,9 @@ func TestMonitoringResponseRequiresItsOwnCanonicalNetworkPolicy(t *testing.T) {
 	if err := value.Validate(endpoint); err != nil {
 		t.Fatal(err)
 	}
-	value.NetworkPolicy.ServerIPv4Allowlist = []string{"192.0.2.10", "192.0.2.10"}
+	value.NetworkPolicy.AgentObservedIPv4 = "192.0.2.010"
 	if err := value.Validate(endpoint); err == nil {
-		t.Fatal("accepted duplicate monitoring allowlist")
+		t.Fatal("accepted non-canonical monitoring observed IPv4")
 	}
 }
 
@@ -87,6 +87,11 @@ func TestMonitoringBindRejectsDeviceMismatchDuplicateAndCrossOrigin(t *testing.T
 			v := response(origin)
 			raw, _ := json.Marshal(v)
 			return append(raw[:len(raw)-1], []byte(`,"credentialEpoch":2}`)...)
+		},
+		"retired-server-allowlist": func(origin string) []byte {
+			v := response(origin)
+			raw, _ := json.Marshal(v)
+			return []byte(strings.Replace(string(raw), `"networkPolicy":{"agentObservedIPv4":"127.0.0.1"}`, `"networkPolicy":{"agentObservedIPv4":"127.0.0.1","serverIPv4Allowlist":["192.0.2.1"]}`, 1))
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

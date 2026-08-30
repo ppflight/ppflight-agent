@@ -88,6 +88,23 @@ func TestBindRejectsUnknownResponseFields(t *testing.T) {
 	}
 }
 
+func TestBindRejectsRetiredServerIPv4Allowlist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		encoded, _ := json.Marshal(validResponse(serverURL(r)))
+		encoded = []byte(strings.Replace(string(encoded), `"networkPolicy":{"agentObservedIPv4":"127.0.0.1"}`, `"networkPolicy":{"agentObservedIPv4":"127.0.0.1","serverIPv4Allowlist":["192.0.2.1"]}`, 1))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(encoded)
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{Endpoint: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Bind(context.Background(), validRequest()); err == nil {
+		t.Fatal("accepted retired serverIPv4Allowlist in strict bind response")
+	}
+}
+
 func TestBindRejectsCrossOriginEndpointAndDoesNotLeakSecrets(t *testing.T) {
 	secret := "SECRET-MUST-NOT-LEAK"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +197,7 @@ func TestResponseValidateAllRequiredContractGroups(t *testing.T) {
 		"signing":    func(r *Response) { r.CommandSigningCredential.Algorithm = "rsa" },
 		"actions":    func(r *Response) { r.AllowedActions = []string{"bad action"} },
 		"assignment": func(r *Response) { r.AssignmentDocument = json.RawMessage(`[]`) },
-		"network":    func(r *Response) { r.NetworkPolicy.ServerIPv4Allowlist = []string{"192.0.2.1", "192.0.2.1"} },
+		"network":    func(r *Response) { r.NetworkPolicy.AgentObservedIPv4 = "0.0.0.0" },
 		"epoch":      func(r *Response) { r.CredentialEpoch = 0 },
 		"issued":     func(r *Response) { r.IssuedAt = time.Time{} },
 	} {

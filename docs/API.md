@@ -39,14 +39,13 @@ x-ppflight-content-sha256:<bodySha256>
 
 ```json
 {
-  "agentObservedIPv4": "198.51.100.24",
-  "serverIPv4Allowlist": ["203.0.113.10", "203.0.113.11"]
+  "agentObservedIPv4": "198.51.100.24"
 }
 ```
 
-两个字段都使用 canonical IPv4 字符串；`serverIPv4Allowlist` 必须有 1..16 个无重复项，且不得为 unspecified、multicast 或 broadcast 地址。`agentObservedIPv4` 由对应服务端观察并签发，只是该 binding 的服务端 source-IP metadata，Agent 不从本地网络学习它，也绝不把它作为拨号目的地。website 与 monitoring 分别签发、保存和轮换自己的 policy，不能合并、复制或在另一域 bind/replace 时覆盖。
+`agentObservedIPv4` 必须是 canonical IPv4，由对应服务端从可信连接元数据观察并签发，只是该 binding 的服务端 source-IP metadata。Agent 不从 payload 或本地网络学习它，也绝不把它作为拨号目的地。website 与 monitoring 分别保存自己的来源白名单，不能在另一域 bind/replace 时覆盖。`serverIPv4Allowlist` 已从 strict response 删除，服务端继续返回该字段会被 Agent 当作 unknown field 拒绝。
 
-官网、监控站和 PVE transport 必须固定 `tcp4`，拒绝 AAAA、IPv6 literal 和 IPv6 fallback；PVE 只访问 `127.0.0.1:8006`。对 DNS endpoint，Agent 只查询 A 记录、取 `A ∩ allowlist`（即 `A ∩ serverIPv4Allowlist`）并向选中的 IPv4 直接拨号；为空即 fail closed。HTTP URL hostname 保持不变，继续作为 Host、TLS SNI 与证书 hostname 校验，不能用 IP 绕过 TLS identity。所有绑定/上报/status client 禁 ambient proxy、拒绝 redirect 和跨 origin credential；未来代理只能是显式受控 CA/认证/固定链路，且不能代理解析绕过最终目标检查。IP allowlist 仅作附加条件，不能替代 TLS、`bindingId/deviceId/agentRef` 关系、key scope/epoch、HMAC/Ed25519、nonce/time、assignment generation 或 action allowlist。Agent 的 strict response 校验、private-state 保存和 tcp4 pinning 已接线；服务端 source-IP 记录、policy 发放/轮换与真实部署仍需官网、监控站各自实现/联调。
+官网、监控站和 PVE transport 必须固定 `tcp4`，拒绝 IPv6 literal 和 IPv6 fallback；PVE 只访问 `127.0.0.1:8006`。DNS endpoint 使用系统 A 解析并直接 tcp4 连接，不固定 Cloudflare A/Anycast 集合；HTTP URL hostname 保持不变，继续作为 Host、TLS SNI 与系统 CA 证书 hostname 校验。所有绑定/上报/status client 禁 ambient proxy、拒绝 redirect 和跨 origin credential。服务端继续以可信来源头、`agentObservedIPv4/32`、TLS、`bindingId/deviceId/agentRef`、key scope/epoch、HMAC/Ed25519、nonce/time、assignment generation 和 action allowlist 联合授权。
 
 ## 2. Assignment 身份
 

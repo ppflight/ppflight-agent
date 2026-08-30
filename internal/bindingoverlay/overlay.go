@@ -39,9 +39,9 @@ var reserved = map[string]struct{}{
 	MonitoringKeyIDEnv: {}, MonitoringSecretEnv: {},
 }
 
-// WebsiteNetworkPolicy returns only the website-domain destination policy.
+// WebsiteNetworkPolicy returns only the website-domain source metadata.
 // It deliberately reads no monitoring state, so callers cannot accidentally
-// share allowlists across the two independent trust domains.
+// share policy across the two independent trust domains.
 func WebsiteNetworkPolicy(stateDirectory string) (netpolicy.NetworkPolicy, error) {
 	state, err := bindstate.Load(stateDirectory)
 	if err != nil {
@@ -60,7 +60,7 @@ func MonitoringNetworkPolicy(stateDirectory string) (netpolicy.NetworkPolicy, er
 }
 
 func copyNetworkPolicy(value netpolicy.NetworkPolicy) netpolicy.NetworkPolicy {
-	return netpolicy.NetworkPolicy{AgentObservedIPv4: value.AgentObservedIPv4, ServerIPv4Allowlist: append([]string(nil), value.ServerIPv4Allowlist...)}
+	return netpolicy.NetworkPolicy{AgentObservedIPv4: value.AgentObservedIPv4}
 }
 
 // Resolve gives private binding state priority only for exact reserved labels.

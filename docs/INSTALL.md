@@ -9,7 +9,7 @@
 - Debian 系 PVE 8.x 或 9.x，root 管理权限；
 - NTP/chrony 正常，生产请求默认只容忍约五分钟时钟偏差；
 - Agent 到官网和监控站的出站 HTTPS 只能走 IPv4；DNS 必须有经审批的 A 记录，不能依赖 AAAA 或 IPv6 fallback；无需开放入站 8006/9100/9633；
-- 为 website 与 monitoring trust domain 分别准备稳定、经管理员确认的 NAT/出口 IPv4；每次 bind response 必须含各自 `networkPolicy.agentObservedIPv4` 与 1..16 项 canonical `serverIPv4Allowlist`，服务端白名单互相独立，地址变化走显式审批/轮换；
+- 为 website 与 monitoring trust domain 分别准备稳定的 NAT/出口 IPv4；每次 bind response 的 exact `networkPolicy` 只含对应服务端从可信连接元数据观察到的 canonical `agentObservedIPv4`，两端分别冻结该地址/32，地址变化走显式 rebind/轮换；
 - `/etc/pve/pve-root-ca.pem` 可读，安装器会复制公开 CA；
 - 已校验的 Agent 二进制和 SHA-256；
 - Python 3.9+、Bash 5+，以及 vendored template manifest 列出的本机命令与 Perl modules；安装器会逐项检查并在缺失时中止；
@@ -17,7 +17,7 @@
 
 监控站使用独立一次性绑定和独立信任域，不复用官网凭据。样例没有真实监控 endpoint/credential，所以默认 `destinations.monitoring.enabled=false`；已部署监控服务端后，成功执行第 6 节的独立绑定才会启用该 destination。
 
-安装前用 `getent ahostsv4 <官网域名>`、`getent ahostsv4 <监控域名>` 和 `curl -4` 验证受控 IPv4 路径。绑定后不能把这个人工检查当作 policy：Agent 只对 hostname 的 `A 记录 ∩ 对应 trust domain serverIPv4Allowlist` 进行 `tcp4` 直拨，并保留 URL hostname 以完成 Host/TLS SNI/证书校验；交集为空、redirect、跨 origin 或 IPv6 都 fail closed。PVE endpoint 必须精确为 `https://127.0.0.1:8006`，不能写 `localhost`、`::1` 或节点公网地址。不要向 service 注入 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`；当前 clients 忽略 ambient proxy，未来若引入代理也必须是显式配置、受控 CA/认证和固定链路。website 与 monitoring 的 strict response 校验/pinning 已在本地 Agent 实现；服务端记录出口 IP、签发/轮换 policy 和部署 endpoint 仍待各自项目交付。
+安装前可用 `getent ahostsv4 <官网域名>`、`getent ahostsv4 <监控域名>` 和 `curl -4` 诊断 IPv4 路径，但不再审批或固定 Cloudflare A/Anycast 集合。Agent 对 hostname 使用系统 A 解析和 `tcp4` 直拨，并保留 URL hostname 完成 Host/TLS SNI/系统 CA 证书校验；redirect、跨 origin、环境代理或 IPv6 fallback 都 fail closed。PVE endpoint 必须精确为 `https://127.0.0.1:8006`，不能写 `localhost`、`::1` 或节点公网地址。
 
 ## 2. 安装已校验发布物
 
@@ -163,7 +163,7 @@ sudo shred -u /run/ppflight-binding-code
 
 CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项；绑定 endpoint 也不得含 query。只能使用 stdin 或 `--code-file`。
 
-`--code-file` 必须是 regular file、非 symlink，Unix 上 group/other 不得有权限。Agent 在首次请求前将 UUID `requestId` 和 canonical 请求指纹保存到 `<stateDirectory>/bindings/.website-binding-pending.json`，网络失败时相同输入复用该 ID；指纹包含 code，但 code 原文不落盘。绑定成功后，`<stateDirectory>/bindings/binding-state.json` 保存响应的 UUID `bindingId`、匹配的 `deviceId`、官网 identity、五组 endpoint-specific HMAC、Ed25519 验签公钥、initial assignment、独立 `networkPolicy={agentObservedIPv4,serverIPv4Allowlist}` 和 `credentialEpoch`；输出不会显示 secret。policy 的 allowlist 必须是 1..16 canonical IPv4，URL hostname 的 A 记录必须与它有交集，Agent 只向交集 tcp4 直拨并保留 hostname 作 TLS 验证；代理、redirect/跨 origin、IPv6 都会拒绝。website policy 不能被 monitoring binding 读取或覆盖。重复绑定需要官网新 code 和显式 `--replace`，响应 epoch 必须单调前进。
+`--code-file` 必须是 regular file、非 symlink，Unix 上 group/other 不得有权限。Agent 在首次请求前将 UUID `requestId` 和 canonical 请求指纹保存到 `<stateDirectory>/bindings/.website-binding-pending.json`，网络失败时相同输入复用该 ID；指纹包含 code，但 code 原文不落盘。绑定成功后，`<stateDirectory>/bindings/binding-state.json` 保存响应的 UUID `bindingId`、匹配的 `deviceId`、官网 identity、五组 endpoint-specific HMAC、Ed25519 验签公钥、initial assignment、exact `networkPolicy={agentObservedIPv4}` 和 `credentialEpoch`；输出不会显示 secret。Agent 保留 hostname 作 Host/TLS SNI/系统 CA 验证，使用 tcp4 并拒绝代理、redirect/跨 origin 与 IPv6 fallback。website policy 不能被 monitoring binding 读取或覆盖。重复绑定需要官网新 code 和显式 `--replace`，响应 epoch 必须单调前进。
 
 安装脚本创建 `/var/lib/ppflight-agent/bindings` 为 `root:ppflight-agent`、`0750`，状态/device/pending 文件为 `0640`。绑定命令由 root 执行；systemd 服务只有组读权限，并以 `ReadOnlyPaths=/var/lib/ppflight-agent/bindings` 禁止写入。远端 assignment 使用独立的 `/var/lib/ppflight-agent/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`；不要把 binding 目录改成 service 可写来实现 refresh。
 
@@ -177,11 +177,11 @@ sudo ag-pve website show
 
 官网 bind/replace 不得修改本地 PVE Token，也不得修改独立的监控站绑定状态；它同样不会修改 `pve.source`、`mode`、`productionExecution`、PVE ACL 或 systemd 服务状态。
 
-官网绑定完成后，管理员还必须确认 website response 中服务端观察的 `agentObservedIPv4`，以及独立 `serverIPv4Allowlist` 与官网 origin A 记录的交集。这个 mutual whitelist 以 `bindingId/deviceId/agentRef` 关系为作用域；IP 命中不能替代 TLS、HMAC、Ed25519、epoch、assignment 或时间窗校验。出口地址变化不能静默自动学习。Agent 侧严格校验、持久化和 pinning 已实现；官网服务端记录/签发/轮换与 endpoint 部署仍待官网任务交付。
+官网绑定完成后，服务端以可信连接元数据观察并冻结 `agentObservedIPv4/32`，作用域绑定到 `bindingId/deviceId/agentRef`；来源 IP 命中不能替代 TLS、HMAC、Ed25519、epoch、assignment 或时间窗校验。出口地址变化不能静默自动学习，必须显式 rebind/轮换。
 
 ## 6. 监控站独立绑定的部署边界
 
-监控站接口为 `POST /internal/v1/monitoring/agents/bind`，使用与官网不同的一次性 code，不要求官网先绑定。请求必须包含 UUID `requestId`、稳定 `deviceId` 和 node/capability 基础字段；响应只含 `bindingId`、匹配的 `deviceId`、`monitoringAgentRef`、ingest endpoint、`hmac-sha256`/base64 credential、`telemetry-v1` compression/大小上限、独立 `networkPolicy={agentObservedIPv4,serverIPv4Allowlist}`、`credentialEpoch` 和 `issuedAt`。allowlist 同样严格为 1..16 canonical IPv4；Agent 只直拨 `monitoring ingest/status` hostname 的 `A ∩ allowlist`，保留 TLS hostname，拒绝 proxy/redirect/IPv6。状态写入 `<stateDirectory>/bindings/monitoring-binding-state.json`，不含 website identity、metering、assignment、commands、receipts 或 Ed25519 key；website bind/replace 不能读取、复用或覆盖该 policy。
+监控站接口为 `POST /internal/v1/monitoring/agents/bind`，使用与官网不同的一次性 code，不要求官网先绑定。请求必须包含 UUID `requestId`、稳定 `deviceId` 和 node/capability 基础字段；响应只含 `bindingId`、匹配的 `deviceId`、`monitoringAgentRef`、ingest endpoint、`hmac-sha256`/base64 credential、`telemetry-v1` compression/大小上限、exact `networkPolicy={agentObservedIPv4}`、`credentialEpoch` 和 `issuedAt`。监控端从可信 `CF-Connecting-IP` 冻结该出口 IPv4/32；Agent 对 ingest/status hostname 使用 tcp4，保留 TLS hostname，并拒绝 proxy/redirect/IPv6 fallback。状态写入 `<stateDirectory>/bindings/monitoring-binding-state.json`；website bind/replace 不能读取、复用或覆盖该 policy。
 
 绑定前必须在将要运行 Agent 的同一台 PVE 上生成可审批的网络证据：
 
@@ -190,7 +190,7 @@ sudo ag-pve monitoring preflight \
   --endpoint https://moniter.example/internal/v1/monitoring/agents/bind
 ```
 
-命令只解析 A，并对每个 A 直接执行 tcp4 + 原 hostname/SNI 的系统 CA TLS 校验；不发送 HTTP、不读取绑定码、不写 state/config，也不自动批准。保存 strict JSON 中的 `resolvedAt/resolvedA/checks/eligibleServerIPv4Allowlist`，且仅在 `readyForOperatorApproval=true` 时提交操作员审批。Cloudflare/Tunnel 地址变化后重新运行；服务端仍必须使用“旧+新重叠配置 → 新 code 显式 rebind → 移除旧地址”，不能把 preflight 变成自动学习。
+命令只解析 A，并对每个 A 直接执行 tcp4 + 原 hostname/SNI 的系统 CA TLS 检查；不发送 HTTP、不读取绑定码、不写 state/config。输出仅含 `resolvedAt/resolvedA/checks`，不再生成 `eligibleServerIPv4Allowlist` 或 `readyForOperatorApproval`，也不是 bind 前置条件。
 
 本仓 Agent 已提供独立绑定 CLI。确认监控服务端路由已经部署后，交互式执行并在标准输入提示中粘贴 monitoring code：
 

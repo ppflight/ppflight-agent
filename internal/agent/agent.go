@@ -105,24 +105,20 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			_ = stateLock.Close()
 		}
 	}()
-	websiteAllowlist := []string(nil)
 	usesWebsiteNetworkPolicy := cfg.Assignments.RefreshURL != "" ||
 		cfg.Destinations.WebsiteMetering.Enabled || cfg.Destinations.WebsiteTelemetry.Enabled ||
 		(cfg.Control.Enabled && cfg.Control.PollURL != "" && cfg.Control.ResultURL != "")
 	if usesWebsiteNetworkPolicy {
-		policy, policyErr := bindingoverlay.WebsiteNetworkPolicy(cfg.Runtime.StateDirectory)
+		_, policyErr := bindingoverlay.WebsiteNetworkPolicy(cfg.Runtime.StateDirectory)
 		if policyErr != nil {
 			return nil, fmt.Errorf("load website destination network policy: %w", policyErr)
 		}
-		websiteAllowlist = append(websiteAllowlist, policy.ServerIPv4Allowlist...)
 	}
-	monitoringAllowlist := []string(nil)
 	if cfg.Destinations.Monitoring.Enabled || cfg.Destinations.MonitoringAudit.Enabled {
-		policy, policyErr := bindingoverlay.MonitoringNetworkPolicy(cfg.Runtime.StateDirectory)
+		_, policyErr := bindingoverlay.MonitoringNetworkPolicy(cfg.Runtime.StateDirectory)
 		if policyErr != nil {
 			return nil, fmt.Errorf("load monitoring destination network policy: %w", policyErr)
 		}
-		monitoringAllowlist = append(monitoringAllowlist, policy.ServerIPv4Allowlist...)
 	}
 	assignments, err := loadAssignments(cfg)
 	if err != nil {
@@ -201,7 +197,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			Credential:   enrollment.HMACCredential{KeyID: secrets.Assignments.KeyID, Secret: enrollment.Secret(base64.StdEncoding.EncodeToString(secrets.Assignments.Secret))},
 			SigningKeyID: secrets.ControlSigningKeyID, SigningPublicKey: ed25519.PublicKey(secrets.ControlPublicKey),
 			Wait: 25 * time.Second, Timeout: 30 * time.Second,
-			AllowLoopbackHTTP: cfg.Mode == "test", ServerIPv4Allowlist: websiteAllowlist,
+			AllowLoopbackHTTP: cfg.Mode == "test",
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create assignment refresh client: %w", err)
@@ -232,31 +228,31 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		progressSource.SetProgressReporter(app.markCollectionProgress)
 	}
 	if cfg.Destinations.WebsiteMetering.Enabled {
-		d, err := newDelivery("website-metering", cfg.Destinations.WebsiteMetering, secrets.WebsiteMetering, meterQueue, websiteAllowlist)
+		d, err := newDelivery("website-metering", cfg.Destinations.WebsiteMetering, secrets.WebsiteMetering, meterQueue)
 		if err != nil {
 			return nil, err
 		}
 		app.deliveries = append(app.deliveries, d)
 	}
 	if cfg.Destinations.WebsiteTelemetry.Enabled {
-		d, err := newDelivery("website-telemetry", cfg.Destinations.WebsiteTelemetry, secrets.WebsiteTelemetry, websiteQueue, websiteAllowlist)
+		d, err := newDelivery("website-telemetry", cfg.Destinations.WebsiteTelemetry, secrets.WebsiteTelemetry, websiteQueue)
 		if err != nil {
 			return nil, err
 		}
 		app.deliveries = append(app.deliveries, d)
-		lifecycleDelivery, lifecycleErr := newDelivery("website-lifecycle", cfg.Destinations.WebsiteTelemetry, secrets.WebsiteTelemetry, websiteLifecycleQueue, websiteAllowlist)
+		lifecycleDelivery, lifecycleErr := newDelivery("website-lifecycle", cfg.Destinations.WebsiteTelemetry, secrets.WebsiteTelemetry, websiteLifecycleQueue)
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
 		}
 		app.deliveries = append(app.deliveries, lifecycleDelivery)
 	}
 	if cfg.Destinations.Monitoring.Enabled {
-		d, err := newDelivery("monitoring", cfg.Destinations.Monitoring, secrets.Monitoring, monitorQueue, monitoringAllowlist)
+		d, err := newDelivery("monitoring", cfg.Destinations.Monitoring, secrets.Monitoring, monitorQueue)
 		if err != nil {
 			return nil, err
 		}
 		app.deliveries = append(app.deliveries, d)
-		lifecycleDelivery, lifecycleErr := newDelivery("monitoring-lifecycle", cfg.Destinations.Monitoring, secrets.Monitoring, monitoringLifecycleQueue, monitoringAllowlist)
+		lifecycleDelivery, lifecycleErr := newDelivery("monitoring-lifecycle", cfg.Destinations.Monitoring, secrets.Monitoring, monitoringLifecycleQueue)
 		if lifecycleErr != nil {
 			return nil, lifecycleErr
 		}
@@ -280,7 +276,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			return nil, fmt.Errorf("create monitoring audit sink: %w", sinkErr)
 		}
 		auditSink = queueSink
-		d, deliveryErr := newDelivery("monitoring-audit", cfg.Destinations.MonitoringAudit, secrets.MonitoringAudit, auditQueue, monitoringAllowlist)
+		d, deliveryErr := newDelivery("monitoring-audit", cfg.Destinations.MonitoringAudit, secrets.MonitoringAudit, auditQueue)
 		if deliveryErr != nil {
 			return nil, deliveryErr
 		}
@@ -296,7 +292,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			Endpoint: cfg.Control.PollURL, AgentRef: cfg.Identity.AgentRef, Limit: cfg.Control.MaxCommandsPerPoll,
 			AuthMode: uploader.AuthMode(cfg.Control.Auth.Mode), KeyID: secrets.ControlAPI.KeyID,
 			Secret: secrets.ControlAPI.Secret, BearerToken: secrets.ControlAPI.Bearer,
-			Timeout: cfg.Control.RequestTimeout.Duration, ServerIPv4Allowlist: websiteAllowlist,
+			Timeout: cfg.Control.RequestTimeout.Duration,
 		})
 		if clientErr != nil {
 			return nil, clientErr
@@ -334,7 +330,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		}
 		app.control = service
 		resultDestination := config.DestinationConfig{Enabled: true, URL: cfg.Control.ResultURL, Auth: cfg.Control.Auth, Timeout: cfg.Control.RequestTimeout, MaxResponseBytes: 2 << 20, MaxQueueBytes: 64 << 20, Compression: "none", PayloadFormat: "control-receipt-v1"}
-		d, deliveryErr := newDelivery("control-results", resultDestination, secrets.ControlReceipts, controlQueue, websiteAllowlist)
+		d, deliveryErr := newDelivery("control-results", resultDestination, secrets.ControlReceipts, controlQueue)
 		if deliveryErr != nil {
 			return nil, deliveryErr
 		}
@@ -358,9 +354,9 @@ func loadAssignments(cfg config.Config) (*inventory.Store, error) {
 	return inventory.NewStore(inventory.Document{SchemaVersion: inventory.SchemaVersion, Revision: "empty-test", IssuedAt: time.Now().UTC(), Assignments: []inventory.Assignment{}}), nil
 }
 
-func newDelivery(name string, cfg config.DestinationConfig, secret config.DestinationSecret, queue *store.Queue, serverIPv4Allowlist []string) (delivery, error) {
+func newDelivery(name string, cfg config.DestinationConfig, secret config.DestinationSecret, queue *store.Queue) (delivery, error) {
 	instance, err := uploader.New(uploader.Config{
-		Destination: uploader.Destination{ID: name, Endpoint: cfg.URL, AuthMode: uploader.AuthMode(cfg.Auth.Mode), KeyID: secret.KeyID, Secret: secret.Secret, BearerToken: secret.Bearer, CredentialEpoch: secret.CredentialEpoch, Compression: cfg.Compression, ServerIPv4Allowlist: append([]string(nil), serverIPv4Allowlist...)},
+		Destination: uploader.Destination{ID: name, Endpoint: cfg.URL, AuthMode: uploader.AuthMode(cfg.Auth.Mode), KeyID: secret.KeyID, Secret: secret.Secret, BearerToken: secret.Bearer, CredentialEpoch: secret.CredentialEpoch, Compression: cfg.Compression},
 		Queue:       queue, RequestTimeout: cfg.Timeout.Duration, MaxResponseBytes: cfg.MaxResponseBytes,
 		MaxCompressedBytes: cfg.MaxCompressedBytes, MaxUncompressedBytes: cfg.MaxUncompressedBytes,
 	})

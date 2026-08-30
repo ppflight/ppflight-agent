@@ -44,8 +44,9 @@ type Destination struct {
 	BearerToken string
 	// CredentialEpoch is issued by the binding authority. Increasing it is the
 	// only in-process way to clear an authentication circuit breaker.
-	CredentialEpoch     uint64
-	Compression         string
+	CredentialEpoch uint64
+	Compression     string
+	// ServerIPv4Allowlist is deprecated and ignored. It is not a wire field.
 	ServerIPv4Allowlist []string
 }
 
@@ -121,27 +122,16 @@ func New(config Config) (*Uploader, error) {
 	if config.Destination.Compression != "none" && config.Destination.Compression != "gzip" {
 		return nil, fmt.Errorf("unknown compression %q", config.Destination.Compression)
 	}
-	if err := netpolicy.ValidateNetworkPolicy(netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: config.Destination.ServerIPv4Allowlist}); err != nil {
-		return nil, errors.New("destination server IPv4 allowlist is invalid")
-	}
 	if config.HTTPClient == nil {
-		config.HTTPClient, err = secureHTTPClient(config.RequestTimeout, config.Destination.ServerIPv4Allowlist)
+		config.HTTPClient, err = secureHTTPClient(config.RequestTimeout)
 		if err != nil {
-			return nil, errors.New("destination server IPv4 allowlist is invalid")
+			return nil, errors.New("destination HTTP client is invalid")
 		}
 	} else if transport, ok := config.HTTPClient.Transport.(*http.Transport); ok {
-		clone := transport.Clone()
-		clone.Proxy = nil
-		clone, err = netpolicy.ApplyIPv4Allowlist(netpolicy.ApplyIPv4Only(clone), config.Destination.ServerIPv4Allowlist)
-		if err != nil {
-			return nil, errors.New("destination server IPv4 allowlist is invalid")
-		}
+		clone := netpolicy.ApplyIPv4Only(transport.Clone())
 		config.HTTPClient = cloneHTTPClient(config.HTTPClient, clone, config.RequestTimeout)
 	} else if config.HTTPClient.Transport == nil {
-		clone, policyErr := netpolicy.ApplyIPv4Allowlist(netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone()), config.Destination.ServerIPv4Allowlist)
-		if policyErr != nil {
-			return nil, errors.New("destination server IPv4 allowlist is invalid")
-		}
+		clone := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
 		config.HTTPClient = cloneHTTPClient(config.HTTPClient, clone, config.RequestTimeout)
 	} else {
 		return nil, errors.New("uploader HTTP transport must be *http.Transport")
@@ -510,17 +500,11 @@ func parseAPIResponse(body io.Reader, maxBytes int64) (apiResponse, error) {
 	return response, nil
 }
 
-func secureHTTPClient(timeout time.Duration, allowlist []string) (*http.Client, error) {
+func secureHTTPClient(timeout time.Duration) (*http.Client, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
 	transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
-	var err error
-	transport, err = netpolicy.ApplyIPv4Allowlist(transport, allowlist)
-	if err != nil {
-		return nil, err
-	}
-	transport.Proxy = nil
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}
 	} else {

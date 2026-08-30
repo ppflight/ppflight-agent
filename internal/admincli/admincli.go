@@ -562,17 +562,18 @@ type monitoringPreflightCheck struct {
 }
 
 type monitoringPreflightResult struct {
-	SchemaVersion               int                        `json:"schemaVersion"`
-	Endpoint                    string                     `json:"endpoint"`
-	Hostname                    string                     `json:"hostname"`
-	ResolvedAt                  time.Time                  `json:"resolvedAt"`
-	ResolvedA                   []string                   `json:"resolvedA"`
-	EligibleServerIPv4Allowlist []string                   `json:"eligibleServerIPv4Allowlist"`
-	ReadyForOperatorApproval    bool                       `json:"readyForOperatorApproval"`
-	Checks                      []monitoringPreflightCheck `json:"checks"`
+	SchemaVersion int                        `json:"schemaVersion"`
+	Endpoint      string                     `json:"endpoint"`
+	Hostname      string                     `json:"hostname"`
+	ResolvedAt    time.Time                  `json:"resolvedAt"`
+	ResolvedA     []string                   `json:"resolvedA"`
+	Checks        []monitoringPreflightCheck `json:"checks"`
 }
 
 type monitoringTLSDial func(context.Context, string, string, time.Duration) (tls.ConnectionState, error)
+type monitoringResolver interface {
+	LookupIP(context.Context, string, string) ([]net.IP, error)
+}
 
 func (c *cli) monitoringPreflight(args []string) int {
 	set := flag.NewFlagSet("monitoring preflight", flag.ContinueOnError)
@@ -592,15 +593,12 @@ func (c *cli) monitoringPreflight(args []string) int {
 	if printJSON(c.out, result) != 0 {
 		return 1
 	}
-	if !result.ReadyForOperatorApproval {
-		return 1
-	}
 	return 0
 }
 
-// buildMonitoringPreflight produces evidence for a human allowlist decision.
-// It never writes binding state, calls an HTTP route, or approves addresses.
-func buildMonitoringPreflight(ctx context.Context, raw string, timeout time.Duration, resolver netpolicy.Resolver, dial monitoringTLSDial, now func() time.Time) (monitoringPreflightResult, error) {
+// buildMonitoringPreflight is optional DNS/tcp4/TLS diagnostics. It never
+// writes binding state, calls an HTTP route, or gates enrollment approval.
+func buildMonitoringPreflight(ctx context.Context, raw string, timeout time.Duration, resolver monitoringResolver, dial monitoringTLSDial, now func() time.Time) (monitoringPreflightResult, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || netpolicy.ValidateIPv4URL(parsed) != nil {
 		return monitoringPreflightResult{}, errors.New("endpoint 必须是有效的 IPv4-capable HTTPS URL")
@@ -644,8 +642,8 @@ func buildMonitoringPreflight(ctx context.Context, raw string, timeout time.Dura
 		addresses = append(addresses, canonical)
 	}
 	sort.Strings(addresses)
-	if len(addresses) == 0 || len(addresses) > netpolicy.MaxServerIPv4Allowlist {
-		return monitoringPreflightResult{}, errors.New("A 记录数量不符合 monitoring allowlist 合同")
+	if len(addresses) == 0 || len(addresses) > 64 {
+		return monitoringPreflightResult{}, errors.New("监控 endpoint 的 A 记录数量无效")
 	}
 	port := parsed.Port()
 	if port == "" {
@@ -654,7 +652,7 @@ func buildMonitoringPreflight(ctx context.Context, raw string, timeout time.Dura
 	if dial == nil {
 		dial = dialMonitoringTLS
 	}
-	result := monitoringPreflightResult{SchemaVersion: 1, Endpoint: parsed.String(), Hostname: hostname, ResolvedAt: now().UTC(), ResolvedA: append([]string(nil), addresses...), EligibleServerIPv4Allowlist: []string{}, Checks: make([]monitoringPreflightCheck, 0, len(addresses))}
+	result := monitoringPreflightResult{SchemaVersion: 1, Endpoint: parsed.String(), Hostname: hostname, ResolvedAt: now().UTC(), ResolvedA: append([]string(nil), addresses...), Checks: make([]monitoringPreflightCheck, 0, len(addresses))}
 	for _, ipv4 := range addresses {
 		state, dialErr := dial(ctx, net.JoinHostPort(ipv4, port), hostname, timeout)
 		check := monitoringPreflightCheck{IPv4: ipv4}
@@ -669,10 +667,8 @@ func buildMonitoringPreflight(ctx context.Context, raw string, timeout time.Dura
 			notAfter := state.PeerCertificates[0].NotAfter.UTC()
 			check.CertificateNotAfter = &notAfter
 		}
-		result.EligibleServerIPv4Allowlist = append(result.EligibleServerIPv4Allowlist, ipv4)
 		result.Checks = append(result.Checks, check)
 	}
-	result.ReadyForOperatorApproval = len(result.EligibleServerIPv4Allowlist) == len(result.ResolvedA)
 	return result, nil
 }
 
@@ -1094,14 +1090,15 @@ func (c *cli) templateInit() int {
 		return 2
 	}
 	discovery.Storages = refreshed
-	backupAnswer, err := c.promptLine(reader, "创建完成后备份模板？[Y/n]: ")
+	backupEnabled, err := c.promptYesNo(reader, "模板创建完成后，是否额外生成备份文件？[Y/n]（回车=是）: ", true)
 	if err != nil {
 		return 2
 	}
 	backupPolicy, backupStorage := "required", ""
-	if strings.EqualFold(backupAnswer, "n") || strings.EqualFold(backupAnswer, "no") {
+	if !backupEnabled {
 		backupPolicy = "disabled"
 	} else {
+		fmt.Fprintln(c.out, "备份可用于恢复模板，但会占用所选备份存储的空间。")
 		backupStorage, refreshed, err = c.chooseTemplateStorage(ctx, reader, discovery.Storages, "backup", "选择模板备份存储")
 		if err != nil {
 			fmt.Fprintf(c.errOut, "备份存储选择失败: %v\n", err)
@@ -1586,6 +1583,25 @@ func (c *cli) promptLine(reader *bufio.Reader, prompt string) (string, error) {
 		return "", errors.New("输入过长")
 	}
 	return value, nil
+}
+
+func (c *cli) promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {
+	for {
+		value, err := c.promptLine(reader, prompt)
+		if err != nil {
+			return false, err
+		}
+		switch strings.ToLower(value) {
+		case "":
+			return defaultYes, nil
+		case "y", "yes":
+			return true, nil
+		case "n", "no":
+			return false, nil
+		default:
+			fmt.Fprintln(c.out, "输入无效：只接受回车、Y 或 N，请重新输入。")
+		}
+	}
 }
 
 func (c *cli) reserved(target, operation string) int {
