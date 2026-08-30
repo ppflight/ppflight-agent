@@ -31,6 +31,7 @@ CATALOG_PATH = REPO_ROOT / "catalog" / "template-catalog.v1.json"
 BUILDER_PATH = REPO_ROOT / "build-cloud-templates.sh"
 
 STORAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+PVE_NODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
 BRIDGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 SAFE_KEY_RE = re.compile(r"^[a-z0-9]+(?:[.-][a-z0-9]+)*$")
 REVISION_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[1-9][0-9]*$")
@@ -555,9 +556,33 @@ def _storage_content_remediations(
     ]
 
 
+def _local_pve_node(runner: CommandRunner) -> str:
+    cluster_status = runner.json(("pvesh", "get", "/cluster/status", "--output-format", "json"))
+    if not isinstance(cluster_status, list):
+        raise ContractError("PVE_NODE_RESPONSE_INVALID", "PVE cluster status did not return an array")
+    local_nodes = [
+        row
+        for row in cluster_status
+        if isinstance(row, dict)
+        and str(row.get("type", "")).lower() == "node"
+        and _as_bool(row.get("local"), False)
+    ]
+    if len(local_nodes) != 1:
+        raise ContractError(
+            "PVE_LOCAL_NODE_INVALID",
+            "PVE cluster status did not identify exactly one local node",
+            {"localNodeCount": len(local_nodes)},
+        )
+    node_name = str(local_nodes[0].get("name", local_nodes[0].get("node", "")))
+    if not PVE_NODE_RE.fullmatch(node_name):
+        raise ContractError("PVE_LOCAL_NODE_INVALID", "PVE returned an invalid local node name")
+    return node_name
+
+
 def discover_storages(runner: CommandRunner) -> List[Dict[str, Any]]:
     configs = runner.json(("pvesh", "get", "/storage", "--output-format", "json"))
-    statuses = runner.json(("pvesm", "status", "--output-format", "json"))
+    local_node = _local_pve_node(runner)
+    statuses = runner.json(("pvesh", "get", f"/nodes/{local_node}/storage", "--output-format", "json"))
     if not isinstance(configs, list) or not isinstance(statuses, list):
         raise ContractError("PVE_STORAGE_RESPONSE_INVALID", "PVE storage discovery did not return arrays")
     status_by_id = {str(row.get("storage")): row for row in statuses if isinstance(row, dict) and row.get("storage")}

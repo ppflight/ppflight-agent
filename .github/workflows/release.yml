@@ -36,6 +36,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          python3 -m unittest discover -s tests -p 'test_*.py'
           go test -race -count=1 ./...
           go vet ./...
 

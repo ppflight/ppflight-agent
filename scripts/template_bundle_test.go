@@ -93,7 +93,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "272d951a3933398849c031624b3ca84e515b99dc2ec2a49ae4fbf723a93649da"
+	const expectedManifestSHA256 = "143169be1cb00e88a239ead9c51eb274def6712038afa6be43ac0e8c4302d37a"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
