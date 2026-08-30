@@ -96,7 +96,7 @@ func TestRealCLIDualBindResolvesAndRunsAgentOnce(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	monitoringCode := RunWithInput([]string{"--config", filename, "monitoring", "bind", "--endpoint", monitoring.URL + "/internal/v1/monitoring/agents/bind", "--pve-version", "9.0.8", "--hostname", "pve-test"}, "integration", strings.NewReader("MONITOR-123456\n"), &stdout, &stderr)
+	monitoringCode := runMonitoringBindForTest([]string{"--config", filename, "monitoring", "bind", "--endpoint", monitoring.URL + "/internal/v1/monitoring/agents/bind", "--hostname", "pve-test"}, "integration", strings.NewReader("MONITOR-123456\n"), &stdout, &stderr)
 	if monitoringCode != 0 {
 		t.Fatalf("monitoring bind code=%d stderr=%s", monitoringCode, stderr.String())
 	}

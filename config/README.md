@@ -10,7 +10,7 @@
 
 样例默认 `mode=test`、`pve.source=simulator`、所有外发 destination disabled、`control.productionExecution=false`。未绑定样例中的 HMAC/Ed25519 environment label 刻意留空；`ag-pve bind` 验证响应后才写入保留 label，运行时从 private binding state 解析真实 credential，而不是从环境变量取同名 secret。
 
-安装器默认原样复制这份 simulator/test 样例。`AG` 五项菜单只包含模板向导、官网/监控绑定和两个通信状态，不会运行 Token bootstrap、把 `pve.source` 切为 `api`、修改 mode/production gate，或启动/重启 service；两种 bind 也不做这些动作。生产 onboarding 必须按下列顺序逐步完成，不能把 binding 成功当作本地 PVE API 已接通。
+安装器默认原样复制这份 simulator/test 样例。`AG` 五项菜单只包含模板向导、官网/监控绑定和两个通信状态，不会运行 Token bootstrap、把 `pve.source` 切为 `api` 或修改 mode/production gate。官网 bind 不改变 service；监控 bind 在安全写入并回验独立状态后会受控重启 `ppflight-agent.service`，并确认新 monitoring binding 已由进程加载，除此之外不改变本地 PVE 接入设置。生产 onboarding 必须按下列顺序逐步完成，不能把 binding 成功当作本地 PVE API 已接通。
 
 样例的 `allowedActions` 只列 `vm.start/vm.shutdown/vm.reboot`，表示本机部署层刻意缩小授权面，不是协议只实现这三项。配置只能从代码 known-action registry 中选择，且还必须是绑定响应 `allowedActions` 的子集；增加本机列表不能绕过绑定授权、scope、approval、`productionExecution`、assignment 或 audit gate。完整动作名以 [Agent API v1 第 7 节](../docs/AGENT-API-V1.md#7-executor-动作和参数事实) 为准。
 
@@ -23,7 +23,7 @@
 5. 未绑定样例的 `assignments.refreshUrl` 保持空字符串；官网绑定成功后 CLI 会写入服务端签发的同源 assignment endpoint，runtime 主循环使用最长 25 秒长轮询、Ed25519 bundle 验签和防回滚状态。不得手工填入其他 URL；生产 assignment 使用 `<stateDirectory>/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`，binding credential 子目录继续只读。
 6. 保持 `control.productionExecution=false`，直到官网 API、Ed25519、approval、UPID 恢复、资源锁、IPv4 whitelist 和独立 monitoring audit outbox/UI 均完成验收；官网 Agent upgrade route feature flag 另行保持默认关闭。
 
-监控站使用第二枚一次性绑定码和 `ag-pve monitoring bind --endpoint ... --pve-version ...`，code 同样只从 stdin 或 owner-only `--code-file` 读取。响应严格包含独立 `bindingId/deviceId/monitoringAgentRef`、ingest endpoint、`hmac-sha256`/base64 credential、`telemetry-v1` compression/大小上限、`credentialEpoch/issuedAt`，并写入独立 `<stateDirectory>/bindings/monitoring-binding-state.json`；官网 bind/replace 不得覆盖它。样例因没有真实 endpoint/credential 而将 `monitoring` 与 `monitoringAudit` 都设为 `enabled=false`、`url=""`；绑定成功后 CLI 启用 telemetry endpoint，并从同 origin 固定派生 audit/status 路径，服务端分别校验 `monitoring:telemetry.write`、`monitoring:audit.write`、`monitoring:status.read`。不得复制官网凭据绕过独立绑定，也不能把 Agent CLI 存在写成监控服务已上线。
+监控站使用第二枚一次性绑定码和 `ag-pve monitoring bind --endpoint ...`，不接受 `--pve-version` 或版本位置参数。CLI 在读取 code 前以固定 `/usr/bin/pveversion` 自动发现本机可信 PVE 8/9 版本；命令失败、超时、非 PVE 或异常输出均 fail closed。code 仍只从 stdin 或 owner-only `--code-file` 读取。响应严格包含独立 `bindingId/deviceId/monitoringAgentRef`、ingest endpoint、`hmac-sha256`/base64 credential、`telemetry-v1` compression/大小上限、`credentialEpoch/issuedAt`，并写入独立 `<stateDirectory>/bindings/monitoring-binding-state.json`；官网 bind/replace 不得覆盖它。绑定后 CLI 严格回验 config/state/runtime overlay，自动重启 unit 并从本地 `/status` 核对新 binding ID/epoch；失败原子回滚并保留可重试 request，成功后无需手工 restart。样例因没有真实 endpoint/credential 而将 `monitoring` 与 `monitoringAudit` 都设为 `enabled=false`、`url=""`；绑定成功后 CLI 启用 telemetry endpoint，并从同 origin 固定派生 audit/status 路径，服务端分别校验 `monitoring:telemetry.write`、`monitoring:audit.write`、`monitoring:status.read`。不得复制官网凭据绕过独立绑定。
 
 生产安装的 `<stateDirectory>/bindings` 为 `root:ppflight-agent`、`0750`，其中 website/monitoring/device/pending 文件为 `0640`；root 管理 CLI 写入，systemd service 组读且通过 `ReadOnlyPaths` 禁止写入。assignment 文件位于独立 `<stateDirectory>/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`；原子替换保留已有 owner/group/mode，不能把 credential 和 assignment 的写权限混在一起。
 

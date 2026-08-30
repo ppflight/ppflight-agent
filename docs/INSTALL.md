@@ -102,7 +102,7 @@ ACL-only 禁止 `/` 和 `--control-global-acl`，也不能与 `--write-env` 混�
 
 ## 4. 本地配置
 
-安装器默认复制的示例是 `mode=test`、`pve.source=simulator`；即使启动也只产生模拟采集。Token bootstrap 不编辑配置，`AG` 菜单和两种 bind 也不会切换 PVE source/mode 或启动服务。创建 Token 后，管理员可先以 root 执行下面的本地准备命令；它只允许在 `mode=test`、`control.productionExecution=false` 下运行，安全读取 root-only 环境文件，先验证只读 Token 的 PVE version/有效权限，再原子写入 API 采集所需字段。它不创建或扩大 control ACL、不打开 production、也不启动服务：
+安装器默认复制的示例是 `mode=test`、`pve.source=simulator`；即使启动也只产生模拟采集。Token bootstrap 不编辑配置，`AG` 菜单和两种 bind 也不会切换 PVE source/mode。官网 bind 不改变 service；监控 bind 仅在独立状态写入并严格回验后自动重启 unit、确认新 binding 已加载，失败则回滚。创建 Token 后，管理员可先以 root 执行下面的本地准备命令；它只允许在 `mode=test`、`control.productionExecution=false` 下运行，安全读取 root-only 环境文件，先验证只读 Token 的 PVE version/有效权限，再原子写入 API 采集所需字段。它不创建或扩大 control ACL、不打开 production、也不启动服务：
 
 ```bash
 sudo ag-pve pve prepare \
@@ -197,7 +197,6 @@ sudo ag-pve monitoring preflight \
 ```bash
 sudo ag-pve monitoring bind \
   --endpoint https://monitor.example/internal/v1/monitoring/agents/bind \
-  --pve-version 9.0.8 \
   --node-ref pve01
 ```
 
@@ -208,13 +207,12 @@ sudo install -m 0600 /dev/null /run/ppflight-monitoring-binding-code
 sudo editor /run/ppflight-monitoring-binding-code
 sudo ag-pve monitoring bind \
   --endpoint https://monitor.example/internal/v1/monitoring/agents/bind \
-  --pve-version 9.0.8 \
   --node-ref pve01 \
   --code-file /run/ppflight-monitoring-binding-code
 sudo shred -u /run/ppflight-monitoring-binding-code
 ```
 
-不要将 code 值作为位置参数或任何 argv 选项。成功响应验证通过后，CLI 只更新 monitoring telemetry/audit destinations 并保存独立状态；audit/status URL 都不是新增响应字段，而是从同 origin 固定派生 `/internal/v1/monitoring/audit-events/batches` 与 `/internal/v1/monitoring/agents/status`。官网 identity/credential 不变。轮换需要新 monitoring code 和 `--replace`。监控服务端路由由另一任务交付，本仓 CLI 存在不代表该路由已经部署；服务未部署时保留样例默认值，不能手工复制官网 HMAC。
+不要将 code 值作为位置参数或任何 argv 选项，也不要提供 `--pve-version`：CLI 在读取 code 前只调用固定 `/usr/bin/pveversion`，自动规范化可信本机 PVE 8/9 版本；失败、超时、异常输出或非 PVE 主机都会停止且不发送绑定码。成功响应验证通过后，CLI 只更新 monitoring telemetry/audit destinations 并保存独立状态；随后严格回读 config/state/runtime overlay，受控重启 `ppflight-agent.service`，并从本地 `/status` 确认新 `bindingId/credentialEpoch` 已由运行进程加载后才报告成功。失败会恢复旧 config/state、保留私有备份与可重试 pending request，并重新确认旧服务，不打印 secret。audit/status URL 都不是新增响应字段，而是从同 origin 固定派生 `/internal/v1/monitoring/audit-events/batches` 与 `/internal/v1/monitoring/agents/status`。官网 identity/credential 不变。轮换需要新 monitoring code 和 `--replace`。
 
 完成后可运行：
 

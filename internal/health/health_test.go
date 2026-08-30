@@ -47,3 +47,15 @@ func TestAuthenticationBlockedIsVisibleAndClearsOnSuccess(t *testing.T) {
 		t.Fatal("successful delivery did not clear auth block")
 	}
 }
+
+func TestBindingAuthorityIsNonSecretAndUsesDecimalEpochs(t *testing.T) {
+	registry := New("0.1.0", "production", "agent-1", "cluster-1", "pve-1", true, true, false, time.Now())
+	registry.Bindings("website-binding", 9007199254740993, "monitoring-binding", 18446744073709551615)
+	status := registry.Snapshot()
+	if status.Bindings.Website.BindingID != "website-binding" || status.Bindings.Website.CredentialEpoch != "9007199254740993" {
+		t.Fatalf("website binding status=%#v", status.Bindings.Website)
+	}
+	if status.Bindings.Monitoring.BindingID != "monitoring-binding" || status.Bindings.Monitoring.CredentialEpoch != "18446744073709551615" {
+		t.Fatalf("monitoring binding status=%#v", status.Bindings.Monitoring)
+	}
+}

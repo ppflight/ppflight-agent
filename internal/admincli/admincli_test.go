@@ -49,6 +49,32 @@ func writeTestConfig(t *testing.T) string {
 	return filename
 }
 
+func runMonitoringBindForTest(args []string, version string, in io.Reader, out, errOut io.Writer) int {
+	c := &cli{
+		in:      in,
+		out:     out,
+		errOut:  errOut,
+		version: version,
+		pveVersion: func(context.Context) (string, error) {
+			return "9.0.8", nil
+		},
+		activateBinding: func(_ context.Context, cfg config.Config, expected bindingActivationExpectation) error {
+			if expected.BindingID == "" {
+				return nil
+			}
+			state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+			if err != nil {
+				return err
+			}
+			if expected.Domain != "monitoring" || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
+				return errors.New("new monitoring binding was not loaded")
+			}
+			return nil
+		},
+	}
+	return c.run(args)
+}
+
 func TestUsageListsWebsiteBindAndStatus(t *testing.T) {
 	var output, stderr bytes.Buffer
 	if code := Run([]string{"help"}, "test", &output, &stderr); code != 0 {
@@ -691,7 +717,7 @@ func TestMonitoringBindUsesIndependentStateAndDoesNotOverwriteWebsite(t *testing
 	}))
 	defer server.Close()
 	var output, stderr bytes.Buffer
-	code := RunWithInput([]string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL + "/internal/v1/monitoring/agents/bind", "--pve-version", "9.0.8", "--hostname", "pve-test"}, "1.2.3", strings.NewReader("MONITOR-123456\n"), &output, &stderr)
+	code := runMonitoringBindForTest([]string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL + "/internal/v1/monitoring/agents/bind", "--hostname", "pve-test"}, "1.2.3", strings.NewReader("MONITOR-123456\n"), &output, &stderr)
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
@@ -712,5 +738,114 @@ func TestMonitoringBindUsesIndependentStateAndDoesNotOverwriteWebsite(t *testing
 	}
 	if loadedWebsite.BindingID != website.BindingID || loadedMonitoring.MonitoringAgentRef != "monitor-agent-01" || received.RequestID == "" {
 		t.Fatalf("website=%#v monitoring=%#v request=%#v", loadedWebsite, loadedMonitoring, received)
+	}
+	if received.NodeClaim.PVEVersion != "9.0.8" {
+		t.Fatalf("automatically discovered PVE version=%q", received.NodeClaim.PVEVersion)
+	}
+	if strings.Contains(output.String(), "systemctl restart") || !strings.Contains(output.String(), "自动生效") {
+		t.Fatalf("unexpected activation output: %s", output.String())
+	}
+}
+
+func TestMonitoringBindActivationFailureRollsBackAndKeepsRetryState(t *testing.T) {
+	filename := prepareBindConfig(t)
+	original, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request monitorenrollment.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		response := monitorenrollment.Response{
+			SchemaVersion:      1,
+			BindingID:          "123e4567-e89b-42d3-a456-426614174004",
+			DeviceID:           request.DeviceID,
+			MonitoringAgentRef: "monitor-agent-rollback",
+			IngestEndpoint:     server.URL + monitorenrollment.TelemetryPath,
+			HMACCredential: monitorenrollment.HMACCredential{
+				Algorithm: "hmac-sha256", KeyID: "monitor-key-rollback", SecretEncoding: "base64",
+				Secret: enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("never-print-this-secret"))),
+			},
+			Telemetry:       monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 8 << 20, MaxUncompressedBytes: 32 << 20},
+			NetworkPolicy:   netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"},
+			CredentialEpoch: 1,
+			IssuedAt:        time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	recoveryCalled := false
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in: strings.NewReader("MONITOR-ROLLBACK-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
+			if expected.BindingID == "" {
+				recoveryCalled = true
+				return nil
+			}
+			return errors.New("service did not load binding")
+		},
+	}
+	code := c.run([]string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL + "/internal/v1/monitoring/agents/bind", "--hostname", "pve-test"})
+	if code == 0 || !recoveryCalled {
+		t.Fatalf("code=%d recoveryCalled=%v", code, recoveryCalled)
+	}
+	restored, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Destinations.Monitoring.Enabled != original.Destinations.Monitoring.Enabled || restored.Destinations.MonitoringAudit.Enabled != original.Destinations.MonitoringAudit.Enabled {
+		t.Fatalf("monitoring config was not rolled back: %#v", restored.Destinations)
+	}
+	if _, err := bindstate.LoadMonitoring(restored.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("first-time monitoring state remains after rollback: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "MONITORING_BIND_ACTIVATION_FAILED") || strings.Contains(stderr.String(), "never-print-this-secret") {
+		t.Fatalf("unsafe or unclear stderr: %s", stderr.String())
+	}
+	pendingPath := bindstate.PendingPath(restored.Runtime.StateDirectory, "monitoring")
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatalf("retry request state was not preserved: %v", err)
+	}
+}
+
+func TestMonitoringBindRejectsUserSuppliedPVEVersion(t *testing.T) {
+	filename := prepareBindConfig(t)
+	called := false
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in: strings.NewReader("MONITOR-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+		pveVersion: func(context.Context) (string, error) { called = true; return "9.0.8", nil },
+	}
+	code := c.run([]string{"--config", filename, "monitoring", "bind", "--endpoint", "https://moniter.ppflight.com/internal/v1/monitoring/agents/bind", "--pve-version", "9.0.8"})
+	if code != 2 || called {
+		t.Fatalf("code=%d discoveryCalled=%v stderr=%s", code, called, stderr.String())
+	}
+}
+
+func TestMonitoringMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testing.T) {
+	filename := prepareBindConfig(t)
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in:  strings.NewReader("3\nhttps://moniter.ppflight.com/internal/v1/monitoring/agents/bind\nSHOULD-NOT-BE-READ\n"),
+		out: &stdout, errOut: &stderr, version: "test",
+		pveVersion: func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
+	}
+	if code := c.run([]string{"--config", filename}); code == 0 {
+		t.Fatal("menu accepted failed trusted PVE discovery")
+	}
+	if strings.Contains(stdout.String(), "PVE 版本") || strings.Contains(stdout.String(), "输入一次性绑定码") {
+		t.Fatalf("monitoring menu prompted before discovery: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "PVE_VERSION_DISCOVERY_FAILED") {
+		t.Fatalf("missing safe discovery error: %s", stderr.String())
 	}
 }

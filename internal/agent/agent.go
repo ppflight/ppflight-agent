@@ -216,6 +216,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	}
 	configuredControl := cfg.Control.Enabled && cfg.Control.PollURL != "" && cfg.Control.ResultURL != ""
 	registry := health.New(version, cfg.Mode, cfg.Identity.AgentRef, cfg.Identity.ClusterRef, cfg.Identity.NodeRef, cfg.Control.Enabled, configuredControl, cfg.Control.ProductionExecution, time.Now())
+	registry.Bindings(secrets.WebsiteBindingID, secrets.WebsiteCredentialEpoch, secrets.MonitoringBindingID, secrets.Monitoring.CredentialEpoch)
 	for name, queue := range queues {
 		registry.RegisterQueue(name, queue)
 	}

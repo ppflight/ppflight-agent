@@ -82,7 +82,7 @@ Content-Type: application/json
 
 Agent 严格拒绝未知响应字段、缺失/非法 `networkPolicy`、跨 origin 端点、重定向、无效 assignment 和不安全凭据。官网状态固定为 `<stateDirectory>/bindings/binding-state.json`，稳定 device ID 为同目录 `device-id`；替换绑定要求新 code、显式 `--replace`，且新的 `credentialEpoch` 必须前进。
 
-绑定是单一职责操作，不是一键初始化：安装器默认配置仍为 `mode=test`、`pve.source=simulator`；website/monitoring bind 都不会创建 PVE Token、切换为 `source=api`、修改 mode/`productionExecution`/PVE ACL，或启动/重启 systemd。`AG` 五项菜单也只含模板、双绑定和双状态。管理员必须分别运行本地 Token bootstrap、显式编辑配置、用 systemd EnvironmentFile 做 secret-aware config check，再启动服务；不能从 binding 成功推断本地 PVE API 已接通。
+绑定是单一职责操作，不是一键初始化：安装器默认配置仍为 `mode=test`、`pve.source=simulator`；website/monitoring bind 都不会创建 PVE Token、切换为 `source=api`、修改 mode/`productionExecution` 或 PVE ACL。website bind 不改变 systemd；monitoring bind 只为让新独立 credential 立即生效而在严格写入回验后受控重启 unit，并确认进程 `/status` 已加载相同 binding ID/epoch，失败则恢复旧配置/状态并重启确认旧服务。不能从 binding 成功推断本地 PVE API 已接通。
 
 `requestId` 是 Agent 在第一次网络请求前生成并持久化的 UUID。相同 `deviceId` 和相同 canonical 请求内容重试时必须复用同一个 `requestId`；输入内容改变则生成新 ID。本地 `<stateDirectory>/bindings/.website-binding-pending.json` 只保存 `requestId` 与 canonical 请求 SHA-256 指纹：绑定码参与指纹计算，但原文绝不能持久化。
 
@@ -122,6 +122,8 @@ Content-Type: application/json
 ```
 
 请求复用官网绑定的安全基础字段并要求独立的 UUID `requestId`；它不要求先完成官网绑定：
+
+`nodeClaim.pveVersion` 不是用户输入。监控 CLI 不提供 `--pve-version`，在读取绑定码前使用固定绝对路径 `/usr/bin/pveversion`（不经 shell）自动发现本机 PVE 8/9，并只接受规范化版本文本。命令失败、3 秒超时、非 PVE 环境、多行/NUL/异常输出或不受支持版本时返回 `PVE_VERSION_DISCOVERY_FAILED`，不发送绑定请求、不得以空值、`unknown` 或旧缓存继续。
 
 ```json
 {
@@ -177,7 +179,7 @@ Content-Type: application/json
 - 监控站凭据只能按逐路由 scope 写 monitoring telemetry/audit 或读取固定 monitoring status，不能调用 website metering、assignment、commands 或 receipts，也不能授权 PVE mutation。
 - 监控站绑定码同样不得进入 argv、URL 或日志。
 
-Agent 侧已有严格 request/response 类型、pending 幂等状态、独立私有状态、运行时 private-state credential overlay 和 `ag-pve monitoring bind` CLI；成功绑定才会把 monitoring destination 配成服务端返回的 ingest 合同。监控服务端路由属于另一交付任务，本仓代码不能证明它已部署。样例因没有真实 endpoint/credential 而默认 `enabled=false`，不是禁止部署双绑定；只有服务端 endpoint 完成后才能执行绑定并启用，不能手工借用官网 credential。
+Agent 侧已有严格 request/response 类型、pending 幂等状态、独立私有状态、运行时 private-state credential overlay 和 `ag-pve monitoring bind` CLI；成功响应后先备份旧 monitoring state 和配置，再原子写入、严格回读 config/state/overlay，受控 `systemctl restart ppflight-agent.service`，轮询 `is-active` 和 loopback `/status`，只有运行进程报告相同 monitoring `bindingId` 与十进制 `credentialEpoch` 才清除 pending 并报告成功。写入、重启或加载确认失败时必须恢复旧 config/state，重新启动并确认恢复后的服务；私有回滚备份和 pending request 保留，日志/输出不得含 secret。该流程不清理 durable audit/HA queue，也不触碰 website state。监控服务端路由属于另一交付任务，本仓代码不能证明它已部署。
 
 ### 3.1 双绑定只读状态合同
 
@@ -526,7 +528,7 @@ payment_authorized
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching、typed metering capability 和 meter 强制 shadow gate 已实现。 | 官网向导/assignment 签发与 APP 呈现仍待远端合并；只有 all-NIC explicitly metered 才可使用 aggregate active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |
-| 监控站绑定 / networkPolicy | `internal/monitorenrollment`、独立 pending/state/`networkPolicy`、运行时 credential overlay、`ag-pve monitoring bind`、`sentAt`、持久 monitoring sequence 和 uploader tcp4 pinning 已实现；官网 bind/replace 不触碰它。 | ingest 联调、monitoring server-observed IPv4/allowlist issuance/rotation 与外部监控服务端路由仍需验收；不可仅凭本仓 Agent 能力宣称服务已上线。 |
+| 监控站绑定 / networkPolicy | `internal/monitorenrollment`、独立 pending/state/`networkPolicy`、运行时 credential overlay、自动可信 PVE 版本发现、写后严格回验、systemd 自动重启与本地 binding ID/epoch 加载确认、失败回滚、`sentAt`、持久 monitoring sequence 和 uploader tcp4 pinning 已实现；官网 bind/replace 不触碰它。 | 仍需在真实 PVE 8/9 对新绑定/轮换及服务端 ingest 做联调；不可仅凭本仓 Agent 能力宣称全部生产链路已验收。 |
 | 双绑定状态 | website/monitoring strict status clients 与 `ag-pve ... status` 已实现固定同源 HMAC GET、identity/epoch/revision/time 回钉、IPv4/no-proxy/no-redirect；scope 由服务端逐路由固定。 | 外部 `/internal/v1/agents/status` 与 `/internal/v1/monitoring/agents/status` 服务仍待交付；本地 CLI 存在不等于远端状态服务已上线。 |
 | 修改命令审计 | `internal/auditlog` 已有严格 wire/builder，control journal 持久化脱敏 context/event，`store.Audit` 是独立、不可淘汰 outbox；runtime 已把 monitoring binding、audit queue/sink、独立 sequence 与 HMAC uploader 接通，并在 monitoring telemetry 暴露 bounded `agentHealth.auditQueue`。正反/golden 测试覆盖最终字段。 | Agent 侧已接线；监控服务端 durable 存储、幂等与可查询 UI 由另一任务实现。端到端验收前 production 修改动作不得开放。 |
 | IPv4/mutual whitelist | `internal/netpolicy` 已把 enrollment、assignment、control、uploader、PVE、exporter 与管理探测统一为 `tcp4`，拒绝 IPv6 literal；clients 禁 ambient proxy/重定向并校验绑定 origin，PVE 配置目标为 `127.0.0.1`。 | IPv4-only 已接；website/monitoring 各自的服务端 source-IP allow set、Agent 目标 IPv4 pin/轮换和端到端任务门槛仍需实现/联调。`mutual-whitelist-v1` capability 不能当作已上线证据。 |

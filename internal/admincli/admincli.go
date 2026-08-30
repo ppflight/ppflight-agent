@@ -50,6 +50,8 @@ type cli struct {
 	tlsServerName   func() string
 	templateRun     func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
 	pvesmSetContent func(context.Context, string, string) error
+	pveVersion      func(context.Context) (string, error)
+	activateBinding func(context.Context, config.Config, bindingActivationExpectation) error
 }
 
 func Run(args []string, version string, out, errOut io.Writer) int {
@@ -132,7 +134,7 @@ func (c *cli) usage() {
   ag-pve [--config FILE] website bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
   ag-pve [--config FILE] website status
 	  ag-pve [--config FILE] monitoring preflight --endpoint HTTPS_URL
-	  ag-pve [--config FILE] monitoring bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
+	  ag-pve [--config FILE] monitoring bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
   ag-pve [--config FILE] monitoring status
   ag-pve [--config FILE] monitoring show|test|set [选项]
   ag-pve [--config FILE] monitoring query|modify     # 预留，v0.1 返回未实现
@@ -144,7 +146,7 @@ func (c *cli) usage() {
   ag-pve template catalog|discover
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
 
-bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
+bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。monitoring bind 从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
 }
 
 func (c *cli) menu(filename string) int {
@@ -195,31 +197,48 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) i
 		fmt.Fprintln(c.errOut, "绑定 API 地址不能为空")
 		return 2
 	}
-	detected := detectPVEVersion()
-	versionPrompt := "PVE 版本: "
-	if detected != "" {
-		versionPrompt = fmt.Sprintf("PVE 版本 [%s]: ", detected)
-	}
-	pveVersion, err := c.promptLine(reader, versionPrompt)
-	if err != nil {
-		return 2
-	}
-	if pveVersion == "" {
-		pveVersion = detected
-	}
-	if pveVersion == "" {
-		fmt.Fprintln(c.errOut, "无法自动检测 PVE 版本，请手工输入")
-		return 2
+	pveVersion := ""
+	if !monitoring {
+		detected := detectPVEVersion()
+		versionPrompt := "PVE 版本: "
+		if detected != "" {
+			versionPrompt = fmt.Sprintf("PVE 版本 [%s]: ", detected)
+		}
+		pveVersion, err = c.promptLine(reader, versionPrompt)
+		if err != nil {
+			return 2
+		}
+		if pveVersion == "" {
+			pveVersion = detected
+		}
+		if pveVersion == "" {
+			fmt.Fprintln(c.errOut, "无法自动检测 PVE 版本，请手工输入")
+			return 2
+		}
+	} else {
+		versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
+		detected, versionErr := c.localPVEVersion(versionContext)
+		cancelVersion()
+		if versionErr != nil {
+			fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
+			return 1
+		}
+		// Reuse the exact trusted result inside monitoringBind so the menu does
+		// not execute discovery twice or read the one-time code before discovery.
+		originalVersionSource := c.pveVersion
+		c.pveVersion = func(context.Context) (string, error) { return detected, nil }
+		defer func() { c.pveVersion = originalVersionSource }()
 	}
 	code, err := c.promptLine(reader, "输入一次性绑定码（不会写入 argv、配置或日志）: ")
 	if err != nil || code == "" || len(code) > 128 {
 		fmt.Fprintln(c.errOut, "一次性绑定码无效")
 		return 2
 	}
-	args := []string{"bind", "--endpoint", endpoint, "--pve-version", pveVersion}
+	args := []string{"bind", "--endpoint", endpoint}
 	if monitoring {
 		args = append([]string{"monitoring"}, args...)
 	} else {
+		args = append(args, "--pve-version", pveVersion)
 		args = append([]string{"website"}, args...)
 	}
 	original := c.in
@@ -232,21 +251,13 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) i
 }
 
 func detectPVEVersion() string {
-	if runtime.GOOS == "windows" {
-		return ""
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, "/usr/bin/pveversion").Output()
-	if err != nil || len(output) > 4096 {
+	value, err := discoverLocalPVEVersion(ctx)
+	if err != nil {
 		return ""
 	}
-	line := strings.TrimSpace(strings.SplitN(string(output), "\n", 2)[0])
-	parts := strings.Split(line, "/")
-	if len(parts) < 2 || parts[0] != "pve-manager" || !safeMenuVersion(parts[1]) {
-		return ""
-	}
-	return parts[1]
+	return value
 }
 
 func safeMenuVersion(value string) bool {
@@ -722,11 +733,11 @@ func (c *cli) monitoringStatus(cfg config.Config) int {
 }
 
 func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) int {
+	originalConfig := cfg
 	set := flag.NewFlagSet("monitoring bind", flag.ContinueOnError)
 	set.SetOutput(c.errOut)
 	endpoint := set.String("endpoint", "", "HTTPS monitoring enrollment endpoint")
 	codeFile := set.String("code-file", "", "private file containing exactly one binding code")
-	pveVersion := set.String("pve-version", "", "PVE version for this node")
 	nodeRef := set.String("node-ref", cfg.Identity.NodeRef, "node claim")
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -736,9 +747,9 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	host := set.String("hostname", hostname, "host claim")
 	capabilities := set.String("capabilities", "telemetry-v1,audit-v1,delivery-state-v1,ipv4-only,mutual-whitelist-v1", "comma-separated monitoring capabilities")
 	replace := set.Bool("replace", false, "rotate an existing monitoring binding")
-	if err := set.Parse(args); err != nil || set.NArg() != 0 || strings.TrimSpace(*endpoint) == "" || strings.TrimSpace(*pveVersion) == "" {
+	if err := set.Parse(args); err != nil || set.NArg() != 0 || strings.TrimSpace(*endpoint) == "" {
 		if err == nil {
-			fmt.Fprintln(c.errOut, "monitoring bind 需要 --endpoint 和 --pve-version，且不接受绑定码位置参数")
+			fmt.Fprintln(c.errOut, "monitoring bind 需要 --endpoint，且不接受绑定码或 PVE 版本位置参数")
 		}
 		return 2
 	}
@@ -751,6 +762,13 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 		previous = existing
 	} else if !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(c.errOut, "现有监控绑定状态不安全或无效，未执行替换")
+		return 1
+	}
+	versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
+	detectedPVEVersion, err := c.localPVEVersion(versionContext)
+	cancelVersion()
+	if err != nil {
+		fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
 		return 1
 	}
 	code, err := c.readBindingCode(*codeFile)
@@ -775,7 +793,7 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 		fmt.Fprintln(c.errOut, "监控绑定地址必须是 HTTPS（测试时仅允许 loopback HTTP）")
 		return 2
 	}
-	request := monitorenrollment.Request{SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID, AgentVersion: c.version, Hostname: strings.TrimSpace(*host), NodeClaim: enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: strings.TrimSpace(*pveVersion)}, Capabilities: splitCapabilities(*capabilities)}
+	request := monitorenrollment.Request{SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID, AgentVersion: c.version, Hostname: strings.TrimSpace(*host), NodeClaim: enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: detectedPVEVersion}, Capabilities: splitCapabilities(*capabilities)}
 	fingerprint, err := bindstate.RequestFingerprint(request)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法生成监控绑定请求指纹")
@@ -818,20 +836,93 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	cfg.Destinations.MonitoringAudit.Compression = response.Telemetry.Compression
 	cfg.Destinations.MonitoringAudit.MaxCompressedBytes = monitorenrollment.AuditMaxCompressedBytes
 	cfg.Destinations.MonitoringAudit.MaxUncompressedBytes = monitorenrollment.AuditMaxUncompressedBytes
-	if code := c.save(filename, cfg); code != 0 {
-		return code
-	}
 	state := bindstate.MonitoringFromResponse(strings.TrimSpace(*endpoint), deviceID, response)
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定生成的配置未通过严格校验；未写入本机")
+		return 1
+	}
+	stateBackup, err := bindstate.BackupMonitoring(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法创建监控绑定回滚备份；未修改本机")
+		return 1
+	}
+	configBackup, err := atomicUpdate(filename, cfg)
+	if err != nil {
+		_ = bindstate.DiscardMonitoringBackup(cfg.Runtime.StateDirectory, stateBackup)
+		fmt.Fprintln(c.errOut, "监控绑定配置保存失败；未修改监控密钥状态")
+		return 1
+	}
 	if err := bindstate.SaveMonitoring(cfg.Runtime.StateDirectory, state); err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定密钥保存失败；可用同一绑定码安全重试")
+		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
+		fmt.Fprintf(c.errOut, "监控绑定密钥保存失败；已回滚配置，可用同一绑定码安全重试；配置备份=%s", configBackup)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动回滚也发生错误，请立即检查备份")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	expected := bindingActivationExpectation{Domain: "monitoring", BindingID: state.BindingID, CredentialEpoch: state.CredentialEpoch}
+	if err := validateMonitoringBindingFiles(filename, expected); err != nil {
+		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
+		fmt.Fprintf(c.errOut, "监控绑定写入后严格回验失败；已回滚，配置备份=%s", configBackup)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动回滚也发生错误，请立即检查备份")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	activationContext, cancelActivation := context.WithTimeout(context.Background(), 45*time.Second)
+	activationErr := c.activateAgentBinding(activationContext, cfg, expected)
+	cancelActivation()
+	if activationErr != nil {
+		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
+		recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 45*time.Second)
+		recoveryErr := c.recoverAgentBinding(recoveryContext, originalConfig)
+		cancelRecovery()
+		fmt.Fprintf(c.errOut, "MONITORING_BIND_ACTIVATION_FAILED: 新监控绑定未能由服务加载，已恢复旧配置；配置备份=%s", configBackup)
+		if stateBackup != "" {
+			fmt.Fprintf(c.errOut, "；监控状态备份=%s", stateBackup)
+		}
+		if rollbackErr != nil || recoveryErr != nil {
+			fmt.Fprint(c.errOut, "；回滚服务未完全确认，请立即检查 systemctl status ppflight-agent")
+		}
+		fmt.Fprintln(c.errOut)
 		return 1
 	}
 	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, "monitoring"); err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定已完成，但清理 pending 标记失败")
+		fmt.Fprintln(c.errOut, "监控绑定已自动生效，但清理 pending 标记失败")
 		return 1
 	}
-	fmt.Fprintln(c.out, "监控绑定完成；凭据仅授权 monitoring telemetry/audit 写入，未触碰官网绑定。")
+	if err := bindstate.DiscardMonitoringBackup(cfg.Runtime.StateDirectory, stateBackup); err != nil {
+		fmt.Fprintln(c.errOut, "警告：监控绑定已生效，但旧状态备份未能自动清理")
+	}
+	fmt.Fprintf(c.out, "监控绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；配置备份=%s。官网绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, configBackup)
 	return 0
+}
+
+func validateMonitoringBindingFiles(filename string, expected bindingActivationExpectation) error {
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		return err
+	}
+	state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	if err != nil || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("monitoring binding state does not match the issued response")
+	}
+	secrets, err := bindingoverlay.Resolve(cfg, os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	if secrets.MonitoringBindingID != expected.BindingID || secrets.Monitoring.CredentialEpoch != expected.CredentialEpoch || secrets.MonitoringAudit.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("monitoring runtime binding overlay does not match the issued response")
+	}
+	return nil
+}
+
+func rollbackMonitoringBinding(filename string, original config.Config, stateDirectory, stateBackup string) error {
+	stateErr := bindstate.RestoreMonitoring(stateDirectory, stateBackup)
+	_, configErr := atomicUpdate(filename, original)
+	return errors.Join(stateErr, configErr)
 }
 
 func (c *cli) website(filename string, args []string) int {

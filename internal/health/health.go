@@ -35,6 +35,16 @@ type ControlState struct {
 	LastError           string     `json:"lastError,omitempty"`
 }
 
+type BindingState struct {
+	BindingID       string `json:"bindingId,omitempty"`
+	CredentialEpoch string `json:"credentialEpoch,omitempty"`
+}
+
+type BindingsState struct {
+	Website    BindingState `json:"website"`
+	Monitoring BindingState `json:"monitoring"`
+}
+
 type Status struct {
 	SchemaVersion int                    `json:"schemaVersion"`
 	Version       string                 `json:"version"`
@@ -50,6 +60,22 @@ type Status struct {
 	AssignmentRev string                 `json:"assignmentRevision,omitempty"`
 	Assignments   int                    `json:"assignments"`
 	Queues        map[string]store.Stats `json:"queues"`
+	Bindings      BindingsState          `json:"bindings"`
+}
+
+func (r *Registry) Bindings(websiteBindingID string, websiteEpoch uint64, monitoringBindingID string, monitoringEpoch uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status.Bindings.Website = bindingState(websiteBindingID, websiteEpoch)
+	r.status.Bindings.Monitoring = bindingState(monitoringBindingID, monitoringEpoch)
+}
+
+func bindingState(bindingID string, epoch uint64) BindingState {
+	value := BindingState{BindingID: bindingID}
+	if epoch != 0 {
+		value.CredentialEpoch = fmt.Sprintf("%d", epoch)
+	}
+	return value
 }
 
 type Registry struct {

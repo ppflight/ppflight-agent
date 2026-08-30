@@ -50,3 +50,52 @@ func TestMonitoringStateIsIndependentFromWebsiteState(t *testing.T) {
 		}
 	}
 }
+
+func TestMonitoringBackupRestoreAndFirstBindingRemoval(t *testing.T) {
+	directory := t.TempDir()
+	original := monitoringTestState(3)
+	if err := SaveMonitoring(directory, original); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := BackupMonitoring(directory)
+	if err != nil || backup == "" {
+		t.Fatalf("backup=%q err=%v", backup, err)
+	}
+	replacement := monitoringTestState(4)
+	replacement.BindingID = "123e4567-e89b-42d3-a456-426614174099"
+	if err := SaveMonitoring(directory, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreMonitoring(directory, backup); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadMonitoring(directory)
+	if err != nil || loaded.BindingID != original.BindingID || loaded.CredentialEpoch != original.CredentialEpoch {
+		t.Fatalf("restored=%#v err=%v", loaded, err)
+	}
+	if err := DiscardMonitoringBackup(directory, backup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("backup still exists: %v", err)
+	}
+
+	firstDirectory := t.TempDir()
+	if backup, err := BackupMonitoring(firstDirectory); err != nil || backup != "" {
+		t.Fatalf("first backup=%q err=%v", backup, err)
+	}
+	if err := SaveMonitoring(firstDirectory, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreMonitoring(firstDirectory, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadMonitoring(firstDirectory); !os.IsNotExist(err) {
+		t.Fatalf("first binding state was not removed: %v", err)
+	}
+}
+
+func monitoringTestState(epoch uint64) MonitoringState {
+	response := monitorenrollment.Response{SchemaVersion: 1, BindingID: "123e4567-e89b-42d3-a456-426614174002", DeviceID: "device-monitor-test", MonitoringAgentRef: "monitor-agent-01", IngestEndpoint: "https://monitor.example/internal/v1/monitoring/telemetry/batches", HMACCredential: monitorenrollment.HMACCredential{Algorithm: "hmac-sha256", KeyID: "monitor-key-01", SecretEncoding: "base64", Secret: enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")))}, Telemetry: monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 8 << 20, MaxUncompressedBytes: 32 << 20}, NetworkPolicy: netpolicy.NetworkPolicy{AgentObservedIPv4: "192.0.2.24"}, CredentialEpoch: epoch, IssuedAt: time.Now().UTC()}
+	return MonitoringFromResponse("https://monitor.example/internal/v1/monitoring/agents/bind", response.DeviceID, response)
+}

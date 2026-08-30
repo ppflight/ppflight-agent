@@ -6,9 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/monitorenrollment"
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
@@ -88,6 +91,10 @@ func LoadMonitoring(stateDirectory string) (MonitoringState, error) {
 	if err != nil {
 		return MonitoringState{}, err
 	}
+	return decodeMonitoringState(raw)
+}
+
+func decodeMonitoringState(raw []byte) (MonitoringState, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	var value MonitoringState
@@ -102,4 +109,97 @@ func LoadMonitoring(stateDirectory string) (MonitoringState, error) {
 		return MonitoringState{}, err
 	}
 	return value, nil
+}
+
+// BackupMonitoring creates a private, validated rollback copy of the current
+// monitoring trust-domain state. A missing first-time binding has no backup.
+func BackupMonitoring(stateDirectory string) (string, error) {
+	state, err := LoadMonitoring(stateDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return "", errors.New("encode monitoring binding backup")
+	}
+	filename := filepath.Join(Directory(stateDirectory), "monitoring-binding-state.backup."+time.Now().UTC().Format("20060102T150405.000000000Z")+".json")
+	if err := writePrivateAtomic(stateDirectory, filename, append(raw, '\n')); err != nil {
+		return "", err
+	}
+	return filename, nil
+}
+
+// RestoreMonitoring restores a prior backup, or removes a first-time state
+// when backup is empty. The backup remains available after restoration.
+func RestoreMonitoring(stateDirectory, backup string) error {
+	if backup == "" {
+		return RemoveMonitoring(stateDirectory)
+	}
+	if err := validateMonitoringBackupPath(stateDirectory, backup); err != nil {
+		return err
+	}
+	raw, err := readPrivateFile(backup, maxStateBytes)
+	if err != nil {
+		return err
+	}
+	state, err := decodeMonitoringState(raw)
+	if err != nil {
+		return err
+	}
+	return SaveMonitoring(stateDirectory, state)
+}
+
+func RemoveMonitoring(stateDirectory string) error {
+	directory, err := ensureBindingDirectory(stateDirectory)
+	if err != nil {
+		return err
+	}
+	filename := MonitoringPath(stateDirectory)
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(directory, filepath.Base(filename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(filename); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(directory)
+}
+
+func DiscardMonitoringBackup(stateDirectory, backup string) error {
+	if backup == "" {
+		return nil
+	}
+	if err := validateMonitoringBackupPath(stateDirectory, backup); err != nil {
+		return err
+	}
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(filepath.Dir(backup), filepath.Base(backup))
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(backup); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(filepath.Dir(backup))
+}
+
+func validateMonitoringBackupPath(stateDirectory, backup string) error {
+	directory := filepath.Clean(Directory(stateDirectory))
+	cleaned := filepath.Clean(backup)
+	base := filepath.Base(cleaned)
+	if filepath.Dir(cleaned) != directory || !strings.HasPrefix(base, "monitoring-binding-state.backup.") || !strings.HasSuffix(base, ".json") {
+		return errors.New("monitoring binding backup path is invalid")
+	}
+	return nil
 }
