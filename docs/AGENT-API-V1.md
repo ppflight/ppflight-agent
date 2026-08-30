@@ -69,7 +69,7 @@ Content-Type: application/json
 }
 ```
 
-`agentVersion` 是必填的受限观测字段，用于资产展示、兼容性告警和升级规划，但**不是官网绑定准入条件**。官网不得按当前 release manifest、最低版本、版本白名单或版本新旧拒绝一次性码绑定；只要请求 schema、code、`requestId/deviceId` 幂等、来源 IPv4 和其余安全校验通过就必须允许绑定。此规则不允许忽略字段格式，也不放宽任何身份、凭据或响应契约校验。
+`agentVersion` 只是一项可选、非权威的观测信息，绝不是官网绑定准入条件。官网绑定处理器不得要求或语义校验它，也不得按版本格式、新旧、最低版本、release manifest、Agent/installer commit、wire identity、binary hash、build ID 或 User-Agent 允许或拒绝绑定；字段缺失、空值、未知值或非 semver 值都不能导致绑定失败。首次绑定只以正确的绑定 API 合同和有效的一次性绑定码为准，并保留 `requestId/deviceId` 的幂等与并发消费规则。版本类信息即使被保存，也只能用于非权威展示或后续升级规划；绑定成功后签发的凭据、可信观测 IPv4 白名单以及后续 HMAC/Ed25519、ACTIVE/epoch/device/key/scope/assignment 校验不因此放宽。
 
 成功响应与 `internal/enrollment.Response` 一致，包含：
 
