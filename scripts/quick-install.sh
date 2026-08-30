@@ -23,11 +23,11 @@ done
 case "$(uname -m)" in
   x86_64|amd64)
     readonly RELEASE_ARCH='amd64'
-    readonly RELEASE_SHA256='80f8a876fd5bc1feece295335f10909e6eec0b5f813ad3e2d1af3b2d0c7e9b91'
+    readonly RELEASE_SHA256='10d2b2440426ec3a7e2ce0de9198dc92a12c91574f0c84e34345d702b5ecab19'
     ;;
   aarch64|arm64)
     readonly RELEASE_ARCH='arm64'
-    readonly RELEASE_SHA256='1a4bc80fc187a327bf1c4b4cfffc783e7a4834203864e5bae04fbabdd8f6e9e5'
+    readonly RELEASE_SHA256='937abd524f50ec0cf0ae5ccd4841d1c9a3c47bf8c9a3b98fbea61714d5d20a70'
     ;;
   *)
     die "不支持的 CPU 架构: $(uname -m)"
