@@ -195,6 +195,30 @@ func Save(stateDirectory string, state State) error {
 	return writePrivateAtomic(stateDirectory, Path(stateDirectory), append(contents, '\n'))
 }
 
+// RemoveWebsite removes only the website trust-domain credential state. The
+// stable device ID and the independent monitoring state are deliberately kept.
+func RemoveWebsite(stateDirectory string) error {
+	directory, err := ensureBindingDirectory(stateDirectory)
+	if err != nil {
+		return err
+	}
+	filename := Path(stateDirectory)
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(directory, filepath.Base(filename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(filename); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(directory)
+}
+
 // LoadOrCreateDeviceID returns an opaque stable identifier.  It is generated
 // with crypto/rand once and stored in a private non-symlink file.
 func LoadOrCreateDeviceID(stateDirectory string) (string, error) {

@@ -129,16 +129,18 @@ func (c *cli) usage() {
 	fmt.Fprintln(c.out, `ag-pve - PPFlight Agent SSH 管理命令
 
   ag-pve [--config FILE] status
-	AG | ag | ag-pve                                     # 六项交互菜单
+  AG | ag | ag-pve                                   # 四项主菜单；官网/监控状态在各自绑定设置中
   ag-pve [--config FILE] validate
   ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE]
   ag-pve [--config FILE] pve status
   ag-pve [--config FILE] bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
   ag-pve [--config FILE] website bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
   ag-pve [--config FILE] website status
-	  ag-pve [--config FILE] monitoring preflight --endpoint HTTPS_URL
-	  ag-pve [--config FILE] monitoring bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
+  ag-pve [--config FILE] website unbind
+  ag-pve [--config FILE] monitoring preflight --endpoint HTTPS_URL
+  ag-pve [--config FILE] monitoring bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
   ag-pve [--config FILE] monitoring status
+  ag-pve [--config FILE] monitoring unbind
   ag-pve [--config FILE] monitoring show|test|set [选项]
   ag-pve [--config FILE] monitoring query|modify     # 预留，v0.1 返回未实现
   ag-pve [--config FILE] website bind|status|show|test
@@ -156,41 +158,41 @@ bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提�
 func (c *cli) menu(filename string) int {
 	reader := bufio.NewReader(io.LimitReader(c.in, 64<<10))
 	fmt.Fprintln(c.out, "PPFlight Agent")
-	c.menuPVEHeader(filename)
-	fmt.Fprintln(c.out, `
+	for {
+		c.menuPVEHeader(filename)
+		fmt.Fprintln(c.out, `
   1) 初始化/克隆 Cloud-Init 模板
-  2) 使用一次性绑定码绑定 PPFlight 官网
-  3) 使用独立一次性绑定码绑定监控站
-  4) 查看 PPFlight 官网通信状态
-  5) 查看监控站通信状态
-  6) 完全卸载 PPFlight Agent
+  2) 官网绑定设置
+  3) 监控绑定设置
+  4) 完全卸载 PPFlight Agent
   0) 退出`)
-	choice, err := c.promptLine(reader, "请选择 [0-6]: ")
-	if err != nil {
-		fmt.Fprintln(c.errOut, "无法读取菜单选择")
-		return 2
-	}
-	switch choice {
-	case "0", "q", "quit", "exit":
-		return 0
-	case "1":
-		original := c.in
-		c.in = reader
-		defer func() { c.in = original }()
-		return c.templateInit()
-	case "2":
-		return c.menuBind(reader, filename, false)
-	case "3":
-		return c.menuBind(reader, filename, true)
-	case "4":
-		return c.website(filename, []string{"status"})
-	case "5":
-		return c.monitoring(filename, []string{"status"})
-	case "6":
-		return c.menuCompleteUninstall(reader)
-	default:
-		fmt.Fprintln(c.errOut, "菜单选择无效")
-		return 2
+		choice, err := c.promptLine(reader, "请选择 [0-4]: ")
+		if err != nil {
+			fmt.Fprintln(c.errOut, "无法读取菜单选择")
+			return 2
+		}
+		switch choice {
+		case "", "0", "q", "quit", "exit":
+			return 0
+		case "1":
+			original := c.in
+			c.in = reader
+			defer func() { c.in = original }()
+			return c.templateInit()
+		case "2":
+			if code, back := c.menuBindingSettings(reader, filename, false); !back {
+				return code
+			}
+		case "3":
+			if code, back := c.menuBindingSettings(reader, filename, true); !back {
+				return code
+			}
+		case "4":
+			return c.menuCompleteUninstall(reader)
+		default:
+			fmt.Fprintln(c.errOut, "菜单选择无效")
+			return 2
+		}
 	}
 }
 
@@ -230,12 +232,93 @@ func (c *cli) menuCompleteUninstall(reader *bufio.Reader) int {
 	return 0
 }
 
-func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) int {
+func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitoring bool) (int, bool) {
+	cfg, ok := c.load(filename)
+	if !ok {
+		return 1, false
+	}
+	target := "PPFlight 官网"
+	bound := false
+	endpoint := ""
+	bindingID := ""
+	credentialEpoch := uint64(0)
+	if monitoring {
+		target = "监控站"
+		state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+		if err == nil {
+			bound, endpoint, bindingID, credentialEpoch = true, state.BindingEndpoint, state.BindingID, state.CredentialEpoch
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(c.errOut, "监控绑定状态不安全或无效；已禁止添加、替换和删除，请先检查本机状态文件")
+			return 1, false
+		}
+	} else {
+		state, err := bindstate.Load(cfg.Runtime.StateDirectory)
+		if err == nil {
+			bound, endpoint, bindingID, credentialEpoch = true, state.BindingEndpoint, state.BindingID, state.CredentialEpoch
+		} else if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintln(c.errOut, "官网绑定状态不安全或无效；已禁止添加、替换和删除，请先检查本机状态文件")
+			return 1, false
+		}
+	}
+
+	fmt.Fprintf(c.out, "\n%s绑定设置\n", target)
+	if bound {
+		fmt.Fprintf(c.out, "当前状态：已绑定  bindingId=%s  credentialEpoch=%d\n", bindingID, credentialEpoch)
+	} else {
+		fmt.Fprintln(c.out, "当前状态：未绑定")
+	}
+	fmt.Fprintln(c.out, "  1) 查看绑定与通信状态")
+	if bound {
+		fmt.Fprintln(c.out, "  2) 使用新的一次性绑定码重新绑定")
+		fmt.Fprintln(c.out, "  3) 删除绑定")
+	} else {
+		fmt.Fprintln(c.out, "  2) 添加绑定")
+	}
+	fmt.Fprintln(c.out, "  0) 返回主菜单")
+	maxChoice := "2"
+	if bound {
+		maxChoice = "3"
+	}
+	choice, err := c.promptLine(reader, fmt.Sprintf("请选择 [0-%s]: ", maxChoice))
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法读取绑定设置选择")
+		return 2, false
+	}
+	switch choice {
+	case "", "0", "q", "quit", "back":
+		return 0, true
+	case "1":
+		if monitoring {
+			return c.monitoring(filename, []string{"status"}), false
+		}
+		return c.website(filename, []string{"status"}), false
+	case "2":
+		return c.menuBind(reader, filename, monitoring, bound, endpoint), false
+	case "3":
+		if !bound {
+			fmt.Fprintln(c.errOut, "当前没有可删除的绑定")
+			return 2, false
+		}
+		return c.menuRemoveBinding(reader, filename, monitoring), false
+	default:
+		fmt.Fprintln(c.errOut, "绑定设置选择无效")
+		return 2, false
+	}
+}
+
+func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring, replace bool, currentEndpoint string) int {
 	target := "官网"
 	if monitoring {
 		target = "监控站"
 	}
-	endpoint, err := c.promptLine(reader, target+"一次性绑定 API 地址（HTTPS）: ")
+	endpointPrompt := target + "一次性绑定 API 地址（HTTPS）: "
+	if currentEndpoint != "" {
+		endpointPrompt = fmt.Sprintf("%s一次性绑定 API 地址（HTTPS）[%s]: ", target, currentEndpoint)
+	}
+	endpoint, err := c.promptLine(reader, endpointPrompt)
+	if endpoint == "" {
+		endpoint = currentEndpoint
+	}
 	if err != nil || endpoint == "" {
 		fmt.Fprintln(c.errOut, "绑定 API 地址不能为空")
 		return 2
@@ -278,6 +361,9 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) i
 		return 2
 	}
 	args := []string{"bind", "--endpoint", endpoint}
+	if replace {
+		args = append(args, "--replace")
+	}
 	if monitoring {
 		args = append([]string{"monitoring"}, args...)
 	} else {
@@ -291,6 +377,142 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) i
 		return c.monitoring(filename, args[1:])
 	}
 	return c.website(filename, args[1:])
+}
+
+func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitoring bool) int {
+	if !c.isRoot() {
+		fmt.Fprintln(c.errOut, "删除绑定必须由 PVE root 显式执行")
+		return 1
+	}
+	cfg, ok := c.load(filename)
+	if !ok {
+		return 1
+	}
+	domain, target, confirmation := "website", "PPFlight 官网", "DELETE WEBSITE"
+	if monitoring {
+		domain, target, confirmation = "monitoring", "监控站", "DELETE MONITORING"
+	}
+	var websiteState bindstate.State
+	var monitoringState bindstate.MonitoringState
+	var stateErr error
+	if monitoring {
+		monitoringState, stateErr = bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	} else {
+		websiteState, stateErr = bindstate.Load(cfg.Runtime.StateDirectory)
+	}
+	if errors.Is(stateErr, os.ErrNotExist) {
+		fmt.Fprintf(c.out, "%s当前没有绑定，无需删除。\n", target)
+		return 0
+	}
+	if stateErr != nil {
+		fmt.Fprintf(c.errOut, "%s绑定状态不安全或无效；拒绝删除\n", target)
+		return 1
+	}
+	fmt.Fprintf(c.out, "删除%s绑定会停用本机该信任域的上传、状态查询和命令凭据，并自动重启 Agent。\n", target)
+	if monitoring {
+		fmt.Fprintln(c.out, "官网绑定、官网配置和所有持久队列不会被删除；监控审计队列会保留，但在重新绑定前无法上传。")
+	} else {
+		fmt.Fprintln(c.out, "监控绑定、监控配置和所有持久队列不会被删除；PVE 虚拟机、模板、镜像和备份不受影响。")
+	}
+	value, err := c.promptLine(reader, fmt.Sprintf("输入 %s 确认删除（其他输入取消）: ", confirmation))
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法读取删除确认；未执行任何修改")
+		return 2
+	}
+	if value != confirmation {
+		fmt.Fprintln(c.out, "已取消，绑定保持不变。")
+		return 0
+	}
+
+	original := cfg
+	if monitoring {
+		disableMonitoringBindingConfig(&cfg)
+	} else {
+		disableWebsiteBindingConfig(&cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(c.errOut, "删除绑定后的安全配置未通过校验；未修改本机")
+		return 1
+	}
+	configBackup, err := atomicUpdate(filename, cfg)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "删除绑定配置保存失败；绑定保持不变")
+		return 1
+	}
+	if monitoring {
+		stateErr = bindstate.RemoveMonitoring(cfg.Runtime.StateDirectory)
+	} else {
+		stateErr = bindstate.RemoveWebsite(cfg.Runtime.StateDirectory)
+	}
+	if stateErr != nil {
+		_, rollbackErr := atomicUpdate(filename, original)
+		fmt.Fprintf(c.errOut, "%s绑定凭据删除失败；已恢复配置，原配置备份=%s", target, configBackup)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；配置自动回滚也失败，请立即检查备份")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+
+	expected := bindingActivationExpectation{Domain: domain, Absent: true}
+	activationContext, cancelActivation := context.WithTimeout(context.Background(), 45*time.Second)
+	activationErr := c.activateAgentBinding(activationContext, cfg, expected)
+	cancelActivation()
+	if activationErr != nil {
+		var restoreStateErr error
+		if monitoring {
+			restoreStateErr = bindstate.SaveMonitoring(original.Runtime.StateDirectory, monitoringState)
+		} else {
+			restoreStateErr = bindstate.Save(original.Runtime.StateDirectory, websiteState)
+		}
+		_, restoreConfigErr := atomicUpdate(filename, original)
+		recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 45*time.Second)
+		recoveryErr := c.recoverAgentBinding(recoveryContext, original)
+		cancelRecovery()
+		fmt.Fprintf(c.errOut, "%s_BINDING_REMOVAL_ACTIVATION_FAILED: 新配置未能由服务确认，已尝试恢复旧绑定；原配置备份=%s", strings.ToUpper(domain), configBackup)
+		if restoreStateErr != nil || restoreConfigErr != nil || recoveryErr != nil {
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请立即检查 systemctl status ppflight-agent")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, domain); err != nil {
+		fmt.Fprintf(c.errOut, "%s绑定已删除并生效，但清理该域 pending 状态失败\n", target)
+		return 1
+	}
+	other := "监控绑定"
+	if monitoring {
+		other = "官网绑定"
+	}
+	fmt.Fprintf(c.out, "%s绑定已从本机安全删除并自动生效；%s保持不变；配置备份=%s。\n", target, other, configBackup)
+	return 0
+}
+
+func disableWebsiteBindingConfig(cfg *config.Config) {
+	disableDestination(&cfg.Destinations.WebsiteMetering)
+	disableDestination(&cfg.Destinations.WebsiteTelemetry)
+	cfg.Assignments.RefreshURL = ""
+	cfg.Control.Enabled = false
+	cfg.Control.PollURL = ""
+	cfg.Control.ResultURL = ""
+	cfg.Control.Auth = config.AuthConfig{Mode: "hmac-sha256"}
+	cfg.Control.CommandSecretEnv = ""
+	cfg.Control.CommandSigningKeyIDEnv = ""
+	cfg.Control.CommandPublicKeyEnv = ""
+	cfg.Control.ProductionExecution = false
+}
+
+func disableMonitoringBindingConfig(cfg *config.Config) {
+	disableDestination(&cfg.Destinations.Monitoring)
+	disableDestination(&cfg.Destinations.MonitoringAudit)
+	// A monitoring audit trust domain is mandatory before real mutations.
+	cfg.Control.ProductionExecution = false
+}
+
+func disableDestination(destination *config.DestinationConfig) {
+	destination.Enabled = false
+	destination.URL = ""
+	destination.Auth = config.AuthConfig{Mode: "hmac-sha256"}
 }
 
 func detectPVEVersion() string {
@@ -574,7 +796,7 @@ func applyBinding(cfg *config.Config, response enrollment.Response) {
 
 func (c *cli) monitoring(filename string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(c.errOut, "monitoring 需要 preflight、bind、status、show、test 或 set")
+		fmt.Fprintln(c.errOut, "monitoring 需要 preflight、bind、unbind、status、show、test 或 set")
 		return 2
 	}
 	cfg, ok := c.load(filename)
@@ -586,6 +808,12 @@ func (c *cli) monitoring(filename string, args []string) int {
 		return c.monitoringPreflight(args[1:])
 	case "bind":
 		return c.monitoringBind(filename, cfg, args[1:])
+	case "unbind":
+		if len(args) != 1 {
+			fmt.Fprintln(c.errOut, "monitoring unbind 不接受额外参数")
+			return 2
+		}
+		return c.menuRemoveBinding(bufio.NewReader(io.LimitReader(c.in, 64<<10)), filename, true)
 	case "status":
 		return c.monitoringStatus(cfg)
 	case "show":
@@ -970,13 +1198,20 @@ func rollbackMonitoringBinding(filename string, original config.Config, stateDir
 
 func (c *cli) website(filename string, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(c.errOut, "website 需要 bind、status、show、test、metering、telemetry 或 control")
+		fmt.Fprintln(c.errOut, "website 需要 bind、unbind、status、show、test、metering、telemetry 或 control")
 		return 2
 	}
 	// Preserve the existing top-level binding workflow exactly, including its
 	// stdin-only one-time code handling and replacement safeguards.
 	if args[0] == "bind" {
 		return c.bind(filename, args[1:])
+	}
+	if args[0] == "unbind" {
+		if len(args) != 1 {
+			fmt.Fprintln(c.errOut, "website unbind 不接受额外参数")
+			return 2
+		}
+		return c.menuRemoveBinding(bufio.NewReader(io.LimitReader(c.in, 64<<10)), filename, false)
 	}
 	cfg, ok := c.load(filename)
 	if !ok {

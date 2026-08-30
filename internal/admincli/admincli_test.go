@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -147,14 +148,63 @@ func TestMonitoringPreflightRecordsPerAddressTLSErrorWithoutApprovalGate(t *test
 	}
 }
 
-func TestNoArgumentsShowsSixItemMenu(t *testing.T) {
+func TestNoArgumentsShowsFourItemMenu(t *testing.T) {
 	var output, stderr bytes.Buffer
 	if code := RunWithInput(nil, "test", strings.NewReader("0\n"), &output, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, text := range []string{"1) 初始化/克隆", "2) 使用一次性绑定码绑定 PPFlight 官网", "3) 使用独立一次性绑定码绑定监控站", "4) 查看 PPFlight 官网通信状态", "5) 查看监控站通信状态", "6) 完全卸载 PPFlight Agent"} {
+	for _, text := range []string{"1) 初始化/克隆", "2) 官网绑定设置", "3) 监控绑定设置", "4) 完全卸载 PPFlight Agent"} {
 		if !strings.Contains(output.String(), text) {
 			t.Fatalf("menu does not contain %q: %s", text, output.String())
+		}
+	}
+	for _, removed := range []string{"查看 PPFlight 官网通信状态", "查看监控站通信状态", "6) 完全卸载"} {
+		if strings.Contains(output.String(), removed) {
+			t.Fatalf("old top-level item %q remains: %s", removed, output.String())
+		}
+	}
+}
+
+func TestBindingSettingsSubmenusMoveStatusAndShowContextualActions(t *testing.T) {
+	filename := prepareBindConfig(t)
+	var output, stderr bytes.Buffer
+	instance := &cli{in: strings.NewReader("2\n0\n0\n"), out: &output, errOut: &stderr}
+	if code := instance.menu(filename); code != 0 {
+		t.Fatalf("unbound website submenu code=%d stderr=%s", code, stderr.String())
+	}
+	text := output.String()
+	for _, expected := range []string{"官网绑定设置", "当前状态：未绑定", "1) 查看绑定与通信状态", "2) 添加绑定", "0) 返回主菜单"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("unbound submenu missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "3) 删除绑定") {
+		t.Fatalf("unbound submenu exposed delete: %s", text)
+	}
+
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := bindingResponse("https://website.example")
+	response.DeviceID = deviceID
+	if err := bindstate.Save(cfg.Runtime.StateDirectory, bindstate.FromResponse("https://website.example/internal/v1/agents/bind", deviceID, response)); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	stderr.Reset()
+	instance.in = strings.NewReader("2\n0\n0\n")
+	if code := instance.menu(filename); code != 0 {
+		t.Fatalf("bound website submenu code=%d stderr=%s", code, stderr.String())
+	}
+	text = output.String()
+	for _, expected := range []string{"当前状态：已绑定", "2) 使用新的一次性绑定码重新绑定", "3) 删除绑定"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("bound submenu missing %q: %s", expected, text)
 		}
 	}
 }
@@ -163,7 +213,7 @@ func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("6\nYES\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("4\nYES\n"), out: &output, errOut: &stderr,
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
@@ -179,7 +229,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("4\nUNINSTALL\n"), out: &output, errOut: &stderr,
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
@@ -193,12 +243,163 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 
 func TestMenuCompleteUninstallRequiresRoot(t *testing.T) {
 	var output, stderr bytes.Buffer
-	instance := &cli{in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	instance := &cli{in: strings.NewReader("4\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
 	if code := instance.menu("unused"); code == 0 {
 		t.Fatal("non-root complete uninstall succeeded")
 	}
 	if !strings.Contains(stderr.String(), "必须由 PVE root") {
 		t.Fatalf("missing root-only error: %s", stderr.String())
+	}
+}
+
+func TestWebsiteBindingRemovalKeepsMonitoringTrustDomain(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+	monitoringBefore := cfg.Destinations.Monitoring
+	monitoringAuditBefore := cfg.Destinations.MonitoringAudit
+	var output, stderr bytes.Buffer
+	activated := false
+	instance := &cli{
+		in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr,
+		effectiveUID: func() int { return 0 },
+		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
+			activated = true
+			if expected.Domain != "website" || !expected.Absent || expected.BindingID != "" || expected.CredentialEpoch != 0 {
+				return errors.New("unexpected removal expectation")
+			}
+			if _, err := bindstate.Load(loaded.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
+				return errors.New("website state still present")
+			}
+			if got, err := bindstate.LoadMonitoring(loaded.Runtime.StateDirectory); err != nil || got.BindingID != monitoringState.BindingID {
+				return errors.New("monitoring state changed")
+			}
+			return nil
+		},
+	}
+	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if !activated {
+		t.Fatal("website removal was not activated")
+	}
+	updated, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Destinations.WebsiteMetering.Enabled || updated.Destinations.WebsiteTelemetry.Enabled || updated.Assignments.RefreshURL != "" || updated.Control.Enabled || updated.Control.ProductionExecution {
+		t.Fatalf("website-derived config remains active: %#v", updated)
+	}
+	if updated.Destinations.Monitoring != monitoringBefore || updated.Destinations.MonitoringAudit != monitoringAuditBefore {
+		t.Fatalf("monitoring config changed: before=%#v/%#v after=%#v/%#v", monitoringBefore, monitoringAuditBefore, updated.Destinations.Monitoring, updated.Destinations.MonitoringAudit)
+	}
+	if _, err := bindstate.Load(updated.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("website state remains: %v", err)
+	}
+	if got, err := bindstate.LoadMonitoring(updated.Runtime.StateDirectory); err != nil || got.BindingID != monitoringState.BindingID {
+		t.Fatalf("monitoring state was not preserved: %#v err=%v", got, err)
+	}
+	if strings.Contains(output.String(), string(websiteState.HMACCredentials.Commands.Secret)) {
+		t.Fatal("website secret leaked during removal")
+	}
+}
+
+func TestMonitoringBindingRemovalKeepsWebsiteTrustDomain(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+	websiteMeteringBefore := cfg.Destinations.WebsiteMetering
+	websiteTelemetryBefore := cfg.Destinations.WebsiteTelemetry
+	controlBefore := cfg.Control
+	var output, stderr bytes.Buffer
+	instance := &cli{
+		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
+			if expected.Domain != "monitoring" || !expected.Absent {
+				return errors.New("unexpected removal expectation")
+			}
+			if _, err := bindstate.LoadMonitoring(loaded.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
+				return errors.New("monitoring state still present")
+			}
+			if got, err := bindstate.Load(loaded.Runtime.StateDirectory); err != nil || got.BindingID != websiteState.BindingID {
+				return errors.New("website state changed")
+			}
+			return nil
+		},
+	}
+	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE MONITORING\n")), filename, true); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	updated, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Destinations.Monitoring.Enabled || updated.Destinations.MonitoringAudit.Enabled {
+		t.Fatalf("monitoring config remains active: %#v", updated.Destinations)
+	}
+	if updated.Destinations.WebsiteMetering != websiteMeteringBefore || updated.Destinations.WebsiteTelemetry != websiteTelemetryBefore || !reflect.DeepEqual(updated.Control, controlBefore) {
+		t.Fatalf("website config changed during monitoring removal")
+	}
+	if got, err := bindstate.Load(updated.Runtime.StateDirectory); err != nil || got.BindingID != websiteState.BindingID {
+		t.Fatalf("website state was not preserved: %#v err=%v", got, err)
+	}
+	if _, err := bindstate.LoadMonitoring(updated.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("monitoring state remains: %v", err)
+	}
+	if strings.Contains(output.String(), string(monitoringState.HMACCredential.Secret)) {
+		t.Fatal("monitoring secret leaked during removal")
+	}
+}
+
+func TestBindingRemovalRequiresRootExactConfirmationAndRollsBackActivationFailure(t *testing.T) {
+	filename := prepareBindConfig(t)
+	_, websiteState, _ := seedDualBindings(t, filename)
+	var output, stderr bytes.Buffer
+	nonRoot := &cli{out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	if code := nonRoot.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code == 0 {
+		t.Fatal("non-root removed binding")
+	}
+	if _, err := bindstate.Load(filepath.Join(filepath.Dir(filename), "state")); err != nil {
+		t.Fatalf("non-root changed state: %v", err)
+	}
+
+	output.Reset()
+	stderr.Reset()
+	wrong := &cli{out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
+	if code := wrong.menuRemoveBinding(bufio.NewReader(strings.NewReader("YES\n")), filename, false); code != 0 {
+		t.Fatalf("wrong confirmation code=%d", code)
+	}
+	if _, err := bindstate.Load(filepath.Join(filepath.Dir(filename), "state")); err != nil {
+		t.Fatalf("wrong confirmation changed state: %v", err)
+	}
+
+	output.Reset()
+	stderr.Reset()
+	recovered := false
+	failing := &cli{
+		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
+			if expected.Absent {
+				return errors.New("service did not load removal")
+			}
+			recovered = true
+			return nil
+		},
+	}
+	if code := failing.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code == 0 {
+		t.Fatal("activation failure reported success")
+	}
+	if !recovered {
+		t.Fatal("old service was not recovered")
+	}
+	restored, err := bindstate.Load(filepath.Join(filepath.Dir(filename), "state"))
+	if err != nil || restored.BindingID != websiteState.BindingID {
+		t.Fatalf("website state not restored: %#v err=%v", restored, err)
+	}
+	restoredConfig, err := config.LoadFile(filename)
+	if err != nil || !restoredConfig.Destinations.WebsiteMetering.Enabled || !restoredConfig.Control.Enabled {
+		t.Fatalf("website config not restored: %#v err=%v", restoredConfig, err)
+	}
+	if !strings.Contains(stderr.String(), "WEBSITE_BINDING_REMOVAL_ACTIVATION_FAILED") {
+		t.Fatalf("missing safe rollback error: %s", stderr.String())
 	}
 }
 
@@ -543,6 +744,67 @@ func prepareBindConfig(t *testing.T) string {
 	return filename
 }
 
+func seedDualBindings(t *testing.T, filename string) (config.Config, bindstate.State, bindstate.MonitoringState) {
+	t.Helper()
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	websiteResponse := bindingResponse("https://website.example")
+	websiteResponse.DeviceID = deviceID
+	websiteState := bindstate.FromResponse("https://website.example/internal/v1/agents/bind", deviceID, websiteResponse)
+	if err := bindstate.Save(cfg.Runtime.StateDirectory, websiteState); err != nil {
+		t.Fatal(err)
+	}
+	applyBinding(&cfg, websiteResponse)
+
+	monitorSecret := enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("monitoring-secret-01")))
+	monitorResponse := monitorenrollment.Response{
+		SchemaVersion: monitorenrollment.SchemaVersion, BindingID: "123e4567-e89b-42d3-a456-426614174099", DeviceID: deviceID,
+		MonitoringAgentRef: "monitor-agent-01", IngestEndpoint: "https://monitor.example/internal/v1/monitoring/telemetry/batches",
+		HMACCredential: monitorenrollment.HMACCredential{Algorithm: "hmac-sha256", KeyID: "monitor-key-01", SecretEncoding: "base64", Secret: monitorSecret},
+		Telemetry:      monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 8 << 20, MaxUncompressedBytes: 32 << 20},
+		NetworkPolicy:  netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"}, CredentialEpoch: 4, IssuedAt: time.Now().UTC(),
+	}
+	monitoringState := bindstate.MonitoringFromResponse("https://monitor.example/internal/v1/monitoring/agents/bind", deviceID, monitorResponse)
+	if err := bindstate.SaveMonitoring(cfg.Runtime.StateDirectory, monitoringState); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Destinations.Monitoring.Enabled = true
+	cfg.Destinations.Monitoring.URL = monitorResponse.IngestEndpoint
+	cfg.Destinations.Monitoring.Auth = config.AuthConfig{Mode: "hmac-sha256", KeyIDEnv: "PPFLIGHT_MONITORING_BINDING_KEY_ID", SecretEnv: "PPFLIGHT_MONITORING_BINDING_SECRET"}
+	cfg.Destinations.Monitoring.PayloadFormat = "telemetry-v1"
+	cfg.Destinations.Monitoring.Compression = "gzip"
+	cfg.Destinations.Monitoring.MaxCompressedBytes = monitorResponse.Telemetry.MaxCompressedBytes
+	cfg.Destinations.Monitoring.MaxUncompressedBytes = monitorResponse.Telemetry.MaxUncompressedBytes
+	auditEndpoint, err := monitorenrollment.AuditEndpoint(monitorResponse.IngestEndpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Destinations.MonitoringAudit.Enabled = true
+	cfg.Destinations.MonitoringAudit.URL = auditEndpoint
+	cfg.Destinations.MonitoringAudit.Auth = config.AuthConfig{Mode: "hmac-sha256", KeyIDEnv: "PPFLIGHT_MONITORING_BINDING_KEY_ID", SecretEnv: "PPFLIGHT_MONITORING_BINDING_SECRET"}
+	cfg.Destinations.MonitoringAudit.PayloadFormat = "audit-v1"
+	cfg.Destinations.MonitoringAudit.Compression = "gzip"
+	cfg.Destinations.MonitoringAudit.MaxCompressedBytes = monitorenrollment.AuditMaxCompressedBytes
+	cfg.Destinations.MonitoringAudit.MaxUncompressedBytes = monitorenrollment.AuditMaxUncompressedBytes
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, append(raw, '\n'), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, websiteState, monitoringState
+}
+
 func TestBindReadsCodeOnlyFromInputAndPersistsPrivateState(t *testing.T) {
 	filename := prepareBindConfig(t)
 	requests := 0
@@ -878,7 +1140,7 @@ func TestMonitoringMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testin
 	filename := prepareBindConfig(t)
 	var stdout, stderr bytes.Buffer
 	c := &cli{
-		in:  strings.NewReader("3\nhttps://moniter.ppflight.com/internal/v1/monitoring/agents/bind\nSHOULD-NOT-BE-READ\n"),
+		in:  strings.NewReader("3\n2\nhttps://moniter.ppflight.com/internal/v1/monitoring/agents/bind\nSHOULD-NOT-BE-READ\n"),
 		out: &stdout, errOut: &stderr, version: "test",
 		pveVersion: func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
 	}

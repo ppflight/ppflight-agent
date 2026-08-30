@@ -73,6 +73,32 @@ func TestSaveLoadAndStableDeviceID(t *testing.T) {
 	}
 }
 
+func TestRemoveWebsiteKeepsStableDeviceAndMonitoringPaths(t *testing.T) {
+	directory := t.TempDir()
+	deviceID, err := LoadOrCreateDeviceID(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := testState("https://service.example")
+	state.DeviceID = deviceID
+	if err := Save(directory, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveWebsite(directory); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(directory); !os.IsNotExist(err) {
+		t.Fatalf("website state remains: %v", err)
+	}
+	loadedDeviceID, err := LoadOrCreateDeviceID(directory)
+	if err != nil || loadedDeviceID != deviceID {
+		t.Fatalf("device ID changed: got=%q want=%q err=%v", loadedDeviceID, deviceID, err)
+	}
+	if err := RemoveWebsite(directory); err != nil {
+		t.Fatalf("idempotent removal failed: %v", err)
+	}
+}
+
 func TestLoadMigratesRetiredStoredServerIPv4Allowlist(t *testing.T) {
 	directory := t.TempDir()
 	state := testState("https://service.example")

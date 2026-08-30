@@ -239,7 +239,7 @@ sudo systemctl start ppflight-agent
 sudo ag-pve pve status
 ```
 
-root 直接运行 `/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml --check-config` 时，会优先通过 no-follow、owner/mode/link-count 校验读取 root-only `/etc/ppflight-agent/agent.env`，并仅为四个固定 `PVE_*` 名称创建进程内 overlay；sudo 遗留的 ambient PVE 变量不能混入或覆盖该值，Token 不会写回配置、日志、argv 或子进程。非 root 的 service account 无法读取该 0600 文件，必须由 systemd manager 的 `EnvironmentFile=` 提供一套完整凭据；缺少任一所需值会 fail closed，绝不混合环境和文件来源。上面的 transient service 因此是验证实际 service 运行条件的推荐方式。不要用 `env KEY=secret ...` 或命令替换把 Token 值放进 argv。`ag-pve validate` 不替代这项 secret-aware 校验。安装、Token bootstrap、PVE prepare/手工切换 source、双绑定、config check 和 `systemctl start` 必须逐步完成，五项 `AG` 菜单不会代替这些步骤。
+root 直接运行 `/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml --check-config` 时，会优先通过 no-follow、owner/mode/link-count 校验读取 root-only `/etc/ppflight-agent/agent.env`，并仅为四个固定 `PVE_*` 名称创建进程内 overlay；sudo 遗留的 ambient PVE 变量不能混入或覆盖该值，Token 不会写回配置、日志、argv 或子进程。非 root 的 service account 无法读取该 0600 文件，必须由 systemd manager 的 `EnvironmentFile=` 提供一套完整凭据；缺少任一所需值会 fail closed，绝不混合环境和文件来源。上面的 transient service 因此是验证实际 service 运行条件的推荐方式。不要用 `env KEY=secret ...` 或命令替换把 Token 值放进 argv。`ag-pve validate` 不替代这项 secret-aware 校验。安装、Token bootstrap、PVE prepare/手工切换 source、双绑定、config check 和 `systemctl start` 必须逐步完成，四项 `AG` 主菜单不会代替这些步骤。
 
 本地 Agent ready 后可分别检查远端状态；外部 status 服务未部署时以下命令按设计非零退出，不影响本地 `/healthz` 事实：
 
@@ -279,7 +279,7 @@ sudo ag
 sudo ag-pve template init
 ```
 
-安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一五项菜单：模板初始化、官网绑定、监控站绑定、官网通信状态、监控站通信状态。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。
+安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一四项主菜单：模板初始化、官网绑定设置、监控绑定设置、完全卸载。原官网/监控通信状态分别移入对应绑定设置子菜单；未绑定时显示“添加绑定”，已有有效绑定时显示“重新绑定”和“删除绑定”。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。域级删除分别要求完整输入 `DELETE WEBSITE`/`DELETE MONITORING`，只删除该域本机凭据与派生配置并自动重启回验；另一信任域、稳定 device ID 和持久队列不删除。完全卸载另需输入 `UNINSTALL`。
 
 向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）、外网桥和可选内网桥。外网桥用于 `net0`，启用内网时另建 `net1`；二者必须是不同的现有 PVE bridge。选择 `all` 也不会跳过任一 storage 或网络选择。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略/网络角色后输入完整单词 `YES` 才执行，输入 `no` 或直接回车不创建模板。
 

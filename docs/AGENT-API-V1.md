@@ -69,6 +69,8 @@ Content-Type: application/json
 }
 ```
 
+`agentVersion` 是必填的受限观测字段，用于资产展示、兼容性告警和升级规划，但**不是官网绑定准入条件**。官网不得按当前 release manifest、最低版本、版本白名单或版本新旧拒绝一次性码绑定；只要请求 schema、code、`requestId/deviceId` 幂等、来源 IPv4 和其余安全校验通过就必须允许绑定。此规则不允许忽略字段格式，也不放宽任何身份、凭据或响应契约校验。
+
 成功响应与 `internal/enrollment.Response` 一致，包含：
 
 - UUID `bindingId`，以及必须与请求完全一致的 `deviceId`；

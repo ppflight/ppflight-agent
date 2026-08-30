@@ -126,4 +126,14 @@ func TestBindingStatusMatchesExactDomainAndUint64Epoch(t *testing.T) {
 	if reflect.DeepEqual(status.Bindings.Website, status.Bindings.Monitoring) {
 		t.Fatal("test setup did not preserve trust-domain separation")
 	}
+	removed := health.Status{Bindings: health.BindingsState{
+		Website:    health.BindingState{DeviceID: "device-01"},
+		Monitoring: health.BindingState{BindingID: "monitor", CredentialEpoch: "42"},
+	}}
+	if !bindingStatusMatches(removed, bindingActivationExpectation{Domain: "website", Absent: true}) {
+		t.Fatal("website removal did not accept an empty website binding")
+	}
+	if bindingStatusMatches(removed, bindingActivationExpectation{Domain: "monitoring", Absent: true}) {
+		t.Fatal("monitoring removal accepted a still-loaded binding")
+	}
 }

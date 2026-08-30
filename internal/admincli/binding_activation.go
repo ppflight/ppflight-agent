@@ -23,6 +23,7 @@ type bindingActivationExpectation struct {
 	Domain          string
 	BindingID       string
 	CredentialEpoch uint64
+	Absent          bool
 }
 
 type agentServiceOperations struct {
@@ -94,7 +95,10 @@ func (c *cli) recoverAgentBinding(ctx context.Context, cfg config.Config) error 
 }
 
 func activateAgentBindingWith(ctx context.Context, cfg config.Config, expected bindingActivationExpectation, operations agentServiceOperations) error {
-	if expected.BindingID == "" || expected.CredentialEpoch == 0 || (expected.Domain != "website" && expected.Domain != "monitoring") {
+	validDomain := expected.Domain == "website" || expected.Domain == "monitoring"
+	validPresent := !expected.Absent && expected.BindingID != "" && expected.CredentialEpoch != 0
+	validAbsent := expected.Absent && expected.BindingID == "" && expected.CredentialEpoch == 0
+	if !validDomain || (!validPresent && !validAbsent) {
 		return errors.New("binding activation expectation is invalid")
 	}
 	if operations.Restart == nil || operations.Active == nil || operations.Status == nil || operations.Delay == nil {
@@ -117,11 +121,14 @@ func activateAgentBindingWith(ctx context.Context, cfg config.Config, expected b
 }
 
 func bindingStatusMatches(status health.Status, expected bindingActivationExpectation) bool {
-	wantedEpoch := fmt.Sprintf("%d", expected.CredentialEpoch)
 	actual := status.Bindings.Website
 	if expected.Domain == "monitoring" {
 		actual = status.Bindings.Monitoring
 	}
+	if expected.Absent {
+		return actual.BindingID == "" && actual.CredentialEpoch == ""
+	}
+	wantedEpoch := fmt.Sprintf("%d", expected.CredentialEpoch)
 	return actual.BindingID == expected.BindingID && actual.CredentialEpoch == wantedEpoch
 }
 

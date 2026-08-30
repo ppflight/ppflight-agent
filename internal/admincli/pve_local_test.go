@@ -140,7 +140,7 @@ func TestPVEStatusRequiresRootBeforeLoadingOrProbing(t *testing.T) {
 	}
 }
 
-func TestMenuKeepsSixItemsAndMarksSimulatorNotReady(t *testing.T) {
+func TestMenuKeepsFourItemsAndMarksSimulatorNotReady(t *testing.T) {
 	filename := writeTestConfig(t)
 	var output, stderr bytes.Buffer
 	instance := &cli{in: strings.NewReader("0\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
@@ -151,10 +151,13 @@ func TestMenuKeepsSixItemsAndMarksSimulatorNotReady(t *testing.T) {
 	if !strings.Contains(menu, "source=simulator") || !strings.Contains(menu, "productionReady=false") {
 		t.Fatalf("simulator readiness missing: %s", menu)
 	}
-	for item := 1; item <= 6; item++ {
+	for item := 1; item <= 4; item++ {
 		if !strings.Contains(menu, fmt.Sprintf("%d)", item)) {
-			t.Fatalf("six-item menu lost item %d: %s", item, menu)
+			t.Fatalf("four-item menu lost item %d: %s", item, menu)
 		}
+	}
+	if strings.Contains(menu, "5)") || strings.Contains(menu, "6)") {
+		t.Fatalf("retired top-level items remain: %s", menu)
 	}
 }
 

@@ -49,7 +49,7 @@ sudo ag-pve bind \
   --pve-version "$(pveversion | sed -n 's/^pve-manager\/\([^/]*\).*/\1/p')"
 ```
 
-这不是一键 onboarding。安装器默认复制的样例仍是 `mode=test`、`pve.source=simulator`；Token bootstrap 只创建本地身份/环境文件，官网 bind 只写官网 identity、endpoint/credential、assignment 和授权，不会把 source 改成 `api`、切换 `mode`/`productionExecution`、授予 control ACL 或启动/重启服务。操作者必须按安装文档显式编辑并校验配置。五项 `AG` 菜单同样不包含 Token bootstrap、source/mode 切换或服务启停。
+这不是一键 onboarding。安装器默认复制的样例仍是 `mode=test`、`pve.source=simulator`；Token bootstrap 只创建本地身份/环境文件，官网 bind 只写官网 identity、endpoint/credential、assignment 和授权，不会把 source 改成 `api`、切换 `mode`/`productionExecution`、授予 control ACL 或启动/重启服务。操作者必须按安装文档显式编辑并校验配置。四项 `AG` 主菜单同样不包含 Token bootstrap、source/mode 切换或服务启停。
 
 完成 bootstrap 后，root 可用 `ag-pve pve prepare --tls-server-name <PVE证书DNS名>` 将仍为 test 的本机配置安全准备为 API 采集：它固定 TCP 为 `https://127.0.0.1:8006`/`tcp4`，并单独使用 `pve.tlsServerName` 做 TLS SNI/证书校验。后者必须是证书中的 DNS 名，不能是 `127.0.0.1`、`localhost`、IPv6 或通配符。prepare 先探测只读 Token 的 PVE version/有效权限，控制 Token 仅作 readiness 探测；不会授予 ACL、打开 production 或启动服务。`ag-pve pve status` 只输出脱敏的本地 read/control 探测与 readiness，不能证明官网、监控站或任一生产写路由已上线。
 
@@ -71,7 +71,9 @@ sudo ag-pve bind \
 
 绑定后的 assignment 客户端支持最长 25 秒的长轮询。命令通道也以持久 cursor/operation 设计；PVE 返回 UPID 只表示任务已提交。Agent journal 保存 UPID，重启后通过 `task.status` 对应的 PVE task status 读取继续对账，不重新提交原 mutation。当前接线状态与服务端仍需实现的部分见契约中的[实现状态](docs/AGENT-API-V1.md#11-实现状态与上线门槛)。
 
-模板初始化是另一条仅限 PVE 本机 root 管理员的流程，不是官网远程 command。cloud-init helper bundle 作为同一 Agent 发布/安装包内的 `bundles/ppflight-cloudinit` 交付，不在安装时从任意 URL 拉代码；缺失或摘要不符时安装失败。安装后的 `AG`/`ag`/`ag-pve` 不带参数会显示六项交互菜单，其中模板向导会依次选择模板、镜像缓存 storage、模板磁盘 storage、备份策略与备份 storage、外网桥，以及可选的独立内网桥。外网桥固定用于模板 `net0`，启用内网时内网桥固定用于 `net1`；两者必须存在且不能相同，单网卡环境可明确不创建 `net1`。若 active/enabled 存储仅缺受支持的 content 类型，向导会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定 `pvesm set` 命令；只有操作者输入 `Y` 才执行，并在继续前重新 discovery 验证。随后先输出无副作用 plan，只有操作者输入完整单词 `YES` 才按该 plan 的 `requestId/operationId/catalogRevision/catalogSha256` 执行；输入 `no` 或直接回车会取消。安装器已校验 bundle、运行依赖、逐文件摘要和 `networkRedirectPolicy.addressFamily=ipv4-only`，以版本目录加原子 managed symlink 提供 `/usr/local/lib/ppflight-agent/template-bootstrap`；helper 的镜像连接固定 `curl --disable --ipv4`、HTTPS-only redirect 和 catalog/official-checksum 完整性链。Agent 每次调用前再次校验，再以 `/usr/bin/python3 -I` 和受限环境执行唯一入口。菜单第 6 项是完全卸载，仅接受 root 输入完整 `UNINSTALL`，会删除 Agent 配置、双绑定凭据、持久队列和审计状态，但不会删除 PVE 虚拟机、模板、镜像缓存或备份。真实 PVE 上会创建模板/备份的 plan/execute 尚未完成破坏性发布验收；它不新增 control action，更不表示 `vm.reinstall` 或远程 Agent 自升级已经实现。
+模板初始化是另一条仅限 PVE 本机 root 管理员的流程，不是官网远程 command。cloud-init helper bundle 作为同一 Agent 发布/安装包内的 `bundles/ppflight-cloudinit` 交付，不在安装时从任意 URL 拉代码；缺失或摘要不符时安装失败。安装后的 `AG`/`ag`/`ag-pve` 不带参数显示四项主菜单：模板初始化、官网绑定设置、监控绑定设置、完全卸载。官网与监控子菜单分别包含绑定/通信状态、添加或重新绑定，以及仅在已有安全绑定状态时显示的删除绑定；两个 trust domain 的状态、配置、pending 和凭据相互隔离。删除绑定要求 PVE root 输入完整 `DELETE WEBSITE` 或 `DELETE MONITORING`，会禁用该域配置、删除该域本机凭据并重启回验，失败自动恢复；另一绑定与所有持久队列保留。第 4 项完全卸载仍要求输入完整 `UNINSTALL`，会删除 Agent 配置、双绑定凭据、持久队列和审计状态，但不会删除 PVE 虚拟机、模板、镜像缓存或备份。
+
+模板向导会依次选择模板、镜像缓存 storage、模板磁盘 storage、备份策略与备份 storage、外网桥，以及可选的独立内网桥。外网桥固定用于模板 `net0`，启用内网时内网桥固定用于 `net1`；两者必须存在且不能相同，单网卡环境可明确不创建 `net1`。若 active/enabled 存储仅缺受支持的 content 类型，向导会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定 `pvesm set` 命令；只有操作者输入 `Y` 才执行，并在继续前重新 discovery 验证。随后先输出无副作用 plan，只有操作者输入完整单词 `YES` 才按该 plan 的 `requestId/operationId/catalogRevision/catalogSha256` 执行；输入 `no` 或直接回车会取消。安装器已校验 bundle、运行依赖、逐文件摘要和 `networkRedirectPolicy.addressFamily=ipv4-only`，以版本目录加原子 managed symlink 提供 `/usr/local/lib/ppflight-agent/template-bootstrap`；helper 的镜像连接固定 `curl --disable --ipv4`、HTTPS-only redirect 和 catalog/official-checksum 完整性链。Agent 每次调用前再次校验，再以 `/usr/bin/python3 -I` 和受限环境执行唯一入口。真实 PVE 上会创建模板/备份的 plan/execute 尚未完成破坏性发布验收；它不新增 control action，更不表示 `vm.reinstall` 或远程 Agent 自升级已经实现。
 
 ## 连续性与离线边界
 
