@@ -5,7 +5,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly RELEASE_TAG='v0.1.0-rc.3'
+readonly RELEASE_TAG='v0.1.0-rc.4'
 readonly RELEASE_VERSION='0.1.0'
 readonly RELEASE_BASE="https://github.com/ppflight/ppflight-agent/releases/download/$RELEASE_TAG"
 
@@ -23,11 +23,11 @@ done
 case "$(uname -m)" in
   x86_64|amd64)
     readonly RELEASE_ARCH='amd64'
-    readonly RELEASE_SHA256='c8251ef4922aad2ae3eb13d829e6a723e279883c1269caf8e259894446e456c5'
+    readonly RELEASE_SHA256='2c86f1f354d22952341f495fb6c7e57234a65b55f69293ba03ebd7d2c17234a3'
     ;;
   aarch64|arm64)
     readonly RELEASE_ARCH='arm64'
-    readonly RELEASE_SHA256='0bcf5a286ae40fab8c977b9f4b4bc555647baaaa3293d6982c8e68b85b7cb9f5'
+    readonly RELEASE_SHA256='1cff3b3f622f46d6838207644cbdb1c809a54b8c0897a0efcae56b5c45c837e5'
     ;;
   *)
     die "不支持的 CPU 架构: $(uname -m)"
