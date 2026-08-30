@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          bash -n scripts/package-release.sh scripts/package-release_test.sh
+          bash -n scripts/package-release.sh scripts/package-release_test.sh scripts/quick-install.sh
           go test ./...
           bash scripts/package-release_test.sh
       - name: Build static Linux binary
