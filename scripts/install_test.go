@@ -3,25 +3,53 @@ package scripts
 import (
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
 
+func TestTmpfilesOwnershipTransitionsDoNotCrossFromAgentToRoot(t *testing.T) {
+	tmpfiles := readDeploymentFile(t, "..", "packaging", "tmpfiles.d", "ppflight-agent.conf")
+	owners := map[string]string{}
+	for _, line := range strings.Split(tmpfiles, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && !strings.HasPrefix(fields[0], "#") {
+			owners[fields[1]] = fields[3]
+		}
+	}
+	for child, childOwner := range owners {
+		if childOwner != "root" {
+			continue
+		}
+		for ancestor := pathpkg.Dir(child); ancestor != "/" && ancestor != "."; ancestor = pathpkg.Dir(ancestor) {
+			if owner, ok := owners[ancestor]; ok && owner != "root" {
+				t.Fatalf("unsafe tmpfiles owner transition %s (%s) -> %s (%s)", ancestor, owner, child, childOwner)
+			}
+		}
+	}
+}
+
 func TestInstalledStateOwnershipContract(t *testing.T) {
 	installer := readDeploymentFile(t, "install.sh")
 	for _, required := range []string{
+		`readonly AGENT_STATE_DIR="$STATE_DIR/agent"`,
 		`readonly BINDINGS_DIR="$STATE_DIR/bindings"`,
 		`readonly ASSIGNMENTS_PATH="$ASSIGNMENTS_DIR/assignments.json"`,
 		`install -d -o root -g ppflight-agent -m 0750 "$BINDINGS_DIR"`,
+		`install -d -o root -g ppflight-agent -m 0750 "$STATE_DIR"`,
+		`install -d -o ppflight-agent -g ppflight-agent -m 0700 "$AGENT_STATE_DIR"`,
 		`install -d -o ppflight-agent -g ppflight-agent -m 0750 "$ASSIGNMENTS_DIR"`,
+		`for legacy_name in .agent.lock queues meter run-state.json control lifecycle-state.json; do`,
 		`ensure_regular_metadata "$ASSIGNMENTS_PATH" 0640 ppflight-agent ppflight-agent`,
 		`systemd-tmpfiles --create "$TMPFILES_PATH"`,
 		`[[ "$service_user" == 'ppflight-agent' ]]`,
 		`readonly TEMPLATE_BUNDLES_DIR="$LIB_DIR/template-bundles"`,
 		`readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"`,
+		`readonly UNINSTALL_HELPER="$LIB_DIR/uninstall.sh"`,
 		`install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"`,
+		`install -o root -g root -m 0700 "$REPO_DIR/scripts/uninstall.sh" "$UNINSTALL_HELPER"`,
 		`python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_SOURCE"`,
 		`TEMPLATE_STAGE="$(mktemp -d "$TEMPLATE_BUNDLES_DIR/.template-bootstrap-stage.XXXXXX")"`,
 		`python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_STAGE"`,
@@ -36,6 +64,8 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 	for _, required := range []string{
 		`rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap`,
 		`rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh`,
+		`rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh`,
+		`rm -rf -- /usr/local/lib/ppflight-agent`,
 		`rm -rf -- /usr/local/lib/ppflight-agent/template-bundles`,
 	} {
 		if !strings.Contains(uninstaller, required) {
@@ -45,6 +75,8 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 
 	tmpfiles := readDeploymentFile(t, "..", "packaging", "tmpfiles.d", "ppflight-agent.conf")
 	for _, required := range []string{
+		"d /var/lib/ppflight-agent 0750 root ppflight-agent -",
+		"d /var/lib/ppflight-agent/agent 0700 ppflight-agent ppflight-agent -",
 		"d /var/lib/ppflight-agent/bindings 0750 root ppflight-agent -",
 		"z /var/lib/ppflight-agent/bindings/binding-state.json 0640 root ppflight-agent -",
 		"z /var/lib/ppflight-agent/bindings/monitoring-binding-state.json 0640 root ppflight-agent -",

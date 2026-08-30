@@ -147,15 +147,58 @@ func TestMonitoringPreflightRecordsPerAddressTLSErrorWithoutApprovalGate(t *test
 	}
 }
 
-func TestNoArgumentsShowsFiveItemMenu(t *testing.T) {
+func TestNoArgumentsShowsSixItemMenu(t *testing.T) {
 	var output, stderr bytes.Buffer
 	if code := RunWithInput(nil, "test", strings.NewReader("0\n"), &output, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, text := range []string{"1) 初始化/克隆", "2) 使用一次性绑定码绑定 PPFlight 官网", "3) 使用独立一次性绑定码绑定监控站", "4) 查看 PPFlight 官网通信状态", "5) 查看监控站通信状态"} {
+	for _, text := range []string{"1) 初始化/克隆", "2) 使用一次性绑定码绑定 PPFlight 官网", "3) 使用独立一次性绑定码绑定监控站", "4) 查看 PPFlight 官网通信状态", "5) 查看监控站通信状态", "6) 完全卸载 PPFlight Agent"} {
 		if !strings.Contains(output.String(), text) {
 			t.Fatalf("menu does not contain %q: %s", text, output.String())
 		}
+	}
+}
+
+func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
+	var output, stderr bytes.Buffer
+	called := false
+	instance := &cli{
+		in: strings.NewReader("6\nYES\n"), out: &output, errOut: &stderr,
+		effectiveUID:      func() int { return 0 },
+		completeUninstall: func(context.Context) error { called = true; return nil },
+	}
+	if code := instance.menu("unused"); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if called || !strings.Contains(output.String(), "已取消") {
+		t.Fatalf("inexact confirmation executed uninstall: called=%v output=%s", called, output.String())
+	}
+}
+
+func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) {
+	var output, stderr bytes.Buffer
+	called := false
+	instance := &cli{
+		in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr,
+		effectiveUID:      func() int { return 0 },
+		completeUninstall: func(context.Context) error { called = true; return nil },
+	}
+	if code := instance.menu("unused"); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if !called || !strings.Contains(output.String(), "已完全卸载") || !strings.Contains(output.String(), "不会删除 PVE 虚拟机") {
+		t.Fatalf("complete uninstall contract missing: called=%v output=%s", called, output.String())
+	}
+}
+
+func TestMenuCompleteUninstallRequiresRoot(t *testing.T) {
+	var output, stderr bytes.Buffer
+	instance := &cli{in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	if code := instance.menu("unused"); code == 0 {
+		t.Fatal("non-root complete uninstall succeeded")
+	}
+	if !strings.Contains(stderr.String(), "必须由 PVE root") {
+		t.Fatalf("missing root-only error: %s", stderr.String())
 	}
 }
 

@@ -8,6 +8,7 @@ umask 077
 readonly APP='ppflight-agent'
 readonly ETC_DIR='/etc/ppflight-agent'
 readonly STATE_DIR='/var/lib/ppflight-agent'
+readonly AGENT_STATE_DIR="$STATE_DIR/agent"
 readonly BINDINGS_DIR="$STATE_DIR/bindings"
 readonly ASSIGNMENTS_DIR="$STATE_DIR/assignments"
 readonly UPGRADES_DIR="$STATE_DIR/upgrades"
@@ -20,6 +21,7 @@ readonly LIB_DIR='/usr/local/lib/ppflight-agent'
 readonly TEMPLATE_BUNDLES_DIR="$LIB_DIR/template-bundles"
 readonly TEMPLATE_LINK="$LIB_DIR/template-bootstrap"
 readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"
+readonly UNINSTALL_HELPER="$LIB_DIR/uninstall.sh"
 readonly BIN_PATH='/usr/local/bin/ppflight-agent'
 readonly SYSTEMD_DIR='/etc/systemd/system'
 readonly TMPFILES_DIR='/usr/lib/tmpfiles.d'
@@ -34,6 +36,8 @@ TEMPLATE_STAGE=''
 TEMPLATE_LINK_STAGE=''
 ENABLE=0
 START=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_RESTARTED=0
 INSTALL_EXPORTERS=0
 INSTALL_SMARTMONTOOLS=0
 BINARY=''
@@ -85,6 +89,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
 cleanup() {
+  local exit_status=$?
   if [[ -n "$TEMPLATE_LINK_STAGE" ]]; then
     case "$TEMPLATE_LINK_STAGE" in
       "$LIB_DIR"/.template-bootstrap-link.*)
@@ -102,6 +107,10 @@ cleanup() {
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
   fi
+  if [[ $SERVICE_WAS_ACTIVE -eq 1 && $SERVICE_RESTARTED -eq 0 ]]; then
+    systemctl start ppflight-agent.service >/dev/null 2>&1 || true
+  fi
+  return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -211,12 +220,30 @@ getent passwd ppflight-agent >/dev/null || useradd --system --gid ppflight-agent
 getent group ppflight-nodeexp >/dev/null || groupadd --system ppflight-nodeexp
 getent passwd ppflight-nodeexp >/dev/null || useradd --system --gid ppflight-nodeexp --no-create-home --shell /usr/sbin/nologin ppflight-nodeexp
 
-for managed_directory in "$ETC_DIR" "$STATE_DIR" "$BINDINGS_DIR" "$ASSIGNMENTS_DIR" "$UPGRADES_DIR" "$UPGRADE_PENDING_DIR" "$UPGRADE_RESULTS_DIR" "$UPGRADE_BACKUPS_DIR"; do
+for managed_directory in "$ETC_DIR" "$STATE_DIR" "$AGENT_STATE_DIR" "$BINDINGS_DIR" "$ASSIGNMENTS_DIR" "$UPGRADES_DIR" "$UPGRADE_PENDING_DIR" "$UPGRADE_RESULTS_DIR" "$UPGRADE_BACKUPS_DIR"; do
   [[ ! -L "$managed_directory" ]] || die "refusing symlink at managed directory: $managed_directory"
   [[ ! -e "$managed_directory" || -d "$managed_directory" ]] || die "managed path is not a directory: $managed_directory"
 done
 install -d -o root -g ppflight-agent -m 0750 "$ETC_DIR"
-install -d -o ppflight-agent -g ppflight-agent -m 0750 "$STATE_DIR"
+if systemctl is-active --quiet ppflight-agent.service; then
+  SERVICE_WAS_ACTIVE=1
+  systemctl stop ppflight-agent.service
+fi
+install -d -o root -g ppflight-agent -m 0750 "$STATE_DIR"
+install -d -o ppflight-agent -g ppflight-agent -m 0700 "$AGENT_STATE_DIR"
+
+# RC.9 and earlier wrote unprivileged runtime data directly below STATE_DIR.
+# Move only the exact allowlisted paths while the service is stopped. Refuse
+# ambiguous or redirected state instead of merging two histories.
+for legacy_name in .agent.lock queues meter run-state.json control lifecycle-state.json; do
+  legacy_path="$STATE_DIR/$legacy_name"
+  target_path="$AGENT_STATE_DIR/$legacy_name"
+  if [[ -e "$legacy_path" || -L "$legacy_path" ]]; then
+    [[ ! -L "$legacy_path" ]] || die "refusing symlink at legacy agent state: $legacy_path"
+    [[ ! -e "$target_path" && ! -L "$target_path" ]] || die "both legacy and current agent state exist for $legacy_name"
+    mv -- "$legacy_path" "$target_path"
+  fi
+done
 # Binding credentials are written by the root-run ag-pve command and read by
 # the service. The service group deliberately has no write permission here.
 install -d -o root -g ppflight-agent -m 0750 "$BINDINGS_DIR"
@@ -229,6 +256,7 @@ install -d -o root -g root -m 0755 "$TEMPLATE_BUNDLES_DIR"
 install -d -o root -g root -m 0755 "$TMPFILES_DIR"
 install -m 0755 "$BINARY" "$BIN_PATH"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"
+install -o root -g root -m 0700 "$REPO_DIR/scripts/uninstall.sh" "$UNINSTALL_HELPER"
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag-pve
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag
 ln -sfn -- "$BIN_PATH" /usr/local/bin/AG
@@ -352,6 +380,16 @@ if [[ $START -eq 1 ]]; then
     systemctl start ppflight-node-exporter.service ppflight-smartctl-exporter.service
   fi
 fi
+if [[ $SERVICE_WAS_ACTIVE -eq 1 && $START -eq 0 ]]; then
+  systemctl start ppflight-agent-upgrade.path ppflight-agent.service
+  SERVICE_RESTARTED=1
+elif [[ $START -eq 1 ]]; then
+  SERVICE_RESTARTED=1
+fi
 
-note "Installed $APP for PVE $pve_version. No service was started unless --start was supplied."
+if [[ $SERVICE_WAS_ACTIVE -eq 1 ]]; then
+  note "Installed $APP for PVE $pve_version and restored the previously active service."
+else
+  note "Installed $APP for PVE $pve_version. No service was started unless --start was supplied."
+fi
 note "Before production: set mode=production, pve.source=api, enable exporters/destinations, replace example identifiers, and validate with: $BIN_PATH --config $ETC_DIR/agent.yaml --check-config"

@@ -94,10 +94,11 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	if version == "" {
 		version = "dev"
 	}
-	if err := fsutil.EnsurePrivateDirectory(cfg.Runtime.StateDirectory); err != nil {
-		return nil, fmt.Errorf("create state directory: %w", err)
+	runtimeStateDirectory := RuntimeStateDirectory(cfg.Runtime.StateDirectory)
+	if err := fsutil.EnsurePrivateDirectory(runtimeStateDirectory); err != nil {
+		return nil, fmt.Errorf("open agent runtime state directory: %w", err)
 	}
-	stateLock, err := fsutil.AcquireExclusive(filepath.Join(cfg.Runtime.StateDirectory, ".agent.lock"))
+	stateLock, err := fsutil.AcquireExclusive(filepath.Join(runtimeStateDirectory, ".agent.lock"))
 	if err != nil {
 		return nil, fmt.Errorf("state directory is already in use: %w", err)
 	}
@@ -129,7 +130,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	if err != nil {
 		return nil, fmt.Errorf("create collector: %w", err)
 	}
-	queueRoot := filepath.Join(cfg.Runtime.StateDirectory, "queues")
+	queueRoot := filepath.Join(runtimeStateDirectory, "queues")
 	queues := map[string]*store.Queue{}
 	openQueue := func(name string, kind store.Kind, maxBytes int64, dropOldest bool) (*store.Queue, error) {
 		queue, openErr := store.Open(store.Config{Root: queueRoot, Destination: name, Kind: kind, Policy: store.Policy{MaxBytes: maxBytes, DropOldest: dropOldest}})
@@ -171,7 +172,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		}
 	}
 	meterManager, err := meter.Open(meter.Config{
-		Directory: filepath.Join(cfg.Runtime.StateDirectory, "meter"), Mode: cfg.Mode,
+		Directory: filepath.Join(runtimeStateDirectory, "meter"), Mode: cfg.Mode,
 		AgentRef: cfg.Identity.AgentRef, CollectorRef: cfg.Identity.CollectorRef,
 		SourceRef: cfg.Identity.SourceRef, ClusterRef: cfg.Identity.ClusterRef,
 	})
@@ -181,7 +182,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	if err := meterManager.Recover(meterQueue); err != nil {
 		return nil, err
 	}
-	state, err := runstate.Open(filepath.Join(cfg.Runtime.StateDirectory, "run-state.json"))
+	state, err := runstate.Open(filepath.Join(runtimeStateDirectory, "run-state.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +300,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		if clientErr != nil {
 			return nil, clientErr
 		}
-		journal, journalErr := control.OpenJournal(filepath.Join(cfg.Runtime.StateDirectory, "control", "journal"))
+		journal, journalErr := control.OpenJournal(filepath.Join(runtimeStateDirectory, "control", "journal"))
 		if journalErr != nil {
 			return nil, journalErr
 		}
@@ -332,7 +333,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 				Client: writeClient, ReadClient: readClient, Discovery: discovery.New(readClient),
 				Mode: cfg.Mode, ProductionExecution: cfg.Control.ProductionExecution, UpgradeSubmitter: upgradeSubmitter,
 			},
-			ReceiptQueue: controlQueue, CursorFile: filepath.Join(cfg.Runtime.StateDirectory, "control", "cursor.json"),
+			ReceiptQueue: controlQueue, CursorFile: filepath.Join(runtimeStateDirectory, "control", "cursor.json"),
 		})
 		if serviceErr != nil {
 			return nil, serviceErr
@@ -361,6 +362,13 @@ func loadAssignments(cfg config.Config) (*inventory.Store, error) {
 		return nil, fmt.Errorf("load assignments: %w", err)
 	}
 	return inventory.NewStore(inventory.Document{SchemaVersion: inventory.SchemaVersion, Revision: "empty-test", IssuedAt: time.Now().UTC(), Assignments: []inventory.Assignment{}}), nil
+}
+
+// RuntimeStateDirectory is the only service-user-owned subtree below the
+// root-owned state root. Privileged binding and upgrade state remain siblings,
+// so the unprivileged service cannot rename or replace them.
+func RuntimeStateDirectory(stateRoot string) string {
+	return filepath.Join(stateRoot, "agent")
 }
 
 func newDelivery(name string, cfg config.DestinationConfig, secret config.DestinationSecret, queue *store.Queue) (delivery, error) {
@@ -429,7 +437,7 @@ func (a *App) auditDeliveryState() auditlog.DeliveryState {
 
 func (a *App) Run(ctx context.Context, once bool) error {
 	defer a.releaseStateLock()
-	session, err := lifecycle.Begin(filepath.Join(a.cfg.Runtime.StateDirectory, "lifecycle-state.json"), a.runstate.BootID(), time.Now().UTC())
+	session, err := lifecycle.Begin(filepath.Join(RuntimeStateDirectory(a.cfg.Runtime.StateDirectory), "lifecycle-state.json"), a.runstate.BootID(), time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("begin agent lifecycle session: %w", err)
 	}

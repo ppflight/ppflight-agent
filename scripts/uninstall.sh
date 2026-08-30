@@ -45,7 +45,9 @@ fi
 rm -f -- /usr/local/bin/ppflight-agent /usr/local/bin/ag-pve /usr/local/bin/ag /usr/local/bin/AG
 rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap
 rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh
+rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh
 rm -rf -- /usr/local/lib/ppflight-agent/template-bundles
+rm -rf -- /usr/local/lib/ppflight-agent
 systemctl daemon-reload
 
 if [[ $PURGE -eq 1 ]]; then

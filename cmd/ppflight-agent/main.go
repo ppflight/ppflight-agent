@@ -142,7 +142,7 @@ func runUpgradeHelper(args []string) int {
 		fmt.Fprintln(os.Stderr, "upgrade helper assignment authority unavailable")
 		return 1
 	}
-	journal, err := control.OpenJournal(filepath.Join(cfg.Runtime.StateDirectory, "control", "journal"))
+	journal, err := control.OpenJournal(filepath.Join(agent.RuntimeStateDirectory(cfg.Runtime.StateDirectory), "control", "journal"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade helper journal unavailable")
 		return 1

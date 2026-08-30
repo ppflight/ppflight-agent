@@ -315,7 +315,7 @@ systemctl status ppflight-agent
 curl -4 --fail http://127.0.0.1:9745/healthz
 ```
 
-`/var/lib/ppflight-agent/lifecycle-state.json` 会保留未 clean 的上一 session。下次启动在访问 PVE 前把它投影为 `agent.previousExit.<eventId>` / `previous_unclean_exit`；相应 telemetry destination 已启用时，分别持久写入不可淘汰的 website/monitoring lifecycle 队列，未启用的一域继续保持 pending。两域的 queued 标记独立。payload 不上传 crash dump、自由错误文本或旧 guest 快照。Agent 本地检测与双域入队已有 Linux/重启测试，外部接收、展示/告警和真实 kill/hang 演练仍须验收，因此不能把 watchdog 写成远端 HA SLA。
+`/var/lib/ppflight-agent/agent/lifecycle-state.json` 会保留未 clean 的上一 session。下次启动在访问 PVE 前把它投影为 `agent.previousExit.<eventId>` / `previous_unclean_exit`；相应 telemetry destination 已启用时，分别持久写入不可淘汰的 website/monitoring lifecycle 队列，未启用的一域继续保持 pending。两域的 queued 标记独立。payload 不上传 crash dump、自由错误文本或旧 guest 快照。Agent 本地检测与双域入队已有 Linux/重启测试，外部接收、展示/告警和真实 kill/hang 演练仍须验收，因此不能把 watchdog 写成远端 HA SLA。
 
 ## 8. 官网迁移与 feature flag
 

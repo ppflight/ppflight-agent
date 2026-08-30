@@ -41,17 +41,18 @@ import (
 )
 
 type cli struct {
-	in              io.Reader
-	out, errOut     io.Writer
-	version         string
-	pveEnvironment  func(string) (map[string]string, error)
-	pveProbe        func(context.Context, pve.Config, bool) (rawCredentialProbe, error)
-	effectiveUID    func() int
-	tlsServerName   func() string
-	templateRun     func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
-	pvesmSetContent func(context.Context, string, string) error
-	pveVersion      func(context.Context) (string, error)
-	activateBinding func(context.Context, config.Config, bindingActivationExpectation) error
+	in                io.Reader
+	out, errOut       io.Writer
+	version           string
+	pveEnvironment    func(string) (map[string]string, error)
+	pveProbe          func(context.Context, pve.Config, bool) (rawCredentialProbe, error)
+	effectiveUID      func() int
+	tlsServerName     func() string
+	templateRun       func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
+	pvesmSetContent   func(context.Context, string, string) error
+	pveVersion        func(context.Context) (string, error)
+	activateBinding   func(context.Context, config.Config, bindingActivationExpectation) error
+	completeUninstall func(context.Context) error
 }
 
 func Run(args []string, version string, out, errOut io.Writer) int {
@@ -114,6 +115,8 @@ func (c *cli) run(args []string) int {
 		return c.template(args[1:])
 	case "pve":
 		return c.pve(*filename, args[1:])
+	case "uninstall":
+		return c.menuCompleteUninstall(bufio.NewReader(io.LimitReader(c.in, 64<<10)))
 	case "menu":
 		return c.menu(*filename)
 	default:
@@ -126,7 +129,7 @@ func (c *cli) usage() {
 	fmt.Fprintln(c.out, `ag-pve - PPFlight Agent SSH 管理命令
 
   ag-pve [--config FILE] status
-	AG | ag | ag-pve                                     # 五项交互菜单
+	AG | ag | ag-pve                                     # 六项交互菜单
   ag-pve [--config FILE] validate
   ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE]
   ag-pve [--config FILE] pve status
@@ -145,6 +148,7 @@ func (c *cli) usage() {
   ag-pve template init                               # 交互选择存储、外网/内网桥并二次确认
   ag-pve template catalog|discover
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
+  ag-pve uninstall                                   # 完全卸载，必须交互输入 UNINSTALL
 
 bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。monitoring bind 从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
 }
@@ -159,8 +163,9 @@ func (c *cli) menu(filename string) int {
   3) 使用独立一次性绑定码绑定监控站
   4) 查看 PPFlight 官网通信状态
   5) 查看监控站通信状态
+  6) 完全卸载 PPFlight Agent
   0) 退出`)
-	choice, err := c.promptLine(reader, "请选择 [0-5]: ")
+	choice, err := c.promptLine(reader, "请选择 [0-6]: ")
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法读取菜单选择")
 		return 2
@@ -181,10 +186,48 @@ func (c *cli) menu(filename string) int {
 		return c.website(filename, []string{"status"})
 	case "5":
 		return c.monitoring(filename, []string{"status"})
+	case "6":
+		return c.menuCompleteUninstall(reader)
 	default:
 		fmt.Fprintln(c.errOut, "菜单选择无效")
 		return 2
 	}
+}
+
+func (c *cli) menuCompleteUninstall(reader *bufio.Reader) int {
+	if !c.isRoot() {
+		fmt.Fprintln(c.errOut, "完全卸载必须由 PVE root 显式执行")
+		return 1
+	}
+	fmt.Fprintln(c.out, `完全卸载会停止并删除 PPFlight Agent、systemd 服务、官网/监控绑定凭据、配置、持久队列和本地审计状态。
+不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存或备份文件。`)
+	confirmation, err := c.promptLine(reader, "输入 UNINSTALL 确认完全卸载（其他输入取消）: ")
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法读取卸载确认；未执行任何修改")
+		return 2
+	}
+	if confirmation != "UNINSTALL" {
+		fmt.Fprintln(c.out, "已取消，未卸载任何内容。")
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var uninstallErr error
+	if c.completeUninstall != nil {
+		uninstallErr = c.completeUninstall(ctx)
+	} else {
+		command := exec.CommandContext(ctx, "/usr/local/lib/ppflight-agent/uninstall.sh", "--remove-exporters", "--purge")
+		command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+		command.Stdout = c.out
+		command.Stderr = c.errOut
+		uninstallErr = command.Run()
+	}
+	if uninstallErr != nil {
+		fmt.Fprintln(c.errOut, "完全卸载失败；请检查上方错误，PVE 虚拟机、模板、镜像和备份未被修改")
+		return 1
+	}
+	fmt.Fprintln(c.out, "PPFlight Agent 已完全卸载；PVE 虚拟机、模板、镜像和备份保持不变。")
+	return 0
 }
 
 func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring bool) int {

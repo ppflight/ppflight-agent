@@ -92,8 +92,9 @@ func TestGracefulContextShutdownDoesNotCreatePreviousExitIncident(t *testing.T) 
 func TestPreviousExitQueuesBeforeListenAndCurrentListenFailureRemainsUnclean(t *testing.T) {
 	root := t.TempDir()
 	stateDirectory := filepath.Join(root, "state")
+	runtimeStateDirectory := RuntimeStateDirectory(stateDirectory)
 	startedAt := time.Date(2026, 8, 30, 1, 2, 3, 0, time.UTC)
-	if _, err := lifecycle.Begin(filepath.Join(stateDirectory, "lifecycle-state.json"), firstLifecycleBootID, startedAt); err != nil {
+	if _, err := lifecycle.Begin(filepath.Join(runtimeStateDirectory, "lifecycle-state.json"), firstLifecycleBootID, startedAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,7 +120,7 @@ func TestPreviousExitQueuesBeforeListenAndCurrentListenFailureRemainsUnclean(t *
 
 	for _, destination := range []string{"website-lifecycle", "monitoring-lifecycle"} {
 		queue, err := store.Open(store.Config{
-			Root:        filepath.Join(stateDirectory, "queues"),
+			Root:        filepath.Join(runtimeStateDirectory, "queues"),
 			Destination: destination,
 			Kind:        store.Metering,
 			Policy:      store.Policy{MaxBytes: 16 << 20},
@@ -149,7 +150,7 @@ func TestPreviousExitQueuesBeforeListenAndCurrentListenFailureRemainsUnclean(t *
 	// The old incident is now owned by both durable queues. The listen failure
 	// itself deliberately remains running and becomes the next dual-domain
 	// incident after systemd restarts the process.
-	next, err := lifecycle.Begin(filepath.Join(stateDirectory, "lifecycle-state.json"), secondLifecycleBootID, startedAt.Add(time.Minute))
+	next, err := lifecycle.Begin(filepath.Join(runtimeStateDirectory, "lifecycle-state.json"), secondLifecycleBootID, startedAt.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}

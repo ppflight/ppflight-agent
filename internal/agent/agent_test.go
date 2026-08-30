@@ -39,7 +39,7 @@ func TestSimulatorOnceCreatesSafeLocalState(t *testing.T) {
 	if !app.health.Snapshot().Ready {
 		t.Fatal("agent did not become ready")
 	}
-	if _, err := os.Stat(filepath.Join(root, "state", "run-state.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(RuntimeStateDirectory(filepath.Join(root, "state")), "run-state.json")); err != nil {
 		t.Fatal(err)
 	}
 }
