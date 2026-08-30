@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="3.1.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -13,6 +13,7 @@ readonly CATALOG_HELPER
 IMAGE_STORAGE="${IMAGE_STORAGE:-}"
 FILE_STORAGE="${FILE_STORAGE:-local}"
 BRIDGE="${BRIDGE:-vmbr0}"
+INTERNAL_BRIDGE="${INTERNAL_BRIDGE:-}"
 CACHE_DIR="${CACHE_DIR:-}"
 DISK_SIZE="${DISK_SIZE:-16G}"
 MEMORY_MB="${MEMORY_MB:-2048}"
@@ -77,7 +78,9 @@ Options:
   --backup-storage ID Back up every newly created template to this PVE storage.
   --no-backup         Explicitly skip template backups (the compatibility default).
   --cache-dir PATH    Override the cloud-image download cache path.
-  --bridge NAME       PVE bridge used by template net0.
+  --bridge NAME       External/public PVE bridge used by template net0.
+  --internal-bridge NAME
+                      Optional internal/private PVE bridge used by template net1.
   --replace           Replace existing project-managed templates.
   --force-replace-unmanaged
                       With --replace, also replace an untagged template whose
@@ -141,6 +144,11 @@ parse_args() {
       --bridge)
         (($# >= 2)) || die "--bridge requires a bridge name"
         BRIDGE="$2"
+        shift 2
+        ;;
+      --internal-bridge)
+        (($# >= 2)) || die "--internal-bridge requires a bridge name"
+        INTERNAL_BRIDGE="$2"
         shift 2
         ;;
       --only)
@@ -355,7 +363,11 @@ preflight() {
     storage_is_active "$BACKUP_STORAGE" || die "backup storage is not active: $BACKUP_STORAGE"
     [[ ",$(storage_content "$BACKUP_STORAGE")," == *",backup,"* ]] || die "$BACKUP_STORAGE does not allow backups"
   fi
-  ip link show "$BRIDGE" >/dev/null 2>&1 || die "bridge not found: $BRIDGE"
+  [[ "$BRIDGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || die "invalid external bridge name"
+  [[ -z "$INTERNAL_BRIDGE" || "$INTERNAL_BRIDGE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || die "invalid internal bridge name"
+  [[ -z "$INTERNAL_BRIDGE" || "$INTERNAL_BRIDGE" != "$BRIDGE" ]] || die "external and internal bridges must be different"
+  ip link show "$BRIDGE" >/dev/null 2>&1 || die "external bridge not found: $BRIDGE"
+  [[ -z "$INTERNAL_BRIDGE" ]] || ip link show "$INTERNAL_BRIDGE" >/dev/null 2>&1 || die "internal bridge not found: $INTERNAL_BRIDGE"
 
   for pair in MEMORY_MB:"$MEMORY_MB" CORES:"$CORES" BALLOON:"$BALLOON" FIREWALL:"$FIREWALL" DISK_SSD:"$DISK_SSD"; do
     validate_integer "${pair%%:*}" "${pair#*:}"
@@ -391,7 +403,7 @@ preflight() {
   fi
 
   log "PVE: $(pveversion)"
-  log "Selected final disk storage: $IMAGE_STORAGE; file storage: $FILE_STORAGE; bridge: $BRIDGE"
+  log "Selected final disk storage: $IMAGE_STORAGE; file storage: $FILE_STORAGE; external bridge: $BRIDGE; internal bridge: ${INTERNAL_BRIDGE:-disabled}"
 }
 
 write_snippets() {
@@ -667,12 +679,17 @@ disk_qos_suffix() {
 create_template() {
   local row="$1" vmid name image _url _checksum_url _algorithm _upstream_expected _source_sha256 _minimum_bytes family placeholder_ip description _version _aliases
   local imported_volume snippet qos description_full
+  local -a network_args
   IFS='|' read -r vmid name image _url _checksum_url _algorithm _upstream_expected _source_sha256 _minimum_bytes family placeholder_ip description _version _aliases <<< "$row"
   snippet="$DEBIAN_SNIPPET"
   [[ "$family" == "rhel" ]] && snippet="$RHEL_SNIPPET"
   [[ -n "$snippet" ]] || die "Cloud-Init profile was not generated for $family"
   qos="$(disk_qos_suffix)"
   description_full="$description; built by ppflight-cloudinit v$SCRIPT_VERSION on $(date -u '+%F')"
+  network_args=(--net0 "virtio,bridge=$BRIDGE,firewall=$FIREWALL")
+  if [[ -n "$INTERNAL_BRIDGE" ]]; then
+    network_args+=(--net1 "virtio,bridge=$INTERNAL_BRIDGE,firewall=$FIREWALL")
+  fi
 
   destroy_existing_template "$vmid" "$name"
   log "Creating $vmid ($name)"
@@ -684,7 +701,7 @@ create_template() {
     --balloon "$BALLOON" \
     --cores "$CORES" \
     --cpu "$CPU_TYPE" \
-    --net0 "virtio,bridge=$BRIDGE,firewall=$FIREWALL" \
+    "${network_args[@]}" \
     --scsihw virtio-scsi-single \
     --serial0 socket \
     --vga std \
@@ -717,7 +734,7 @@ create_template() {
 }
 
 verify_template() {
-  local row="$1" vmid name _image _url _checksum _algorithm _upstream_expected _source_sha256 _minimum_bytes family config disk cloudinit_disk field expected_snippet
+  local row="$1" vmid name _image _url _checksum _algorithm _upstream_expected _source_sha256 _minimum_bytes family config disk cloudinit_disk field expected_snippet net0 net1
   IFS='|' read -r vmid name _image _url _checksum _algorithm _upstream_expected _source_sha256 _minimum_bytes family _ <<< "$row"
   expected_snippet="$DEBIAN_SNIPPET"
   [[ "$family" == "rhel" ]] && expected_snippet="$RHEL_SNIPPET"
@@ -729,6 +746,14 @@ verify_template() {
   grep -q '^serial0: socket' <<< "$config" || die "$vmid does not have serial0"
   grep -q '^vga: std' <<< "$config" || die "$vmid does not have VGA"
   grep -Fqx "cicustom: vendor=$FILE_STORAGE:snippets/$expected_snippet" <<< "$config" || die "$vmid has an unexpected Cloud-Init profile"
+  net0="$(sed -n 's/^net0: //p' <<< "$config")"
+  [[ ",$net0," == *",bridge=$BRIDGE,"* && ",$net0," == *",firewall=$FIREWALL,"* ]] || die "$vmid net0 does not match the external bridge policy"
+  net1="$(sed -n 's/^net1: //p' <<< "$config")"
+  if [[ -n "$INTERNAL_BRIDGE" ]]; then
+    [[ ",$net1," == *",bridge=$INTERNAL_BRIDGE,"* && ",$net1," == *",firewall=$FIREWALL,"* ]] || die "$vmid net1 does not match the internal bridge policy"
+  else
+    [[ -z "$net1" ]] || die "$vmid unexpectedly contains net1"
+  fi
   disk="$(sed -n 's/^scsi0: //p' <<< "$config")"
   cloudinit_disk="$(sed -n 's/^ide2: //p' <<< "$config")"
   [[ "$disk" == "$IMAGE_STORAGE:"* ]] || die "$vmid system disk is not on $IMAGE_STORAGE"
@@ -764,7 +789,7 @@ write_manifest() {
     printf 'catalog_revision=%s\ncatalog_sha256=%s\n' "$CATALOG_REVISION" "$CATALOG_SHA256"
     printf 'built_at_utc=%s\n' "$(date -u '+%FT%TZ')"
     printf 'pve_version=%s\n' "$(pveversion)"
-    printf 'image_storage=%s\nfile_storage=%s\nbridge=%s\n' "$IMAGE_STORAGE" "$FILE_STORAGE" "$BRIDGE"
+    printf 'image_storage=%s\nfile_storage=%s\nexternal_bridge=%s\ninternal_bridge=%s\n' "$IMAGE_STORAGE" "$FILE_STORAGE" "$BRIDGE" "${INTERNAL_BRIDGE:-disabled}"
     printf 'backup_storage=%s\nbackup_policy=%s\n' "${BACKUP_STORAGE:-disabled}" "$backup_policy"
     printf 'debian_snippet=%s\nrhel_snippet=%s\n' "$DEBIAN_SNIPPET" "$RHEL_SNIPPET"
     printf 'disk_size=%s\ndisk_ssd=%s\nmemory_mb=%s\ncores=%s\ncpu_type=%s\nqos_enabled=%s\n' "$DISK_SIZE" "$DISK_SSD" "$MEMORY_MB" "$CORES" "$CPU_TYPE" "$ENABLE_QOS"

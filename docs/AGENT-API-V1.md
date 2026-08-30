@@ -271,13 +271,13 @@ monitoring 响应中的三个 last-verified/received 时间和两个 batch ID ke
 
 ### 4.1 本地模板 bootstrap（非远程 action）
 
-模板 catalog/storage 发现和首次创建模板属于 PVE 节点上的 root 管理流程，不进入第 7 节的远程 command registry。固定命令是 `ag-pve template catalog|discover|bootstrap`；推荐入口 `ag-pve template init` 会交互选择 catalog item、image/template/backup storage、backup policy 和 bridge，先生成 plan，只有操作者输入完整单词 `YES` 后才执行；输入 `no` 或直接回车会取消。`backupPolicy=required` 必须选择支持 `backup` content 的 storage；不备份必须显式选择 `disabled`，不能从空值推断。
+模板 catalog/storage 发现和首次创建模板属于 PVE 节点上的 root 管理流程，不进入第 7 节的远程 command registry。固定命令是 `ag-pve template catalog|discover|bootstrap`；推荐入口 `ag-pve template init` 会交互选择 catalog item、image/template/backup storage、backup policy、外网桥和可选内网桥。外网桥映射模板 `net0/public`，可选内网桥映射 `net1/private`，二者不得相同；未启用内网时不创建 `net1`。向导先生成 plan，只有操作者输入完整单词 `YES` 后才执行；输入 `no` 或直接回车会取消。`backupPolicy=required` 必须选择支持 `backup` content 的 storage；不备份必须显式选择 `disabled`，不能从空值推断。
 
 受信 bundle 与 Agent 使用同一发布/安装包交付，仓内固定源为 `bundles/ppflight-cloudinit`；安装器不从网络下载 helper 代码，bundle 缺失、多文件或摘要不符都会 fail closed。安装后的默认根目录是 root-owned managed symlink `/usr/local/lib/ppflight-agent/template-bootstrap`；它只能解析到 `/usr/local/lib/ppflight-agent/template-bundles/<manifest-derived-id>` 的单层受管版本目录。自定义 root 不允许 symlink，受管 target 与内部组件也不得可被 group/other 写入或再含 symlink。入口固定为 `tools/ppflight-template-bootstrap.py`。Runner 每次特权调用前严格解析 `agent-vendor-manifest.v1.json`，拒绝 unknown/版本混装/摘要不符，校验 catalog revision/SHA-256，再用 `/usr/bin/python3 -I`、固定 PATH、无 stdin、受限环境和有界 stdout 调用唯一入口；不能下载或执行官网传来的脚本、URL、catalog 路径或 shell 片段。
 
 manifest 的 `networkRedirectPolicy` 也是 strict 合同：只能是 `allowed=true`、`schemes=["https"]`、`addressFamily=ipv4-only`、`hostPolicy=upstream-selected`、`integrityPolicy=catalog-sha256-and-official-checksum`。因此上游可以选择 HTTPS redirect host，但 helper 的每次下载都必须使用 `curl --disable --ipv4`、最多五次 HTTPS-only redirect，并继续通过 catalog SHA-256 与官方 checksum 链验证内容；不得把“redirect 可用”解释为可执行任意远程代码。
 
-`bootstrap` 默认只做 plan。显式 `--execute` 必须使用与已确认 plan 相同的 storage/items/bridge，并原样带回 plan 的 UUID `requestId`、UUID `operationId`、`catalogRevision` 和 `catalogSha256`；任一 catalog 漂移都必须在 PVE mutation 前拒绝。helper 退出码固定为：0 表示 catalog/discovery 成功、plan ready 或 execute 全部成功；1 表示已进入执行后 builder/template/backup 失败；2 表示参数、catalog、storage、PVE preflight 或 VMID 冲突拒绝。调用方优先读取 strict JSON `state/errorCode`，不得解析 stderr 人类日志。
+`bootstrap` 默认只做 plan。`--bridge` 是外网 `net0`，`--internal-bridge` 是可选内网 `net1`。显式 `--execute` 必须使用与已确认 plan 相同的 storage/items/两个 bridge，并原样带回 plan 的 UUID `requestId`、UUID `operationId`、`catalogRevision` 和 `catalogSha256`；任一 catalog 漂移都必须在 PVE mutation 前拒绝。helper 退出码固定为：0 表示 catalog/discovery 成功、plan ready 或 execute 全部成功；1 表示已进入执行后 builder/template/backup 失败；2 表示参数、catalog、storage、PVE preflight 或 VMID 冲突拒绝。调用方优先读取 strict JSON `state/errorCode`，不得解析 stderr 人类日志。
 
 storage discovery 若给出 content remediation，管理 CLI 只在 `program=pvesm`，且 `argv/storageId/current/required/proposed content` 全部通过 strict 交叉校验，存储 active/enabled，角色失败原因仅为缺 content 时允许选择。CLI 用中文分块显示当前/新增/完成后能力和精确命令，要求输入 `Y`，再以固定绝对路径执行且不经 shell；完成后必须重新 discovery 并确认该角色 `allowed=true` 才继续。未确认、执行失败或回读不一致均 fail closed。
 

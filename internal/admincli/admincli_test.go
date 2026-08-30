@@ -316,7 +316,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var bootstrapArgs []string
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in: strings.NewReader("\n1\nY\n1\n\n1\n\n\n"), out: &output, errOut: &stderr, version: "test",
+		in: strings.NewReader("\n1\nY\n1\n\n1\nvmbr0\nY\nvmbr0\nvmbr1\n\n"), out: &output, errOut: &stderr, version: "test",
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {
 				t.Fatalf("unexpected storage content update: %s %s", storageID, content)
@@ -350,12 +350,12 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 		t.Fatalf("discover calls=%d", discoverCalls)
 	}
 	joined := strings.Join(bootstrapArgs, " ")
-	for _, expected := range []string{"--items all", "--image-storage local", "--template-storage local-zfs", "--backup-policy required", "--backup-storage local"} {
+	for _, expected := range []string{"--items all", "--image-storage local", "--template-storage local-zfs", "--backup-policy required", "--backup-storage local", "--bridge vmbr0", "--internal-bridge vmbr1"} {
 		if !strings.Contains(joined, expected) {
 			t.Fatalf("bootstrap args missing %q: %v", expected, bootstrapArgs)
 		}
 	}
-	for _, expected := range []string{"选择镜像缓存存储", "选择模板磁盘存储", "选择模板备份存储", "未执行任何模板变更"} {
+	for _, expected := range []string{"选择镜像缓存存储", "选择模板磁盘存储", "选择模板备份存储", "内网网桥不能与外网网桥相同", "外网 net0 -> vmbr0", "内网 net1 -> vmbr1", "未执行任何模板变更"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("output missing %q: %s", expected, output.String())
 		}

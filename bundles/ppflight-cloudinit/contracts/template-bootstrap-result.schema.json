@@ -4,7 +4,7 @@
   "title": "PPFlight local template bootstrap plan/result",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schemaVersion", "mode", "state", "executable", "catalog", "request", "bridge", "requiredBytes", "selectedStorages", "items", "errors", "command"],
+  "required": ["schemaVersion", "mode", "state", "executable", "catalog", "request", "bridge", "internalBridge", "requiredBytes", "selectedStorages", "items", "errors", "command"],
   "properties": {
     "schemaVersion": {"const": "ppflight.template-bootstrap-result/v1"},
     "mode": {"enum": ["plan", "execute"]},
@@ -24,6 +24,7 @@
     },
     "request": {"$ref": "https://ppflight.com/schemas/template-bootstrap-request.v1.json"},
     "bridge": {"type": "string"},
+    "internalBridge": {"type": ["string", "null"]},
     "requiredBytes": {"$ref": "#/$defs/bytes"},
     "selectedStorages": {
       "type": "object",

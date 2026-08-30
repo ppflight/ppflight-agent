@@ -666,6 +666,14 @@ def validate_uuid(value: Optional[str], field: str) -> str:
 def build_request(args: argparse.Namespace, catalog: Mapping[str, Any], items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     image_storage = validate_storage_id(args.image_storage, "imageStorage")
     template_storage = validate_storage_id(args.template_storage, "templateStorage")
+    external_bridge = validate_bridge(args.bridge)
+    internal_bridge = validate_bridge(args.internal_bridge) if args.internal_bridge else None
+    if internal_bridge == external_bridge:
+        raise ContractError(
+            "BRIDGE_ROLE_CONFLICT",
+            "external and internal template bridges must be different",
+            {"externalBridge": external_bridge, "internalBridge": internal_bridge},
+        )
     if args.backup_policy == "required":
         if not args.backup_storage:
             raise ContractError("BACKUP_STORAGE_REQUIRED", "backupPolicy=required requires --backup-storage")
@@ -706,6 +714,7 @@ def build_request(args: argparse.Namespace, catalog: Mapping[str, Any], items: S
         "imageStorage": image_storage,
         "templateStorage": template_storage,
         "backupPolicy": args.backup_policy,
+        "externalBridge": external_bridge,
         "items": [
             {
                 "templateRef": item["templateRef"],
@@ -718,6 +727,8 @@ def build_request(args: argparse.Namespace, catalog: Mapping[str, Any], items: S
     }
     if backup_storage is not None:
         request["backupStorage"] = backup_storage
+    if internal_bridge is not None:
+        request["internalBridge"] = internal_bridge
     return request
 
 
@@ -787,7 +798,8 @@ def _error_dict(error: ContractError) -> Dict[str, Any]:
 def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: CommandRunner) -> Dict[str, Any]:
     items = select_items(catalog, args.items)
     request = build_request(args, catalog, items)
-    bridge = validate_bridge(args.bridge)
+    bridge = request["externalBridge"]
+    internal_bridge = request.get("internalBridge")
     storages = discover_storages(runner)
     errors: List[Dict[str, Any]] = []
     selected_storages: Dict[str, Mapping[str, Any]] = {}
@@ -823,9 +835,20 @@ def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: C
         except ContractError as error:
             errors.append(_error_dict(error))
 
-    bridge_result = runner.run(("ip", "link", "show", "dev", bridge), check=False)
-    if bridge_result.returncode != 0:
-        errors.append(_error_dict(ContractError("BRIDGE_NOT_FOUND", "selected PVE bridge does not exist", {"bridge": bridge})))
+    for role, selected_bridge in (("external", bridge), ("internal", internal_bridge)):
+        if selected_bridge is None:
+            continue
+        bridge_result = runner.run(("ip", "link", "show", "dev", selected_bridge), check=False)
+        if bridge_result.returncode != 0:
+            errors.append(
+                _error_dict(
+                    ContractError(
+                        f"{role.upper()}_BRIDGE_NOT_FOUND",
+                        f"selected PVE {role} bridge does not exist",
+                        {"role": role, "bridge": selected_bridge},
+                    )
+                )
+            )
 
     existing = _existing_vmids(runner)
     item_results: List[Dict[str, Any]] = []
@@ -883,6 +906,8 @@ def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: C
         catalog["_catalogSha256"],
         "--no-backup",
     ]
+    if internal_bridge is not None:
+        builder_argv.extend(("--internal-bridge", internal_bridge))
     return {
         "schemaVersion": RESULT_SCHEMA,
         "mode": "execute" if args.execute else "plan",
@@ -897,6 +922,7 @@ def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: C
         },
         "request": request,
         "bridge": bridge,
+        "internalBridge": internal_bridge,
         "requiredBytes": str(required_bytes),
         "selectedStorages": selected_storages,
         "items": item_results,
@@ -1112,6 +1138,7 @@ def make_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--backup-storage", help="active PVE storage supporting backup; required by backupPolicy=required")
     bootstrap.add_argument("--items", default="all", help="all or comma-separated catalog refs/aliases/VMIDs")
     bootstrap.add_argument("--bridge", default="vmbr0")
+    bootstrap.add_argument("--internal-bridge", help="optional PVE bridge used by template net1")
     bootstrap.add_argument("--request-id")
     bootstrap.add_argument("--operation-id")
     bootstrap.add_argument("--expected-catalog-revision", help="catalogRevision copied from the confirmed plan")

@@ -283,7 +283,7 @@ sudo ag-pve template init
 
 安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一五项菜单：模板初始化、官网绑定、监控站绑定、官网通信状态、监控站通信状态。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。
 
-向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）和 bridge。选择 `all` 也不会跳过任一 storage 选择。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略后输入完整单词 `YES` 才执行，输入 `no` 或直接回车不创建模板。
+向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）、外网桥和可选内网桥。外网桥用于 `net0`，启用内网时另建 `net1`；二者必须是不同的现有 PVE bridge。选择 `all` 也不会跳过任一 storage 或网络选择。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略/网络角色后输入完整单词 `YES` 才执行，输入 `no` 或直接回车不创建模板。
 
 若 discovery 返回 storage content remediation，`ag` 只会在 `program=pvesm` 且 argv、storage ID、current/required/proposed content 全部严格匹配，存储 active/enabled，且该角色没有其他阻断原因时把它列为“选择后新增”的候选项。选中后会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定命令；只有输入 `Y` 才以固定绝对路径执行，不经 shell，并立即重新 discovery。取消、命令失败或重新检测仍不合格都会停止向导，不会进入模板 plan/execute。
 
@@ -298,7 +298,8 @@ sudo ag-pve template bootstrap \
   --backup-policy required \
   --backup-storage pbs-backup \
   --items all \
-  --bridge vmbr0
+  --bridge vmbr0 \
+  --internal-bridge vmbr1
 ```
 
 `bootstrap` 默认为 plan。自动化执行时必须使用相同选择，加 `--execute`，并原样带回 plan 的 `--request-id`、`--operation-id`、`--expected-catalog-revision`、`--expected-catalog-sha256`；缺失或 catalog 漂移应在修改 PVE 前以 exit 2 拒绝。exit 0 表示 catalog/discovery 成功、plan ready 或 execute 全部成功；exit 1 仅表示已进入执行后的 builder/template/backup 失败；业务判断优先使用 stdout strict JSON 的 `state/errorCode`，不能解析 stderr。

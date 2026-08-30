@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import types
 import unittest
 from pathlib import Path
 
@@ -21,8 +22,9 @@ SPEC.loader.exec_module(BOOTSTRAP)
 
 
 class FakeRunner:
-    def __init__(self, cluster_status=None):
+    def __init__(self, cluster_status=None, available_bytes=9876543210):
         self.calls = []
+        self.available_bytes = available_bytes
         self.cluster_status = cluster_status or [
             {"type": "cluster", "name": "lab"},
             {"type": "node", "name": "pve-a", "local": 1},
@@ -48,10 +50,12 @@ class FakeRunner:
                     "storage": "local",
                     "type": "dir",
                     "active": 1,
-                    "avail": 9876543210,
+                    "avail": self.available_bytes,
                     "shared": 0,
                 }
             ]
+        if call == ("pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"):
+            return []
         raise AssertionError(f"unexpected JSON command: {call!r}")
 
     def run(self, argv, check=True, timeout=120):
@@ -61,6 +65,11 @@ class FakeRunner:
         if call[:2] == ("pvesm", "path"):
             probe_name = call[2].split("/", 1)[1]
             return subprocess.CompletedProcess(call, 0, f"/var/lib/vz/{probe_name}\n", "")
+        if call[:5] in (
+            ("ip", "link", "show", "dev", "vmbr0"),
+            ("ip", "link", "show", "dev", "vmbr1"),
+        ):
+            return subprocess.CompletedProcess(call, 0, "", "")
         raise AssertionError(f"unexpected command: {call!r}")
 
 
@@ -104,6 +113,82 @@ class StorageDiscoveryTest(unittest.TestCase):
             BOOTSTRAP.discover_storages(runner)
 
         self.assertEqual(raised.exception.code, "PVE_LOCAL_NODE_INVALID")
+
+
+class DualBridgeRequestTest(unittest.TestCase):
+    def _arguments(self, **overrides):
+        values = {
+            "image_storage": "local",
+            "template_storage": "local",
+            "backup_policy": "disabled",
+            "backup_storage": None,
+            "bridge": "vmbr0",
+            "internal_bridge": "vmbr1",
+            "execute": False,
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "operation_id": "22222222-2222-4222-8222-222222222222",
+            "expected_catalog_revision": None,
+            "expected_catalog_sha256": None,
+            "items": "ubuntu-24.04",
+        }
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def test_request_freezes_external_and_internal_bridge_roles(self):
+        catalog = {"catalogRevision": "2026-08-30.1", "_catalogSha256": "a" * 64}
+        items = [
+            {
+                "templateRef": "ubuntu-24.04",
+                "version": "24.04",
+                "source": {"sha256": "b" * 64},
+                "target": {"vmid": 9001},
+            }
+        ]
+
+        request = BOOTSTRAP.build_request(self._arguments(), catalog, items)
+
+        self.assertEqual(request["externalBridge"], "vmbr0")
+        self.assertEqual(request["internalBridge"], "vmbr1")
+
+    def test_request_rejects_same_bridge_for_both_roles(self):
+        catalog = {"catalogRevision": "2026-08-30.1", "_catalogSha256": "a" * 64}
+        items = [
+            {
+                "templateRef": "ubuntu-24.04",
+                "version": "24.04",
+                "source": {"sha256": "b" * 64},
+                "target": {"vmid": 9001},
+            }
+        ]
+
+        with self.assertRaises(BOOTSTRAP.ContractError) as raised:
+            BOOTSTRAP.build_request(self._arguments(internal_bridge="vmbr0"), catalog, items)
+
+        self.assertEqual(raised.exception.code, "BRIDGE_ROLE_CONFLICT")
+
+    def test_plan_passes_optional_internal_bridge_to_builder(self):
+        plan = BOOTSTRAP.prepare_plan(
+            self._arguments(),
+            BOOTSTRAP.load_catalog(),
+            FakeRunner(available_bytes=100_000_000_000),
+        )
+
+        self.assertTrue(plan["executable"])
+        self.assertEqual(plan["bridge"], "vmbr0")
+        self.assertEqual(plan["internalBridge"], "vmbr1")
+        self.assertIn("--internal-bridge", plan["command"]["argv"])
+        self.assertEqual(plan["command"]["argv"][-2:], ["--internal-bridge", "vmbr1"])
+
+    def test_plan_keeps_single_nic_compatibility(self):
+        plan = BOOTSTRAP.prepare_plan(
+            self._arguments(internal_bridge=None),
+            BOOTSTRAP.load_catalog(),
+            FakeRunner(available_bytes=100_000_000_000),
+        )
+
+        self.assertTrue(plan["executable"])
+        self.assertIsNone(plan["internalBridge"])
+        self.assertNotIn("--internal-bridge", plan["command"]["argv"])
 
 
 if __name__ == "__main__":

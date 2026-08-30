@@ -1,18 +1,18 @@
 {
   "schemaVersion": "ppflight.agent-vendor-manifest/v1",
-  "bundleVersion": "3.0.1",
+  "bundleVersion": "3.1.0",
   "catalogRevision": "2026-08-30.1",
   "catalogSha256": "d716522fe98baf85ab03c2760ac56c90a6f4fc73d1833bb8f4aa46c4dafb0c75",
   "entrypoint": "tools/ppflight-template-bootstrap.py",
   "files": [
     {
       "path": "build-cloud-templates.sh",
-      "sha256": "bba3fb84fc0b3255710ed19ee0e0e864c3a0f15eb4c97137f51aa4f34007a3f7",
+      "sha256": "d03f802febe050940b41aac8f44f8ce72de8400748fcaa08bf834c2733d48475",
       "requiredAtRuntime": true
     },
     {
       "path": "tools/ppflight-template-bootstrap.py",
-      "sha256": "65adfe7d46b665b8862dcab09a69c7495f37b30989b45b9a5ddfa348155fdef2",
+      "sha256": "b5c00b80155ce65199f4cf1473f6817b1635f7cf55730ff78185fb63e461c1ab",
       "requiredAtRuntime": true
     },
     {
@@ -27,12 +27,12 @@
     },
     {
       "path": "contracts/template-bootstrap-request.schema.json",
-      "sha256": "69b50edd3269caefa238d8e8d32281265c8a36f9b72a9e5661a15ddfb1d3a25e",
+      "sha256": "1fbe8219bc108d3b863acce8f61cebd39a0984b8126c8d97b972f7feaea93c92",
       "requiredAtRuntime": true
     },
     {
       "path": "contracts/template-bootstrap-result.schema.json",
-      "sha256": "1fc4e52f5669b6a3e7b423e52ca0daec005d6f382ae409d2b1fb3b003f630962",
+      "sha256": "b973c6cbae8baa73c6732b094bee63c0fdd9d6de7d4a3755cca59c47773a4b8d",
       "requiredAtRuntime": true
     },
     {

@@ -140,7 +140,7 @@ func (c *cli) usage() {
   ag-pve [--config FILE] website metering|telemetry set [选项]
   ag-pve [--config FILE] website control set [选项]
   ag-pve [--config FILE] website query|modify        # 预留，v0.1 返回未实现
-  ag-pve template init                               # 交互选择镜像/模板/备份存储并二次确认
+  ag-pve template init                               # 交互选择存储、外网/内网桥并二次确认
   ag-pve template catalog|discover
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
 
@@ -1106,12 +1106,38 @@ func (c *cli) templateInit() int {
 		}
 		discovery.Storages = refreshed
 	}
-	bridge, err := c.promptLine(reader, "模板默认网桥 [vmbr0]: ")
+	externalBridge, err := c.promptLine(reader, "外网网桥（模板 net0）[vmbr0]: ")
 	if err != nil {
 		return 2
 	}
-	if bridge == "" {
-		bridge = "vmbr0"
+	if externalBridge == "" {
+		externalBridge = "vmbr0"
+	}
+	internalEnabled, err := c.promptYesNo(reader, "是否为模板添加内网网卡 net1？[y/N]（回车=否）: ", false)
+	if err != nil {
+		return 2
+	}
+	internalBridge := ""
+	if internalEnabled {
+		for {
+			internalBridge, err = c.promptLine(reader, "内网网桥（模板 net1）[vmbr1]: ")
+			if err != nil {
+				return 2
+			}
+			if internalBridge == "" {
+				internalBridge = "vmbr1"
+			}
+			if internalBridge != externalBridge {
+				break
+			}
+			fmt.Fprintln(c.out, "内网网桥不能与外网网桥相同，请重新输入。")
+		}
+	}
+	fmt.Fprintf(c.out, "网络配置：\n  外网 net0 -> %s\n", externalBridge)
+	if internalBridge == "" {
+		fmt.Fprintln(c.out, "  内网 net1 -> 不创建")
+	} else {
+		fmt.Fprintf(c.out, "  内网 net1 -> %s\n", internalBridge)
 	}
 	requestID, err := protocol.NewID()
 	if err != nil {
@@ -1121,9 +1147,12 @@ func (c *cli) templateInit() int {
 	if err != nil {
 		return 1
 	}
-	baseArgs := []string{"bootstrap", "--image-storage", imageStorage, "--template-storage", templateStorage, "--backup-policy", backupPolicy, "--items", items, "--bridge", bridge, "--request-id", requestID, "--operation-id", operationID}
+	baseArgs := []string{"bootstrap", "--image-storage", imageStorage, "--template-storage", templateStorage, "--backup-policy", backupPolicy, "--items", items, "--bridge", externalBridge, "--request-id", requestID, "--operation-id", operationID}
 	if backupPolicy == "required" {
 		baseArgs = append(baseArgs, "--backup-storage", backupStorage)
+	}
+	if internalBridge != "" {
+		baseArgs = append(baseArgs, "--internal-bridge", internalBridge)
 	}
 	planResult, err := c.runTemplateBootstrap(ctx, baseArgs)
 	if err != nil {
