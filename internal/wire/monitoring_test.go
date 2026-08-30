@@ -2,10 +2,13 @@ package wire
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/collector"
+	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/exporter"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/observation"
@@ -63,5 +66,102 @@ func TestMonitoringTelemetryRejectsMissingBindingAuthority(t *testing.T) {
 	_, err := BuildMonitoringTelemetry(observation.Snapshot{ObservedAt: time.Now().UTC()}, nil, MonitoringBuildContext{})
 	if err == nil {
 		t.Fatal("missing monitoring binding authority was accepted")
+	}
+}
+
+func TestMonitoringSimulatorPayloadNormalizesRequiredArrays(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 30, 0, 0, time.UTC)
+	simulator := collector.NewSimulator(config.Config{
+		Mode: "test",
+		Identity: config.IdentityConfig{
+			AgentRef: "agent-simulator", CollectorRef: "collector-simulator",
+			ClusterRef: "cluster-simulator", Site: "test-site",
+		},
+	})
+	snapshot, err := simulator.Collect(context.Background(), now, collector.Due{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Exercise the empty required-array path as well as the simulator's nil
+	// QGA SupportedCommands fixture that caused production HTTP 400 responses.
+	snapshot.Tasks = nil
+	originalInfo := snapshot.Guests[0].QGA.Info
+	if originalInfo == nil || originalInfo.SupportedCommands != nil {
+		t.Fatalf("simulator fixture no longer exercises nil supported_commands: %#v", originalInfo)
+	}
+
+	batch, err := BuildMonitoringTelemetry(snapshot, nil, MonitoringBuildContext{
+		BindingID: "550e8400-e29b-41d4-a716-446655440001", MonitoringAgentRef: "monitor-agent-simulator",
+		DeviceID: "device-simulator", CredentialEpoch: 1, BootID: "550e8400-e29b-41d4-a716-446655440002",
+		Sequence: 1, AgentVersion: "0.1.0-rc.12", SourceRef: "source-simulator", SentAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if originalInfo.SupportedCommands != nil {
+		t.Fatal("monitoring projection mutated the collector snapshot")
+	}
+	if got := batch.Components["smartctlExporter"].FreshUntil; got == nil || !got.Equal(now.Add(10*time.Minute)) {
+		t.Fatalf("monitoring projection changed the collector freshness horizon: %v", got)
+	}
+	if got := batch.Guests[1].QGA.Availability; got.ObservedAt == nil || !got.ObservedAt.Equal(now) || got.FreshUntil != nil {
+		t.Fatalf("unavailable QGA timestamps were not canonicalized: %#v", got)
+	}
+	if got := batch.Guests[1].Capabilities.Lifecycle; got.ObservedAt != nil || got.FreshUntil != nil {
+		t.Fatalf("zero capability timestamps were not omitted: %#v", got)
+	}
+
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte(`"supported_commands":null`)) {
+		t.Fatalf("monitoring payload still contains null supported_commands: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"supported_commands":[]`)) {
+		t.Fatalf("monitoring payload does not contain the required empty array: %s", raw)
+	}
+	if !bytes.Contains(raw, []byte(`"tasks":[]`)) {
+		t.Fatalf("monitoring payload does not normalize nil tasks to []: %s", raw)
+	}
+	if bytes.Contains(raw, []byte(`"components":null`)) {
+		t.Fatalf("monitoring payload contains a null required object: %s", raw)
+	}
+	if bytes.Contains(raw, []byte(`0001-01-01`)) {
+		t.Fatalf("monitoring payload contains a Go zero timestamp: %s", raw)
+	}
+}
+
+func TestMonitoringGuestAgentInfoPreservesSupportedCommands(t *testing.T) {
+	input := &pve.GuestAgentInfo{Version: "8.2.0", SupportedCommands: []pve.GuestAgentCommand{{Name: "guest-ping", Enabled: true}}}
+	output := monitoringGuestAgentInfo(input)
+	if output == input {
+		t.Fatal("monitoring projection reused the collector-owned info pointer")
+	}
+	if len(output.SupportedCommands) != 1 || output.SupportedCommands[0] != input.SupportedCommands[0] {
+		t.Fatalf("supported command was not preserved: %#v", output.SupportedCommands)
+	}
+	output.SupportedCommands[0].Name = "changed"
+	if input.SupportedCommands[0].Name != "guest-ping" {
+		t.Fatal("monitoring projection reused the collector-owned supported command slice")
+	}
+}
+
+func TestMonitoringGuestAgentInfoNormalizesPVENullAndMissingCommands(t *testing.T) {
+	for _, input := range []string{
+		`{"version":"8.2.0"}`,
+		`{"version":"8.2.0","supported_commands":null}`,
+	} {
+		var info pve.GuestAgentInfo
+		if err := json.Unmarshal([]byte(input), &info); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(monitoringGuestAgentInfo(&info))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(raw, []byte(`"supported_commands":[]`)) {
+			t.Fatalf("PVE info %s was not normalized for monitoring: %s", input, raw)
+		}
 	}
 }

@@ -18,7 +18,7 @@ PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网�
 curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scripts/quick-install.sh | bash
 ```
 
-`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载 `v0.1.0-rc.11`，校验内置 SHA-256 后才解压并运行包内安装器。它只安装并启用开机启动，不会启动 Agent、创建 PVE Token、授予 control ACL 或绑定官网/监控站；RC.11 保留模板初始化，把官网和监控绑定分别收进独立设置菜单（状态、添加/重新绑定、删除绑定），并把完整卸载放到主菜单第 4 项。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
+`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本，校验内置 SHA-256 后才解压并运行包内安装器。它只安装并启用开机启动，不会启动 Agent、创建 PVE Token、授予 control ACL 或绑定官网/监控站；RC.12 保留模板初始化、双域绑定设置菜单和完整卸载，并修正 monitoring telemetry 的严格编码：PVE/QGA 未返回命令列表或当前没有任务时分别输出 `supported_commands: []`、`tasks: []`，不再发送 `null`；未知时间不再错误编码成公元 1 年。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
 安装完成后只输入：
 

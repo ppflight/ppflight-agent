@@ -36,26 +36,36 @@ type MonitoringBuildContext struct {
 }
 
 type MonitoringTelemetryBatch struct {
-	SchemaVersion      int                                 `json:"schemaVersion"`
-	BatchID            string                              `json:"batchId"`
-	BindingID          string                              `json:"bindingId"`
-	MonitoringAgentRef string                              `json:"monitoringAgentRef"`
-	DeviceID           string                              `json:"deviceId"`
-	CredentialEpoch    protocol.Counter                    `json:"credentialEpoch"`
-	BootID             string                              `json:"bootId"`
-	Sequence           protocol.Counter                    `json:"sequence"`
-	ObservedAt         time.Time                           `json:"observedAt"`
-	SentAt             time.Time                           `json:"sentAt"`
-	Source             MonitoringSource                    `json:"source"`
-	PVEVersion         pve.Version                         `json:"pveVersion"`
-	Components         map[string]observation.Availability `json:"components"`
-	Nodes              []MonitoringNode                    `json:"nodes"`
-	Storages           []MonitoringStorage                 `json:"storages"`
-	Tasks              []observation.Task                  `json:"tasks"`
-	Guests             []MonitoringGuest                   `json:"guests"`
-	Host               *MonitoringHost                     `json:"host,omitempty"`
-	SMART              *MonitoringSMART                    `json:"smart,omitempty"`
-	AgentHealth        MonitoringAgentHealth               `json:"agentHealth"`
+	SchemaVersion      int                               `json:"schemaVersion"`
+	BatchID            string                            `json:"batchId"`
+	BindingID          string                            `json:"bindingId"`
+	MonitoringAgentRef string                            `json:"monitoringAgentRef"`
+	DeviceID           string                            `json:"deviceId"`
+	CredentialEpoch    protocol.Counter                  `json:"credentialEpoch"`
+	BootID             string                            `json:"bootId"`
+	Sequence           protocol.Counter                  `json:"sequence"`
+	ObservedAt         time.Time                         `json:"observedAt"`
+	SentAt             time.Time                         `json:"sentAt"`
+	Source             MonitoringSource                  `json:"source"`
+	PVEVersion         pve.Version                       `json:"pveVersion"`
+	Components         map[string]MonitoringAvailability `json:"components"`
+	Nodes              []MonitoringNode                  `json:"nodes"`
+	Storages           []MonitoringStorage               `json:"storages"`
+	Tasks              []observation.Task                `json:"tasks"`
+	Guests             []MonitoringGuest                 `json:"guests"`
+	Host               *MonitoringHost                   `json:"host,omitempty"`
+	SMART              *MonitoringSMART                  `json:"smart,omitempty"`
+	AgentHealth        MonitoringAgentHealth             `json:"agentHealth"`
+}
+
+// MonitoringAvailability is the canonical telemetry-v1 representation. Go's
+// time.Time zero value is not removed by omitempty, so pointers are required
+// to distinguish an absent observation/freshness timestamp from year 1.
+type MonitoringAvailability struct {
+	Available         bool       `json:"available"`
+	ObservedAt        *time.Time `json:"observedAt,omitempty"`
+	FreshUntil        *time.Time `json:"freshUntil,omitempty"`
+	UnavailableReason string     `json:"unavailableReason,omitempty"`
 }
 
 type MonitoringSource struct {
@@ -117,43 +127,58 @@ type MonitoringAssignment struct {
 }
 
 type MonitoringGuest struct {
-	Managed      bool                  `json:"managed"`
-	Identity     *MonitoringAssignment `json:"identity,omitempty"`
-	VMID         int                   `json:"vmid"`
-	GuestType    string                `json:"guestType"`
-	Name         string                `json:"name"`
-	Node         string                `json:"node"`
-	Template     bool                  `json:"template"`
-	PVE          MonitoringPVEGuest    `json:"pveObserved"`
-	QGA          MonitoringQGA         `json:"guestObserved"`
-	Networks     []WebsiteNetwork      `json:"networks"`
-	Capabilities GuestCapabilities     `json:"capabilities"`
-	ObservedAt   time.Time             `json:"observedAt"`
+	Managed      bool                        `json:"managed"`
+	Identity     *MonitoringAssignment       `json:"identity,omitempty"`
+	VMID         int                         `json:"vmid"`
+	GuestType    string                      `json:"guestType"`
+	Name         string                      `json:"name"`
+	Node         string                      `json:"node"`
+	Template     bool                        `json:"template"`
+	PVE          MonitoringPVEGuest          `json:"pveObserved"`
+	QGA          MonitoringQGA               `json:"guestObserved"`
+	Networks     []WebsiteNetwork            `json:"networks"`
+	Capabilities MonitoringGuestCapabilities `json:"capabilities"`
+	ObservedAt   time.Time                   `json:"observedAt"`
 }
 
 type MonitoringPVEGuest struct {
-	Availability  observation.Availability `json:"availability"`
-	Status        string                   `json:"status"`
-	CPU           *float64                 `json:"cpuRatio,omitempty"`
-	CPUCount      *float64                 `json:"cpuCount,omitempty"`
-	MemoryUsed    *protocol.Counter        `json:"memoryUsedBytes,omitempty"`
-	MemoryTotal   *protocol.Counter        `json:"memoryTotalBytes,omitempty"`
-	DiskUsed      *protocol.Counter        `json:"diskUsedBytes,omitempty"`
-	DiskTotal     *protocol.Counter        `json:"diskTotalBytes,omitempty"`
-	DiskRead      *protocol.Counter        `json:"diskReadBytesTotal,omitempty"`
-	DiskWrite     *protocol.Counter        `json:"diskWriteBytesTotal,omitempty"`
-	IngressBytes  *protocol.Counter        `json:"ingressBytesTotal,omitempty"`
-	EgressBytes   *protocol.Counter        `json:"egressBytesTotal,omitempty"`
-	UptimeSeconds *protocol.Counter        `json:"uptimeSeconds,omitempty"`
+	Availability  MonitoringAvailability `json:"availability"`
+	Status        string                 `json:"status"`
+	CPU           *float64               `json:"cpuRatio,omitempty"`
+	CPUCount      *float64               `json:"cpuCount,omitempty"`
+	MemoryUsed    *protocol.Counter      `json:"memoryUsedBytes,omitempty"`
+	MemoryTotal   *protocol.Counter      `json:"memoryTotalBytes,omitempty"`
+	DiskUsed      *protocol.Counter      `json:"diskUsedBytes,omitempty"`
+	DiskTotal     *protocol.Counter      `json:"diskTotalBytes,omitempty"`
+	DiskRead      *protocol.Counter      `json:"diskReadBytesTotal,omitempty"`
+	DiskWrite     *protocol.Counter      `json:"diskWriteBytesTotal,omitempty"`
+	IngressBytes  *protocol.Counter      `json:"ingressBytesTotal,omitempty"`
+	EgressBytes   *protocol.Counter      `json:"egressBytesTotal,omitempty"`
+	UptimeSeconds *protocol.Counter      `json:"uptimeSeconds,omitempty"`
 }
 
 type MonitoringQGA struct {
-	Availability observation.Availability    `json:"availability"`
+	Availability MonitoringAvailability      `json:"availability"`
 	Info         *pve.GuestAgentInfo         `json:"info,omitempty"`
 	OS           *pve.GuestOSInfo            `json:"os,omitempty"`
 	Filesystems  []MonitoringGuestFilesystem `json:"filesystems,omitempty"`
 	Interfaces   []MonitoringGuestInterface  `json:"interfaces,omitempty"`
 	Capabilities map[string]pve.Availability `json:"capabilities,omitempty"`
+}
+
+type MonitoringGuestCapabilities struct {
+	Lifecycle          MonitoringActionCapability `json:"lifecycle"`
+	RootPasswordReset  MonitoringActionCapability `json:"rootPasswordReset"`
+	GuestNetworkVerify MonitoringActionCapability `json:"guestNetworkVerify"`
+	Metering           inventory.Capability       `json:"metering"`
+}
+
+type MonitoringActionCapability struct {
+	Available          bool       `json:"available"`
+	Reason             string     `json:"reason,omitempty"`
+	ObservedAt         *time.Time `json:"observedAt,omitempty"`
+	FreshUntil         *time.Time `json:"freshUntil,omitempty"`
+	ExecutionPreflight bool       `json:"executionPreflight"`
 }
 
 type MonitoringGuestFilesystem struct {
@@ -296,7 +321,7 @@ func BuildMonitoringTelemetry(snapshot observation.Snapshot, assignments *invent
 		Sequence: protocol.Counter(cfg.Sequence), ObservedAt: snapshot.ObservedAt.UTC(), SentAt: cfg.SentAt.UTC(),
 		Source: MonitoringSource{WebsiteAgentRef: snapshot.AgentRef, CollectorRef: snapshot.CollectorRef, SourceRef: cfg.SourceRef,
 			ClusterRef: snapshot.ClusterRef, NodeRef: snapshot.NodeRef, Site: snapshot.Site, Mode: snapshot.Mode, AgentVersion: cfg.AgentVersion},
-		PVEVersion: snapshot.PVEVersion, Components: snapshot.Components, Tasks: append([]observation.Task(nil), snapshot.Tasks...),
+		PVEVersion: snapshot.PVEVersion, Components: monitoringComponents(snapshot.Components), Tasks: append([]observation.Task{}, snapshot.Tasks...),
 		Nodes: []MonitoringNode{}, Storages: []MonitoringStorage{}, Guests: []MonitoringGuest{}, AgentHealth: cfg.AgentHealth,
 	}
 	for _, node := range snapshot.Nodes {
@@ -331,13 +356,13 @@ func monitoringStorage(value observation.Storage) MonitoringStorage {
 }
 func monitoringGuest(cluster string, guest observation.Guest, assignments *inventory.Store, now time.Time) MonitoringGuest {
 	item := MonitoringGuest{VMID: guest.VMID, GuestType: guest.GuestType, Name: guest.Name, Node: guest.Node, Template: guest.Template,
-		PVE: monitoringPVEGuest(guest.PVE), QGA: monitoringQGA(guest.QGA), Networks: websiteNetworks(guest.Networks, nil), Capabilities: guestCapabilities(guest, nil, now), ObservedAt: guest.ObservedAt}
+		PVE: monitoringPVEGuest(guest.PVE), QGA: monitoringQGA(guest.QGA), Networks: websiteNetworks(guest.Networks, nil), Capabilities: monitoringGuestCapabilities(guestCapabilities(guest, nil, now)), ObservedAt: guest.ObservedAt}
 	if assignments != nil {
 		if assignment, ok := assignments.Lookup(cluster, guest.GuestType, guest.VMID); ok {
 			item.Managed = true
 			item.Identity = monitoringAssignment(assignment)
 			item.Networks = websiteNetworks(guest.Networks, assignment.NICBindings)
-			item.Capabilities = guestCapabilities(guest, &assignment, now)
+			item.Capabilities = monitoringGuestCapabilities(guestCapabilities(guest, &assignment, now))
 		}
 	}
 	if item.Networks == nil {
@@ -351,12 +376,12 @@ func monitoringAssignment(value inventory.Assignment) *MonitoringAssignment {
 		CutoverAt: value.CutoverAt, NICBindings: append([]inventory.NICBinding(nil), value.NICBindings...)}
 }
 func monitoringPVEGuest(value observation.PVEGuestView) MonitoringPVEGuest {
-	return MonitoringPVEGuest{Availability: value.Availability, Status: value.Status, CPU: value.CPU, CPUCount: value.CPUCount,
+	return MonitoringPVEGuest{Availability: monitoringAvailability(value.Availability), Status: value.Status, CPU: value.CPU, CPUCount: value.CPUCount,
 		MemoryUsed: counterPointer(value.MemoryUsed), MemoryTotal: counterPointer(value.MemoryTotal), DiskUsed: counterPointer(value.DiskUsed), DiskTotal: counterPointer(value.DiskTotal),
 		DiskRead: counterPointer(value.DiskRead), DiskWrite: counterPointer(value.DiskWrite), IngressBytes: counterPointer(value.IngressBytes), EgressBytes: counterPointer(value.EgressBytes), UptimeSeconds: counterPointer(value.UptimeSeconds)}
 }
 func monitoringQGA(value observation.QGAView) MonitoringQGA {
-	result := MonitoringQGA{Availability: value.Availability, Info: value.Info, OS: value.OS, Capabilities: value.Capabilities}
+	result := MonitoringQGA{Availability: monitoringAvailability(value.Availability), Info: monitoringGuestAgentInfo(value.Info), OS: value.OS, Capabilities: value.Capabilities}
 	for _, fs := range value.Filesystems {
 		result.Filesystems = append(result.Filesystems, MonitoringGuestFilesystem{Name: fs.Name, Mountpoint: fs.Mountpoint, Type: fs.Type, TotalBytes: counterPointer(fs.TotalBytes), UsedBytes: counterPointer(fs.UsedBytes)})
 	}
@@ -371,6 +396,63 @@ func monitoringQGA(value observation.QGAView) MonitoringQGA {
 		result.Interfaces = append(result.Interfaces, item)
 	}
 	return result
+}
+
+// monitoringGuestAgentInfo keeps the monitoring wire contract independent
+// from the PVE API's nil-slice representation. The monitoring receiver
+// requires supported_commands to be an array whenever info is present, so an
+// unavailable/empty command list must serialize as [] rather than null. The
+// copy also avoids mutating the collector snapshot shared with other outputs.
+func monitoringGuestAgentInfo(value *pve.GuestAgentInfo) *pve.GuestAgentInfo {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	result.SupportedCommands = append([]pve.GuestAgentCommand{}, value.SupportedCommands...)
+	return &result
+}
+
+func monitoringComponents(value map[string]observation.Availability) map[string]MonitoringAvailability {
+	result := make(map[string]MonitoringAvailability, len(value))
+	for name, availability := range value {
+		result[name] = monitoringAvailability(availability)
+	}
+	return result
+}
+
+func monitoringAvailability(value observation.Availability) MonitoringAvailability {
+	result := MonitoringAvailability{Available: value.Available, UnavailableReason: value.UnavailableReason}
+	if value.ObservedAt.IsZero() {
+		return result
+	}
+	observedAt := value.ObservedAt.UTC()
+	result.ObservedAt = &observedAt
+	if value.FreshUntil.IsZero() || value.FreshUntil.Before(value.ObservedAt) {
+		return result
+	}
+	freshUntil := value.FreshUntil.UTC()
+	result.FreshUntil = &freshUntil
+	return result
+}
+
+func monitoringGuestCapabilities(value GuestCapabilities) MonitoringGuestCapabilities {
+	return MonitoringGuestCapabilities{
+		Lifecycle:          monitoringActionCapability(value.Lifecycle),
+		RootPasswordReset:  monitoringActionCapability(value.RootPasswordReset),
+		GuestNetworkVerify: monitoringActionCapability(value.GuestNetworkVerify),
+		Metering:           value.Metering,
+	}
+}
+
+func monitoringActionCapability(value ActionCapability) MonitoringActionCapability {
+	availability := monitoringAvailability(observation.Availability{
+		Available: value.Available, ObservedAt: value.ObservedAt,
+		FreshUntil: value.FreshUntil, UnavailableReason: value.Reason,
+	})
+	return MonitoringActionCapability{
+		Available: value.Available, Reason: value.Reason, ObservedAt: availability.ObservedAt,
+		FreshUntil: availability.FreshUntil, ExecutionPreflight: value.ExecutionPreflight,
+	}
 }
 
 func monitoringMetric(value exporter.Value) *MonitoringMetric {
