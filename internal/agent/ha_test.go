@@ -80,7 +80,7 @@ func TestGracefulContextShutdownDoesNotCreatePreviousExitIncident(t *testing.T) 
 		t.Fatalf("next process observed a false incident: website=%#v monitoring=%#v", website, monitoring)
 	}
 
-	next, err := lifecycle.Begin(filepath.Join(root, "state", "lifecycle-state.json"), secondLifecycleBootID, time.Now().UTC())
+	next, err := lifecycle.Begin(filepath.Join(RuntimeStateDirectory(filepath.Join(root, "state")), "lifecycle-state.json"), secondLifecycleBootID, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

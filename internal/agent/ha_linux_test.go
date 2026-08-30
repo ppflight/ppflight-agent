@@ -138,7 +138,7 @@ func TestSystemdWatchdogFailureLeavesLifecycleRunningForNextRestart(t *testing.T
 		t.Fatal("watchdog did not terminate the stuck agent")
 	}
 
-	next, err := lifecycle.Begin(filepath.Join(root, "state", "lifecycle-state.json"), secondLifecycleBootID, time.Now().UTC())
+	next, err := lifecycle.Begin(filepath.Join(RuntimeStateDirectory(filepath.Join(root, "state")), "lifecycle-state.json"), secondLifecycleBootID, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
