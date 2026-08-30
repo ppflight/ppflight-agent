@@ -10,6 +10,43 @@ PPFlight 官网  <── Agent 主动出站 HTTPS ──>  ppflight-agent  ─�
 
 PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网开放。官网持有业务资产、IPAM、套餐、审批、`generation` 和操作线程；Agent 持有本地 PVE 凭据并执行固定 schema 的 PVE 原语。两侧都不能只用 VMID 代表客户资产。
 
+## 全新 PVE 一键安装（联调测试）
+
+在 PVE 8.x/9.x 的 **root 终端**完整复制并执行下面这一条 Bash 命令。它会固定使用 IPv4 和 HTTPS 下载 `v0.1.0-rc.1`，按架构选择 `amd64`/`arm64`，校验写死的 SHA-256 后才解压并运行包内安装器；安装只启用开机启动，不会启动 Agent、创建 PVE Token、授予 control ACL 或绑定官网/监控站。
+
+```bash
+bash -c '
+set -Eeuo pipefail
+test "$(id -u)" -eq 0 || { echo "请在 PVE root 终端执行" >&2; exit 1; }
+case "$(uname -m)" in
+  x86_64|amd64) arch="amd64"; expected="0a62a85d5f34c66d21b52c2d600f6f2f0068f0f3be2082d0fb9daadd85c19d0d" ;;
+  aarch64|arm64) arch="arm64"; expected="0e28aaabc3c8ee3626d03ec411a578386b144d7af866f593d9f8bfd8997b8adb" ;;
+  *) echo "不支持的 CPU 架构：$(uname -m)" >&2; exit 1 ;;
+esac
+work="$(mktemp -d /tmp/ppflight-agent-install.XXXXXX)"
+trap "rm -rf -- \"$work\"" EXIT
+cd "$work"
+archive="ppflight-agent-0.1.0-linux-${arch}.tar.gz"
+base="https://github.com/ppflight/ppflight-agent/releases/download/v0.1.0-rc.1"
+curl -4fL --proto "=https" --tlsv1.2 "$base/$archive" -o "$archive"
+printf "%s  %s\n" "$expected" "$archive" | sha256sum -c -
+tar -xzf "$archive"
+cd ppflight-agent
+sha256sum -c ppflight-agent.sha256
+binary_sha="$(cut -d " " -f1 ppflight-agent.sha256)"
+scripts/install.sh --binary ./ppflight-agent --binary-sha256 "$binary_sha" --enable
+printf "\n安装完成。现在输入 AG 进入 PPFlight 菜单。\n"
+'
+```
+
+安装完成后只输入：
+
+```bash
+AG
+```
+
+先从 `AG` 菜单查看和调整；在完成本地 PVE Token、API source、双绑定、IPv4 白名单及配置校验前，不要手工启动服务。该命令是当前联调候选的固定版本安装入口，后续 RC/正式版会同步更新版本和摘要。
+
 官网、监控站和 PVE 外连的目标合同是 IPv4-only：DNS 仅使用获准 A 记录，dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网绑定和 monitoring 绑定分别返回并持久化独立 `networkPolicy={agentObservedIPv4,serverIPv4Allowlist}`：两者均为 canonical IPv4，allowlist 为 1..16 项。对 DNS endpoint，Agent 只直拨 `A 记录 ∩ allowlist`，保留 URL hostname 作 HTTP Host/TLS SNI 与证书校验；禁代理和 redirect，绝不把解析结果改写成 URL hostname。`agentObservedIPv4` 是各服务端观察到的本次绑定出口地址，只作该 trust domain 的服务端元数据，不能从本地网络学习或当作目的地。IP 命中只是 TLS、绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、time、action allowlist 和审计可用性之外的附加门槛，不能替代加密身份。Agent 的严格 response 校验、private-state 保存及 tcp4 pinning 已接线；官网/监控服务端生成、持久化和部署这两套 policy 仍待各自任务完成。
 
 > 上线状态：Agent 侧绑定、发现、assignment、受控执行和 UPID 恢复所需的代码与资源原语已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
