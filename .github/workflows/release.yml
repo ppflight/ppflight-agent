@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Numeric semantic version to package (manual dispatch never publishes)
+        description: Semantic version to package, optionally X.Y.Z-rc.N (manual dispatch never publishes)
         required: true
         type: string
 
@@ -71,7 +71,7 @@ jobs:
           else
             version="${{ inputs.version }}"
           fi
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'version must be X.Y.Z' >&2; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || { echo 'version must be X.Y.Z or X.Y.Z-rc.N' >&2; exit 1; }
           printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Test release packaging policy
         shell: bash

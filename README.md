@@ -30,7 +30,7 @@ AG
 
 官网、监控站和 PVE 外连的目标合同是 IPv4-only：dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网和 monitoring bind response 分别返回 exact `networkPolicy={agentObservedIPv4}`；该值是对应服务端从可信连接元数据观察并冻结的 Agent 公网出口 canonical IPv4，只用于服务端 `/32` 来源白名单，不是 Agent 自报值或拨号目的地。Agent 不再固定 Cloudflare DNS A/Anycast 地址，始终保留 endpoint hostname 作 HTTP Host、TLS SNI 和系统 CA 证书校验，并禁环境代理、redirect 与跨 origin credential。来源 IP 命中不能替代绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、nonce/time、action allowlist 和审计校验。
 
-> 上线状态：Agent 侧绑定、发现、assignment、受控执行和 UPID 恢复所需的代码与资源原语已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
+> 上线状态：Agent 侧绑定、发现、assignment、受控执行、UPID 恢复与 `agent.upgrade` 安全执行链已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。RC.8 没有 root upgrade helper，因此首次升级到支持版仍需人工执行固定 SHA 安装；后续版本才允许按合同远程升级。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
 
 发布物由 tag `vX.Y.Z` workflow 分别构建 Linux `amd64`/`arm64`、离线可复现打包并发布 tarball 与 `SHA256SUMS`；手动触发只生成 artifact，不发布。上面的 `curl | bash` 仅是 `main` 联调测试入口，脚本仍会校验固定发布包摘要；正式生产节点必须按安装文档先独立校验 checksum、再解压并运行包内 installer。发布脚本不会下载代码或把运行时凭据/队列打入包；具体校验和本地重建方式见[安装文档](docs/INSTALL.md#2-安装已校验发布物)。
 
@@ -91,7 +91,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 - 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`、`firewall.guest.set-ipfilter`。
 - 只读发现：`pve.discover`。
 
-当前 33 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`vm.reinstall` 和远程 Agent 自升级不在当前动作表中，不能用 create/upgrade 原语推断它们已经实现；尤其 `vm.reinstall` 仍因 PVE 恢复流程非事务性，且没有可被命令签名/校验的安装介质 allowlist，而刻意不实现。
+当前 34 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`agent.upgrade` 仅接受官网固定 manifest 制品并由独立 root helper 复验、原子替换、回验和回滚，完整合同见[安全自升级合同](docs/SELF-UPGRADE-V1.md)。`vm.reinstall` 仍因 PVE 恢复流程非事务性，且没有可被命令签名/校验的安装介质 allowlist，而刻意不实现。
 
 所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；只允许冻结的 command/action/scope/typed target/outcome 元数据和 SHA-256 digest，严禁 secret、root 密码、Token、完整 command parameters/result 或原始 UPID。monitoring audit schema 不含 `operationId`/`executionMode`；精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；监控服务端存储和可查询 UI 仍由另一任务交付。官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
 
@@ -134,6 +134,7 @@ go build ./...
 更多文档：
 
 - [安装与迁移](docs/INSTALL.md)
+- [Agent 安全自升级合同 v1](docs/SELF-UPGRADE-V1.md)
 - [Agent API v1 目标契约](docs/AGENT-API-V1.md)
 - [现有数据面 API 与兼容说明](docs/API.md)
 - [历史审阅输入（非规范）](docs/CONTRACT-REVIEW.md)

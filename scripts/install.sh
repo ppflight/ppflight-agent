@@ -10,6 +10,10 @@ readonly ETC_DIR='/etc/ppflight-agent'
 readonly STATE_DIR='/var/lib/ppflight-agent'
 readonly BINDINGS_DIR="$STATE_DIR/bindings"
 readonly ASSIGNMENTS_DIR="$STATE_DIR/assignments"
+readonly UPGRADES_DIR="$STATE_DIR/upgrades"
+readonly UPGRADE_PENDING_DIR="$UPGRADES_DIR/pending"
+readonly UPGRADE_RESULTS_DIR="$UPGRADES_DIR/results"
+readonly UPGRADE_BACKUPS_DIR="$UPGRADES_DIR/backups"
 readonly ASSIGNMENTS_PATH="$ASSIGNMENTS_DIR/assignments.json"
 readonly LEGACY_ASSIGNMENTS_PATH="$ETC_DIR/assignments.json"
 readonly LIB_DIR='/usr/local/lib/ppflight-agent'
@@ -207,7 +211,7 @@ getent passwd ppflight-agent >/dev/null || useradd --system --gid ppflight-agent
 getent group ppflight-nodeexp >/dev/null || groupadd --system ppflight-nodeexp
 getent passwd ppflight-nodeexp >/dev/null || useradd --system --gid ppflight-nodeexp --no-create-home --shell /usr/sbin/nologin ppflight-nodeexp
 
-for managed_directory in "$ETC_DIR" "$STATE_DIR" "$BINDINGS_DIR" "$ASSIGNMENTS_DIR"; do
+for managed_directory in "$ETC_DIR" "$STATE_DIR" "$BINDINGS_DIR" "$ASSIGNMENTS_DIR" "$UPGRADES_DIR" "$UPGRADE_PENDING_DIR" "$UPGRADE_RESULTS_DIR" "$UPGRADE_BACKUPS_DIR"; do
   [[ ! -L "$managed_directory" ]] || die "refusing symlink at managed directory: $managed_directory"
   [[ ! -e "$managed_directory" || -d "$managed_directory" ]] || die "managed path is not a directory: $managed_directory"
 done
@@ -217,6 +221,9 @@ install -d -o ppflight-agent -g ppflight-agent -m 0750 "$STATE_DIR"
 # the service. The service group deliberately has no write permission here.
 install -d -o root -g ppflight-agent -m 0750 "$BINDINGS_DIR"
 install -d -o ppflight-agent -g ppflight-agent -m 0750 "$ASSIGNMENTS_DIR"
+install -d -o root -g ppflight-agent -m 0750 "$UPGRADES_DIR"
+install -d -o ppflight-agent -g ppflight-agent -m 0700 "$UPGRADE_PENDING_DIR" "$UPGRADE_RESULTS_DIR"
+install -d -o root -g root -m 0700 "$UPGRADE_BACKUPS_DIR"
 install -d -o root -g root -m 0755 "$LIB_DIR"
 install -d -o root -g root -m 0755 "$TEMPLATE_BUNDLES_DIR"
 install -d -o root -g root -m 0755 "$TMPFILES_DIR"
@@ -309,6 +316,8 @@ for binding_file in \
 done
 
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent.service" "$SYSTEMD_DIR/ppflight-agent.service"
+install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent-upgrade.path" "$SYSTEMD_DIR/ppflight-agent-upgrade.path"
+install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent-upgrade.service" "$SYSTEMD_DIR/ppflight-agent-upgrade.service"
 
 if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
   extract_binary() {
@@ -329,14 +338,16 @@ fi
 systemctl daemon-reload
 service_user="$(systemctl show --property=User --value ppflight-agent.service)"
 [[ "$service_user" == 'ppflight-agent' ]] || die "ppflight-agent.service must run as User=ppflight-agent (effective User=${service_user:-unset})"
+upgrade_user="$(systemctl show --property=User --value ppflight-agent-upgrade.service)"
+[[ "$upgrade_user" == 'root' ]] || die "ppflight-agent-upgrade.service must run as User=root (effective User=${upgrade_user:-unset})"
 if [[ $ENABLE -eq 1 ]]; then
-  systemctl enable ppflight-agent.service
+  systemctl enable ppflight-agent.service ppflight-agent-upgrade.path
   if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
     systemctl enable ppflight-node-exporter.service ppflight-smartctl-exporter.service
   fi
 fi
 if [[ $START -eq 1 ]]; then
-  systemctl start ppflight-agent.service
+  systemctl start ppflight-agent-upgrade.path ppflight-agent.service
   if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
     systemctl start ppflight-node-exporter.service ppflight-smartctl-exporter.service
   fi

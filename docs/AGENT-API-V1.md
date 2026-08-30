@@ -388,7 +388,7 @@ POST /internal/v1/monitoring/audit-events/batches
 }
 ```
 
-`deliveryState` 的必填键是 `pendingItems`、`pendingBytes`、`lastDeliveryError` 和 `authBlocked`；`authBlockedSince` 与 `oldestObservedAt` 可选，且前者只有在 `authBlocked=true` 时出现并固定为本轮首次认证阻断时间。`lastDeliveryError` 的 exact allowlist 是空字符串、`AUTH_BLOCKED`、`DELIVERY_FAILED`、`QUEUE_CAPACITY`。Event 必填 `eventId/assignmentRevision/commandId/idempotencyKey/action/scope/targetRef/websiteCommandKeyId/receivedAt/outcome/payloadDigest/policyDecision/agentVersion`；`acceptedAt/startedAt/finishedAt/errorCode/upid/approvalRef/requestedByRef/resultDigest` 可选。`requestedByRef` 只能是受限的不透明引用，不能是邮箱或自由文本身份。`outcome` 只能是 `dry_run|submitted|waiting|succeeded|failed|indeterminate|rejected`；`policyDecision` 只能是 `allowed|denied`，且 `rejected` 必须对应 `denied`。
+`deliveryState` 的必填键是 `pendingItems`、`pendingBytes`、`lastDeliveryError` 和 `authBlocked`；`authBlockedSince` 与 `oldestObservedAt` 可选，且前者只有在 `authBlocked=true` 时出现并固定为本轮首次认证阻断时间。`lastDeliveryError` 的 exact allowlist 是空字符串、`AUTH_BLOCKED`、`DELIVERY_FAILED`、`QUEUE_CAPACITY`。Event 必填 `eventId/assignmentRevision/commandId/idempotencyKey/action/scope/targetRef/websiteCommandKeyId/receivedAt/outcome/payloadDigest/policyDecision/agentVersion`；`acceptedAt/startedAt/finishedAt/errorCode/upid/approvalRef/requestedByRef/resultDigest` 可选。`requestedByRef` 只能是受限的不透明引用，不能是邮箱或自由文本身份。通用 `outcome` 是 `dry_run|submitted|waiting|succeeded|failed|rolled_back|indeterminate|rejected`；`rolled_back` 只由 `agent.upgrade` 的回滚终态 builder 产生。升级 receipt 的 `waiting` 在 audit 中规范映射为 `submitted`，不会输出升级专用 `waiting`。`policyDecision` 只能是 `allowed|denied`，且 `rejected` 必须对应 `denied`。
 
 `targetRef` 只能由已验签的 typed identity 在 Agent 内部构造，调用者不能自由填写：cluster 为 `cluster:<clusterRef>`，node 为 `node:<clusterRef>:<nodeRef>`，VM 为 `vm:<clusterRef>:<guestType>:<instanceUuid>:<generation>`。审计 schema 故意不含 `operationId` 或 `executionMode`；它们可以保留在 website command/receipt，但不能被额外塞入 monitoring audit payload。
 
@@ -404,6 +404,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | --- | --- | --- |
 | cluster/node | `pve.discover` | 第 4 节 `operationId/phase/nodeRef/cursor/limit`。 |
 | node | `task.status` | `upid`，格式必须以 `UPID:<identity.nodeRef>:` 开头。 |
+| node | `agent.upgrade` | strict 固定 manifest 制品参数；需要 approval、独立 root helper、重启回验与回滚，详见 `SELF-UPGRADE-V1.md`。 |
 | vm | `vm.start`, `vm.shutdown`, `vm.stop`, `vm.reboot` | `parameters` 必须是空对象。 |
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
 | vm | `vm.clone` | `sourceVmid`, `name` 和必填 bool `full`；`target/storage` 可选。 |
@@ -425,7 +426,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `firewall.ipset.entry.delete` | `name`, `cidr`，固定 DELETE 该 guest IPSet entry。 |
 | vm | `firewall.guest.set-ipfilter` | `interface=netN`, `enable`，映射到 PVE option `ipfilter-netN`。 |
 
-当前共有 33 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`vm.reinstall` 和远程 Agent 自升级不在 registry 中；不得发明别名或把本地模板 helper、`vm.create`、资源扩容原语写成这两项已实现。特别是 `vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
+当前共有 34 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
@@ -524,7 +525,7 @@ payment_authorized
 | 操作线程/UPID | command/receipt 含 `operationId`；journal 保存 submitted/waiting UPID，runtime 在 command cycle 前后调用 reconcile 并查询原 UPID。 | Agent 与官网端到端恢复矩阵通过前不得称生产就绪。 |
 | watchdog/previousExit | systemd notify/watchdog、请求级采集 progress deadline、自动重启所需 unit 设置、`lifecycle-state.json` 和按 destination 启用的 website/monitoring 不可淘汰 lifecycle outbox 已实现并有 Linux/重启测试；未启用域保持 pending。 | 这是本地恢复与补报原语，不是远端 SLA；官网/监控接收、展示/告警以及真实故障演练仍需验收。 |
 | Agent 离线命令 | Agent 主动 poll、领取后的 journal/UPID/receipt durable recovery 已实现。 | 官网持久离线命令队列与 command `wait` 尚待实现/联调；任何离线场景都禁止自动回退官网直连 PVE。 |
-| 固定动作 Executor | 第 7 节 33 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval。 | 只是 Agent 原语；各产品动作需独立 rollout，`vm.reinstall`/Agent 自升级仍未实现，升级业务 flag 默认关闭。 |
+| 固定动作 Executor | 第 7 节 34 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval。 | 只是 Agent 原语；`agent.upgrade` 仍需独立产品 rollout 与真实 PVE 验收，升级业务 flag 默认关闭；`vm.reinstall` 未实现。 |
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching、typed metering capability 和 meter 强制 shadow gate 已实现。 | 官网向导/assignment 签发与 APP 呈现仍待远端合并；只有 all-NIC explicitly metered 才可使用 aggregate active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for verified PPFlight Agent upgrade handoffs
+Documentation=https://github.com/ppflight/ppflight-agent
+
+[Path]
+PathExistsGlob=/var/lib/ppflight-agent/upgrades/pending/*.request.json
+Unit=ppflight-agent-upgrade.service
+
+[Install]
+WantedBy=multi-user.target

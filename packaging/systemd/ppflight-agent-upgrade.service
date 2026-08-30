@@ -1,0 +1,31 @@
+[Unit]
+Description=Verify, install, and roll back a PPFlight Agent upgrade
+Documentation=https://github.com/ppflight/ppflight-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/ppflight-agent/agent.env
+ExecStart=/usr/local/bin/ppflight-agent upgrade-helper --config /etc/ppflight-agent/agent.yaml
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+ReadOnlyPaths=/etc/ppflight-agent
+ReadWritePaths=/usr/local/bin /var/lib/ppflight-agent
+TimeoutStartSec=180s

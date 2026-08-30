@@ -50,8 +50,8 @@ find "$root" -type f \( -path '*/secrets/*' -o -path '*/queue/*' -o -path '*/que
 expected=(
   ppflight-agent ppflight-agent.sha256 VERSION README.md
   config/README.md config/agent.env.example config/agent.example.yaml config/assignments.example.yaml
-  docs/AGENT-API-V1.md docs/API.md docs/CONTRACT-REVIEW.md docs/INSTALL.md
-  packaging/systemd/ppflight-agent.service packaging/systemd/ppflight-node-exporter.service packaging/systemd/ppflight-smartctl-exporter.service
+  docs/AGENT-API-V1.md docs/API.md docs/CONTRACT-REVIEW.md docs/INSTALL.md docs/SELF-UPGRADE-V1.md
+  packaging/systemd/ppflight-agent.service packaging/systemd/ppflight-agent-upgrade.path packaging/systemd/ppflight-agent-upgrade.service packaging/systemd/ppflight-node-exporter.service packaging/systemd/ppflight-smartctl-exporter.service
   packaging/tmpfiles.d/ppflight-agent.conf
   scripts/install.sh scripts/uninstall.sh scripts/create-pve-tokens.sh scripts/verify-template-bundle.py
   bundles/ppflight-cloudinit/agent-vendor-manifest.v1.json
@@ -82,4 +82,7 @@ fi
 if "$PACKAGER" --binary "$binary" --version 0.1.0 --arch amd64 --output-dir "$output" >/dev/null 2>&1; then
   fail 'packager overwrote an existing archive or checksum file'
 fi
+rc_output="$TMP_DIR/rc-output"
+"$PACKAGER" --binary "$binary" --version 0.1.0-rc.9 --arch amd64 --output-dir "$rc_output"
+[[ -f "$rc_output/ppflight-agent-0.1.0-rc.9-linux-amd64.tar.gz" ]] || fail 'packager did not preserve the prerelease identity'
 printf '%s\n' 'package-release test passed'

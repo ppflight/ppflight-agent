@@ -47,6 +47,7 @@ type journalRecord struct {
 	ResourceKey    string          `json:"resourceKey"`
 	NodeRef        string          `json:"nodeRef,omitempty"`
 	PVETaskUPID    string          `json:"pveTaskUpid,omitempty"`
+	AgentUpgradeID string          `json:"agentUpgradeId,omitempty"`
 	State          string          `json:"state"`
 	ReceiptPending bool            `json:"receiptPending,omitempty"`
 	CreatedAt      time.Time       `json:"createdAt"`
@@ -79,13 +80,14 @@ type auditContext struct {
 // SubmittedTask is the safe recovery view of an asynchronous command.
 // It intentionally has no command parameters.
 type SubmittedTask struct {
-	CommandID   string
-	OperationID string
-	Digest      string
-	ResourceKey string
-	NodeRef     string
-	PVETaskUPID string
-	Receipt     Receipt
+	CommandID      string
+	OperationID    string
+	Digest         string
+	ResourceKey    string
+	NodeRef        string
+	PVETaskUPID    string
+	AgentUpgradeID string
+	Receipt        Receipt
 }
 
 // PendingReceipt is an outbox entry whose journal state is durable but whose
@@ -237,10 +239,26 @@ func (j *Journal) CompleteSubmitted(task SubmittedTask, receipt Receipt) error {
 	if err != nil {
 		return err
 	}
-	if record.Digest != task.Digest || record.PVETaskUPID != task.PVETaskUPID {
+	if record.Digest != task.Digest || record.PVETaskUPID != task.PVETaskUPID || record.AgentUpgradeID != task.AgentUpgradeID {
 		return ErrCommandConflict
 	}
 	return j.completeLocked(filename, &record, receipt)
+}
+
+// AuthorizeUpgrade is the root helper's final durable handoff gate. It proves
+// the unprivileged service recorded the same signed command as submitted
+// before the helper mutates the installed binary.
+func (j *Journal) AuthorizeUpgrade(commandID, digest, upgradeID string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	record, err := readJournal(j.path(commandID))
+	if err != nil {
+		return err
+	}
+	if record.Digest != digest || record.AgentUpgradeID != upgradeID || record.Receipt == nil || record.Receipt.AgentUpgradeID != upgradeID || record.State != "submitted" {
+		return ErrCommandConflict
+	}
+	return nil
 }
 
 func (j *Journal) completeLocked(filename string, record *journalRecord, receipt Receipt) error {
@@ -258,6 +276,9 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	record.State, record.UpdatedAt, record.Receipt, record.ReceiptPending = receipt.State, receipt.FinishedAt.UTC(), &journalReceipt, true
 	if receipt.PVETaskUPID != "" {
 		record.PVETaskUPID = receipt.PVETaskUPID
+	}
+	if receipt.AgentUpgradeID != "" {
+		record.AgentUpgradeID = receipt.AgentUpgradeID
 	}
 	if record.AuditContext != nil {
 		event, err := auditEventFromReceipt(*record.AuditContext, receipt)
@@ -287,12 +308,12 @@ func (j *Journal) SubmittedWaiting() ([]SubmittedTask, error) {
 		if err != nil {
 			return nil, err
 		}
-		if record.Receipt == nil || (record.State != "submitted" && record.State != "waiting") || record.PVETaskUPID == "" {
+		if record.Receipt == nil || (record.State != "submitted" && record.State != "waiting") || (record.PVETaskUPID == "") == (record.AgentUpgradeID == "") {
 			continue
 		}
 		result = append(result, SubmittedTask{
 			CommandID: record.CommandID, OperationID: record.OperationID, Digest: record.Digest,
-			ResourceKey: record.ResourceKey, NodeRef: record.NodeRef, PVETaskUPID: record.PVETaskUPID,
+			ResourceKey: record.ResourceKey, NodeRef: record.NodeRef, PVETaskUPID: record.PVETaskUPID, AgentUpgradeID: record.AgentUpgradeID,
 			Receipt: *record.Receipt,
 		})
 	}
@@ -587,6 +608,17 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 	if receipt.State == "rejected" {
 		policy = "denied"
 	}
+	outcome := receipt.State
+	if context.Action == "agent.upgrade" {
+		switch {
+		case receipt.State == "waiting":
+			// The monitoring upgrade contract has no separate waiting enum;
+			// repeated observations remain part of the submitted phase.
+			outcome = "submitted"
+		case receipt.State == "failed" && receipt.Code == "AGENT_UPGRADE_ROLLED_BACK":
+			outcome = "rolled_back"
+		}
+	}
 	upidDigest := ""
 	if receipt.PVETaskUPID != "" {
 		sum := sha256.Sum256([]byte(receipt.PVETaskUPID))
@@ -598,7 +630,7 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 		Action: context.Action, Scope: context.Scope, TargetRef: context.TargetRef,
 		WebsiteCommandKeyID: context.WebsiteCommandKeyID, ReceivedAt: context.ReceivedAt.UTC(),
 		AcceptedAt: &acceptedAt, StartedAt: startedAt, FinishedAt: finishedAt,
-		Outcome: receipt.State, ErrorCode: receipt.Code, UPID: upidDigest,
+		Outcome: outcome, ErrorCode: receipt.Code, UPID: upidDigest,
 		ApprovalRef: context.ApprovalRef, RequestedByRef: context.RequestedByRef,
 		PayloadDigest: context.PayloadDigest, ResultDigest: resultDigest,
 		PolicyDecision: policy, AgentVersion: context.AgentVersion,

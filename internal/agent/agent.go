@@ -37,6 +37,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/pve"
 	"github.com/ppflight/ppflight-agent/internal/runstate"
 	"github.com/ppflight/ppflight-agent/internal/sdnotify"
+	"github.com/ppflight/ppflight-agent/internal/selfupdate"
 	"github.com/ppflight/ppflight-agent/internal/store"
 	"github.com/ppflight/ppflight-agent/internal/uploader"
 	"github.com/ppflight/ppflight-agent/internal/wire"
@@ -216,7 +217,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	}
 	configuredControl := cfg.Control.Enabled && cfg.Control.PollURL != "" && cfg.Control.ResultURL != ""
 	registry := health.New(version, cfg.Mode, cfg.Identity.AgentRef, cfg.Identity.ClusterRef, cfg.Identity.NodeRef, cfg.Control.Enabled, configuredControl, cfg.Control.ProductionExecution, time.Now())
-	registry.Bindings(secrets.WebsiteBindingID, secrets.WebsiteCredentialEpoch, secrets.MonitoringBindingID, secrets.Monitoring.CredentialEpoch)
+	registry.Bindings(secrets.DeviceID, secrets.WebsiteBindingID, secrets.WebsiteCredentialEpoch, secrets.MonitoringBindingID, secrets.Monitoring.CredentialEpoch)
 	for name, queue := range queues {
 		registry.RegisterQueue(name, queue)
 	}
@@ -313,6 +314,12 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 				return nil, fmt.Errorf("create control PVE client: %w", err)
 			}
 		}
+		upgradeSubmitter, upgradeErr := selfupdate.New(selfupdate.Config{
+			StateDirectory: cfg.Runtime.StateDirectory, WebsiteEndpoint: cfg.Control.PollURL, CurrentVersion: version,
+		})
+		if upgradeErr != nil {
+			return nil, fmt.Errorf("create self-update coordinator: %w", upgradeErr)
+		}
 		service, serviceErr := control.NewService(control.ServiceConfig{
 			AgentRef: cfg.Identity.AgentRef, ClusterRef: cfg.Identity.ClusterRef,
 			BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch,
@@ -320,9 +327,10 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			CommandSecret: secrets.ControlCommandSecret, CommandSigningKeyID: secrets.ControlSigningKeyID,
 			CommandPublicKey: ed25519.PublicKey(secrets.ControlPublicKey), AllowedActions: cfg.Control.AllowedActions,
 			Assignments: assignments, Poller: poller, Journal: journal,
+			UpgradeResolver: upgradeSubmitter,
 			Executor: control.Executor{
 				Client: writeClient, ReadClient: readClient, Discovery: discovery.New(readClient),
-				Mode: cfg.Mode, ProductionExecution: cfg.Control.ProductionExecution,
+				Mode: cfg.Mode, ProductionExecution: cfg.Control.ProductionExecution, UpgradeSubmitter: upgradeSubmitter,
 			},
 			ReceiptQueue: controlQueue, CursorFile: filepath.Join(cfg.Runtime.StateDirectory, "control", "cursor.json"),
 		})

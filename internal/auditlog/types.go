@@ -250,7 +250,7 @@ func (b *Batch) UnmarshalJSON(raw []byte) error {
 
 func validOutcome(value string) bool {
 	switch value {
-	case "dry_run", "submitted", "waiting", "succeeded", "failed", "indeterminate", "rejected":
+	case "dry_run", "submitted", "waiting", "succeeded", "failed", "rolled_back", "indeterminate", "rejected":
 		return true
 	default:
 		return false

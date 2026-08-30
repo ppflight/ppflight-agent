@@ -37,6 +37,7 @@ type ControlState struct {
 
 type BindingState struct {
 	BindingID       string `json:"bindingId,omitempty"`
+	DeviceID        string `json:"deviceId,omitempty"`
 	CredentialEpoch string `json:"credentialEpoch,omitempty"`
 }
 
@@ -63,15 +64,15 @@ type Status struct {
 	Bindings      BindingsState          `json:"bindings"`
 }
 
-func (r *Registry) Bindings(websiteBindingID string, websiteEpoch uint64, monitoringBindingID string, monitoringEpoch uint64) {
+func (r *Registry) Bindings(deviceID, websiteBindingID string, websiteEpoch uint64, monitoringBindingID string, monitoringEpoch uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.status.Bindings.Website = bindingState(websiteBindingID, websiteEpoch)
-	r.status.Bindings.Monitoring = bindingState(monitoringBindingID, monitoringEpoch)
+	r.status.Bindings.Website = bindingState(deviceID, websiteBindingID, websiteEpoch)
+	r.status.Bindings.Monitoring = bindingState(deviceID, monitoringBindingID, monitoringEpoch)
 }
 
-func bindingState(bindingID string, epoch uint64) BindingState {
-	value := BindingState{BindingID: bindingID}
+func bindingState(deviceID, bindingID string, epoch uint64) BindingState {
+	value := BindingState{BindingID: bindingID, DeviceID: deviceID}
 	if epoch != 0 {
 		value.CredentialEpoch = fmt.Sprintf("%d", epoch)
 	}

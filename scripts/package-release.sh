@@ -20,7 +20,7 @@ STAGING_DIR=''
 
 usage() {
   cat <<'EOF'
-Usage: scripts/package-release.sh --binary FILE --version X.Y.Z --arch amd64|arm64 --output-dir DIR
+Usage: scripts/package-release.sh --binary FILE --version X.Y.Z[-rc.N] --arch amd64|arm64 --output-dir DIR
 
 Creates DIR/ppflight-agent-X.Y.Z-linux-ARCH.tar.gz and DIR/SHA256SUMS.
 The input binary must be an existing regular file, never a symlink.  The
@@ -51,7 +51,7 @@ done
   usage >&2
   exit 2
 }
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'version must be a numeric semantic version (X.Y.Z)'
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || die 'version must be X.Y.Z or X.Y.Z-rc.N'
 [[ "$ARCH" == 'amd64' || "$ARCH" == 'arm64' ]] || die 'arch must be amd64 or arm64'
 [[ -f "$BINARY" && ! -L "$BINARY" ]] || die 'binary must be an existing regular file, not a symlink'
 [[ -s "$BINARY" ]] || die 'binary must not be empty'
@@ -97,7 +97,10 @@ readonly -a RELEASE_FILES=(
   'docs/API.md'
   'docs/CONTRACT-REVIEW.md'
   'docs/INSTALL.md'
+  'docs/SELF-UPGRADE-V1.md'
   'packaging/systemd/ppflight-agent.service'
+  'packaging/systemd/ppflight-agent-upgrade.path'
+  'packaging/systemd/ppflight-agent-upgrade.service'
   'packaging/systemd/ppflight-node-exporter.service'
   'packaging/systemd/ppflight-smartctl-exporter.service'
   'packaging/tmpfiles.d/ppflight-agent.conf'

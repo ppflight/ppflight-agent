@@ -30,6 +30,18 @@ type TaskResolver interface {
 	ResolveTask(ctx context.Context, nodeRef, upid string) (TaskResolution, error)
 }
 
+// UpgradeResolver reads the root helper's durable terminal result. It never
+// performs, retries, or downloads an upgrade.
+type UpgradeResolver interface {
+	ResolveUpgrade(ctx context.Context, upgradeID string) (UpgradeResolution, error)
+}
+
+type UpgradeResolution struct {
+	Status  string
+	Version string
+	Code    string
+}
+
 // TaskResolution is intentionally a small PVE-neutral task view. Status is
 // normally "queued", "running", or a terminal value; ExitStatus is "OK" only
 // for a successful terminal task.
@@ -56,6 +68,7 @@ type ServiceConfig struct {
 	Journal             *Journal
 	Executor            Executor
 	TaskResolver        TaskResolver
+	UpgradeResolver     UpgradeResolver
 	ReceiptQueue        ReceiptQueue
 	AuditSink           auditlog.Sink
 	CursorFile          string
@@ -81,6 +94,7 @@ type Service struct {
 	journal             *Journal
 	executor            Executor
 	taskResolver        TaskResolver
+	upgradeResolver     UpgradeResolver
 	receiptQueue        ReceiptQueue
 	auditSink           auditlog.Sink
 	cursorFile          string
@@ -131,7 +145,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		commandSecret: append([]byte(nil), cfg.CommandSecret...), commandSigningKeyID: cfg.CommandSigningKeyID,
 		commandPublicKey: append(ed25519.PublicKey(nil), cfg.CommandPublicKey...), allowed: AllowedSet(cfg.AllowedActions),
 		assignments: cfg.Assignments, poller: cfg.Poller, journal: cfg.Journal,
-		executor: cfg.Executor, taskResolver: cfg.TaskResolver, receiptQueue: cfg.ReceiptQueue,
+		executor: cfg.Executor, taskResolver: cfg.TaskResolver, upgradeResolver: cfg.UpgradeResolver, receiptQueue: cfg.ReceiptQueue,
 		auditSink: cfg.AuditSink, cursorFile: cfg.CursorFile, now: cfg.Now,
 	}
 	if err := service.loadCursor(); err != nil {
@@ -278,13 +292,22 @@ func (s *Service) ReconcileOnce(ctx context.Context) (int, error) {
 	if err != nil {
 		return updated, err
 	}
-	if len(tasks) > 0 && s.taskResolver == nil {
-		return updated, errors.New("control task resolver is not configured")
-	}
 	for _, task := range tasks {
 		now := s.now().UTC()
-		result, resolveErr := s.taskResolver.ResolveTask(ctx, task.NodeRef, task.PVETaskUPID)
-		receipt, err := s.reconciledReceipt(task, result, resolveErr, now)
+		var receipt Receipt
+		if task.AgentUpgradeID != "" {
+			if s.upgradeResolver == nil {
+				return updated, errors.New("control upgrade resolver is not configured")
+			}
+			result, resolveErr := s.upgradeResolver.ResolveUpgrade(ctx, task.AgentUpgradeID)
+			receipt, err = s.reconciledUpgradeReceipt(task, result, resolveErr, now)
+		} else {
+			if s.taskResolver == nil {
+				return updated, errors.New("control task resolver is not configured")
+			}
+			result, resolveErr := s.taskResolver.ResolveTask(ctx, task.NodeRef, task.PVETaskUPID)
+			receipt, err = s.reconciledReceipt(task, result, resolveErr, now)
+		}
 		if err != nil {
 			return updated, err
 		}
@@ -297,6 +320,39 @@ func (s *Service) ReconcileOnce(ctx context.Context) (int, error) {
 		updated++
 	}
 	return updated, nil
+}
+
+func (s *Service) reconciledUpgradeReceipt(task SubmittedTask, result UpgradeResolution, resolveErr error, now time.Time) (Receipt, error) {
+	id, err := protocol.NewID()
+	if err != nil {
+		return Receipt{}, err
+	}
+	receipt := task.Receipt
+	receipt.ReceiptID, receipt.OperationID, receipt.AgentUpgradeID, receipt.FinishedAt = id, task.OperationID, task.AgentUpgradeID, now
+	if receipt.StartedAt.IsZero() {
+		receipt.StartedAt = now
+	}
+	if receipt.FinishedAt.Before(receipt.StartedAt) {
+		receipt.FinishedAt = receipt.StartedAt
+	}
+	if resolveErr != nil {
+		receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_STATUS_INDETERMINATE"
+	} else {
+		switch strings.ToLower(strings.TrimSpace(result.Status)) {
+		case "pending", "running":
+			receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_WAITING"
+		case "succeeded":
+			receipt.State, receipt.Code = "succeeded", "AGENT_UPGRADE_SUCCEEDED"
+		case "rolled_back":
+			receipt.State, receipt.Code = "failed", "AGENT_UPGRADE_ROLLED_BACK"
+		case "failed":
+			receipt.State, receipt.Code = "failed", "AGENT_UPGRADE_FAILED"
+		default:
+			receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_STATUS_INDETERMINATE"
+		}
+	}
+	ApplyReceiptCompatibility(&receipt)
+	return receipt, nil
 }
 
 func (s *Service) reconciledReceipt(task SubmittedTask, result TaskResolution, resolveErr error, now time.Time) (Receipt, error) {

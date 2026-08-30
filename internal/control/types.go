@@ -92,6 +92,7 @@ var protocolActions = map[string]actionSpec{
 	"firewall.ipset.entry.create":  {scopes: map[string]bool{ScopeVM: true}},
 	"firewall.ipset.entry.update":  {scopes: map[string]bool{ScopeVM: true}},
 	"firewall.ipset.entry.delete":  {scopes: map[string]bool{ScopeVM: true}},
+	"agent.upgrade":                {scopes: map[string]bool{ScopeNode: true}},
 }
 
 // KnownAction exposes the single protocol registry to configuration validation.
@@ -161,18 +162,19 @@ func (c *Command) UnmarshalJSON(raw []byte) error {
 }
 
 type Receipt struct {
-	SchemaVersion int       `json:"schemaVersion"`
-	ReceiptID     string    `json:"receiptId"`
-	CommandID     string    `json:"commandId"`
-	OperationID   string    `json:"operationId,omitempty"`
-	AgentRef      string    `json:"agentRef"`
-	State         string    `json:"state"`
-	Code          string    `json:"code"`
-	ExecutionMode string    `json:"executionMode"`
-	DryRun        bool      `json:"dryRun"`
-	StartedAt     time.Time `json:"startedAt"`
-	FinishedAt    time.Time `json:"finishedAt"`
-	PVETaskUPID   string    `json:"pveTaskUpid,omitempty"`
+	SchemaVersion  int       `json:"schemaVersion"`
+	ReceiptID      string    `json:"receiptId"`
+	CommandID      string    `json:"commandId"`
+	OperationID    string    `json:"operationId,omitempty"`
+	AgentRef       string    `json:"agentRef"`
+	State          string    `json:"state"`
+	Code           string    `json:"code"`
+	ExecutionMode  string    `json:"executionMode"`
+	DryRun         bool      `json:"dryRun"`
+	StartedAt      time.Time `json:"startedAt"`
+	FinishedAt     time.Time `json:"finishedAt"`
+	PVETaskUPID    string    `json:"pveTaskUpid,omitempty"`
+	AgentUpgradeID string    `json:"agentUpgradeId,omitempty"`
 	// These fields are additive compatibility signals for consumers which
 	// cannot yet interpret the finer-grained State/Code pair.
 	Accepted                 bool            `json:"accepted,omitempty"`
@@ -449,6 +451,7 @@ func AuditReceiptDigest(receipt Receipt) (string, error) {
 		StartedAt                time.Time `json:"startedAt"`
 		FinishedAt               time.Time `json:"finishedAt"`
 		PVETaskUPID              string    `json:"pveTaskUpid"`
+		AgentUpgradeID           string    `json:"agentUpgradeId"`
 		Accepted                 bool      `json:"accepted"`
 		Asynchronous             bool      `json:"asynchronous"`
 		MutationMayHaveSucceeded bool      `json:"mutationMayHaveSucceeded"`
@@ -457,7 +460,7 @@ func AuditReceiptDigest(receipt Receipt) (string, error) {
 		SchemaVersion: receipt.SchemaVersion, ReceiptID: receipt.ReceiptID, CommandID: receipt.CommandID,
 		OperationID: receipt.OperationID, AgentRef: receipt.AgentRef, State: receipt.State, Code: receipt.Code,
 		ExecutionMode: receipt.ExecutionMode, DryRun: receipt.DryRun, StartedAt: receipt.StartedAt.UTC(),
-		FinishedAt: receipt.FinishedAt.UTC(), PVETaskUPID: receipt.PVETaskUPID, Accepted: receipt.Accepted,
+		FinishedAt: receipt.FinishedAt.UTC(), PVETaskUPID: receipt.PVETaskUPID, AgentUpgradeID: receipt.AgentUpgradeID, Accepted: receipt.Accepted,
 		Asynchronous: receipt.Asynchronous, MutationMayHaveSucceeded: receipt.MutationMayHaveSucceeded,
 		OperatorRef: receipt.OperatorRef,
 	}
@@ -503,9 +506,9 @@ func ApplyReceiptCompatibility(r *Receipt) {
 	case "succeeded":
 		r.Accepted = true
 	case "failed":
-		r.Accepted = r.PVETaskUPID != ""
+		r.Accepted = r.PVETaskUPID != "" || r.AgentUpgradeID != ""
 	}
-	if r.PVETaskUPID != "" && r.Accepted {
+	if (r.PVETaskUPID != "" || r.AgentUpgradeID != "") && r.Accepted {
 		r.Asynchronous = true
 	}
 }
@@ -520,6 +523,9 @@ func (r Receipt) Validate() error {
 	if r.PVETaskUPID != "" && !upidRE.MatchString(r.PVETaskUPID) {
 		return fmt.Errorf("invalid control receipt PVE task UPID")
 	}
+	if r.AgentUpgradeID != "" && !commandIDRE.MatchString(r.AgentUpgradeID) {
+		return fmt.Errorf("invalid control receipt agent upgrade ID")
+	}
 	if r.ExecutionMode != "test" && r.ExecutionMode != "production" || r.FinishedAt.Before(r.StartedAt) {
 		return fmt.Errorf("invalid control receipt timing or mode")
 	}
@@ -529,8 +535,8 @@ func (r Receipt) Validate() error {
 			return fmt.Errorf("dry-run receipt is missing dryRun=true")
 		}
 	case "submitted", "waiting":
-		if r.PVETaskUPID == "" {
-			return fmt.Errorf("asynchronous receipt is missing PVE task UPID")
+		if (r.PVETaskUPID == "") == (r.AgentUpgradeID == "") {
+			return fmt.Errorf("asynchronous receipt must identify exactly one task")
 		}
 	case "succeeded", "failed", "indeterminate", "rejected":
 	default:

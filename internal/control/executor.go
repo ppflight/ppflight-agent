@@ -21,6 +21,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/discovery"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 	"github.com/ppflight/ppflight-agent/internal/pve"
+	"github.com/ppflight/ppflight-agent/internal/upgradecontract"
 )
 
 var (
@@ -55,6 +56,14 @@ type Executor struct {
 	Capabilities        GuestCapabilityChecker
 	Mode                string
 	ProductionExecution bool
+	UpgradeSubmitter    UpgradeSubmitter
+}
+
+// UpgradeSubmitter stages an already verified agent.upgrade command for the
+// independently privileged systemd helper. It must not replace or restart the
+// running binary in the control poller's process.
+type UpgradeSubmitter interface {
+	Prepare(context.Context, Command) (string, error)
 }
 
 type GuestCapability string
@@ -134,6 +143,20 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	}
 	if e.Mode != "production" || !e.ProductionExecution {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "dry_run", "DRY_RUN", true, time.Now().UTC()
+		return finish(nil)
+	}
+	if command.Action == "agent.upgrade" {
+		if e.UpgradeSubmitter == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "UPGRADE_HELPER_UNAVAILABLE", time.Now().UTC()
+			return finish(errors.New("agent upgrade helper is unavailable"))
+		}
+		upgradeID, prepareErr := e.UpgradeSubmitter.Prepare(ctx, command)
+		r.FinishedAt = time.Now().UTC()
+		if prepareErr != nil {
+			r.State, r.Code = "failed", "UPGRADE_PREPARE_FAILED"
+			return finish(prepareErr)
+		}
+		r.State, r.Code, r.AgentUpgradeID = "submitted", "AGENT_UPGRADE_SUBMITTED", upgradeID
 		return finish(nil)
 	}
 	if e.Client == nil {
@@ -414,6 +437,9 @@ func validateParameters(c Command) error {
 	switch c.Action {
 	case "pve.discover":
 		_, err := discoveryRequest(c)
+		return err
+	case "agent.upgrade":
+		_, err := upgradecontract.DecodeParameters(c.Parameters)
 		return err
 	case "vm.start", "vm.shutdown", "vm.stop", "vm.reboot":
 		return requireEmptyObject(c.Parameters)

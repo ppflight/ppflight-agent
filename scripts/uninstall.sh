@@ -33,10 +33,10 @@ done
 [[ $EUID -eq 0 ]] || { printf 'error: run as root\n' >&2; exit 1; }
 command -v systemctl >/dev/null || { printf 'error: systemd is required\n' >&2; exit 1; }
 
-for unit in ppflight-agent.service ppflight-node-exporter.service ppflight-smartctl-exporter.service; do
+for unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service ppflight-node-exporter.service ppflight-smartctl-exporter.service; do
   systemctl disable --now "$unit" 2>/dev/null || true
 done
-rm -f -- /etc/systemd/system/ppflight-agent.service
+rm -f -- /etc/systemd/system/ppflight-agent.service /etc/systemd/system/ppflight-agent-upgrade.path /etc/systemd/system/ppflight-agent-upgrade.service
 rm -f -- /usr/lib/tmpfiles.d/ppflight-agent.conf
 if [[ $REMOVE_EXPORTERS -eq 1 ]]; then
   rm -f -- /etc/systemd/system/ppflight-node-exporter.service /etc/systemd/system/ppflight-smartctl-exporter.service

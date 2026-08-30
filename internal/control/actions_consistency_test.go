@@ -24,6 +24,9 @@ func TestKnownActionsHaveValidationAndExecutorDispatch(t *testing.T) {
 		known[action] = true
 		if spec.readOnly {
 			knownReads[action] = true
+		} else if action == "agent.upgrade" {
+			// Host upgrades are dispatched to the separately privileged helper,
+			// never to the PVE API write switch.
 		} else {
 			knownWrites[action] = true
 		}
@@ -34,6 +37,9 @@ func TestKnownActionsHaveValidationAndExecutorDispatch(t *testing.T) {
 		if !executeChecks[action] {
 			t.Errorf("read-only action %q has no Executor.Execute dispatch", action)
 		}
+	}
+	if !executeChecks["agent.upgrade"] {
+		t.Error("agent.upgrade has no Executor.Execute dispatch")
 	}
 	for action := range executeChecks {
 		if !known[action] {
@@ -85,7 +91,14 @@ func validActionParameterFixtures() map[string]string {
 		"firewall.ipset.entry.create":  `{"name":"trusted","cidr":"10.0.0.0/24","noSubnet":false}`,
 		"firewall.ipset.entry.update":  `{"name":"trusted","cidr":"10.0.0.0/24","comment":"office"}`,
 		"firewall.ipset.entry.delete":  `{"name":"trusted","cidr":"10.0.0.0/24"}`,
+		"agent.upgrade":                upgradeFixture(),
 	}
+}
+
+func upgradeFixture() string {
+	arch := runtime.GOARCH
+	name := "ppflight-agent-0.1.0-rc.9-linux-" + arch + ".tar.gz"
+	return `{"schemaVersion":1,"releaseTag":"v0.1.0-rc.9","agentCommitSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","artifact":{"architecture":"` + arch + `","assetName":"` + name + `","sizeBytes":"1048576","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","downloadUrl":"https://www.ppflight.com/api/pve-agent/v1/releases/artifacts/v0.1.0-rc.9/` + arch + `"}}`
 }
 
 func fixtureActions(fixtures map[string]string) map[string]bool {

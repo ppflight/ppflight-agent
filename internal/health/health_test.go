@@ -50,7 +50,7 @@ func TestAuthenticationBlockedIsVisibleAndClearsOnSuccess(t *testing.T) {
 
 func TestBindingAuthorityIsNonSecretAndUsesDecimalEpochs(t *testing.T) {
 	registry := New("0.1.0", "production", "agent-1", "cluster-1", "pve-1", true, true, false, time.Now())
-	registry.Bindings("website-binding", 9007199254740993, "monitoring-binding", 18446744073709551615)
+	registry.Bindings("device-01", "website-binding", 9007199254740993, "monitoring-binding", 18446744073709551615)
 	status := registry.Snapshot()
 	if status.Bindings.Website.BindingID != "website-binding" || status.Bindings.Website.CredentialEpoch != "9007199254740993" {
 		t.Fatalf("website binding status=%#v", status.Bindings.Website)
