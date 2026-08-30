@@ -213,8 +213,8 @@ func TestPVEBootstrapFreshNotFoundCreatesBothTokensWithoutLeakingSecrets(t *test
 	for _, required := range []string{
 		"user\ttoken\tadd\tppflight-agent@pve\tcollector",
 		"user\ttoken\tadd\tppflight-control@pve\texecutor",
-		"acl\tmodify\t/pool/production\t-user\tppflight-control@pve",
-		"acl\tmodify\t/pool/production\t-token\tppflight-control@pve!executor",
+		"acl\tmodify\t/pool/production\t--users\tppflight-control@pve",
+		"acl\tmodify\t/pool/production\t--tokens\tppflight-control@pve!executor",
 	} {
 		if !strings.Contains(log, required) {
 			t.Fatalf("mock pveum log is missing %q:\n%s", required, log)
@@ -356,7 +356,6 @@ func TestPVEBootstrapPostReplaceFailureRestoresExistingEnvironment(t *testing.T)
 
 func TestPVEBootstrapRollbackPreservesExistingACLAndObjects(t *testing.T) {
 	fixture := newBootstrapFixture(t)
-	fixture.putRole(t, "PPFlightAgentAudit", readPrivileges)
 	fixture.putRole(t, "PPFlightAgentControl", controlPrivileges)
 	fixture.putUser(t, "ppflight-control@pve")
 	fixture.putACL(t, "/pool/production", "user", "ppflight-control@pve", "PPFlightAgentControl")
@@ -404,10 +403,10 @@ func TestPVEBootstrapACLOnlyUsesExistingDedicatedIdentityAndNeverRoot(t *testing
 		}
 	}
 	for _, required := range []string{
-		"acl\tmodify\t/pool/production\t-user\tppflight-control@pve",
-		"acl\tmodify\t/pool/production\t-token\tppflight-control@pve!executor",
-		"acl\tmodify\t/vms/101\t-user\tppflight-control@pve",
-		"acl\tmodify\t/vms/101\t-token\tppflight-control@pve!executor",
+		"acl\tmodify\t/pool/production\t--users\tppflight-control@pve",
+		"acl\tmodify\t/pool/production\t--tokens\tppflight-control@pve!executor",
+		"acl\tmodify\t/vms/101\t--users\tppflight-control@pve",
+		"acl\tmodify\t/vms/101\t--tokens\tppflight-control@pve!executor",
 	} {
 		if !strings.Contains(log, required) {
 			t.Fatalf("ACL-only log is missing %q:\n%s", required, log)
