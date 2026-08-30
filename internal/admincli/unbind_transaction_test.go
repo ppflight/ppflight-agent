@@ -119,6 +119,7 @@ func TestBindingRemovalLocalFailuresRestoreBothTrustDomains(t *testing.T) {
 				recoveries, writes := 0, 0
 				instance := &cli{
 					out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+					managedWritePolicy: allowManagedWriteForTest,
 					restartUnbind: func(context.Context) error {
 						if failure == "restart" {
 							return errors.New("injected restart arm failure")
@@ -180,8 +181,9 @@ func TestBindingRemovalArmFailureKeepsJournalForMarkerOnlyRecovery(t *testing.T)
 			armCalls, recoveries := 0, 0
 			instance := &cli{
 				out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
-				restartUnbind:     func(context.Context) error { return nil },
-				removeUnbindState: func(string, string) error { return errors.New("injected state failure before rollback") },
+				managedWritePolicy: allowManagedWriteForTest,
+				restartUnbind:      func(context.Context) error { return nil },
+				removeUnbindState:  func(string, string) error { return errors.New("injected state failure before rollback") },
 				armBinding: func(context.Context) error {
 					armCalls++
 					if armCalls == 1 {
@@ -265,6 +267,7 @@ func TestBindingRemovalForwardJournalRecoveryAtEveryBoundary(t *testing.T) {
 				activations := 0
 				instance := &cli{
 					out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+					managedWritePolicy: allowManagedWriteForTest,
 					activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
 						if !expected.Absent || expected.Domain != domain {
 							return errors.New("forward recovery activated an unexpected binding")
@@ -302,7 +305,8 @@ func TestBindingRemovalFinishFailureResumesForwardWithoutInput(t *testing.T) {
 			activations := 0
 			instance := &cli{
 				out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
-				finishUnbind: func(string, string) error { return errors.New("injected journal finish failure") },
+				managedWritePolicy: allowManagedWriteForTest,
+				finishUnbind:       func(string, string) error { return errors.New("injected journal finish failure") },
 				activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
 					if !expected.Absent || expected.Domain != domain {
 						return errors.New("finish failure activated an unexpected binding")
@@ -349,6 +353,7 @@ func TestBindRefusesUnbindJournalBeforeReadingCode(t *testing.T) {
 			var output, stderr bytes.Buffer
 			instance := &cli{
 				in: reader, out: &output, errOut: &stderr, version: "test",
+				managedWritePolicy: allowManagedWriteForTest,
 				bindingPVE: func(context.Context, string, config.Config) (config.Config, error) {
 					t.Fatal("bind reached PVE preparation while an unbind journal exists")
 					return config.Config{}, errors.New("unexpected")

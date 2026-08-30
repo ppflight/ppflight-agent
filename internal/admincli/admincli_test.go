@@ -52,6 +52,11 @@ func writeTestConfig(t *testing.T) string {
 	return filename
 }
 
+// allowManagedWriteForTest is the explicit test-only boundary for mutations
+// against temporary configs. Production CLI instances keep this nil so Linux
+// continues to require the installed configuration and state root.
+func allowManagedWriteForTest(string, config.Config) error { return nil }
+
 func runMonitoringBindForTest(args []string, version string, in io.Reader, out, errOut io.Writer) int {
 	c := &cli{
 		in:      in,
@@ -77,7 +82,7 @@ func runMonitoringBindForTest(args []string, version string, in io.Reader, out, 
 			}
 			return nil
 		},
-		managedWritePolicy: func(string, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	return c.run(args)
 }
@@ -102,7 +107,7 @@ func runWebsiteBindForTest(args []string, version string, in io.Reader, out, err
 			}
 			return nil
 		},
-		managedWritePolicy: func(string, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	return c.run(args)
 }
@@ -111,7 +116,7 @@ func runWebsiteBindForTest(args []string, version string, in io.Reader, out, err
 // production write-target gate. Tests must opt in rather than weakening the
 // real exported CLI for arbitrary --config paths.
 func runMutationForTest(args []string, version string, out, errOut io.Writer) int {
-	return (&cli{in: strings.NewReader(""), out: out, errOut: errOut, version: version, managedWritePolicy: func(string, config.Config) error { return nil }}).run(args)
+	return (&cli{in: strings.NewReader(""), out: out, errOut: errOut, version: version, managedWritePolicy: allowManagedWriteForTest}).run(args)
 }
 
 type readTrackingReader struct{ read bool }
@@ -276,8 +281,9 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 	called := false
 	instance := &cli{
 		in: strings.NewReader("4\nUNINSTALL\n"), out: &output, errOut: &stderr,
-		effectiveUID:      func() int { return 0 },
-		completeUninstall: func(context.Context) error { called = true; return nil },
+		effectiveUID:       func() int { return 0 },
+		completeUninstall:  func(context.Context) error { called = true; return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.menu(filename); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
@@ -307,7 +313,8 @@ func TestWebsiteBindingRemovalKeepsMonitoringTrustDomain(t *testing.T) {
 	activated := false
 	instance := &cli{
 		in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr,
-		effectiveUID: func() int { return 0 },
+		effectiveUID:       func() int { return 0 },
+		managedWritePolicy: allowManagedWriteForTest,
 		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
 			activated = true
 			if expected.Domain != "website" || !expected.Absent || expected.BindingID != "" || expected.CredentialEpoch != 0 {
@@ -358,6 +365,7 @@ func TestMonitoringBindingRemovalKeepsWebsiteTrustDomain(t *testing.T) {
 	var output, stderr bytes.Buffer
 	instance := &cli{
 		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+		managedWritePolicy: allowManagedWriteForTest,
 		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
 			if expected.Domain != "monitoring" || !expected.Absent {
 				return errors.New("unexpected removal expectation")
@@ -422,6 +430,7 @@ func TestBindingRemovalRequiresRootExactConfirmationAndRollsBackActivationFailur
 	recovered := false
 	failing := &cli{
 		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+		managedWritePolicy: allowManagedWriteForTest,
 		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
 			if expected.Absent {
 				return errors.New("service did not load removal")
@@ -806,14 +815,15 @@ func TestPVEPrepareUnbindAndUninstallRefuseIncompleteBindingTransaction(t *testi
 	pveTouched := false
 	pveCLI := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
-		pveBootstrap: func(context.Context) error { pveTouched = true; return nil },
+		pveBootstrap:       func(context.Context) error { pveTouched = true; return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := pveCLI.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 || pveTouched {
 		t.Fatalf("incomplete binding allowed PVE prepare: code=%d touched=%t", code, pveTouched)
 	}
 
 	var output, stderr bytes.Buffer
-	unbindCLI := &cli{in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
+	unbindCLI := &cli{in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }, managedWritePolicy: allowManagedWriteForTest}
 	if code := unbindCLI.menuRemoveBinding(bufio.NewReader(unbindCLI.in), filename, false); code == 0 {
 		t.Fatalf("incomplete binding allowed unbind output=%s stderr=%s", output.String(), stderr.String())
 	}
@@ -826,7 +836,8 @@ func TestPVEPrepareUnbindAndUninstallRefuseIncompleteBindingTransaction(t *testi
 	stderr.Reset()
 	uninstallCLI := &cli{
 		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
-		completeUninstall: func(context.Context) error { called = true; return nil },
+		completeUninstall:  func(context.Context) error { called = true; return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code == 0 || called {
 		t.Fatalf("incomplete binding allowed complete uninstall: code=%d called=%t output=%s stderr=%s", code, called, output.String(), stderr.String())
@@ -859,7 +870,8 @@ func TestUnbindRefusesPendingRequestInEitherBindingDomain(t *testing.T) {
 			var output, stderr bytes.Buffer
 			instance := &cli{
 				in: strings.NewReader(confirmation), out: &output, errOut: &stderr,
-				effectiveUID: func() int { return 0 },
+				effectiveUID:       func() int { return 0 },
+				managedWritePolicy: allowManagedWriteForTest,
 				quiesceBinding: func(context.Context) error {
 					t.Fatal("pending binding request reached service stop")
 					return nil

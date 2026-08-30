@@ -65,13 +65,14 @@ func TestPVEPrepareProbesThenOnlyEnablesReadAPISource(t *testing.T) {
 	var output, stderr bytes.Buffer
 	instance := &cli{
 		in: strings.NewReader(""), out: &output, errOut: &stderr, version: "test",
-		effectiveUID:    func() int { return 0 },
-		pveEnvironment:  func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:        prepareProbe(false),
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: successfulPVETLSPreflight,
-		activatePVE:     func(context.Context, config.Config) error { return nil },
+		effectiveUID:       func() int { return 0 },
+		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe:           prepareProbe(false),
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile})
 	if code != 0 {
@@ -115,10 +116,11 @@ func TestPVEPrepareFailureDoesNotMutateConfig(t *testing.T) {
 		pveProbe: func(context.Context, pve.Config, bool, string) (rawCredentialProbe, error) {
 			return rawCredentialProbe{}, io.ErrUnexpectedEOF
 		},
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: successfulPVETLSPreflight,
-		activatePVE:     func(context.Context, config.Config) error { return nil },
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 {
 		t.Fatal("failed probe enabled the API source")
@@ -144,12 +146,13 @@ func TestPVEPrepareBootstrapsMissingCredentialsBeforeRealProbe(t *testing.T) {
 			}
 			return localPVEEnvironmentForTest(), nil
 		},
-		pveBootstrap:    func(context.Context) error { bootstrapped = true; return nil },
-		pveProbe:        prepareProbe(false),
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: successfulPVETLSPreflight,
-		activatePVE:     func(context.Context, config.Config) error { return nil },
+		pveBootstrap:       func(context.Context) error { bootstrapped = true; return nil },
+		pveProbe:           prepareProbe(false),
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code != 0 || !bootstrapped {
 		t.Fatalf("code=%d bootstrapped=%v stderr=%s", code, bootstrapped, stderr.String())
@@ -161,11 +164,12 @@ func TestPVEPrepareRunsTLSAndCAValidationBeforeCredentialMutation(t *testing.T) 
 	bootstrapped := false
 	instance := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
-		pveEnvironment:  func(string) (map[string]string, error) { return nil, os.ErrNotExist },
-		pveBootstrap:    func(context.Context) error { bootstrapped = true; return nil },
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: func(context.Context, string, string) error { return errors.New("certificate mismatch") },
+		pveEnvironment:     func(string) (map[string]string, error) { return nil, os.ErrNotExist },
+		pveBootstrap:       func(context.Context) error { bootstrapped = true; return nil },
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    func(context.Context, string, string) error { return errors.New("certificate mismatch") },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 {
 		t.Fatal("failed TLS preflight reported ready")
@@ -180,12 +184,13 @@ func TestPVEPrepareRejectsUnmanagedCAAndUnrelatedPermissions(t *testing.T) {
 	bootstrapped := false
 	base := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
-		pveEnvironment:  func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveBootstrap:    func(context.Context) error { bootstrapped = true; return nil },
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: successfulPVETLSPreflight,
-		activatePVE:     func(context.Context, config.Config) error { return nil },
+		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveBootstrap:       func(context.Context) error { bootstrapped = true; return nil },
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := base.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", "/root/custom.pem"}); code == 0 || bootstrapped {
 		t.Fatalf("unmanaged CA accepted or mutated credentials: code=%d bootstrap=%v", code, bootstrapped)
@@ -226,6 +231,7 @@ func TestPVEPrepareActivationFailureRestoresDisabledConfig(t *testing.T) {
 			stopped++
 			return nil
 		},
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 {
 		t.Fatal("failed activation reported real PVE ready")
@@ -248,12 +254,13 @@ func TestPVEPrepareDoesNotRevertRealCollectionAfterLocalReadiness(t *testing.T) 
 	var stderr bytes.Buffer
 	instance := &cli{
 		out: io.Discard, errOut: &stderr, effectiveUID: func() int { return 0 },
-		pveEnvironment:  func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:        prepareProbe(false),
-		pveNodeName:     func() (string, error) { return "pve01", nil },
-		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
-		pveTLSPreflight: successfulPVETLSPreflight,
-		activatePVE:     func(context.Context, config.Config) error { return &realPVEActivationError{localReady: true} },
+		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe:           prepareProbe(false),
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return &realPVEActivationError{localReady: true} },
+		managedWritePolicy: allowManagedWriteForTest,
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 {
 		t.Fatal("unconfirmed upload reported fully ready")
