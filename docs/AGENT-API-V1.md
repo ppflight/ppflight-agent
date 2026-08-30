@@ -13,7 +13,7 @@
 
 PVE Token 由节点上的凭据 bootstrap 自动创建并保存在 root-only 本地环境文件。只读采集身份和受控写身份必须分离，写身份默认不获得全局 ACL。绑定请求和任何上报都不得包含 PVE endpoint/Token。安装后的 helper 是 `/usr/local/lib/ppflight-agent/create-pve-tokens.sh`（root-only `0700`）；首次运行创建 read/control Token，control 默认无 ACL。资源审查后，`--acl-only --control-pool NAME` 或重复 `--control-scope PATH` 只补既有 dedicated role/user/token 的已审核非根 scope，不读取、重写或重新创建 secret，也不能与 `--write-env`、`/` 或 `--control-global-acl` 混用。
 
-节点 root 随后可用 `ag-pve pve prepare --tls-server-name <证书DNS名>` 完成本地 read readiness：命令只在 test/productionExecution=false 时安全读取 root-only environment file，成功探测 read Token 的 version/permissions 后才写入 API 配置。TCP endpoint 始终精确为 `https://127.0.0.1:8006`（`tcp4`）；独立的 `pve.tlsServerName` 只做 TLS SNI/证书 hostname verification，必须是严格 DNS 名，不能是 IP、`localhost`、IPv6 或通配符。prepare 不创建 ACL、不启用 production、不启动 service；`ag-pve pve status` 只提供脱敏本地 read/control 探测，不能作为远端服务或 production rollout 的证据。
+节点 root 可用 `ag-pve pve prepare --tls-server-name <证书DNS名>` 完成本地 read readiness。命令在任何 PVE RBAC 修改前先验证固定 `/etc/ppflight-agent/pve-root-ca.pem`、严格 SNI、本机节点和本机版本；缺少凭据时才调用固定 helper 创建隔离 read/control Token（control 默认无 ACL）。TCP endpoint 始终精确为 `https://127.0.0.1:8006`（`tcp4`）；`pve.tlsServerName` 必须是证书覆盖的 DNS 名，不能是 IP、`localhost`、IPv6 或通配符。read Token 必须在 `/` 具备 `Sys.Audit VM.Audit VM.Monitor Datastore.Audit`，并成功读取本机 node status/storage。成功后 prepare 切到 production/api、受控重启，等待真实采集及已绑定 telemetry 通道成功；它不授予 control ACL，也不打开 `productionExecution`。
 
 官网 Agent upgrade route 的 feature flag **必须默认关闭**。迁移期间，旧客户升级继续走既有升级路由；它是待迁移的兼容路径，不是目标架构。只有某资产完成 shadow/read-back、幂等、资源互斥和显式 cutover 后，才能开启该资产的 Agent upgrade route 并关闭其旧 PVE 直连。任何时刻不得让新旧升级路径并发写同一资源。
 
@@ -84,9 +84,9 @@ Content-Type: application/json
 
 Agent 严格拒绝未知响应字段、缺失/非法 `networkPolicy`、跨 origin 端点、重定向、无效 assignment 和不安全凭据。官网状态固定为 `<stateDirectory>/bindings/binding-state.json`，稳定 device ID 为同目录 `device-id`；替换绑定要求新 code、显式 `--replace`，且新的 `credentialEpoch` 必须前进。
 
-绑定是单一职责操作，不是一键初始化：安装器默认配置仍为 `mode=test`、`pve.source=simulator`；website/monitoring bind 都不会创建 PVE Token、切换为 `source=api`、修改 mode/`productionExecution` 或 PVE ACL。website bind 不改变 systemd；monitoring bind 只为让新独立 credential 立即生效而在严格写入回验后受控重启 unit，并确认进程 `/status` 已加载相同 binding ID/epoch，失败则恢复旧配置/状态并重启确认旧服务。不能从 binding 成功推断本地 PVE API 已接通。
+绑定前包含一个共享、本机 root-only readiness 阶段：安装器默认的 `mode=production`/`pve.source=disabled` 不能启动、采集或外发；发布版运行态只有 `mode=production`/`pve.source=api`，不含 simulator 或测试数据上报路径。CLI 在读取 code 前先完成无凭据 CA/SNI/本机预检，再安全创建或读取隔离 PVE Token；固定 `127.0.0.1:8006/tcp4`，校验 API version、`/` 完整 read audit 权限、本机 node status/storage 和 `/usr/bin/pveversion` 一致性，切到 `mode=production`/`source=api`，受控重启并等待真实采集及已有 telemetry 通道成功。readiness 失败不读取 code、不创建 pending、不发 bind 请求。该阶段不会授予 control ACL 或打开 `productionExecution`。两域 binding 事务随后各自回读 config/state/overlay、重启并确认对应 binding ID/epoch 与首次 telemetry 成功；website 以 fail-closed commit marker 关联 config/state/initial assignment。服务端一旦签发新 binding，任何后续本地失败都不得恢复旧凭据、旧配置或旧 assignment，而必须保留 marker/pending、停止服务并通过同码幂等重试恢复；两个 trust domain 互不覆盖。
 
-`requestId` 是 Agent 在第一次网络请求前生成并持久化的 UUID。相同 `deviceId` 和相同 canonical 请求内容重试时必须复用同一个 `requestId`；输入内容改变则生成新 ID。本地 `<stateDirectory>/bindings/.website-binding-pending.json` 只保存 `requestId` 与 canonical 请求 SHA-256 指纹：绑定码参与指纹计算，但原文绝不能持久化。
+`requestId` 是 Agent 在第一次网络请求前生成并持久化的 UUID。相同 `deviceId` 和相同 canonical 请求内容重试时必须复用同一个 `requestId`；未清除的 pending 不允许换输入或生成新 ID。本地 `<stateDirectory>/bindings/.website-binding-pending.json` 只保存 `requestId` 与 canonical 请求 SHA-256 指纹：绑定码参与指纹计算，但原文绝不能持久化。pending 或 commit marker 存在时 runtime 必须 fail closed；操作者以同一 code 重试，服务端回放同一幂等响应，Agent 验证并完成中断的本地事务后才清除它们。
 
 生产安装中，`<stateDirectory>/bindings` 必须为 `root:ppflight-agent`、`0750`，其中 website/monitoring/device/pending 文件为 `0640`。root 运行的管理 CLI 负责原子更新；systemd Agent 只通过组权限读取，并以 `ReadOnlyPaths=<stateDirectory>/bindings` 进一步禁止服务写入凭据目录。assignment 文件不属于该目录：远端 refresh 写入 `<stateDirectory>/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`；原子替换已有文件时保留 owner/group/mode。安装器首次迁移旧 `/etc/ppflight-agent/assignments.json` 时必须保留内容，不得用空文档覆盖。
 
@@ -94,12 +94,10 @@ Agent 严格拒绝未知响应字段、缺失/非法 `networkPolicy`、跨 origi
 
 ```bash
 sudo ag-pve bind \
-  --endpoint https://www.example/internal/v1/agents/bind \
-  --pve-version 9.0.8
+  --endpoint https://www.example/internal/v1/agents/bind
 
 sudo ag-pve bind \
   --endpoint https://www.example/internal/v1/agents/bind \
-  --pve-version 9.0.8 \
   --code-file /run/ppflight-binding-code
 ```
 
@@ -125,7 +123,7 @@ Content-Type: application/json
 
 请求复用官网绑定的安全基础字段并要求独立的 UUID `requestId`；它不要求先完成官网绑定：
 
-`nodeClaim.pveVersion` 不是用户输入。监控 CLI 不提供 `--pve-version`，在读取绑定码前使用固定绝对路径 `/usr/bin/pveversion`（不经 shell）自动发现本机 PVE 8/9，并只接受规范化版本文本。命令失败、3 秒超时、非 PVE 环境、多行/NUL/异常输出或不受支持版本时返回 `PVE_VERSION_DISCOVERY_FAILED`，不发送绑定请求、不得以空值、`unknown` 或旧缓存继续。
+`nodeClaim.pveVersion` 不是用户输入。官网与监控 CLI 都不提供 `--pve-version`，在读取绑定码前使用固定绝对路径 `/usr/bin/pveversion`（不经 shell）自动发现本机 PVE 8/9，并只接受规范化版本文本。命令失败、3 秒超时、非 PVE 环境、多行/NUL/异常输出或不受支持版本时返回 `PVE_VERSION_DISCOVERY_FAILED`，不发送绑定请求、不得以空值、`unknown` 或旧缓存继续。服务端可将该字段作为非权威观测信息，但不得用它或 Agent version/commit/hash 作为一次性码绑定准入条件。
 
 ```json
 {
@@ -181,7 +179,7 @@ Content-Type: application/json
 - 监控站凭据只能按逐路由 scope 写 monitoring telemetry/audit 或读取固定 monitoring status，不能调用 website metering、assignment、commands 或 receipts，也不能授权 PVE mutation。
 - 监控站绑定码同样不得进入 argv、URL 或日志。
 
-Agent 侧已有严格 request/response 类型、pending 幂等状态、独立私有状态、运行时 private-state credential overlay 和 `ag-pve monitoring bind` CLI；成功响应后先备份旧 monitoring state 和配置，再原子写入、严格回读 config/state/overlay，受控 `systemctl restart ppflight-agent.service`，轮询 `is-active` 和 loopback `/status`，只有运行进程报告相同 monitoring `bindingId` 与十进制 `credentialEpoch` 才清除 pending 并报告成功。写入、重启或加载确认失败时必须恢复旧 config/state，重新启动并确认恢复后的服务；私有回滚备份和 pending request 保留，日志/输出不得含 secret。该流程不清理 durable audit/HA queue，也不触碰 website state。监控服务端路由属于另一交付任务，本仓代码不能证明它已部署。
+Agent 侧已有严格 request/response 类型、pending 幂等状态、独立私有状态、运行时 private-state credential overlay 和 `ag-pve monitoring bind` CLI；在首次请求前持久化 pending 后，成功响应立即建立 fail-closed commit marker，再原子写入 monitoring state/config、严格回读 config/state/overlay，受控 `systemctl restart ppflight-agent.service`，轮询 `is-active` 和 loopback `/status`，只有运行进程报告相同 monitoring `bindingId` 与十进制 `credentialEpoch` 才清除 marker/pending 并报告成功。服务端已签发时，写入、重启或加载确认失败绝不恢复旧 monitoring config/state（旧凭据可能已撤销）；marker/pending 和停止的服务保留，操作者使用同一 code 重试以复用 requestId 和服务端原响应完成恢复。日志/输出不得含 secret。该流程不清理 durable audit/HA queue，也不触碰 website state。监控服务端路由属于另一交付任务，本仓代码不能证明它已部署。
 
 ### 3.1 双绑定只读状态合同
 
@@ -517,9 +515,9 @@ payment_authorized
 
 | 能力 | 当前代码事实 | 对外状态 |
 | --- | --- | --- |
-| PVE 本地专用 Token / prepare | installer 以 root-only `0700` 安装 `/usr/local/lib/ppflight-agent/create-pve-tokens.sh`；其 `--write-env` 流程自动创建独立 read/control Token，control 默认无 ACL，`--acl-only` 可在不触碰 secret 的情况下给既有 dedicated user/token 增加已审核非根 scope。`ag-pve pve prepare/status` 已接入 root-only PVE env、安全 read/control 探测和脱敏 readiness；prepare 仅在 test/productionExecution=false 时将 TCP `127.0.0.1:8006` 与证书 DNS `pve.tlsServerName` 分离写入。 | 是独立本地 bootstrap/readiness 步骤；不会改 mode/production gate、授予 control ACL 或启动服务，仍需按资源审查 ACL。它不能证明官网/监控服务端、production mutation 或真实 PVE 破坏性验收已经完成；卸载 helper 也不自动删除 PVE identity/ACL。 |
+| PVE 本地专用 Token / prepare | installer 以 root-only `0700` 安装固定 helper；bind/`ag-pve pve prepare` 在读取 code 前创建或读取独立 read/control Token，control 默认无 ACL，固定 loopback tcp4+证书 DNS，验证 version/permissions/node，切换 production/api，受控重启并等待真实采集成功。 | 已实现真实数据 readiness；不会自动授予 control ACL 或打开 `productionExecution`。已绑定旧节点可单独运行 prepare，无需重新绑定。卸载 helper 不自动删除 PVE identity/ACL。 |
 | 安装发布物 | tag `vX.Y.Z` release workflow 已分别构建 Linux amd64/arm64、运行 Go/packaging 测试，并用 `scripts/package-release.sh` 生成离线、可复现 tarball 和 `SHA256SUMS`；脚本只打包已构建 binary 与显式 allowlist 内容、二次验证 bundle，拒绝网络下载、symlink、secret/queue material 和输出覆盖。manual dispatch 只生成 artifact，不发布。installer 继续校验包内 binary SHA-256、cloud-init bundle、依赖、权限、systemd unit 和 assignment 迁移。 | 发布物应先离线校验 `SHA256SUMS` 再解压，不能 `curl | bash`。当前 workflow 的完整性机制是 SHA-256；如需发布签名/来源审批，仍须由组织发布流程另行完成。 |
-| 官网 bind / networkPolicy | `internal/enrollment`、`internal/bindstate`、运行时 private-state credential overlay、exact `networkPolicy={agentObservedIPv4}` strict decoder/persistence 及 `ag-pve bind` 已有实现；绑定码不进 argv，Agent 使用 hostname + tcp4 direct dial。 | 不修改 PVE source/mode/ACL/service；官网可信来源 IPv4/32 冻结、轮换与 endpoint 部署仍需官网任务完成，不能仅凭 Agent 代码称已上线。 |
+| 官网 bind / networkPolicy | `internal/enrollment`、`internal/bindstate`、运行时 private-state credential overlay、exact `networkPolicy={agentObservedIPv4}` strict decoder/persistence 及 `ag-pve bind` 已有实现；绑定码不进 argv，Agent 使用 hostname + tcp4 direct dial。绑定前完成真实 PVE prepare；签发后使用 pending/commit marker 恢复，绝不退回可能已撤销的旧凭据。 | 真实 PVE read readiness 与绑定自动生效已接线；官网可信来源 IPv4/32 冻结、轮换与 endpoint 部署仍需官网任务完成，不能仅凭 Agent 代码称已上线。 |
 | assignment | `internal/assignment` 已有 HMAC `wait<=25s`、Ed25519 bundle 验签、revision/cursor 防回滚；runtime 主循环已接客户端并原子保存 assignment/cursor，安装器已接 service-owned 路径与 legacy 首次迁移。 | Agent 侧读写/权限闭环已接；官网服务仍需联调，不能据此宣称服务已上线。 |
 | discovery | `internal/discovery` 和 `pve.discover` Executor 分支已有 typed phase、分页与安全错误码；API 模式 runtime 已注入本地 PVE read client/Discovery。 | 仍须在 PVE 8/9 fixture 和真实非生产节点验收，不等于官网向导已上线。 |
 | 本地模板 bootstrap | cloud-init bundle 已在同一 Agent 包的 `bundles/ppflight-cloudinit` 落仓；installer 验证依赖/两次校验 bundle、strict IPv4/HTTPS redirect policy 并原子切换版本 symlink；`internal/templatebootstrap` 每次调用复验 manifest/运行文件摘要并用隔离 Python 入口执行，`ag-pve template init|catalog|discover|bootstrap` 已接本地 plan/显式确认流程。 | 不在远程 action registry；真实 PVE 上创建模板/备份的 plan/execute 破坏性验收完成前不可称模板业务上线，更不等于 `vm.reinstall`。 |
@@ -531,7 +529,7 @@ payment_authorized
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching、typed metering capability 和 meter 强制 shadow gate 已实现。 | 官网向导/assignment 签发与 APP 呈现仍待远端合并；只有 all-NIC explicitly metered 才可使用 aggregate active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |
-| 监控站绑定 / networkPolicy | `internal/monitorenrollment`、独立 pending/state/`networkPolicy`、运行时 credential overlay、自动可信 PVE 版本发现、写后严格回验、systemd 自动重启与本地 binding ID/epoch 加载确认、失败回滚、`sentAt`、持久 monitoring sequence 和 uploader tcp4 pinning 已实现；官网 bind/replace 不触碰它。 | 仍需在真实 PVE 8/9 对新绑定/轮换及服务端 ingest 做联调；不可仅凭本仓 Agent 能力宣称全部生产链路已验收。 |
+| 监控站绑定 / networkPolicy | `internal/monitorenrollment`、独立 pending/state/`networkPolicy`、运行时 credential overlay、自动可信 PVE 版本发现、写后严格回验、systemd 自动重启与本地 binding ID/epoch 加载确认、签发后 fail-closed 同码恢复、`sentAt`、持久 monitoring sequence 和 uploader tcp4 pinning 已实现；官网 bind/replace 不触碰它。 | 仍需在真实 PVE 8/9 对新绑定/轮换及服务端 ingest 做联调；不可仅凭本仓 Agent 能力宣称全部生产链路已验收。 |
 | 双绑定状态 | website/monitoring strict status clients 与 `ag-pve ... status` 已实现固定同源 HMAC GET、identity/epoch/revision/time 回钉、IPv4/no-proxy/no-redirect；scope 由服务端逐路由固定。 | 外部 `/internal/v1/agents/status` 与 `/internal/v1/monitoring/agents/status` 服务仍待交付；本地 CLI 存在不等于远端状态服务已上线。 |
 | 修改命令审计 | `internal/auditlog` 已有严格 wire/builder，control journal 持久化脱敏 context/event，`store.Audit` 是独立、不可淘汰 outbox；runtime 已把 monitoring binding、audit queue/sink、独立 sequence 与 HMAC uploader 接通，并在 monitoring telemetry 暴露 bounded `agentHealth.auditQueue`。正反/golden 测试覆盖最终字段。 | Agent 侧已接线；监控服务端 durable 存储、幂等与可查询 UI 由另一任务实现。端到端验收前 production 修改动作不得开放。 |
 | IPv4/mutual whitelist | `internal/netpolicy` 已把 enrollment、assignment、control、uploader、PVE、exporter 与管理探测统一为 `tcp4`，拒绝 IPv6 literal；clients 禁 ambient proxy/重定向并校验绑定 origin，PVE 配置目标为 `127.0.0.1`。 | IPv4-only 已接；website/monitoring 各自的服务端 source-IP allow set、Agent 目标 IPv4 pin/轮换和端到端任务门槛仍需实现/联调。`mutual-whitelist-v1` capability 不能当作已上线证据。 |

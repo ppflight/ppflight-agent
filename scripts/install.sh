@@ -38,6 +38,7 @@ ENABLE=0
 START=0
 SERVICE_WAS_ACTIVE=0
 SERVICE_RESTARTED=0
+PVE_PREPARATION_REQUIRED=0
 INSTALL_EXPORTERS=0
 INSTALL_SMARTMONTOOLS=0
 BINARY=''
@@ -339,9 +340,93 @@ for binding_file in \
   monitoring-binding-state.json \
   device-id \
   .website-binding-pending.json \
-  .monitoring-binding-pending.json; do
+  .monitoring-binding-pending.json \
+  .website-binding-commit.json \
+  .monitoring-binding-commit.json \
+  .website-unbind-commit.json \
+  .monitoring-unbind-commit.json; do
   ensure_regular_metadata "$BINDINGS_DIR/$binding_file" 0640 root ppflight-agent
 done
+
+# Releases before RC.13 could leave test mode or a generated snapshot source in
+# the public config. Convert either legacy state to production+disabled while
+# the service is stopped; local PVE readiness must explicitly re-enable api.
+# Preserve every other field, binding and private credential.
+migrate_legacy_source() {
+  local target=$1
+  [[ ! -L "$target" && -f "$target" ]] || die "agent config is not a safe regular file: $target"
+  python3 -I - "$target" <<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+target = sys.argv[1]
+directory = os.path.dirname(target)
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(target, flags)
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit("agent config is not a safe regular file")
+    if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) != 0o640:
+        raise SystemExit("agent config owner or mode is unsafe")
+    raw = os.read(descriptor, 1 << 20 | 1)
+finally:
+    os.close(descriptor)
+if len(raw) > 1 << 20:
+    raise SystemExit("agent config is too large")
+try:
+    document = json.loads(raw.decode("utf-8"))
+    mode = document["mode"]
+    source = document["pve"]["source"]
+except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit("agent config cannot be safely parsed") from error
+if source == "simulator" or mode == "test":
+    document["mode"] = "production"
+    document["pve"]["source"] = "disabled"
+    replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc13.", dir=directory)
+    try:
+        os.fchmod(replacement, 0o640)
+        os.fchown(replacement, metadata.st_uid, metadata.st_gid)
+        with os.fdopen(replacement, "w", encoding="utf-8", closefd=False) as output:
+            json.dump(document, output, indent=2, sort_keys=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.close(replacement)
+        replacement = -1
+        os.replace(temporary, target)
+        directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if replacement != -1:
+            os.close(replacement)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    source = "disabled"
+    mode = "production"
+if source not in {"api", "disabled"}:
+    raise SystemExit("invalid pve.source in existing Agent config")
+if mode != "production":
+    raise SystemExit("invalid mode in existing Agent config")
+print(source)
+PY
+}
+
+pve_source="$(migrate_legacy_source "$ETC_DIR/agent.yaml")" || die 'cannot safely inspect or migrate existing Agent pve.source'
+if [[ "$pve_source" == 'disabled' ]]; then
+  PVE_PREPARATION_REQUIRED=1
+  # Never let the EXIT trap resurrect an old process after the source was
+  # explicitly disabled.  The operator completes readiness through AG.
+  SERVICE_RESTARTED=1
+fi
 
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent.service" "$SYSTEMD_DIR/ppflight-agent.service"
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent-upgrade.path" "$SYSTEMD_DIR/ppflight-agent-upgrade.path"
@@ -374,22 +459,24 @@ if [[ $ENABLE -eq 1 ]]; then
     systemctl enable ppflight-node-exporter.service ppflight-smartctl-exporter.service
   fi
 fi
-if [[ $START -eq 1 ]]; then
+if [[ $START -eq 1 && $PVE_PREPARATION_REQUIRED -eq 0 ]]; then
   systemctl start ppflight-agent-upgrade.path ppflight-agent.service
   if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
     systemctl start ppflight-node-exporter.service ppflight-smartctl-exporter.service
   fi
 fi
-if [[ $SERVICE_WAS_ACTIVE -eq 1 && $START -eq 0 ]]; then
+if [[ $PVE_PREPARATION_REQUIRED -eq 0 && $SERVICE_WAS_ACTIVE -eq 1 && $START -eq 0 ]]; then
   systemctl start ppflight-agent-upgrade.path ppflight-agent.service
   SERVICE_RESTARTED=1
 elif [[ $START -eq 1 ]]; then
   SERVICE_RESTARTED=1
 fi
 
-if [[ $SERVICE_WAS_ACTIVE -eq 1 ]]; then
+if [[ $PVE_PREPARATION_REQUIRED -eq 1 ]]; then
+  note "Installed $APP for PVE $pve_version. PVE collection is disabled and the service remains stopped; enter AG to complete local PVE preparation."
+elif [[ $SERVICE_WAS_ACTIVE -eq 1 ]]; then
   note "Installed $APP for PVE $pve_version and restored the previously active service."
 else
   note "Installed $APP for PVE $pve_version. No service was started unless --start was supplied."
 fi
-note "Before production: set mode=production, pve.source=api, enable exporters/destinations, replace example identifiers, and validate with: $BIN_PATH --config $ETC_DIR/agent.yaml --check-config"
+note "AG local PVE preparation verifies the local API and enables pve.source=api before the service can collect or upload."

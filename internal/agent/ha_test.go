@@ -33,13 +33,36 @@ const (
 	secondLifecycleBootID = "22222222-2222-4222-8222-222222222222"
 )
 
+func TestAgentRefusesDisabledPVEConfiguration(t *testing.T) {
+	cfg := parseHAConfig(t, t.TempDir(), "127.0.0.1:0", true)
+	cfg.Mode = "production"
+	cfg.PVE.Source = "disabled"
+	if app, err := New(cfg, config.Secrets{}, "0.1.0-rc.13", discardedLogger()); err == nil {
+		app.releaseStateLock()
+		t.Fatal("released Agent accepted disabled PVE source")
+	} else if !strings.Contains(err.Error(), "collection is disabled") {
+		t.Fatalf("unexpected disabled PVE failure: %v", err)
+	}
+}
+
+func TestReleasedAgentRefusesTestModeWithRealAPISource(t *testing.T) {
+	cfg := parseHAConfig(t, t.TempDir(), "127.0.0.1:0", false)
+	if app, err := New(cfg, testPVESecrets(), "0.1.0-rc.13", discardedLogger()); err == nil {
+		app.releaseStateLock()
+		t.Fatal("released Agent accepted test mode")
+	} else if !strings.Contains(err.Error(), "requires production mode") {
+		t.Fatalf("unexpected test-mode failure: %v", err)
+	}
+}
+
 func TestGracefulContextShutdownDoesNotCreatePreviousExitIncident(t *testing.T) {
 	root := t.TempDir()
 	cfg := parseHAConfig(t, root, "127.0.0.1:0", false)
-	app, err := New(cfg, config.Secrets{}, "test", discardedLogger())
+	app, err := New(cfg, testPVESecrets(), "test", discardedLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
+	app.source = &fixtureCollectionSource{cfg: cfg}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- app.Run(ctx, false) }()
@@ -52,7 +75,7 @@ func TestGracefulContextShutdownDoesNotCreatePreviousExitIncident(t *testing.T) 
 		cancel()
 		t.Fatal("agent did not complete its initial collection")
 	}
-	if competing, err := New(cfg, config.Secrets{}, "test", discardedLogger()); err == nil {
+	if competing, err := New(cfg, testPVESecrets(), "test", discardedLogger()); err == nil {
 		competing.releaseStateLock()
 		cancel()
 		t.Fatal("a second process acquired the state directory during Run")
@@ -69,10 +92,11 @@ func TestGracefulContextShutdownDoesNotCreatePreviousExitIncident(t *testing.T) 
 
 	// Once Run has persisted the clean marker, it releases the process lock and
 	// the next process may safely enter without observing a false crash.
-	second, err := New(cfg, config.Secrets{}, "test", discardedLogger())
+	second, err := New(cfg, testPVESecrets(), "test", discardedLogger())
 	if err != nil {
 		t.Fatalf("state lock was not released after clean shutdown: %v", err)
 	}
+	second.source = &fixtureCollectionSource{cfg: cfg}
 	if err := second.Run(context.Background(), true); err != nil {
 		t.Fatalf("second clean session: %v", err)
 	}
@@ -110,6 +134,7 @@ func TestPreviousExitQueuesBeforeListenAndCurrentListenFailureRemainsUnclean(t *
 		MonitoringAgentRef:  "monitor-agent-ha-test",
 		Monitoring:          config.DestinationSecret{CredentialEpoch: 1},
 	}
+	secrets.PVETokenID, secrets.PVETokenSecret = testPVESecrets().PVETokenID, testPVESecrets().PVETokenSecret
 	app, err := New(cfg, secrets, "test", discardedLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +440,7 @@ func parseHAConfig(t *testing.T, root, listenAddress string, destinations bool) 
 		"mode":"test",
 		"identity":{"agentRef":"agent-ha-test","collectorRef":"collector-ha-test","sourceRef":"source-ha-test","clusterRef":"cluster-ha-test","nodeRef":"node-ha-test","site":"test"},
 		"runtime":{"stateDirectory":%q,"listenAddress":%q,"shutdownGrace":"2s","logLevel":"error"},
+		"pve":{"source":"api","endpoint":"https://127.0.0.1:8006","tokenIdEnv":"PVE_READ_TOKEN_ID","tokenSecretEnv":"PVE_READ_TOKEN_SECRET","tlsServerName":"pve.example.test","caFile":""},
 		"assignments":{"file":%q,"refreshUrl":"","refreshInterval":"1m"},
 		%s,
 		"control":{"enabled":false}

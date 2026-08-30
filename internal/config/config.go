@@ -199,8 +199,11 @@ type DestinationSecret struct {
 func defaults() Config {
 	return Config{
 		SchemaVersion: SchemaVersion,
-		Mode:          "test",
-		Identity:      IdentityConfig{NodeRef: "auto", Site: "primary"},
+		// A newly installed node is deliberately inert.  It becomes a running
+		// collector only after the root-only AG readiness flow has verified the
+		// local PVE API and changed this to the api source.
+		Mode:     "production",
+		Identity: IdentityConfig{NodeRef: "auto", Site: "primary"},
 		Runtime: RuntimeConfig{
 			StateDirectory: "/var/lib/ppflight-agent", ListenAddress: "127.0.0.1:9745",
 			ShutdownGrace: Duration{15 * time.Second}, LogLevel: "info",
@@ -212,7 +215,7 @@ func defaults() Config {
 			RequestConcurrency: 8, GuestRequestConcurrency: 4,
 		},
 		PVE: PVEConfig{
-			Source: "simulator", Endpoint: LocalPVEEndpoint, CAFile: "/etc/ppflight-agent/pve-root-ca.pem",
+			Source: "disabled", Endpoint: LocalPVEEndpoint, CAFile: "/etc/ppflight-agent/pve-root-ca.pem",
 			Timeout: Duration{10 * time.Second}, MaxResponseBytes: 8 << 20, LocalNode: "auto",
 		},
 		Exporters: ExportersConfig{
@@ -227,7 +230,7 @@ func defaults() Config {
 			MonitoringAudit:  defaultDestination(512<<20, "audit-v1"),
 		},
 		Control: ControlConfig{
-			Enabled: true, PollInterval: Duration{30 * time.Second}, RequestTimeout: Duration{10 * time.Second},
+			Enabled: false, PollInterval: Duration{30 * time.Second}, RequestTimeout: Duration{10 * time.Second},
 			MaxCommandsPerPoll: 20, ProductionExecution: false,
 			Auth:           AuthConfig{Mode: "hmac-sha256"},
 			AllowedActions: []string{"vm.start", "vm.shutdown", "vm.reboot"},
@@ -324,8 +327,8 @@ func (c Config) Validate() error {
 	if err := validateIntervals(c.Collection); err != nil {
 		return err
 	}
-	if c.PVE.Source != "api" && c.PVE.Source != "simulator" {
-		return errors.New("pve.source must be api or simulator")
+	if c.PVE.Source != "api" && c.PVE.Source != "disabled" {
+		return errors.New("pve.source must be api or disabled")
 	}
 	if c.PVE.Source == "api" {
 		if c.PVE.Endpoint != LocalPVEEndpoint {

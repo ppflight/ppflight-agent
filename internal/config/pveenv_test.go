@@ -72,7 +72,7 @@ func TestPVEEnvironmentOverlayDoesNotMixCredentialSources(t *testing.T) {
 }
 
 func TestPVEEnvironmentLookupUsesFileForRootAndPID1EnvironmentForService(t *testing.T) {
-	cfg, err := Parse([]byte(strings.Replace(validTestConfig(), `"source":"simulator"`, `"source":"api","endpoint":"https://127.0.0.1:8006","tokenIdEnv":"PVE_READ_TOKEN_ID","tokenSecretEnv":"PVE_READ_TOKEN_SECRET","tlsServerName":"pve.example.test"`, 1)))
+	cfg, err := Parse([]byte(strings.Replace(validTestConfig(), `"source":"disabled"`, `"source":"api","endpoint":"https://127.0.0.1:8006","tokenIdEnv":"PVE_READ_TOKEN_ID","tokenSecretEnv":"PVE_READ_TOKEN_SECRET","tlsServerName":"pve.example.test"`, 1)))
 	if err != nil {
 		t.Fatal(err)
 	}

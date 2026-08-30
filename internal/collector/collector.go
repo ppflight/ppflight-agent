@@ -40,8 +40,8 @@ type ProgressSource interface {
 }
 
 func New(cfg config.Config, secrets config.Secrets) (Source, error) {
-	if cfg.PVE.Source == "simulator" {
-		return NewSimulator(cfg), nil
+	if cfg.PVE.Source != "api" {
+		return nil, errors.New("PVE collection is disabled; complete AG local PVE preparation before starting the agent")
 	}
 	client, err := pve.NewClient(pve.Config{
 		Endpoint: cfg.PVE.Endpoint, TokenID: secrets.PVETokenID, TokenSecret: secrets.PVETokenSecret,

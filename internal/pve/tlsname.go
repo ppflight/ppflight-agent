@@ -12,7 +12,7 @@ import (
 // because they would reintroduce the common PVE 127.0.0.1 SAN mismatch or
 // broaden certificate identity unexpectedly.
 func ValidateTLSServerName(value string) error {
-	if value == "" || len(value) > 253 || strings.TrimSpace(value) != value || strings.Contains(value, "*") || net.ParseIP(value) != nil {
+	if value == "" || len(value) > 253 || strings.TrimSpace(value) != value || strings.Contains(value, "*") || net.ParseIP(value) != nil || strings.EqualFold(value, "localhost") {
 		return errors.New("TLS server name must be a strict DNS hostname, not an IP address or wildcard")
 	}
 	for _, label := range strings.Split(value, ".") {

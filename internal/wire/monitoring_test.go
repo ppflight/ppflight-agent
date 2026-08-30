@@ -2,13 +2,10 @@ package wire
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
-	"github.com/ppflight/ppflight-agent/internal/collector"
-	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/exporter"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/observation"
@@ -69,31 +66,38 @@ func TestMonitoringTelemetryRejectsMissingBindingAuthority(t *testing.T) {
 	}
 }
 
-func TestMonitoringSimulatorPayloadNormalizesRequiredArrays(t *testing.T) {
+func TestMonitoringPayloadNormalizesRequiredArrays(t *testing.T) {
 	now := time.Date(2026, 8, 30, 12, 30, 0, 0, time.UTC)
-	simulator := collector.NewSimulator(config.Config{
-		Mode: "test",
-		Identity: config.IdentityConfig{
-			AgentRef: "agent-simulator", CollectorRef: "collector-simulator",
-			ClusterRef: "cluster-simulator", Site: "test-site",
+	// This is a deliberately hand-written observation fixture.  The released
+	// collector never fabricates a PVE snapshot; it only reads the local API.
+	// Keep the nil values here because a real PVE/QGA response may omit them.
+	snapshot := observation.Snapshot{
+		SchemaVersion: 1, Mode: "production", AgentRef: "agent-fixture", CollectorRef: "collector-fixture",
+		ClusterRef: "cluster-fixture", NodeRef: "node-fixture", Site: "test-site", ObservedAt: now,
+		PVEVersion: pve.Version{Version: "9.0", Release: "9.0", RepoID: "pve-no-subscription"},
+		Components: map[string]observation.Availability{
+			"pve":              {Available: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)},
+			"smartctlExporter": {Available: true, ObservedAt: now, FreshUntil: now.Add(5 * time.Minute)},
 		},
-	})
-	snapshot, err := simulator.Collect(context.Background(), now, collector.Due{})
-	if err != nil {
-		t.Fatal(err)
+		Tasks: nil,
+		Guests: []observation.Guest{
+			{VMID: 101, GuestType: "qemu", Name: "guest-with-qga", Node: "node-fixture", ObservedAt: now,
+				PVE: observation.PVEGuestView{Availability: observation.Availability{Available: true, ObservedAt: now}, Status: "running"},
+				QGA: observation.QGAView{Availability: observation.Availability{Available: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}, Info: &pve.GuestAgentInfo{Version: "8.2.0"}}},
+			{VMID: 102, GuestType: "qemu", Name: "guest-without-qga", Node: "node-fixture", ObservedAt: now,
+				PVE: observation.PVEGuestView{Availability: observation.Availability{Available: true, ObservedAt: now}, Status: "running"},
+				QGA: observation.QGAView{Availability: observation.Availability{Available: false, ObservedAt: now, UnavailableReason: "guest-agent-unavailable"}}},
+		},
 	}
-	// Exercise the empty required-array path as well as the simulator's nil
-	// QGA SupportedCommands fixture that caused production HTTP 400 responses.
-	snapshot.Tasks = nil
 	originalInfo := snapshot.Guests[0].QGA.Info
 	if originalInfo == nil || originalInfo.SupportedCommands != nil {
-		t.Fatalf("simulator fixture no longer exercises nil supported_commands: %#v", originalInfo)
+		t.Fatalf("fixture no longer exercises nil supported_commands: %#v", originalInfo)
 	}
 
 	batch, err := BuildMonitoringTelemetry(snapshot, nil, MonitoringBuildContext{
-		BindingID: "550e8400-e29b-41d4-a716-446655440001", MonitoringAgentRef: "monitor-agent-simulator",
-		DeviceID: "device-simulator", CredentialEpoch: 1, BootID: "550e8400-e29b-41d4-a716-446655440002",
-		Sequence: 1, AgentVersion: "0.1.0-rc.12", SourceRef: "source-simulator", SentAt: now,
+		BindingID: "550e8400-e29b-41d4-a716-446655440001", MonitoringAgentRef: "monitor-agent-fixture",
+		DeviceID: "device-fixture", CredentialEpoch: 1, BootID: "550e8400-e29b-41d4-a716-446655440002",
+		Sequence: 1, AgentVersion: "0.1.0-rc.13", SourceRef: "source-fixture", SentAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +105,7 @@ func TestMonitoringSimulatorPayloadNormalizesRequiredArrays(t *testing.T) {
 	if originalInfo.SupportedCommands != nil {
 		t.Fatal("monitoring projection mutated the collector snapshot")
 	}
-	if got := batch.Components["smartctlExporter"].FreshUntil; got == nil || !got.Equal(now.Add(10*time.Minute)) {
+	if got := batch.Components["smartctlExporter"].FreshUntil; got == nil || !got.Equal(now.Add(5*time.Minute)) {
 		t.Fatalf("monitoring projection changed the collector freshness horizon: %v", got)
 	}
 	if got := batch.Guests[1].QGA.Availability; got.ObservedAt == nil || !got.ObservedAt.Equal(now) || got.FreshUntil != nil {

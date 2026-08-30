@@ -51,10 +51,11 @@ func TestSystemdReadyIsSentOnlyAfterHealthListenerIsReachable(t *testing.T) {
 	}
 	root := t.TempDir()
 	cfg := parseHAConfig(t, root, healthAddress, false)
-	app, err := New(cfg, config.Secrets{}, "test", discardedLogger())
+	app, err := New(cfg, testPVESecrets(), "test", discardedLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
+	app.source = &fixtureCollectionSource{cfg: cfg}
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() { result <- app.Run(ctx, false) }()
@@ -116,7 +117,7 @@ func TestSystemdWatchdogFailureLeavesLifecycleRunningForNextRestart(t *testing.T
 	root := t.TempDir()
 	cfg := parseHAConfig(t, root, healthAddress, false)
 	cfg.Collection.SampleInterval = config.Duration{Duration: time.Second}
-	app, err := New(cfg, config.Secrets{}, "test", discardedLogger())
+	app, err := New(cfg, testPVESecrets(), "test", discardedLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +176,7 @@ func TestSystemdWatchdogDeadlineResetsOnInnerCollectionProgress(t *testing.T) {
 	root := t.TempDir()
 	cfg := parseHAConfig(t, root, healthAddress, false)
 	cfg.Collection.SampleInterval = config.Duration{Duration: time.Second}
-	app, err := New(cfg, config.Secrets{}, "test", discardedLogger())
+	app, err := New(cfg, testPVESecrets(), "test", discardedLogger())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -76,6 +76,144 @@ func TestResolveReservedLabelsCannotBeOverriddenByEnvironment(t *testing.T) {
 	}
 }
 
+func TestResolveFailsClosedDuringAnyBindingMultiFileCommit(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		begin func(string, string, uint64) error
+	}{
+		{name: "website", begin: bindstate.BeginWebsiteCommit},
+		{name: "monitoring", begin: bindstate.BeginMonitoringCommit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			response := websiteResponse(time.Now().UTC())
+			if err := bindstate.Save(stateDir, bindstate.FromResponse("https://website.example/internal/v1/agents/bind", "device-01", response)); err != nil {
+				t.Fatal(err)
+			}
+			if err := test.begin(stateDir, response.BindingID, response.CredentialEpoch); err != nil {
+				t.Fatal(err)
+			}
+			cfg := boundConfig(stateDir, response, monitorenrollment.Response{})
+			cfg.Destinations.Monitoring.Enabled = false
+			cfg.Destinations.Monitoring.Auth = config.AuthConfig{}
+			cfg.Destinations.MonitoringAudit.Enabled = false
+			cfg.Destinations.MonitoringAudit.Auth = config.AuthConfig{}
+			if _, err := Resolve(cfg, func(string) (string, bool) { return "", false }); err == nil {
+				t.Fatal("incomplete binding transaction was accepted")
+			}
+		})
+	}
+}
+
+func TestResolveAllowsLastCompleteBindingWhileRequestOutcomeIsUnresolved(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		t.Run(domain, func(t *testing.T) {
+			stateDir := t.TempDir()
+			response := websiteResponse(time.Now().UTC())
+			if err := bindstate.Save(stateDir, bindstate.FromResponse("https://website.example/internal/v1/agents/bind", "device-01", response)); err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, err := bindstate.RequestFingerprint(map[string]string{"bindingCode": "unresolved-code", "domain": domain})
+			if err != nil {
+				t.Fatal(err)
+			}
+			capabilities := []string{"pve.discovery.v1", "pve.telemetry.v1"}
+			if domain == "monitoring" {
+				capabilities = []string{"telemetry-v1"}
+			}
+			template, err := bindstate.NewBindingRequestTemplate(domain, "https://pending.example/internal/v1/agents/bind", "device-01", "test", "pve-test", enrollment.NodeClaim{NodeRef: "node-01", PVEVersion: "9.0.8"}, capabilities)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, lock, err := bindstate.PreparePending(stateDir, domain, fingerprint, template)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lock.Close()
+			cfg := boundConfig(stateDir, response, monitorenrollment.Response{})
+			cfg.Destinations.Monitoring.Enabled = false
+			cfg.Destinations.Monitoring.Auth = config.AuthConfig{}
+			cfg.Destinations.MonitoringAudit.Enabled = false
+			cfg.Destinations.MonitoringAudit.Auth = config.AuthConfig{}
+			secrets, err := Resolve(cfg, func(string) (string, bool) { return "", false })
+			if err != nil {
+				t.Fatalf("unresolved %s request blocked the last complete binding: %v", domain, err)
+			}
+			if secrets.WebsiteBindingID != response.BindingID || secrets.WebsiteCredentialEpoch != response.CredentialEpoch {
+				t.Fatalf("unresolved %s request did not resolve the old website state: %#v", domain, secrets)
+			}
+		})
+	}
+}
+
+func TestResolveUnbindJournalBlocksOnlyUntilExactRemovalConfigIsDurable(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		domain := domain
+		t.Run(domain, func(t *testing.T) {
+			stateDir := t.TempDir()
+			now := time.Now().UTC()
+			website := websiteResponse(now)
+			monitoring := monitoringResponse(now)
+			websiteState := bindstate.FromResponse("https://website.example/internal/v1/agents/bind", "device-01", website)
+			monitoringState := bindstate.MonitoringFromResponse("https://monitor.example/internal/v1/monitoring/agents/bind", "device-01", monitoring)
+			if err := bindstate.Save(stateDir, websiteState); err != nil {
+				t.Fatal(err)
+			}
+			if err := bindstate.SaveMonitoring(stateDir, monitoringState); err != nil {
+				t.Fatal(err)
+			}
+			cfg := boundConfig(stateDir, website, monitoring)
+			if domain == "website" {
+				if _, err := bindstate.BeginWebsiteUnbind(stateDir, websiteState); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := bindstate.BeginMonitoringUnbind(stateDir, monitoringState); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Resolve(cfg, func(string) (string, bool) { return "", false }); err == nil {
+				t.Fatal("old credentials were accepted while unbind journal still had active config")
+			}
+
+			if domain == "website" {
+				disableWebsiteForUnbindTest(&cfg)
+			} else {
+				disableMonitoringForUnbindTest(&cfg)
+			}
+			secrets, err := Resolve(cfg, func(string) (string, bool) { return "", false })
+			if err != nil {
+				t.Fatalf("safe forward unbind state remained unavailable: %v", err)
+			}
+			if domain == "website" {
+				if secrets.MonitoringBindingID != monitoring.BindingID || secrets.Monitoring.CredentialEpoch != monitoring.CredentialEpoch || secrets.WebsiteBindingID != "" {
+					t.Fatalf("safe website forward state did not preserve only monitoring: %#v", secrets)
+				}
+			} else if secrets.WebsiteBindingID != website.BindingID || secrets.WebsiteCredentialEpoch != website.CredentialEpoch || secrets.MonitoringBindingID != "" {
+				t.Fatalf("safe monitoring forward state did not preserve only website: %#v", secrets)
+			}
+		})
+	}
+}
+
+func disableWebsiteForUnbindTest(cfg *config.Config) {
+	cfg.Destinations.WebsiteMetering = config.DestinationConfig{Auth: config.AuthConfig{Mode: "hmac-sha256"}}
+	cfg.Destinations.WebsiteTelemetry = config.DestinationConfig{Auth: config.AuthConfig{Mode: "hmac-sha256"}}
+	cfg.Assignments.RefreshURL = ""
+	cfg.Control.Enabled = false
+	cfg.Control.PollURL = ""
+	cfg.Control.ResultURL = ""
+	cfg.Control.Auth = config.AuthConfig{Mode: "hmac-sha256"}
+	cfg.Control.CommandSecretEnv = ""
+	cfg.Control.CommandSigningKeyIDEnv = ""
+	cfg.Control.CommandPublicKeyEnv = ""
+	cfg.Control.ProductionExecution = false
+}
+
+func disableMonitoringForUnbindTest(cfg *config.Config) {
+	cfg.Destinations.Monitoring = config.DestinationConfig{Auth: config.AuthConfig{Mode: "hmac-sha256"}}
+	cfg.Destinations.MonitoringAudit = config.DestinationConfig{Auth: config.AuthConfig{Mode: "hmac-sha256"}}
+	cfg.Control.ProductionExecution = false
+}
+
 func TestResolveRejectsUnknownReservedLabelAndStateMismatch(t *testing.T) {
 	cfg := config.Config{}
 	cfg.Destinations.WebsiteTelemetry.Enabled = true
@@ -117,6 +255,16 @@ func websiteResponse(now time.Time) enrollment.Response {
 		AllowedActions:           []string{"pve.discover", "task.status", "vm.start", "vm.reset-password"}, AssignmentDocument: assignment,
 		NetworkPolicy:   netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: []string{"192.0.2.1"}},
 		CredentialEpoch: 4, IssuedAt: now,
+	}
+}
+
+func monitoringResponse(now time.Time) monitorenrollment.Response {
+	return monitorenrollment.Response{
+		SchemaVersion: 1, BindingID: "550e8400-e29b-41d4-a716-446655440002", DeviceID: "device-01", MonitoringAgentRef: "monitor-agent-01",
+		IngestEndpoint: "https://monitor.example/internal/v1/monitoring/telemetry/batches", CredentialEpoch: 7, IssuedAt: now,
+		HMACCredential: monitorenrollment.HMACCredential{Algorithm: "hmac-sha256", KeyID: "monitor-key-01", SecretEncoding: "base64", Secret: enrollment.Secret(encoded(0x66))},
+		Telemetry:      monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 1 << 20, MaxUncompressedBytes: 4 << 20},
+		NetworkPolicy:  netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"},
 	}
 }
 

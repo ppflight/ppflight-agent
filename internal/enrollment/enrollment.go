@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -46,6 +45,17 @@ type Request struct {
 	Hostname      string    `json:"hostname"`
 	NodeClaim     NodeClaim `json:"nodeClaim"`
 	Capabilities  []string  `json:"capabilities"`
+}
+
+// ValidateBindingCode checks only the local syntax of a website enrollment
+// code.  It never contacts the service and its error intentionally omits the
+// supplied value, so callers can reject malformed terminal/file input before
+// creating a durable request, stopping the Agent, or sending HTTP.
+func ValidateBindingCode(value string) error {
+	if !bindingCode.MatchString(value) {
+		return errors.New("invalid binding code")
+	}
+	return nil
 }
 
 type NodeClaim struct {
@@ -169,7 +179,11 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 		return Response{}, errors.New("binding response exceeds maximum size")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return Response{}, fmt.Errorf("binding service returned HTTP %d", response.StatusCode)
+		// A one-time-code service may have committed its response before a
+		// gateway/proxy changes or loses the response.  A non-2xx status alone
+		// is never proof that no credential was issued, so deliberately expose
+		// no status/body classification to the resumable local transaction.
+		return Response{}, errors.New("binding response outcome is unknown")
 	}
 	if !isJSON(response.Header.Get("Content-Type")) {
 		return Response{}, errors.New("binding response must be application/json")
@@ -196,7 +210,7 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 }
 
 func (r Request) Validate() error {
-	if r.SchemaVersion != SchemaVersion || !uuidValue.MatchString(r.RequestID) || !bindingCode.MatchString(r.BindingCode) || !safeID.MatchString(r.DeviceID) ||
+	if r.SchemaVersion != SchemaVersion || !uuidValue.MatchString(r.RequestID) || ValidateBindingCode(r.BindingCode) != nil || !safeID.MatchString(r.DeviceID) ||
 		!versionValue.MatchString(r.AgentVersion) || !validHostname(r.Hostname) || !safeID.MatchString(r.NodeClaim.NodeRef) ||
 		!versionValue.MatchString(r.NodeClaim.PVEVersion) || len(r.Capabilities) == 0 || len(r.Capabilities) > 64 {
 		return errors.New("invalid binding request")

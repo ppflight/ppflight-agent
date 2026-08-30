@@ -2,11 +2,8 @@ package admincli
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/json"
-	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ppflight/ppflight-agent/internal/agent"
 	"github.com/ppflight/ppflight-agent/internal/bindingoverlay"
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/enrollment"
@@ -22,7 +18,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
 
-func TestRealCLIDualBindResolvesAndRunsAgentOnce(t *testing.T) {
+func TestRealCLIDualBindResolvesRuntimeOverlay(t *testing.T) {
 	filename := prepareBindConfig(t)
 	assertIPv4 := func(r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -90,7 +86,7 @@ func TestRealCLIDualBindResolvesAndRunsAgentOnce(t *testing.T) {
 	defer monitoring.Close()
 
 	var stdout, stderr bytes.Buffer
-	websiteCode := RunWithInput([]string{"--config", filename, "bind", "--endpoint", website.URL + "/internal/v1/agents/bind", "--pve-version", "9.0.8", "--hostname", "pve-test"}, "integration", strings.NewReader("WEBSITE-123456\n"), &stdout, &stderr)
+	websiteCode := runWebsiteBindForTest([]string{"--config", filename, "bind", "--endpoint", website.URL + "/internal/v1/agents/bind", "--hostname", "pve-test"}, "integration", strings.NewReader("WEBSITE-123456\n"), &stdout, &stderr)
 	if websiteCode != 0 {
 		t.Fatalf("website bind code=%d stderr=%s", websiteCode, stderr.String())
 	}
@@ -111,12 +107,5 @@ func TestRealCLIDualBindResolvesAndRunsAgentOnce(t *testing.T) {
 	}
 	if secrets.WebsiteBindingID == "" || secrets.WebsiteCredentialEpoch != 1 || secrets.MonitoringBindingID == "" || secrets.MonitoringAudit.CredentialEpoch != 1 {
 		t.Fatalf("incomplete runtime identities: %#v", secrets)
-	}
-	app, err := agent.New(cfg, secrets, "integration", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("agent.New after CLI binding: %v", err)
-	}
-	if err := app.Run(context.Background(), true); err != nil {
-		t.Fatalf("agent once after CLI binding: %v", err)
 	}
 }

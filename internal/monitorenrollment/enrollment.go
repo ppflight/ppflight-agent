@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -48,6 +47,18 @@ type Request struct {
 	Hostname      string               `json:"hostname"`
 	NodeClaim     enrollment.NodeClaim `json:"nodeClaim"`
 	Capabilities  []string             `json:"capabilities"`
+}
+
+// ValidateBindingCode checks only the local syntax of a monitoring enrollment
+// code.  It does not consume or reveal the code and lets the CLI reject bad
+// input before it persists a request intent, stops the service, or sends an
+// HTTP request.  The monitoring grammar intentionally remains owned by this
+// trust domain rather than reusing the website validator.
+func ValidateBindingCode(value string) error {
+	if !bindingCode.MatchString(value) {
+		return errors.New("invalid monitoring binding code")
+	}
+	return nil
 }
 
 // AuditEndpoint derives the second monitoring write route without expanding
@@ -141,7 +152,10 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 		return Response{}, errors.New("invalid monitoring binding response")
 	}
 	if httpResponse.StatusCode < 200 || httpResponse.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("monitoring binding service returned HTTP %d", httpResponse.StatusCode)
+		// See the website enrollment client: any non-2xx reply is ambiguous for
+		// a consumed one-time code. Do not let a proxy/body/status heuristic
+		// clear the durable request ID and make recovery impossible.
+		return Response{}, errors.New("monitoring binding response outcome is unknown")
 	}
 	if media := strings.ToLower(strings.TrimSpace(strings.Split(httpResponse.Header.Get("Content-Type"), ";")[0])); media != "application/json" {
 		return Response{}, errors.New("monitoring binding response must be application/json")
@@ -166,7 +180,7 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 }
 
 func (r Request) Validate() error {
-	if r.SchemaVersion != SchemaVersion || !uuidValue.MatchString(r.RequestID) || !bindingCode.MatchString(r.BindingCode) || !safeID.MatchString(r.DeviceID) || !version.MatchString(r.AgentVersion) || !hostname(r.Hostname) || !safeID.MatchString(r.NodeClaim.NodeRef) || !version.MatchString(r.NodeClaim.PVEVersion) || len(r.Capabilities) == 0 || len(r.Capabilities) > 32 {
+	if r.SchemaVersion != SchemaVersion || !uuidValue.MatchString(r.RequestID) || ValidateBindingCode(r.BindingCode) != nil || !safeID.MatchString(r.DeviceID) || !version.MatchString(r.AgentVersion) || !hostname(r.Hostname) || !safeID.MatchString(r.NodeClaim.NodeRef) || !version.MatchString(r.NodeClaim.PVEVersion) || len(r.Capabilities) == 0 || len(r.Capabilities) > 32 {
 		return errors.New("invalid monitoring binding request")
 	}
 	seen := map[string]bool{}

@@ -78,6 +78,39 @@ func Resolve(cfg config.Config, lookup func(string) (string, bool)) (config.Secr
 	}
 	usesWebsite := cfg.Assignments.RefreshURL != "" || containsWebsiteLabel(labels)
 	usesMonitoring := containsLabel(labels, MonitoringKeyIDEnv) || containsLabel(labels, MonitoringSecretEnv)
+	// A marker in either trust domain means a root-run binding transaction
+	// stopped between private/public state writes. Refuse to load all binding
+	// credentials until it is explicitly recovered or finished; otherwise a
+	// monitoring-only update could start with a half-written website state (or
+	// vice versa).
+	if _, pending, pendingErr := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory); pendingErr != nil || pending {
+		return config.Secrets{}, errors.New("binding transaction is incomplete")
+	}
+	if _, pending, pendingErr := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory); pendingErr != nil || pending {
+		return config.Secrets{}, errors.New("binding transaction is incomplete")
+	}
+	// Binding removal has its own journal. Unlike a normal pending enrollment,
+	// config/state are about to be deliberately separated, so a replacement
+	// service process must not load either domain's old credentials until the
+	// unbind transaction commits or rolls back.
+	if _, pending, pendingErr := bindstate.ReadWebsiteUnbind(cfg.Runtime.StateDirectory); pendingErr != nil || (pending && !websiteRemovalConfigApplied(cfg)) {
+		return config.Secrets{}, errors.New("website binding removal transaction is incomplete")
+	}
+	if _, pending, pendingErr := bindstate.ReadMonitoringUnbind(cfg.Runtime.StateDirectory); pendingErr != nil || (pending && !monitoringRemovalConfigApplied(cfg)) {
+		return config.Secrets{}, errors.New("monitoring binding removal transaction is incomplete")
+	}
+	// A valid pending request means an enrollment response may have been lost,
+	// but no public/private binding write is allowed before its separate commit
+	// marker exists. Keep the durable requestId for replay while allowing the
+	// unchanged old binding (and the independent trust domain) to keep running.
+	// A malformed pending file remains fail-closed because it is local state
+	// corruption, not an ordinary remote enrollment outcome.
+	if _, pendingErr := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "website"); pendingErr != nil {
+		return config.Secrets{}, errors.New("website binding request state is unsafe")
+	}
+	if _, pendingErr := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "monitoring"); pendingErr != nil {
+		return config.Secrets{}, errors.New("monitoring binding request state is unsafe")
+	}
 	resolved, err := cfg.ResolveSecrets(func(name string) (string, bool) {
 		if isReserved(name) {
 			return "binding-state-placeholder", true
@@ -259,6 +292,24 @@ func containsWebsiteLabel(labels []string) bool {
 		}
 	}
 	return false
+}
+
+// A removal journal continues to block credential loading until the public
+// config itself is durably switched off. Once that exact safe boundary is
+// reached, allowing the Agent to start is preferable to a crash-induced
+// outage: the removed domain has no configured uploader/assignment/control
+// route, even if private-state cleanup is still being retried.
+func websiteRemovalConfigApplied(cfg config.Config) bool {
+	return !cfg.Destinations.WebsiteMetering.Enabled && cfg.Destinations.WebsiteMetering.URL == "" &&
+		!cfg.Destinations.WebsiteTelemetry.Enabled && cfg.Destinations.WebsiteTelemetry.URL == "" &&
+		cfg.Assignments.RefreshURL == "" && !cfg.Control.Enabled && cfg.Control.PollURL == "" && cfg.Control.ResultURL == "" &&
+		cfg.Control.Auth.KeyIDEnv == "" && cfg.Control.Auth.SecretEnv == "" && cfg.Control.Auth.BearerTokenEnv == "" &&
+		cfg.Control.CommandSecretEnv == "" && cfg.Control.CommandSigningKeyIDEnv == "" && cfg.Control.CommandPublicKeyEnv == "" && !cfg.Control.ProductionExecution
+}
+
+func monitoringRemovalConfigApplied(cfg config.Config) bool {
+	return !cfg.Destinations.Monitoring.Enabled && cfg.Destinations.Monitoring.URL == "" &&
+		!cfg.Destinations.MonitoringAudit.Enabled && cfg.Destinations.MonitoringAudit.URL == "" && !cfg.Control.ProductionExecution
 }
 
 func containsLabel(labels []string, wanted string) bool { return slices.Contains(labels, wanted) }

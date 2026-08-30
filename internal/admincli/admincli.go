@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -45,14 +46,39 @@ type cli struct {
 	out, errOut       io.Writer
 	version           string
 	pveEnvironment    func(string) (map[string]string, error)
-	pveProbe          func(context.Context, pve.Config, bool) (rawCredentialProbe, error)
+	pveProbe          func(context.Context, pve.Config, bool, string) (rawCredentialProbe, error)
 	effectiveUID      func() int
 	tlsServerName     func() string
 	templateRun       func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
 	pvesmSetContent   func(context.Context, string, string) error
 	pveVersion        func(context.Context) (string, error)
+	pveBootstrap      func(context.Context) error
+	pveNodeName       func() (string, error)
+	pveTLSPreflight   func(context.Context, string, string) error
+	bindingPVE        func(context.Context, string, config.Config) (config.Config, error)
+	bindingCodePrompt func() (string, error)
+	activatePVE       func(context.Context, config.Config) error
 	activateBinding   func(context.Context, config.Config, bindingActivationExpectation) error
+	// armBinding is a test-only boundary for the systemd start --no-block
+	// activation arm. Production callers leave it nil.
+	armBinding          func(context.Context) error
+	finishBindingCommit func(stateDirectory, domain string) error
+	clearBindingPending func(stateDirectory, domain string) error
+	// restartUnbind is the test boundary for the systemd restart-and-arm job
+	// used by the durable unbind transaction. Production callers leave it nil.
+	restartUnbind     func(context.Context) error
+	writeUnbindConfig func(string, config.Config) (string, error)
+	removeUnbindState func(string, string) error
+	finishUnbind      func(string, string) error
+	// quiesceBinding is a test-only boundary for the systemd stop/verify
+	// operation. Production callers leave it nil and use the fixed systemd
+	// commands in binding_activation.go.
+	quiesceBinding    func(context.Context) error
 	completeUninstall func(context.Context) error
+	// managedWritePolicy is an explicit in-process test/embedding boundary for
+	// production-path ownership validation. Real CLI construction leaves it nil
+	// and therefore always uses the fixed installer paths on Linux root.
+	managedWritePolicy func(string, config.Config) error
 }
 
 func Run(args []string, version string, out, errOut io.Writer) int {
@@ -116,7 +142,7 @@ func (c *cli) run(args []string) int {
 	case "pve":
 		return c.pve(*filename, args[1:])
 	case "uninstall":
-		return c.menuCompleteUninstall(bufio.NewReader(io.LimitReader(c.in, 64<<10)))
+		return c.menuCompleteUninstallAt(bufio.NewReader(io.LimitReader(c.in, 64<<10)), *filename)
 	case "menu":
 		return c.menu(*filename)
 	default:
@@ -133,8 +159,8 @@ func (c *cli) usage() {
   ag-pve [--config FILE] validate
   ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE]
   ag-pve [--config FILE] pve status
-  ag-pve [--config FILE] bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
-  ag-pve [--config FILE] website bind --endpoint HTTPS_URL --pve-version VERSION [--code-file FILE] [--replace]
+  ag-pve [--config FILE] bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
+  ag-pve [--config FILE] website bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
   ag-pve [--config FILE] website status
   ag-pve [--config FILE] website unbind
   ag-pve [--config FILE] monitoring preflight --endpoint HTTPS_URL
@@ -152,7 +178,7 @@ func (c *cli) usage() {
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
   ag-pve uninstall                                   # 完全卸载，必须交互输入 UNINSTALL
 
-bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。monitoring bind 从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
+bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。website bind 与 monitoring bind 都从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载对应新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
 }
 
 func (c *cli) menu(filename string) int {
@@ -188,7 +214,7 @@ func (c *cli) menu(filename string) int {
 				return code
 			}
 		case "4":
-			return c.menuCompleteUninstall(reader)
+			return c.menuCompleteUninstallAt(reader, filename)
 		default:
 			fmt.Fprintln(c.errOut, "菜单选择无效")
 			return 2
@@ -196,7 +222,15 @@ func (c *cli) menu(filename string) int {
 	}
 }
 
+// menuCompleteUninstall retains the historical direct-test entry point. Real
+// command dispatch always supplies the selected configuration path through
+// menuCompleteUninstallAt, so the purge participates in the same state
+// transaction lock as bind, unbind and PVE preparation.
 func (c *cli) menuCompleteUninstall(reader *bufio.Reader) int {
+	return c.menuCompleteUninstallAt(reader, "/etc/ppflight-agent/agent.yaml")
+}
+
+func (c *cli) menuCompleteUninstallAt(reader *bufio.Reader, filename string) int {
 	if !c.isRoot() {
 		fmt.Fprintln(c.errOut, "完全卸载必须由 PVE root 显式执行")
 		return 1
@@ -212,6 +246,12 @@ func (c *cli) menuCompleteUninstall(reader *bufio.Reader) int {
 		fmt.Fprintln(c.out, "已取消，未卸载任何内容。")
 		return 0
 	}
+	_, transaction, err := c.acquireStableMutationTransaction(filename, "")
+	if err != nil {
+		fmt.Fprintln(c.errOut, "完全卸载已拒绝：本机存在并发或未完成的 Agent 管理事务；未删除任何内容")
+		return 1
+	}
+	defer transaction.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	var uninstallErr error
@@ -323,41 +363,12 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring, replac
 		fmt.Fprintln(c.errOut, "绑定 API 地址不能为空")
 		return 2
 	}
-	pveVersion := ""
-	if !monitoring {
-		detected := detectPVEVersion()
-		versionPrompt := "PVE 版本: "
-		if detected != "" {
-			versionPrompt = fmt.Sprintf("PVE 版本 [%s]: ", detected)
-		}
-		pveVersion, err = c.promptLine(reader, versionPrompt)
-		if err != nil {
+	if endpointErr := c.validateBindingEndpoint(endpoint, monitoring); endpointErr != nil {
+		if monitoring {
+			fmt.Fprintln(c.errOut, "监控绑定 API 地址无效；未修改本机 PVE 或读取绑定码")
 			return 2
 		}
-		if pveVersion == "" {
-			pveVersion = detected
-		}
-		if pveVersion == "" {
-			fmt.Fprintln(c.errOut, "无法自动检测 PVE 版本，请手工输入")
-			return 2
-		}
-	} else {
-		versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
-		detected, versionErr := c.localPVEVersion(versionContext)
-		cancelVersion()
-		if versionErr != nil {
-			fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
-			return 1
-		}
-		// Reuse the exact trusted result inside monitoringBind so the menu does
-		// not execute discovery twice or read the one-time code before discovery.
-		originalVersionSource := c.pveVersion
-		c.pveVersion = func(context.Context) (string, error) { return detected, nil }
-		defer func() { c.pveVersion = originalVersionSource }()
-	}
-	code, err := c.promptLine(reader, "输入一次性绑定码（不会写入 argv、配置或日志）: ")
-	if err != nil || code == "" || len(code) > 128 {
-		fmt.Fprintln(c.errOut, "一次性绑定码无效")
+		fmt.Fprintln(c.errOut, "官网绑定 API 地址无效；未修改本机 PVE 或读取绑定码")
 		return 2
 	}
 	args := []string{"bind", "--endpoint", endpoint}
@@ -367,12 +378,13 @@ func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring, replac
 	if monitoring {
 		args = append([]string{"monitoring"}, args...)
 	} else {
-		args = append(args, "--pve-version", pveVersion)
 		args = append([]string{"website"}, args...)
 	}
-	original := c.in
-	c.in = strings.NewReader(code + "\n")
-	defer func() { c.in = original }()
+	originalPrompt := c.bindingCodePrompt
+	c.bindingCodePrompt = func() (string, error) {
+		return c.promptLine(reader, "输入一次性绑定码（不会写入 argv、配置或日志）: ")
+	}
+	defer func() { c.bindingCodePrompt = originalPrompt }()
 	if monitoring {
 		return c.monitoring(filename, args[1:])
 	}
@@ -391,6 +403,28 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 	domain, target, confirmation := "website", "PPFlight 官网", "DELETE WEBSITE"
 	if monitoring {
 		domain, target, confirmation = "monitoring", "监控站", "DELETE MONITORING"
+	}
+	marker, markerFound, markerErr := readUnbindMarker(cfg.Runtime.StateDirectory, domain)
+	if markerErr != nil {
+		fmt.Fprintf(c.errOut, "%s绑定删除事务不安全或损坏；拒绝继续\n", target)
+		return 1
+	}
+	if markerFound {
+		latest, transaction, err := c.acquireStableUnbindTransaction(filename, cfg.Runtime.StateDirectory, domain)
+		if err != nil {
+			fmt.Fprintln(c.errOut, "绑定删除恢复被拒绝：另一个 Agent 管理事务正在执行，或存在未完成的其它事务")
+			return 1
+		}
+		defer transaction.Close()
+		// Re-read under the shared transaction lock. A stale marker must never
+		// choose a backup after another root process has completed/restarted the
+		// transaction between the optimistic first inspection and lock acquire.
+		marker, markerFound, markerErr = readUnbindMarker(latest.Runtime.StateDirectory, domain)
+		if markerErr != nil || !markerFound {
+			fmt.Fprintf(c.errOut, "%s绑定删除事务在获取锁期间发生变化；拒绝继续\n", target)
+			return 1
+		}
+		return c.resumeUnbindTransaction(filename, latest, domain, target, marker)
 	}
 	var websiteState bindstate.State
 	var monitoringState bindstate.MonitoringState
@@ -423,7 +457,34 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 		fmt.Fprintln(c.out, "已取消，绑定保持不变。")
 		return 0
 	}
-
+	latest, transaction, err := c.acquireStableUnbindTransaction(filename, cfg.Runtime.StateDirectory, domain)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "绑定保持不变：另一个 Agent 管理事务正在执行，或存在未完成的官网/监控绑定事务")
+		return 1
+	}
+	defer transaction.Close()
+	if marker, markerFound, markerErr = readUnbindMarker(latest.Runtime.StateDirectory, domain); markerErr != nil {
+		fmt.Fprintf(c.errOut, "%s绑定删除事务不安全或损坏；拒绝继续\n", target)
+		return 1
+	} else if markerFound {
+		return c.resumeUnbindTransaction(filename, latest, domain, target, marker)
+	}
+	if monitoring {
+		current, loadErr := bindstate.LoadMonitoring(latest.Runtime.StateDirectory)
+		if loadErr != nil || current.BindingID != monitoringState.BindingID || current.CredentialEpoch != monitoringState.CredentialEpoch {
+			fmt.Fprintln(c.errOut, "监控绑定在删除确认期间发生变化；未执行删除")
+			return 1
+		}
+		monitoringState = current
+	} else {
+		current, loadErr := bindstate.Load(latest.Runtime.StateDirectory)
+		if loadErr != nil || current.BindingID != websiteState.BindingID || current.CredentialEpoch != websiteState.CredentialEpoch {
+			fmt.Fprintln(c.errOut, "官网绑定在删除确认期间发生变化；未执行删除")
+			return 1
+		}
+		websiteState = current
+	}
+	cfg = latest
 	original := cfg
 	if monitoring {
 		disableMonitoringBindingConfig(&cfg)
@@ -434,50 +495,71 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 		fmt.Fprintln(c.errOut, "删除绑定后的安全配置未通过校验；未修改本机")
 		return 1
 	}
-	configBackup, err := atomicUpdate(filename, cfg)
-	if err != nil {
-		fmt.Fprintln(c.errOut, "删除绑定配置保存失败；绑定保持不变")
-		return 1
-	}
 	if monitoring {
-		stateErr = bindstate.RemoveMonitoring(cfg.Runtime.StateDirectory)
+		marker, err = bindstate.BeginMonitoringUnbind(original.Runtime.StateDirectory, monitoringState)
 	} else {
-		stateErr = bindstate.RemoveWebsite(cfg.Runtime.StateDirectory)
+		marker, err = bindstate.BeginWebsiteUnbind(original.Runtime.StateDirectory, websiteState)
 	}
-	if stateErr != nil {
-		_, rollbackErr := atomicUpdate(filename, original)
-		fmt.Fprintf(c.errOut, "%s绑定凭据删除失败；已恢复配置，原配置备份=%s", target, configBackup)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "%s绑定删除事务无法建立；未停止 Agent 或修改绑定\n", target)
+		return 1
+	}
+	restartContext, cancelRestart := context.WithTimeout(context.Background(), 30*time.Second)
+	restartErr := c.restartAgentForUnbind(restartContext)
+	cancelRestart()
+	if restartErr != nil {
+		rollbackErr := c.rollbackUnbindTransaction(filename, original, domain, marker)
+		fmt.Fprintf(c.errOut, "%s绑定删除尚未开始；已尝试恢复原 Agent 运行状态", target)
 		if rollbackErr != nil {
-			fmt.Fprint(c.errOut, "；配置自动回滚也失败，请立即检查备份")
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请重新执行删除绑定以恢复事务")
 		}
 		fmt.Fprintln(c.errOut)
 		return 1
 	}
-
-	expected := bindingActivationExpectation{Domain: domain, Absent: true}
-	activationContext, cancelActivation := context.WithTimeout(context.Background(), 45*time.Second)
-	activationErr := c.activateAgentBinding(activationContext, cfg, expected)
-	cancelActivation()
-	if activationErr != nil {
-		var restoreStateErr error
-		if monitoring {
-			restoreStateErr = bindstate.SaveMonitoring(original.Runtime.StateDirectory, monitoringState)
-		} else {
-			restoreStateErr = bindstate.Save(original.Runtime.StateDirectory, websiteState)
+	configBackup, err := c.writeUnbindConfigFile(filename, cfg)
+	if err != nil {
+		rollbackErr := c.rollbackUnbindTransaction(filename, original, domain, marker)
+		fmt.Fprintf(c.errOut, "%s绑定配置保存失败；已尝试恢复原 Agent 运行状态", target)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请重新执行删除绑定以恢复事务")
 		}
-		_, restoreConfigErr := atomicUpdate(filename, original)
-		recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 45*time.Second)
-		recoveryErr := c.recoverAgentBinding(recoveryContext, original)
-		cancelRecovery()
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	stateErr = c.removeUnbindTargetState(cfg.Runtime.StateDirectory, domain)
+	if stateErr != nil {
+		rollbackErr := c.rollbackUnbindTransaction(filename, original, domain, marker)
+		fmt.Fprintf(c.errOut, "%s绑定凭据删除失败；已尝试恢复原 Agent 运行状态，原配置备份=%s", target, configBackup)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请重新执行删除绑定以恢复事务")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	if err := validateUnboundRemovalState(filename, cfg, domain); err != nil {
+		rollbackErr := c.rollbackUnbindTransaction(filename, original, domain, marker)
+		fmt.Fprintf(c.errOut, "%s绑定删除后的本地状态未通过校验；已尝试恢复原 Agent 运行状态，原配置备份=%s", target, configBackup)
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请重新执行删除绑定以恢复事务")
+		}
+		fmt.Fprintln(c.errOut)
+		return 1
+	}
+	if err := c.activateUnboundWhileJournalPresent(cfg, domain); err != nil {
+		rollbackErr := c.rollbackUnbindTransaction(filename, original, domain, marker)
 		fmt.Fprintf(c.errOut, "%s_BINDING_REMOVAL_ACTIVATION_FAILED: 新配置未能由服务确认，已尝试恢复旧绑定；原配置备份=%s", strings.ToUpper(domain), configBackup)
-		if restoreStateErr != nil || restoreConfigErr != nil || recoveryErr != nil {
-			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请立即检查 systemctl status ppflight-agent")
+		if rollbackErr != nil {
+			fmt.Fprint(c.errOut, "；自动恢复未完全确认，请重新执行删除绑定以恢复事务")
 		}
 		fmt.Fprintln(c.errOut)
 		return 1
 	}
-	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, domain); err != nil {
-		fmt.Fprintf(c.errOut, "%s绑定已删除并生效，但清理该域 pending 状态失败\n", target)
+	if err := discardUnbindBackup(cfg.Runtime.StateDirectory, domain, marker); err != nil {
+		fmt.Fprintf(c.errOut, "%s绑定已停止上传并自动生效，但私有回滚副本清理失败；请重新执行删除绑定完成恢复事务\n", target)
+		return 1
+	}
+	if err := c.finishUnbindTransaction(cfg.Runtime.StateDirectory, domain); err != nil {
+		fmt.Fprintf(c.errOut, "%s绑定已停止上传并自动生效，但删除事务标记清理失败；请重新执行删除绑定完成恢复事务\n", target)
 		return 1
 	}
 	other := "监控绑定"
@@ -485,6 +567,231 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 		other = "官网绑定"
 	}
 	fmt.Fprintf(c.out, "%s绑定已从本机安全删除并自动生效；%s保持不变；配置备份=%s。\n", target, other, configBackup)
+	return 0
+}
+
+func readUnbindMarker(stateDirectory, domain string) (bindstate.UnbindCommit, bool, error) {
+	if domain == "website" {
+		return bindstate.ReadWebsiteUnbind(stateDirectory)
+	}
+	if domain == "monitoring" {
+		return bindstate.ReadMonitoringUnbind(stateDirectory)
+	}
+	return bindstate.UnbindCommit{}, false, errors.New("invalid binding removal domain")
+}
+
+func (c *cli) writeUnbindConfigFile(filename string, cfg config.Config) (string, error) {
+	if c.writeUnbindConfig != nil {
+		return c.writeUnbindConfig(filename, cfg)
+	}
+	return atomicUpdate(filename, cfg)
+}
+
+func (c *cli) removeUnbindTargetState(stateDirectory, domain string) error {
+	if c.removeUnbindState != nil {
+		return c.removeUnbindState(stateDirectory, domain)
+	}
+	if domain == "website" {
+		return bindstate.RemoveWebsite(stateDirectory)
+	}
+	if domain == "monitoring" {
+		return bindstate.RemoveMonitoring(stateDirectory)
+	}
+	return errors.New("invalid binding removal domain")
+}
+
+func (c *cli) finishUnbindTransaction(stateDirectory, domain string) error {
+	if c.finishUnbind != nil {
+		return c.finishUnbind(stateDirectory, domain)
+	}
+	if domain == "website" {
+		return bindstate.FinishWebsiteUnbind(stateDirectory)
+	}
+	if domain == "monitoring" {
+		return bindstate.FinishMonitoringUnbind(stateDirectory)
+	}
+	return errors.New("invalid binding removal domain")
+}
+
+func discardUnbindBackup(stateDirectory, domain string, marker bindstate.UnbindCommit) error {
+	if domain == "website" {
+		return bindstate.DiscardWebsiteUnbindBackup(stateDirectory, marker)
+	}
+	if domain == "monitoring" {
+		return bindstate.DiscardMonitoringUnbindBackup(stateDirectory, marker)
+	}
+	return errors.New("invalid binding removal domain")
+}
+
+func websiteRemovalConfigApplied(cfg config.Config) bool {
+	return !cfg.Destinations.WebsiteMetering.Enabled && cfg.Destinations.WebsiteMetering.URL == "" &&
+		!cfg.Destinations.WebsiteTelemetry.Enabled && cfg.Destinations.WebsiteTelemetry.URL == "" &&
+		cfg.Assignments.RefreshURL == "" && !cfg.Control.Enabled && cfg.Control.PollURL == "" && cfg.Control.ResultURL == "" &&
+		cfg.Control.Auth.KeyIDEnv == "" && cfg.Control.Auth.SecretEnv == "" && cfg.Control.Auth.BearerTokenEnv == "" &&
+		cfg.Control.CommandSecretEnv == "" && cfg.Control.CommandSigningKeyIDEnv == "" && cfg.Control.CommandPublicKeyEnv == "" && !cfg.Control.ProductionExecution
+}
+
+func monitoringRemovalConfigApplied(cfg config.Config) bool {
+	return !cfg.Destinations.Monitoring.Enabled && cfg.Destinations.Monitoring.URL == "" &&
+		!cfg.Destinations.MonitoringAudit.Enabled && cfg.Destinations.MonitoringAudit.URL == "" && !cfg.Control.ProductionExecution
+}
+
+func removalConfigApplied(cfg config.Config, domain string) bool {
+	if domain == "website" {
+		return websiteRemovalConfigApplied(cfg)
+	}
+	return domain == "monitoring" && monitoringRemovalConfigApplied(cfg)
+}
+
+func validateUnboundRemovalState(filename string, expected config.Config, domain string) error {
+	cfg, err := config.LoadFile(filename)
+	if err != nil || cfg.Runtime.StateDirectory != expected.Runtime.StateDirectory || !removalConfigApplied(cfg, domain) {
+		return errors.New("public binding removal configuration is not exact")
+	}
+	if domain == "website" {
+		if _, err := bindstate.Load(cfg.Runtime.StateDirectory); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return errors.New("website binding state remains after removal")
+	}
+	if domain == "monitoring" {
+		if _, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory); errors.Is(err, os.ErrNotExist) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return errors.New("monitoring binding state remains after removal")
+	}
+	return errors.New("invalid binding removal domain")
+}
+
+func validateBoundUnbindState(filename string, expected config.Config, domain string, marker bindstate.UnbindCommit) error {
+	cfg, err := config.LoadFile(filename)
+	if err != nil || cfg.Runtime.StateDirectory != expected.Runtime.StateDirectory || removalConfigApplied(cfg, domain) {
+		return errors.New("restored binding removal public configuration is not exact")
+	}
+	if domain == "website" {
+		state, loadErr := bindstate.Load(cfg.Runtime.StateDirectory)
+		if loadErr != nil || state.BindingID != marker.BindingID || state.CredentialEpoch != marker.CredentialEpoch {
+			return errors.New("restored website binding removal state is not exact")
+		}
+		return nil
+	}
+	if domain == "monitoring" {
+		state, loadErr := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+		if loadErr != nil || state.BindingID != marker.BindingID || state.CredentialEpoch != marker.CredentialEpoch {
+			return errors.New("restored monitoring binding removal state is not exact")
+		}
+		return nil
+	}
+	return errors.New("invalid binding removal domain")
+}
+
+// activateUnboundWhileJournalPresent intentionally runs before the journal is
+// removed. The overlay permits this only after the exact target config is
+// disabled, so a crash after state removal cannot strand the host offline or
+// revive the removed domain's upload credentials.
+func (c *cli) activateUnboundWhileJournalPresent(cfg config.Config, domain string) error {
+	armContext, cancelArm := context.WithTimeout(context.Background(), 30*time.Second)
+	armErr := c.armAgentBinding(armContext)
+	cancelArm()
+	if armErr != nil {
+		return errors.New("arm unbound ppflight-agent service")
+	}
+	activationContext, cancelActivation := context.WithTimeout(context.Background(), 45*time.Second)
+	err := c.activateAgentBinding(activationContext, cfg, bindingActivationExpectation{Domain: domain, Absent: true})
+	cancelActivation()
+	if err != nil {
+		return errors.New("confirm unbound ppflight-agent service")
+	}
+	return nil
+}
+
+// rollbackUnbindTransaction restores the exact preimage while its journal
+// blocks credential loading, then arms systemd before exposing the old state
+// again. It is used for every ordinary failure after the service restart job
+// was created, so a failed unbind never leaves the host intentionally stopped.
+func (c *cli) rollbackUnbindTransaction(filename string, original config.Config, domain string, marker bindstate.UnbindCommit) error {
+	var restoreErr error
+	if domain == "website" {
+		restoreErr = bindstate.RestoreWebsiteUnbind(original.Runtime.StateDirectory, marker)
+	} else if domain == "monitoring" {
+		restoreErr = bindstate.RestoreMonitoringUnbind(original.Runtime.StateDirectory, marker)
+	} else {
+		return errors.New("invalid binding removal domain")
+	}
+	if restoreErr != nil {
+		return errors.New("restore binding removal private-state preimage")
+	}
+	if _, err := c.writeUnbindConfigFile(filename, original); err != nil {
+		return errors.New("restore binding removal public-config preimage")
+	}
+	if err := validateBoundUnbindState(filename, original, domain, marker); err != nil {
+		return errors.New("restored binding removal preimage is not exact")
+	}
+	armContext, cancelArm := context.WithTimeout(context.Background(), 30*time.Second)
+	armErr := c.armAgentBinding(armContext)
+	cancelArm()
+	// The journal and its private preimage are the only durable proof that a
+	// restart has to keep failing closed until the old binding is safe to load
+	// again.  Do not clear either one before systemd has accepted the arm: a
+	// crash after a failed arm but before recovery would otherwise strand the
+	// host with neither an active service nor a recoverable transaction.
+	if armErr != nil {
+		return errors.New("arm restored ppflight-agent service")
+	}
+	if err := c.finishUnbindTransaction(original.Runtime.StateDirectory, domain); err != nil {
+		return errors.New("finish restored binding removal transaction")
+	}
+	recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 45*time.Second)
+	recoveryErr := c.recoverAgentBinding(recoveryContext, original)
+	cancelRecovery()
+	if recoveryErr != nil {
+		return errors.New("confirm restored ppflight-agent service")
+	}
+	if err := discardUnbindBackup(original.Runtime.StateDirectory, domain, marker); err != nil {
+		return errors.New("discard restored binding rollback backup")
+	}
+	return nil
+}
+
+// resumeUnbindTransaction is entered before any new confirmation or binding
+// state inspection. A journal with the old public config rolls back; a journal
+// with the already-disabled config completes forward. This makes every durable
+// crash shape recoverable without reusing or clearing any enrollment code.
+func (c *cli) resumeUnbindTransaction(filename string, cfg config.Config, domain, target string, marker bindstate.UnbindCommit) int {
+	if !removalConfigApplied(cfg, domain) {
+		if err := c.rollbackUnbindTransaction(filename, cfg, domain, marker); err != nil {
+			fmt.Fprintf(c.errOut, "%s绑定删除事务尚未完成，且恢复旧运行状态未确认；请检查本机并再次执行删除绑定\n", target)
+			return 1
+		}
+		fmt.Fprintf(c.out, "%s绑定删除事务已安全回滚，原 Agent 运行状态已恢复。\n", target)
+		return 0
+	}
+	removeErr := c.removeUnbindTargetState(cfg.Runtime.StateDirectory, domain)
+	if removeErr == nil {
+		removeErr = validateUnboundRemovalState(filename, cfg, domain)
+	}
+	activationErr := c.activateUnboundWhileJournalPresent(cfg, domain)
+	if activationErr != nil {
+		fmt.Fprintf(c.errOut, "%s绑定删除事务仍在恢复；本机 Agent 未确认 active，请再次执行删除绑定\n", target)
+		return 1
+	}
+	if removeErr != nil {
+		fmt.Fprintf(c.errOut, "%s上传已停用且 Agent 已恢复，但私有绑定状态尚未清理；请再次执行删除绑定\n", target)
+		return 1
+	}
+	if err := discardUnbindBackup(cfg.Runtime.StateDirectory, domain, marker); err != nil {
+		fmt.Fprintf(c.errOut, "%s上传已停用且 Agent 已恢复，但回滚副本尚未清理；请再次执行删除绑定\n", target)
+		return 1
+	}
+	if err := c.finishUnbindTransaction(cfg.Runtime.StateDirectory, domain); err != nil {
+		fmt.Fprintf(c.errOut, "%s上传已停用且 Agent 已恢复，但删除事务标记尚未清理；请再次执行删除绑定\n", target)
+		return 1
+	}
+	fmt.Fprintf(c.out, "%s绑定删除事务已恢复并自动生效。\n", target)
 	return 0
 }
 
@@ -515,16 +822,6 @@ func disableDestination(destination *config.DestinationConfig) {
 	destination.Auth = config.AuthConfig{Mode: "hmac-sha256"}
 }
 
-func detectPVEVersion() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	value, err := discoverLocalPVEVersion(ctx)
-	if err != nil {
-		return ""
-	}
-	return value
-}
-
 func safeMenuVersion(value string) bool {
 	if value == "" || len(value) > 128 {
 		return false
@@ -545,6 +842,135 @@ func (c *cli) load(filename string) (config.Config, bool) {
 		return config.Config{}, false
 	}
 	return cfg, true
+}
+
+// acquireStableMutationTransaction takes the one process-wide local Agent
+// mutation lock used by both binding domains.  It is deliberately separate
+// from the bind flow: bind owns its resumable pending/commit markers, while
+// every other operation that can replace agent.yaml, remove binding state, or
+// purge the installation must refuse to run while either marker exists.
+//
+// expectedStateDirectory is captured before command parsing.  Reloading after
+// acquiring the lock prevents a second root command from swapping the config
+// to a different state root between the first read and lock acquisition.
+func (c *cli) acquireStableMutationTransaction(filename, expectedStateDirectory string) (config.Config, *fsutil.Lock, error) {
+	return c.acquireStableMutationTransactionExceptUnbind(filename, expectedStateDirectory, "")
+}
+
+// acquireStableUnbindTransaction is the sole exception to the normal marker
+// guard: an unbind command may resume its own durable removal journal, but it
+// still refuses all enrollment markers, pending requests and the other
+// trust-domain's unbind journal.
+func (c *cli) acquireStableUnbindTransaction(filename, expectedStateDirectory, domain string) (config.Config, *fsutil.Lock, error) {
+	if domain != "website" && domain != "monitoring" {
+		return config.Config{}, nil, errors.New("invalid binding removal domain")
+	}
+	return c.acquireStableMutationTransactionExceptUnbind(filename, expectedStateDirectory, domain)
+}
+
+func (c *cli) acquireStableMutationTransactionExceptUnbind(filename, expectedStateDirectory, allowedUnbindDomain string) (config.Config, *fsutil.Lock, error) {
+	initial, err := config.LoadFile(filename)
+	if err != nil {
+		return config.Config{}, nil, errors.New("load Agent configuration")
+	}
+	if expectedStateDirectory != "" && initial.Runtime.StateDirectory != expectedStateDirectory {
+		return config.Config{}, nil, errors.New("Agent configuration state directory changed before mutation")
+	}
+	if err := c.requireManagedWriteTarget(filename, initial); err != nil {
+		return config.Config{}, nil, err
+	}
+	transaction, err := bindstate.AcquireTransaction(initial.Runtime.StateDirectory)
+	if err != nil {
+		return config.Config{}, nil, errors.New("acquire Agent management transaction")
+	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = transaction.Close()
+		}
+	}()
+	latest, err := config.LoadFile(filename)
+	if err != nil {
+		return config.Config{}, nil, errors.New("reload Agent configuration under transaction lock")
+	}
+	if latest.Runtime.StateDirectory != initial.Runtime.StateDirectory || (expectedStateDirectory != "" && latest.Runtime.StateDirectory != expectedStateDirectory) {
+		return config.Config{}, nil, errors.New("Agent configuration changed during transaction acquisition")
+	}
+	if err := c.requireManagedWriteTarget(filename, latest); err != nil {
+		return config.Config{}, nil, err
+	}
+	if err := requireNoIncompleteBindingTransactionExceptUnbind(latest.Runtime.StateDirectory, allowedUnbindDomain); err != nil {
+		return config.Config{}, nil, err
+	}
+	closeOnError = false
+	return latest, transaction, nil
+}
+
+// requireNoIncompleteBindingTransaction is the shared fail-closed guard for
+// non-bind mutations.  A binding code may have been consumed already, so a
+// pending request or commit marker may not be deleted, bypassed, or raced by
+// set, unbind, PVE preparation, or complete uninstall.
+func requireNoIncompleteBindingTransaction(stateDirectory string) error {
+	return requireNoIncompleteBindingTransactionExceptUnbind(stateDirectory, "")
+}
+
+func requireNoIncompleteBindingTransactionExceptUnbind(stateDirectory, allowedUnbindDomain string) error {
+	if allowedUnbindDomain != "" && allowedUnbindDomain != "website" && allowedUnbindDomain != "monitoring" {
+		return errors.New("invalid allowed binding removal domain")
+	}
+	for _, domain := range []string{"website", "monitoring"} {
+		var commitPending bool
+		var err error
+		if domain == "website" {
+			_, commitPending, err = bindstate.ReadWebsiteCommit(stateDirectory)
+		} else {
+			_, commitPending, err = bindstate.ReadMonitoringCommit(stateDirectory)
+		}
+		if err != nil {
+			return fmt.Errorf("%s binding commit marker is unsafe or unreadable", domain)
+		}
+		if commitPending {
+			return fmt.Errorf("%s binding transaction is incomplete", domain)
+		}
+		requestPending, err := bindstate.PendingRequestExists(stateDirectory, domain)
+		if err != nil {
+			return fmt.Errorf("%s binding pending request is unsafe or unreadable", domain)
+		}
+		if requestPending {
+			return fmt.Errorf("%s binding request outcome is unresolved", domain)
+		}
+		var unbindPending bool
+		if domain == "website" {
+			_, unbindPending, err = bindstate.ReadWebsiteUnbind(stateDirectory)
+		} else {
+			_, unbindPending, err = bindstate.ReadMonitoringUnbind(stateDirectory)
+		}
+		if err != nil {
+			return fmt.Errorf("%s binding removal transaction is unsafe or unreadable", domain)
+		}
+		if unbindPending && domain != allowedUnbindDomain {
+			return fmt.Errorf("%s binding removal transaction is incomplete", domain)
+		}
+	}
+	return nil
+}
+
+// requireNoUnbindTransaction protects either enrollment path from racing a
+// durable binding removal. Bind owns its own pending/commit markers and must
+// be able to resume those markers, but it must never replace credentials while
+// either trust domain has a removal preimage in flight.
+func requireNoUnbindTransaction(stateDirectory string) error {
+	if _, pending, err := bindstate.ReadWebsiteUnbind(stateDirectory); err != nil {
+		return errors.New("website binding removal transaction is unsafe or unreadable")
+	} else if pending {
+		return errors.New("website binding removal transaction is incomplete")
+	}
+	if _, pending, err := bindstate.ReadMonitoringUnbind(stateDirectory); err != nil {
+		return errors.New("monitoring binding removal transaction is unsafe or unreadable")
+	} else if pending {
+		return errors.New("monitoring binding removal transaction is incomplete")
+	}
+	return nil
 }
 
 func (c *cli) validate(filename string) int {
@@ -600,6 +1026,131 @@ func fetchLocalStatus(cfg config.Config) (health.Status, error) {
 	return value, nil
 }
 
+// restoreAfterUnsentBinding is only called when the request never reached the
+// enrollment service (for example, service quiescing failed). The pending
+// marker is removed first so the old runtime overlay can load again before we
+// restart it. Every HTTP response, including all 4xx, is ambiguous and must
+// retain the marker and request ID for an idempotent replay.
+func (c *cli) restoreAfterUnsentBinding(cfg config.Config, domain string) error {
+	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, domain); err != nil {
+		return errors.New("clear rejected binding pending state")
+	}
+	// An unbound/disabled installation has no old Agent process to restore.
+	// Test callers inject activateBinding even for a minimal config, so retain
+	// that controlled recovery boundary for the transaction tests.
+	if c.activateBinding == nil && cfg.PVE.Source != "api" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	if err := c.recoverAgentBinding(ctx, cfg); err != nil {
+		return errors.New("restore previous ppflight-agent service")
+	}
+	return nil
+}
+
+// recoverAfterAmbiguousBinding restarts the last complete local generation
+// without clearing its durable requestId. A non-2xx response can be emitted
+// by a proxy after the service consumed the one-time code; retaining pending
+// makes that request replayable while the old domain and the other domain stay
+// available.
+func (c *cli) recoverAfterAmbiguousBinding(cfg config.Config) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	if err := c.recoverAgentBinding(ctx, cfg); err != nil {
+		return errors.New("restore last complete ppflight-agent service")
+	}
+	return nil
+}
+
+func (c *cli) finalizeWebsiteBindingCommit(filename string, cfg config.Config, expected bindingActivationExpectation) error {
+	if err := validateWebsiteBindingDiskFiles(filename, expected); err != nil {
+		return errors.New("website binding disk validation failed")
+	}
+	marker, found, err := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory)
+	if err != nil || !found || marker.BindingID != expected.BindingID || marker.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("website binding commit marker does not match disk state")
+	}
+	armContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = c.armAgentBinding(armContext)
+	cancel()
+	if err != nil {
+		return errors.New("arm website binding activation before clearing commit marker")
+	}
+	// Leave the marker in place while clearing the retry intent. A crash here
+	// remains fail-closed and can be resumed without another code because the
+	// marker still carries the exact issued identity. The final marker removal
+	// is only reached after systemd has an active/restarting job armed.
+	if err := c.clearBindingPendingState(cfg.Runtime.StateDirectory, "website"); err != nil {
+		return errors.New("clear website binding pending state")
+	}
+	if err := c.finishBindingCommitState(cfg.Runtime.StateDirectory, "website"); err != nil {
+		return errors.New("finish website binding commit marker")
+	}
+	if err := validateWebsiteBindingFiles(filename, expected); err != nil {
+		// The marker is the fail-closed guard after a post-clear runtime
+		// validation failure. It is intentionally restored rather than
+		// resurrecting a server-revoked credential generation.
+		if markerErr := bindstate.BeginWebsiteCommit(cfg.Runtime.StateDirectory, expected.BindingID, expected.CredentialEpoch); markerErr != nil {
+			return errors.New("website runtime validation failed and commit marker could not be restored")
+		}
+		return errors.New("website runtime binding overlay validation failed")
+	}
+	return nil
+}
+
+func (c *cli) finalizeMonitoringBindingCommit(filename string, cfg config.Config, expected bindingActivationExpectation) error {
+	if err := validateMonitoringBindingDiskFiles(filename, expected); err != nil {
+		return errors.New("monitoring binding disk validation failed")
+	}
+	marker, found, err := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory)
+	if err != nil || !found || marker.BindingID != expected.BindingID || marker.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("monitoring binding commit marker does not match disk state")
+	}
+	armContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = c.armAgentBinding(armContext)
+	cancel()
+	if err != nil {
+		return errors.New("arm monitoring binding activation before clearing commit marker")
+	}
+	// Keep the commit marker until the unit has been armed. See the website
+	// equivalent for why pending is cleared first and marker removal is the
+	// final durable activation step.
+	if err := c.clearBindingPendingState(cfg.Runtime.StateDirectory, "monitoring"); err != nil {
+		return errors.New("clear monitoring binding pending state")
+	}
+	if err := c.finishBindingCommitState(cfg.Runtime.StateDirectory, "monitoring"); err != nil {
+		return errors.New("finish monitoring binding commit marker")
+	}
+	if err := validateMonitoringBindingFiles(filename, expected); err != nil {
+		if markerErr := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, expected.BindingID, expected.CredentialEpoch); markerErr != nil {
+			return errors.New("monitoring runtime validation failed and commit marker could not be restored")
+		}
+		return errors.New("monitoring runtime binding overlay validation failed")
+	}
+	return nil
+}
+
+func (c *cli) clearBindingPendingState(stateDirectory, domain string) error {
+	if c.clearBindingPending != nil {
+		return c.clearBindingPending(stateDirectory, domain)
+	}
+	return bindstate.ClearPending(stateDirectory, domain)
+}
+
+func (c *cli) finishBindingCommitState(stateDirectory, domain string) error {
+	if c.finishBindingCommit != nil {
+		return c.finishBindingCommit(stateDirectory, domain)
+	}
+	if domain == "website" {
+		return bindstate.FinishWebsiteCommit(stateDirectory)
+	}
+	if domain == "monitoring" {
+		return bindstate.FinishMonitoringCommit(stateDirectory)
+	}
+	return errors.New("invalid binding commit domain")
+}
+
 func (c *cli) bind(filename string, args []string) int {
 	cfg, ok := c.load(filename)
 	if !ok {
@@ -609,59 +1160,168 @@ func (c *cli) bind(filename string, args []string) int {
 	set.SetOutput(c.errOut)
 	endpoint := set.String("endpoint", "", "HTTPS enrollment endpoint")
 	codeFile := set.String("code-file", "", "private file containing exactly one binding code")
-	pveVersion := set.String("pve-version", "", "PVE version for this node")
 	nodeRef := set.String("node-ref", cfg.Identity.NodeRef, "node claim (defaults to identity.nodeRef)")
-	hostname, hostErr := os.Hostname()
-	if hostErr != nil {
-		fmt.Fprintln(c.errOut, "无法读取本机主机名")
-		return 1
-	}
-	host := set.String("hostname", hostname, "host claim (defaults to local hostname)")
+	host := set.String("hostname", "", "host claim (defaults to local hostname)")
 	capabilities := set.String("capabilities", "pve.discovery.v1,pve.telemetry.v1", "comma-separated supported capabilities; pve.control.v1 requires a verified local control token")
 	replace := set.Bool("replace", false, "replace an existing local binding after obtaining a new code")
-	if err := set.Parse(args); err != nil || set.NArg() != 0 || strings.TrimSpace(*endpoint) == "" || strings.TrimSpace(*pveVersion) == "" {
+	if err := set.Parse(args); err != nil || set.NArg() != 0 || strings.TrimSpace(*endpoint) == "" {
 		if err == nil {
-			fmt.Fprintln(c.errOut, "bind 需要 --endpoint 和 --pve-version，且不接受绑定码位置参数")
+			fmt.Fprintln(c.errOut, "bind 需要 --endpoint，且不接受绑定码或 PVE 版本位置参数")
 		}
 		return 2
 	}
-	explicitCapabilities := false
-	set.Visit(func(item *flag.Flag) {
-		if item.Name == "capabilities" {
-			explicitCapabilities = true
-		}
-	})
-	resolvedCapabilities, capabilityErr := c.websiteCapabilities(cfg, *capabilities, explicitCapabilities)
-	if capabilityErr != nil {
-		fmt.Fprintln(c.errOut, "官网能力声明与本机已验证能力不一致；未发送绑定请求")
+	if err := c.validateBindingEndpoint(strings.TrimSpace(*endpoint), false); err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定 API 地址无效；未修改本机 PVE 或读取绑定码")
 		return 2
 	}
-
+	if err := c.requireManagedWriteTarget(filename, cfg); err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定已拒绝：生产管理配置或状态目录不安全")
+		return 1
+	}
+	transaction, err := bindstate.AcquireTransaction(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "另一个 Agent 管理事务正在执行；未修改本机")
+		return 1
+	}
+	defer transaction.Close()
+	latest, err := config.LoadFile(filename)
+	if err != nil || latest.Runtime.StateDirectory != cfg.Runtime.StateDirectory {
+		fmt.Fprintln(c.errOut, "配置在绑定开始前发生变化；请重试")
+		return 1
+	}
+	cfg = latest
+	if err := requireNoUnbindTransaction(cfg.Runtime.StateDirectory); err != nil {
+		fmt.Fprintln(c.errOut, "绑定删除事务尚未完成；请先恢复或完成现有绑定删除")
+		return 1
+	}
+	websiteCommit, resumingWebsiteCommit, err := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定事务标记不安全或损坏；拒绝继续")
+		return 1
+	}
+	if _, pending, markerErr := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory); markerErr != nil || pending {
+		fmt.Fprintln(c.errOut, "监控绑定事务尚未完成；请先用原监控绑定码恢复监控绑定")
+		return 1
+	}
+	websitePending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "website")
+	if err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定 pending 状态不安全或损坏；拒绝继续")
+		return 1
+	}
+	if pending, pendingErr := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "monitoring"); pendingErr != nil || pending {
+		fmt.Fprintln(c.errOut, "监控绑定请求结果尚未确定；请先用原监控绑定码恢复")
+		return 1
+	}
+	// A marker without a request intent can only be safely completed when all
+	// local files already exactly match it. New transactions always create the
+	// pending request first, so an incomplete legacy marker is never allowed to
+	// make a fresh request with a different requestId.
+	if resumingWebsiteCommit && !websitePending {
+		expected := bindingActivationExpectation{Domain: "website", BindingID: websiteCommit.BindingID, CredentialEpoch: websiteCommit.CredentialEpoch}
+		if err := c.finalizeWebsiteBindingCommit(filename, cfg, expected); err != nil {
+			fmt.Fprintln(c.errOut, "官网本地提交事务不完整且没有可恢复请求意图；Agent 保持停止，请检查本地绑定文件")
+			return 1
+		}
+		activationContext, cancelActivation := context.WithTimeout(context.Background(), 15*time.Minute)
+		activationErr := c.activateAgentBinding(activationContext, cfg, expected)
+		cancelActivation()
+		if activationErr != nil {
+			fmt.Fprintln(c.errOut, "WEBSITE_BIND_ACTIVATION_FAILED: 官网绑定已安全保存，但尚未确认首次真实上传；请检查本机 Agent")
+			return 1
+		}
+		fmt.Fprintf(c.out, "官网绑定恢复并已自动生效：%s active，bindingId=%s，credentialEpoch=%d。\n", agentServiceUnit, expected.BindingID, expected.CredentialEpoch)
+		return 0
+	}
+	resumingWebsite := websitePending
+	var requestTemplate bindstate.BindingRequestTemplate
+	if resumingWebsite {
+		_, requestTemplate, err = bindstate.LoadPendingTemplate(cfg.Runtime.StateDirectory, "website")
+		if err != nil {
+			fmt.Fprintln(c.errOut, "官网绑定 pending 请求模板不安全或不受支持；拒绝猜测重试")
+			return 1
+		}
+		canonicalEndpoint, canonicalErr := bindstate.CanonicalBindingEndpoint(strings.TrimSpace(*endpoint))
+		if canonicalErr != nil || canonicalEndpoint != requestTemplate.Endpoint {
+			fmt.Fprintln(c.errOut, "官网绑定重试必须使用原来的 API 地址；未读取绑定码或发送网络请求")
+			return 1
+		}
+	}
 	// A malformed or unsafe existing state is never overwritten, even with
 	// --replace.  This makes accidental replacement and symlink attacks fail
 	// closed before the one-time code is sent to the service.
 	var previous bindstate.State
-	if existing, err := bindstate.Load(cfg.Runtime.StateDirectory); err == nil {
+	if existing, err := bindstate.Load(cfg.Runtime.StateDirectory); err == nil && !resumingWebsite {
 		if !*replace {
 			fmt.Fprintln(c.errOut, "本机已经绑定；如需轮换请使用新的绑定码和 --replace")
 			return 1
 		}
 		previous = existing
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !resumingWebsite && !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(c.errOut, "现有绑定状态不安全或无效，未执行替换")
 		return 1
 	}
-
+	if !resumingWebsite {
+		readinessContext, cancelReadiness := context.WithTimeout(context.Background(), 15*time.Minute)
+		prepared, readinessErr := c.ensureBindingPVEReady(readinessContext, filename, cfg)
+		cancelReadiness()
+		if readinessErr != nil {
+			fmt.Fprintln(c.errOut, "PVE_REAL_READINESS_FAILED: 未能启用并验证本机真实 PVE 读取；未读取或发送一次性绑定码")
+			return 1
+		}
+		cfg = prepared
+		if strings.TrimSpace(*host) == "" {
+			localHostname, hostErr := os.Hostname()
+			if hostErr != nil {
+				fmt.Fprintln(c.errOut, "无法读取本机主机名")
+				return 1
+			}
+			*host = localHostname
+		}
+		explicitCapabilities := false
+		set.Visit(func(item *flag.Flag) {
+			if item.Name == "capabilities" {
+				explicitCapabilities = true
+			}
+		})
+		resolvedCapabilities, capabilityErr := c.websiteCapabilities(cfg, *capabilities, explicitCapabilities)
+		if capabilityErr != nil {
+			fmt.Fprintln(c.errOut, "官网能力声明与本机已验证能力不一致；未发送绑定请求")
+			return 2
+		}
+		versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
+		detectedPVEVersion, versionErr := c.localPVEVersion(versionContext)
+		cancelVersion()
+		if versionErr != nil {
+			fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
+			return 1
+		}
+		deviceID, deviceErr := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+		if deviceErr != nil {
+			fmt.Fprintln(c.errOut, "设备状态目录不安全或不可写")
+			return 1
+		}
+		requestTemplate, err = bindstate.NewBindingRequestTemplate("website", strings.TrimSpace(*endpoint), deviceID, c.version, strings.TrimSpace(*host), enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: detectedPVEVersion}, resolvedCapabilities)
+		if err != nil {
+			fmt.Fprintln(c.errOut, "无法创建安全的官网绑定请求模板")
+			return 1
+		}
+	} else if cfg.PVE.Source != "api" || (cfg.Mode != "production" && c.bindingPVE == nil) {
+		fmt.Fprintln(c.errOut, "官网绑定恢复事务缺少已验证的真实 PVE 配置；拒绝继续")
+		return 1
+	}
+	// This is still before the durable request and service-stop boundary. Keep
+	// the established PVE readiness-before-code UX so an operator is never
+	// prompted for a one-time code on an unready host.
 	code, err := c.readBindingCode(*codeFile)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "读取绑定码失败")
 		return 1
 	}
-	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
-	if err != nil {
-		fmt.Fprintln(c.errOut, "设备状态目录不安全或不可写")
-		return 1
+	if err := enrollment.ValidateBindingCode(code); err != nil {
+		fmt.Fprintln(c.errOut, "绑定码格式无效；未写入绑定事务、未停止 Agent 或发送网络请求")
+		return 2
 	}
+
 	if cfg.Mode != "test" {
 		parsed, parseErr := url.Parse(strings.TrimSpace(*endpoint))
 		if parseErr != nil || !strings.EqualFold(parsed.Scheme, "https") {
@@ -669,69 +1329,121 @@ func (c *cli) bind(filename string, args []string) int {
 			return 2
 		}
 	}
-	client, err := enrollment.NewClient(enrollment.Config{Endpoint: strings.TrimSpace(*endpoint)})
+	client, err := enrollment.NewClient(enrollment.Config{Endpoint: requestTemplate.Endpoint})
 	if err != nil {
 		fmt.Fprintln(c.errOut, "绑定地址必须是 HTTPS（测试时仅允许 loopback HTTP）")
 		return 2
 	}
-	request := enrollment.Request{
-		SchemaVersion: enrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID,
-		AgentVersion: c.version, Hostname: strings.TrimSpace(*host),
-		NodeClaim:    enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: strings.TrimSpace(*pveVersion)},
-		Capabilities: resolvedCapabilities,
-	}
-	fingerprint, err := bindstate.RequestFingerprint(request)
+	request := enrollment.Request{SchemaVersion: enrollment.SchemaVersion, BindingCode: code, DeviceID: requestTemplate.DeviceID, AgentVersion: requestTemplate.AgentVersion, Hostname: requestTemplate.Hostname, NodeClaim: requestTemplate.NodeClaim, Capabilities: append([]string(nil), requestTemplate.Capabilities...)}
+	fingerprint, err := bindstate.BindingRequestFingerprint("website", requestTemplate.Endpoint, request)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法生成绑定请求指纹")
 		return 1
 	}
-	requestID, bindingLock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "website", fingerprint)
+	requestID, storedTemplate, err := bindstate.PreparePendingLocked(cfg.Runtime.StateDirectory, "website", fingerprint, requestTemplate)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法持久化绑定请求；未发送绑定码")
 		return 1
 	}
-	defer bindingLock.Close()
+	if !reflect.DeepEqual(storedTemplate, requestTemplate) {
+		fmt.Fprintln(c.errOut, "官网绑定请求模板在重试期间发生变化；拒绝发送网络请求")
+		return 1
+	}
 	request.RequestID = requestID
+	quiesceContext, cancelQuiesce := context.WithTimeout(context.Background(), 30*time.Second)
+	quiesceErr := c.quiesceAgentForBinding(quiesceContext)
+	cancelQuiesce()
+	if quiesceErr != nil {
+		if recoveryErr := c.restoreAfterUnsentBinding(cfg, "website"); recoveryErr != nil {
+			fmt.Fprintln(c.errOut, "官网绑定未发送：无法确认 Agent 已停止，且旧服务恢复未确认；请检查本机 Agent")
+			return 1
+		}
+		fmt.Fprintln(c.errOut, "官网绑定未发送：无法确认 Agent 已停止；已恢复原服务")
+		return 1
+	}
 	response, err := client.Bind(context.Background(), request)
 	if err != nil {
-		// enrollment errors intentionally redact both the submitted code and all
-		// returned credential values.  Do not decorate this error with request data.
-		fmt.Fprintln(c.errOut, "绑定请求失败")
+		// Every HTTP response is deliberately treated as ambiguous: an upstream
+		// proxy can replace a successful enrollment response with any 4xx body.
+		// Retain pending for idempotent replay, but restore the last complete
+		// runtime so a bad/expired code cannot take either domain offline.
+		if resumingWebsiteCommit {
+			fmt.Fprintln(c.errOut, "官网绑定请求结果未确定；本地新凭据提交尚未完成，Agent 保持受保护状态，请使用同一绑定码重试")
+			return 1
+		}
+		if recoveryErr := c.recoverAfterAmbiguousBinding(cfg); recoveryErr != nil {
+			fmt.Fprintln(c.errOut, "官网绑定请求结果未确定；已保留同一绑定码请求，但旧 Agent 运行状态恢复未确认")
+			return 1
+		}
+		fmt.Fprintln(c.errOut, "官网绑定请求结果未确定；已保留同一绑定码请求并恢复现有 Agent 运行状态，请使用同一绑定码重试")
+		return 1
+	}
+	state := bindstate.FromResponse(requestTemplate.Endpoint, requestTemplate.DeviceID, response)
+	if resumingWebsiteCommit && (websiteCommit.BindingID != response.BindingID || websiteCommit.CredentialEpoch != response.CredentialEpoch) {
+		fmt.Fprintln(c.errOut, "官网绑定恢复响应与持久事务标记不一致；拒绝覆盖")
+		return 1
+	}
+	if !resumingWebsiteCommit {
+		if err := bindstate.BeginWebsiteCommit(cfg.Runtime.StateDirectory, state.BindingID, state.CredentialEpoch); err != nil {
+			fmt.Fprintln(c.errOut, "官网绑定已由服务端签发，但无法建立本地提交标记；Agent 保持停止，请使用同一绑定码重试")
+			return 1
+		}
+	}
+	if !resumingWebsite && previous.CredentialEpoch != 0 && response.CredentialEpoch <= previous.CredentialEpoch {
+		fmt.Fprintln(c.errOut, "官网绑定响应的凭据版本未前进；事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	if _, err := inventory.Parse(response.AssignmentDocument, response.ClusterRef); err != nil {
-		fmt.Fprintln(c.errOut, "绑定响应中的初始分配无效")
-		return 1
-	}
-	if previous.CredentialEpoch != 0 && response.CredentialEpoch <= previous.CredentialEpoch {
-		fmt.Fprintln(c.errOut, "绑定响应的凭据版本未前进，未替换本地绑定")
-		return 1
-	}
-	if err := bindstate.WriteAssignment(cfg.Assignments.File, response.AssignmentDocument); err != nil {
-		fmt.Fprintln(c.errOut, "初始分配保存失败")
+		fmt.Fprintln(c.errOut, "官网绑定响应中的初始分配无效；事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	applyBinding(&cfg, response)
-	if code := c.save(filename, cfg); code != 0 {
-		return code
+	if err := cfg.Validate(); err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定生成的配置未通过严格校验；事务保持冻结，请使用同一绑定码重试")
+		return 1
 	}
-	// Persist credentials last. If an earlier public-file write fails, the
-	// pending request ID remains and the same code can recover the service's
-	// original response without issuing a second credential set.
-	state := bindstate.FromResponse(strings.TrimSpace(*endpoint), deviceID, response)
+	configBackup := ""
+	if err := bindstate.WriteAssignment(cfg.Assignments.File, response.AssignmentDocument); err != nil {
+		fmt.Fprintln(c.errOut, "官网初始分配保存失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
+		return 1
+	}
+	configBackup, err = atomicUpdate(filename, cfg)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "官网绑定配置保存失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
+		return 1
+	}
+	expected := bindingActivationExpectation{Domain: "website", BindingID: state.BindingID, CredentialEpoch: state.CredentialEpoch}
+	// Commit private credentials last. Until this write completes, an old state
+	// cannot be paired with the new public config and assignment as a valid
+	// runtime overlay; the durable commit marker makes every crash window fail
+	// closed on service startup.
 	if err := bindstate.Save(cfg.Runtime.StateDirectory, state); err != nil {
-		fmt.Fprintln(c.errOut, "绑定密钥状态保存失败；可用同一绑定码安全重试")
+		fmt.Fprintf(c.errOut, "官网绑定密钥保存失败；不会恢复可能已撤销的旧凭据，事务保持冻结，请使用同一绑定码重试；配置备份=%s\n", configBackup)
 		return 1
 	}
-	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, "website"); err != nil {
-		fmt.Fprintln(c.errOut, "绑定已完成，但清理本地 pending 标记失败")
+	if err := c.finalizeWebsiteBindingCommit(filename, cfg, expected); err != nil {
+		fmt.Fprintf(c.errOut, "官网绑定本地提交回验失败；不会恢复可能已撤销的旧凭据，Agent 保持停止，请使用同一绑定码重试；配置备份=%s\n", configBackup)
 		return 1
 	}
-	fmt.Fprintln(c.out, "绑定完成；凭据已保存在私有本地状态中，未输出。")
+	activationContext, cancelActivation := context.WithTimeout(context.Background(), 15*time.Minute)
+	activationErr := c.activateAgentBinding(activationContext, cfg, expected)
+	cancelActivation()
+	if activationErr != nil {
+		fmt.Fprintf(c.errOut, "WEBSITE_BIND_ACTIVATION_FAILED: 新官网绑定已安全保存但尚未确认首次真实上传；不会恢复服务端已经撤销的旧凭据，请检查 systemctl status ppflight-agent 后重试启动；配置备份=%s\n", configBackup)
+		return 1
+	}
+	fmt.Fprintf(c.out, "官网绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；官网采集、上传与任务轮询已启动；配置备份=%s。监控绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, configBackup)
 	return 0
 }
 
 func (c *cli) readBindingCode(filename string) (string, error) {
+	if filename == "" && c.bindingCodePrompt != nil {
+		code, err := c.bindingCodePrompt()
+		if err != nil || code == "" || len(code) > 128 || strings.ContainsAny(code, "\r\n\x00") {
+			return "", errors.New("binding code input is invalid")
+		}
+		return code, nil
+	}
 	var reader io.Reader = c.in
 	if filename != "" {
 		info, err := os.Lstat(filename)
@@ -783,9 +1495,10 @@ func applyBinding(cfg *config.Config, response enrollment.Response) {
 	cfg.Destinations.WebsiteTelemetry.Enabled, cfg.Destinations.WebsiteTelemetry.URL = true, response.Endpoints.Telemetry
 	cfg.Destinations.WebsiteTelemetry.Auth = config.AuthConfig{Mode: "hmac-sha256", KeyIDEnv: bindingoverlay.WebsiteTelemetryKeyIDEnv, SecretEnv: bindingoverlay.WebsiteTelemetrySecretEnv}
 	cfg.Assignments.RefreshURL = response.Endpoints.Assignments
-	// Do not alter Control.Enabled or ProductionExecution.  The endpoint values
-	// are recorded for an already-enabled control plane, while the distinct
-	// command/receipt credentials and Ed25519 key stay in bindstate.
+	// Website enrollment activates the signed command polling channel. Real PVE
+	// mutation remains independently gated by ProductionExecution, assignments,
+	// monitoring audit availability, scoped PVE ACLs, and per-command policy.
+	cfg.Control.Enabled = true
 	cfg.Control.PollURL, cfg.Control.ResultURL = response.Endpoints.Commands, response.Endpoints.Receipts
 	cfg.Control.Auth = config.AuthConfig{Mode: "hmac-sha256", KeyIDEnv: bindingoverlay.WebsiteCommandKeyIDEnv, SecretEnv: bindingoverlay.WebsiteCommandSecretEnv}
 	cfg.Control.CommandSecretEnv = ""
@@ -825,8 +1538,9 @@ func (c *cli) monitoring(filename string, args []string) int {
 		if !parsed {
 			return 2
 		}
+		original := cfg
 		cfg.Destinations.Monitoring = value
-		return c.save(filename, cfg)
+		return c.saveMutation(filename, original, cfg)
 	case "query", "modify":
 		return c.reserved("monitoring", args[0])
 	default:
@@ -1004,18 +1718,12 @@ func (c *cli) monitoringStatus(cfg config.Config) int {
 }
 
 func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) int {
-	originalConfig := cfg
 	set := flag.NewFlagSet("monitoring bind", flag.ContinueOnError)
 	set.SetOutput(c.errOut)
 	endpoint := set.String("endpoint", "", "HTTPS monitoring enrollment endpoint")
 	codeFile := set.String("code-file", "", "private file containing exactly one binding code")
 	nodeRef := set.String("node-ref", cfg.Identity.NodeRef, "node claim")
-	hostname, err := os.Hostname()
-	if err != nil {
-		fmt.Fprintln(c.errOut, "无法读取本机主机名")
-		return 1
-	}
-	host := set.String("hostname", hostname, "host claim")
+	host := set.String("hostname", "", "host claim")
 	capabilities := set.String("capabilities", "telemetry-v1,audit-v1,delivery-state-v1,ipv4-only,mutual-whitelist-v1", "comma-separated monitoring capabilities")
 	replace := set.Bool("replace", false, "rotate an existing monitoring binding")
 	if err := set.Parse(args); err != nil || set.NArg() != 0 || strings.TrimSpace(*endpoint) == "" {
@@ -1024,33 +1732,138 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 		}
 		return 2
 	}
+	if err := c.validateBindingEndpoint(strings.TrimSpace(*endpoint), true); err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定 API 地址无效；未修改本机 PVE 或读取绑定码")
+		return 2
+	}
+	if err := c.requireManagedWriteTarget(filename, cfg); err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定已拒绝：生产管理配置或状态目录不安全")
+		return 1
+	}
+	transaction, err := bindstate.AcquireTransaction(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "另一个 Agent 管理事务正在执行；未修改本机")
+		return 1
+	}
+	defer transaction.Close()
+	latest, err := config.LoadFile(filename)
+	if err != nil || latest.Runtime.StateDirectory != cfg.Runtime.StateDirectory {
+		fmt.Fprintln(c.errOut, "配置在绑定开始前发生变化；请重试")
+		return 1
+	}
+	cfg = latest
+	if err := requireNoUnbindTransaction(cfg.Runtime.StateDirectory); err != nil {
+		fmt.Fprintln(c.errOut, "绑定删除事务尚未完成；请先恢复或完成现有绑定删除")
+		return 1
+	}
+	monitoringCommit, resumingMonitoringCommit, err := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定事务标记不安全或损坏；拒绝继续")
+		return 1
+	}
+	if _, pending, markerErr := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory); markerErr != nil || pending {
+		fmt.Fprintln(c.errOut, "官网绑定事务尚未完成；请先用原官网绑定码恢复官网绑定")
+		return 1
+	}
+	monitoringPending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "monitoring")
+	if err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定 pending 状态不安全或损坏；拒绝继续")
+		return 1
+	}
+	if pending, pendingErr := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "website"); pendingErr != nil || pending {
+		fmt.Fprintln(c.errOut, "官网绑定请求结果尚未确定；请先用原官网绑定码恢复")
+		return 1
+	}
+	if resumingMonitoringCommit && !monitoringPending {
+		expected := bindingActivationExpectation{Domain: "monitoring", BindingID: monitoringCommit.BindingID, CredentialEpoch: monitoringCommit.CredentialEpoch}
+		if err := c.finalizeMonitoringBindingCommit(filename, cfg, expected); err != nil {
+			fmt.Fprintln(c.errOut, "监控本地提交事务不完整且没有可恢复请求意图；Agent 保持停止，请检查本地绑定文件")
+			return 1
+		}
+		activationContext, cancelActivation := context.WithTimeout(context.Background(), 15*time.Minute)
+		activationErr := c.activateAgentBinding(activationContext, cfg, expected)
+		cancelActivation()
+		if activationErr != nil {
+			fmt.Fprintln(c.errOut, "MONITORING_BIND_ACTIVATION_FAILED: 监控绑定已安全保存，但尚未确认首次真实上传；请检查本机 Agent")
+			return 1
+		}
+		fmt.Fprintf(c.out, "监控绑定恢复并已自动生效：%s active，bindingId=%s，credentialEpoch=%d。\n", agentServiceUnit, expected.BindingID, expected.CredentialEpoch)
+		return 0
+	}
+	resumingMonitoring := monitoringPending
+	var requestTemplate bindstate.BindingRequestTemplate
+	if resumingMonitoring {
+		_, requestTemplate, err = bindstate.LoadPendingTemplate(cfg.Runtime.StateDirectory, "monitoring")
+		if err != nil {
+			fmt.Fprintln(c.errOut, "监控绑定 pending 请求模板不安全或不受支持；拒绝猜测重试")
+			return 1
+		}
+		canonicalEndpoint, canonicalErr := bindstate.CanonicalBindingEndpoint(strings.TrimSpace(*endpoint))
+		if canonicalErr != nil || canonicalEndpoint != requestTemplate.Endpoint {
+			fmt.Fprintln(c.errOut, "监控绑定重试必须使用原来的 API 地址；未读取绑定码或发送网络请求")
+			return 1
+		}
+	}
 	var previous bindstate.MonitoringState
-	if existing, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory); err == nil {
+	if existing, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory); err == nil && !resumingMonitoring {
 		if !*replace {
 			fmt.Fprintln(c.errOut, "监控信任域已经绑定；轮换需使用新绑定码和 --replace")
 			return 1
 		}
 		previous = existing
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !resumingMonitoring && !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintln(c.errOut, "现有监控绑定状态不安全或无效，未执行替换")
 		return 1
 	}
-	versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
-	detectedPVEVersion, err := c.localPVEVersion(versionContext)
-	cancelVersion()
-	if err != nil {
-		fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
+	if !resumingMonitoring {
+		readinessContext, cancelReadiness := context.WithTimeout(context.Background(), 15*time.Minute)
+		prepared, readinessErr := c.ensureBindingPVEReady(readinessContext, filename, cfg)
+		cancelReadiness()
+		if readinessErr != nil {
+			fmt.Fprintln(c.errOut, "PVE_REAL_READINESS_FAILED: 未能启用并验证本机真实 PVE 读取；未读取或发送监控一次性绑定码")
+			return 1
+		}
+		cfg = prepared
+		if strings.TrimSpace(*host) == "" {
+			localHostname, hostErr := os.Hostname()
+			if hostErr != nil {
+				fmt.Fprintln(c.errOut, "无法读取本机主机名")
+				return 1
+			}
+			*host = localHostname
+		}
+		versionContext, cancelVersion := context.WithTimeout(context.Background(), 3*time.Second)
+		detectedPVEVersion, versionErr := c.localPVEVersion(versionContext)
+		cancelVersion()
+		if versionErr != nil {
+			fmt.Fprintln(c.errOut, "PVE_VERSION_DISCOVERY_FAILED: 无法从本机可信 PVE 环境读取有效版本；请确认 /usr/bin/pveversion 可执行且当前主机为 PVE 8/9")
+			return 1
+		}
+		deviceID, deviceErr := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+		if deviceErr != nil {
+			fmt.Fprintln(c.errOut, "设备状态目录不安全或不可写")
+			return 1
+		}
+		requestTemplate, err = bindstate.NewBindingRequestTemplate("monitoring", strings.TrimSpace(*endpoint), deviceID, c.version, strings.TrimSpace(*host), enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: detectedPVEVersion}, splitCapabilities(*capabilities))
+		if err != nil {
+			fmt.Fprintln(c.errOut, "无法创建安全的监控绑定请求模板")
+			return 1
+		}
+	} else if cfg.PVE.Source != "api" || (cfg.Mode != "production" && c.bindingPVE == nil) {
+		fmt.Fprintln(c.errOut, "监控绑定恢复事务缺少已验证的真实 PVE 配置；拒绝继续")
 		return 1
 	}
+	// Validate monitoring syntax after readiness but before durable pending,
+	// service stop, or network activity. The independent monitoring grammar is
+	// deliberately not delegated to the website domain.
 	code, err := c.readBindingCode(*codeFile)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "读取监控绑定码失败")
 		return 1
 	}
-	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
-	if err != nil {
-		fmt.Fprintln(c.errOut, "设备状态目录不安全或不可写")
-		return 1
+	if err := monitorenrollment.ValidateBindingCode(code); err != nil {
+		fmt.Fprintln(c.errOut, "监控绑定码格式无效；未写入绑定事务、未停止 Agent 或发送网络请求")
+		return 2
 	}
 	if cfg.Mode != "test" {
 		parsed, parseErr := url.Parse(strings.TrimSpace(*endpoint))
@@ -1059,31 +1872,67 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 			return 2
 		}
 	}
-	client, err := monitorenrollment.NewClient(monitorenrollment.Config{Endpoint: strings.TrimSpace(*endpoint)})
+	client, err := monitorenrollment.NewClient(monitorenrollment.Config{Endpoint: requestTemplate.Endpoint})
 	if err != nil {
 		fmt.Fprintln(c.errOut, "监控绑定地址必须是 HTTPS（测试时仅允许 loopback HTTP）")
 		return 2
 	}
-	request := monitorenrollment.Request{SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID, AgentVersion: c.version, Hostname: strings.TrimSpace(*host), NodeClaim: enrollment.NodeClaim{NodeRef: strings.TrimSpace(*nodeRef), PVEVersion: detectedPVEVersion}, Capabilities: splitCapabilities(*capabilities)}
-	fingerprint, err := bindstate.RequestFingerprint(request)
+	request := monitorenrollment.Request{SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: code, DeviceID: requestTemplate.DeviceID, AgentVersion: requestTemplate.AgentVersion, Hostname: requestTemplate.Hostname, NodeClaim: requestTemplate.NodeClaim, Capabilities: append([]string(nil), requestTemplate.Capabilities...)}
+	fingerprint, err := bindstate.BindingRequestFingerprint("monitoring", requestTemplate.Endpoint, request)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法生成监控绑定请求指纹")
 		return 1
 	}
-	requestID, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "monitoring", fingerprint)
+	requestID, storedTemplate, err := bindstate.PreparePendingLocked(cfg.Runtime.StateDirectory, "monitoring", fingerprint, requestTemplate)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法持久化监控绑定请求；未发送绑定码")
 		return 1
 	}
-	defer lock.Close()
-	request.RequestID = requestID
-	response, err := client.Bind(context.Background(), request)
-	if err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定请求失败")
+	if !reflect.DeepEqual(storedTemplate, requestTemplate) {
+		fmt.Fprintln(c.errOut, "监控绑定请求模板在重试期间发生变化；拒绝发送网络请求")
 		return 1
 	}
-	if previous.CredentialEpoch != 0 && response.CredentialEpoch <= previous.CredentialEpoch {
-		fmt.Fprintln(c.errOut, "监控绑定凭据版本未前进")
+	request.RequestID = requestID
+	quiesceContext, cancelQuiesce := context.WithTimeout(context.Background(), 30*time.Second)
+	quiesceErr := c.quiesceAgentForBinding(quiesceContext)
+	cancelQuiesce()
+	if quiesceErr != nil {
+		if recoveryErr := c.restoreAfterUnsentBinding(cfg, "monitoring"); recoveryErr != nil {
+			fmt.Fprintln(c.errOut, "监控绑定未发送：无法确认 Agent 已停止，且旧服务恢复未确认；请检查本机 Agent")
+			return 1
+		}
+		fmt.Fprintln(c.errOut, "监控绑定未发送：无法确认 Agent 已停止；已恢复原服务")
+		return 1
+	}
+	response, err := client.Bind(context.Background(), request)
+	if err != nil {
+		// Every monitoring HTTP response is ambiguous for a consumed one-time
+		// code. Retain the exact durable request ID, then restore the last
+		// complete runtime so the independent website domain stays available.
+		if resumingMonitoringCommit {
+			fmt.Fprintln(c.errOut, "监控绑定请求结果未确定；本地新凭据提交尚未完成，Agent 保持受保护状态，请使用同一绑定码重试")
+			return 1
+		}
+		if recoveryErr := c.recoverAfterAmbiguousBinding(cfg); recoveryErr != nil {
+			fmt.Fprintln(c.errOut, "监控绑定请求结果未确定；已保留同一绑定码请求，但旧 Agent 运行状态恢复未确认")
+			return 1
+		}
+		fmt.Fprintln(c.errOut, "监控绑定请求结果未确定；已保留同一绑定码请求并恢复现有 Agent 运行状态，请使用同一绑定码重试")
+		return 1
+	}
+	state := bindstate.MonitoringFromResponse(requestTemplate.Endpoint, requestTemplate.DeviceID, response)
+	if resumingMonitoringCommit && (monitoringCommit.BindingID != response.BindingID || monitoringCommit.CredentialEpoch != response.CredentialEpoch) {
+		fmt.Fprintln(c.errOut, "监控绑定恢复响应与持久事务标记不一致；拒绝覆盖")
+		return 1
+	}
+	if !resumingMonitoringCommit {
+		if err := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, state.BindingID, state.CredentialEpoch); err != nil {
+			fmt.Fprintln(c.errOut, "监控绑定已由服务端签发，但无法建立本地提交标记；Agent 保持停止，请使用同一绑定码重试")
+			return 1
+		}
+	}
+	if !resumingMonitoring && previous.CredentialEpoch != 0 && response.CredentialEpoch <= previous.CredentialEpoch {
+		fmt.Fprintln(c.errOut, "监控绑定响应的凭据版本未前进；事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	// Only the monitoring destination is changed. Website identity, endpoint and
@@ -1097,7 +1946,7 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	cfg.Destinations.Monitoring.MaxUncompressedBytes = response.Telemetry.MaxUncompressedBytes
 	auditEndpoint, err := monitorenrollment.AuditEndpoint(response.IngestEndpoint)
 	if err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定响应缺少受支持的审计路由")
+		fmt.Fprintln(c.errOut, "监控绑定响应缺少受支持的审计路由；事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	cfg.Destinations.MonitoringAudit.Enabled = true
@@ -1107,80 +1956,61 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	cfg.Destinations.MonitoringAudit.Compression = response.Telemetry.Compression
 	cfg.Destinations.MonitoringAudit.MaxCompressedBytes = monitorenrollment.AuditMaxCompressedBytes
 	cfg.Destinations.MonitoringAudit.MaxUncompressedBytes = monitorenrollment.AuditMaxUncompressedBytes
-	state := bindstate.MonitoringFromResponse(strings.TrimSpace(*endpoint), deviceID, response)
 	if err := cfg.Validate(); err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定生成的配置未通过严格校验；未写入本机")
-		return 1
-	}
-	stateBackup, err := bindstate.BackupMonitoring(cfg.Runtime.StateDirectory)
-	if err != nil {
-		fmt.Fprintln(c.errOut, "无法创建监控绑定回滚备份；未修改本机")
+		fmt.Fprintln(c.errOut, "监控绑定生成的配置未通过严格校验；事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	configBackup, err := atomicUpdate(filename, cfg)
 	if err != nil {
-		_ = bindstate.DiscardMonitoringBackup(cfg.Runtime.StateDirectory, stateBackup)
-		fmt.Fprintln(c.errOut, "监控绑定配置保存失败；未修改监控密钥状态")
+		fmt.Fprintln(c.errOut, "监控绑定配置保存失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
 	if err := bindstate.SaveMonitoring(cfg.Runtime.StateDirectory, state); err != nil {
-		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
-		fmt.Fprintf(c.errOut, "监控绑定密钥保存失败；已回滚配置，可用同一绑定码安全重试；配置备份=%s", configBackup)
-		if rollbackErr != nil {
-			fmt.Fprint(c.errOut, "；自动回滚也发生错误，请立即检查备份")
-		}
-		fmt.Fprintln(c.errOut)
+		fmt.Fprintf(c.errOut, "监控绑定密钥保存失败；不会恢复可能已撤销的旧凭据，事务保持冻结，请使用同一绑定码重试；配置备份=%s\n", configBackup)
 		return 1
 	}
 	expected := bindingActivationExpectation{Domain: "monitoring", BindingID: state.BindingID, CredentialEpoch: state.CredentialEpoch}
-	if err := validateMonitoringBindingFiles(filename, expected); err != nil {
-		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
-		fmt.Fprintf(c.errOut, "监控绑定写入后严格回验失败；已回滚，配置备份=%s", configBackup)
-		if rollbackErr != nil {
-			fmt.Fprint(c.errOut, "；自动回滚也发生错误，请立即检查备份")
-		}
-		fmt.Fprintln(c.errOut)
+	if err := c.finalizeMonitoringBindingCommit(filename, cfg, expected); err != nil {
+		fmt.Fprintf(c.errOut, "监控绑定本地提交回验失败；不会恢复可能已撤销的旧凭据，Agent 保持停止，请使用同一绑定码重试；配置备份=%s\n", configBackup)
 		return 1
 	}
-	activationContext, cancelActivation := context.WithTimeout(context.Background(), 45*time.Second)
+	activationContext, cancelActivation := context.WithTimeout(context.Background(), 15*time.Minute)
 	activationErr := c.activateAgentBinding(activationContext, cfg, expected)
 	cancelActivation()
 	if activationErr != nil {
-		rollbackErr := rollbackMonitoringBinding(filename, originalConfig, cfg.Runtime.StateDirectory, stateBackup)
-		recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 45*time.Second)
-		recoveryErr := c.recoverAgentBinding(recoveryContext, originalConfig)
-		cancelRecovery()
-		fmt.Fprintf(c.errOut, "MONITORING_BIND_ACTIVATION_FAILED: 新监控绑定未能由服务加载，已恢复旧配置；配置备份=%s", configBackup)
-		if stateBackup != "" {
-			fmt.Fprintf(c.errOut, "；监控状态备份=%s", stateBackup)
-		}
-		if rollbackErr != nil || recoveryErr != nil {
-			fmt.Fprint(c.errOut, "；回滚服务未完全确认，请立即检查 systemctl status ppflight-agent")
-		}
-		fmt.Fprintln(c.errOut)
+		fmt.Fprintf(c.errOut, "MONITORING_BIND_ACTIVATION_FAILED: 新监控绑定已安全保存但尚未确认首次真实上传；不会恢复服务端已经撤销的旧凭据，请检查 systemctl status ppflight-agent 后重试启动；配置备份=%s\n", configBackup)
 		return 1
-	}
-	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, "monitoring"); err != nil {
-		fmt.Fprintln(c.errOut, "监控绑定已自动生效，但清理 pending 标记失败")
-		return 1
-	}
-	if err := bindstate.DiscardMonitoringBackup(cfg.Runtime.StateDirectory, stateBackup); err != nil {
-		fmt.Fprintln(c.errOut, "警告：监控绑定已生效，但旧状态备份未能自动清理")
 	}
 	fmt.Fprintf(c.out, "监控绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；配置备份=%s。官网绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, configBackup)
 	return 0
 }
 
+func (c *cli) validateBindingEndpoint(endpoint string, monitoring bool) error {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed == nil || (c.bindingPVE == nil && !strings.EqualFold(parsed.Scheme, "https")) {
+		return errors.New("binding endpoint is not production-safe")
+	}
+	if monitoring {
+		_, err = monitorenrollment.NewClient(monitorenrollment.Config{Endpoint: endpoint})
+	} else {
+		_, err = enrollment.NewClient(enrollment.Config{Endpoint: endpoint})
+	}
+	return err
+}
+
 func validateMonitoringBindingFiles(filename string, expected bindingActivationExpectation) error {
+	if err := validateMonitoringBindingDiskFiles(filename, expected); err != nil {
+		return err
+	}
 	cfg, err := config.LoadFile(filename)
 	if err != nil {
 		return err
 	}
-	state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
-	if err != nil || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
-		return errors.New("monitoring binding state does not match the issued response")
+	lookup, err := config.ResolvePVEEnvironmentLookup(cfg, os.LookupEnv)
+	if err != nil {
+		return err
 	}
-	secrets, err := bindingoverlay.Resolve(cfg, os.LookupEnv)
+	secrets, err := bindingoverlay.Resolve(cfg, lookup)
 	if err != nil {
 		return err
 	}
@@ -1190,10 +2020,138 @@ func validateMonitoringBindingFiles(filename string, expected bindingActivationE
 	return nil
 }
 
+func validateMonitoringBindingDiskFiles(filename string, expected bindingActivationExpectation) error {
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		return err
+	}
+	state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	if err != nil || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("monitoring binding state does not match the issued response")
+	}
+	auditEndpoint, err := monitorenrollment.AuditEndpoint(state.IngestEndpoint)
+	if err != nil || !cfg.Destinations.Monitoring.Enabled || cfg.Destinations.Monitoring.URL != state.IngestEndpoint ||
+		cfg.Destinations.Monitoring.Auth.Mode != "hmac-sha256" || cfg.Destinations.Monitoring.Auth.KeyIDEnv != bindingoverlay.MonitoringKeyIDEnv || cfg.Destinations.Monitoring.Auth.SecretEnv != bindingoverlay.MonitoringSecretEnv ||
+		cfg.Destinations.Monitoring.PayloadFormat != state.Telemetry.PayloadFormat || cfg.Destinations.Monitoring.Compression != state.Telemetry.Compression ||
+		cfg.Destinations.Monitoring.MaxCompressedBytes != state.Telemetry.MaxCompressedBytes || cfg.Destinations.Monitoring.MaxUncompressedBytes != state.Telemetry.MaxUncompressedBytes ||
+		!cfg.Destinations.MonitoringAudit.Enabled || cfg.Destinations.MonitoringAudit.URL != auditEndpoint || cfg.Destinations.MonitoringAudit.Auth.Mode != "hmac-sha256" ||
+		cfg.Destinations.MonitoringAudit.Auth.KeyIDEnv != bindingoverlay.MonitoringKeyIDEnv || cfg.Destinations.MonitoringAudit.Auth.SecretEnv != bindingoverlay.MonitoringSecretEnv ||
+		cfg.Destinations.MonitoringAudit.PayloadFormat != "audit-v1" || cfg.Destinations.MonitoringAudit.Compression != state.Telemetry.Compression ||
+		cfg.Destinations.MonitoringAudit.MaxCompressedBytes != monitorenrollment.AuditMaxCompressedBytes || cfg.Destinations.MonitoringAudit.MaxUncompressedBytes != monitorenrollment.AuditMaxUncompressedBytes {
+		return errors.New("monitoring public configuration does not match the issued response")
+	}
+	return nil
+}
+
 func rollbackMonitoringBinding(filename string, original config.Config, stateDirectory, stateBackup string) error {
 	stateErr := bindstate.RestoreMonitoring(stateDirectory, stateBackup)
 	_, configErr := atomicUpdate(filename, original)
 	return errors.Join(stateErr, configErr)
+}
+
+type websiteAssignmentSnapshot struct {
+	Exists bool
+	Raw    json.RawMessage
+}
+
+func captureWebsiteAssignment(filename string) (websiteAssignmentSnapshot, error) {
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(filepath.Dir(filename), filepath.Base(filename))
+	if errors.Is(err, os.ErrNotExist) {
+		return websiteAssignmentSnapshot{}, nil
+	}
+	if err != nil {
+		return websiteAssignmentSnapshot{}, err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, enrollment.MaxResponseBytes+1))
+	if err != nil || len(raw) > enrollment.MaxResponseBytes || !json.Valid(raw) {
+		return websiteAssignmentSnapshot{}, errors.New("website assignment is invalid")
+	}
+	return websiteAssignmentSnapshot{Exists: true, Raw: append(json.RawMessage(nil), raw...)}, nil
+}
+
+func restoreWebsiteAssignment(filename string, snapshot websiteAssignmentSnapshot) error {
+	if snapshot.Exists {
+		return bindstate.WriteAssignment(filename, snapshot.Raw)
+	}
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(filepath.Dir(filename), filepath.Base(filename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(filename); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(filepath.Dir(filename))
+}
+
+func validateWebsiteBindingFiles(filename string, expected bindingActivationExpectation) error {
+	if err := validateWebsiteBindingDiskFiles(filename, expected); err != nil {
+		return err
+	}
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		return err
+	}
+	lookup, err := config.ResolvePVEEnvironmentLookup(cfg, os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	secrets, err := bindingoverlay.Resolve(cfg, lookup)
+	if err != nil {
+		return err
+	}
+	if secrets.WebsiteBindingID != expected.BindingID || secrets.WebsiteCredentialEpoch != expected.CredentialEpoch ||
+		secrets.WebsiteMetering.CredentialEpoch != expected.CredentialEpoch || secrets.WebsiteTelemetry.CredentialEpoch != expected.CredentialEpoch ||
+		secrets.Assignments.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("website runtime binding overlay does not match the issued response")
+	}
+	if cfg.Control.Enabled && (secrets.ControlAPI.CredentialEpoch != expected.CredentialEpoch || secrets.ControlReceipts.CredentialEpoch != expected.CredentialEpoch) {
+		return errors.New("website control binding overlay does not match the issued response")
+	}
+	return nil
+}
+
+func validateWebsiteBindingDiskFiles(filename string, expected bindingActivationExpectation) error {
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		return err
+	}
+	state, err := bindstate.Load(cfg.Runtime.StateDirectory)
+	if err != nil || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
+		return errors.New("website binding state does not match the issued response")
+	}
+	assignment, err := captureWebsiteAssignment(cfg.Assignments.File)
+	assignmentCanonical, assignmentCanonicalErr := compactJSON(assignment.Raw)
+	stateCanonical, stateCanonicalErr := compactJSON(state.AssignmentDocument)
+	if err != nil || !assignment.Exists || assignmentCanonicalErr != nil || stateCanonicalErr != nil || !bytes.Equal(assignmentCanonical, stateCanonical) {
+		return errors.New("website assignment does not match the issued response")
+	}
+	return nil
+}
+
+func compactJSON(raw []byte) ([]byte, error) {
+	var result bytes.Buffer
+	if err := json.Compact(&result, raw); err != nil {
+		return nil, err
+	}
+	return result.Bytes(), nil
+}
+
+func rollbackWebsiteBinding(filename string, original config.Config, stateDirectory, stateBackup, assignmentFile string, assignment websiteAssignmentSnapshot) error {
+	stateErr := bindstate.RestoreWebsite(stateDirectory, stateBackup)
+	_, configErr := atomicUpdate(filename, original)
+	assignmentErr := restoreWebsiteAssignment(assignmentFile, assignment)
+	rollbackErr := errors.Join(stateErr, configErr, assignmentErr)
+	if rollbackErr == nil {
+		rollbackErr = bindstate.FinishWebsiteCommit(stateDirectory)
+	}
+	return rollbackErr
 }
 
 func (c *cli) website(filename string, args []string) int {
@@ -1233,6 +2191,7 @@ func (c *cli) website(filename string, args []string) int {
 			fmt.Fprintf(c.errOut, "website %s 需要 set\n", args[0])
 			return 2
 		}
+		original := cfg
 		current := cfg.Destinations.WebsiteMetering
 		if args[0] == "telemetry" {
 			current = cfg.Destinations.WebsiteTelemetry
@@ -1246,7 +2205,7 @@ func (c *cli) website(filename string, args []string) int {
 		} else {
 			cfg.Destinations.WebsiteTelemetry = value
 		}
-		return c.save(filename, cfg)
+		return c.saveMutation(filename, original, cfg)
 	case "control":
 		if len(args) < 2 || args[1] != "set" {
 			fmt.Fprintln(c.errOut, "website control 需要 set")
@@ -2044,6 +3003,7 @@ func destinationFlags(name string, current config.DestinationConfig, args []stri
 }
 
 func (c *cli) controlSet(filename string, cfg config.Config, args []string) int {
+	original := cfg
 	set := flag.NewFlagSet("website control set", flag.ContinueOnError)
 	set.SetOutput(c.errOut)
 	enabled := set.Bool("enabled", cfg.Control.Enabled, "enable control channel")
@@ -2061,15 +3021,29 @@ func (c *cli) controlSet(filename string, cfg config.Config, args []string) int 
 	cfg.Control.Enabled, cfg.Control.PollURL, cfg.Control.ResultURL, cfg.Control.ProductionExecution = *enabled, strings.TrimSpace(*poll), strings.TrimSpace(*result), *production
 	cfg.Control.Auth = config.AuthConfig{Mode: *authMode, KeyIDEnv: *keyEnv, SecretEnv: *secretEnv, BearerTokenEnv: *bearerEnv}
 	cfg.Control.CommandSecretEnv = *commandEnv
-	return c.save(filename, cfg)
+	return c.saveMutation(filename, original, cfg)
 }
 
-func (c *cli) save(filename string, cfg config.Config) int {
-	if err := cfg.Validate(); err != nil {
+// saveMutation applies a public configuration change only while holding the
+// same bind-state transaction lock as enrollment.  The before snapshot makes
+// a stale interactive `set` fail instead of overwriting a concurrent bind,
+// unbind, PVE prepare, or another set operation.
+func (c *cli) saveMutation(filename string, before, after config.Config) int {
+	latest, transaction, err := c.acquireStableMutationTransaction(filename, before.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "配置未更新：另一个 Agent 管理事务正在执行，或存在未完成绑定事务")
+		return 1
+	}
+	defer transaction.Close()
+	if !reflect.DeepEqual(latest, before) {
+		fmt.Fprintln(c.errOut, "配置未更新：配置在操作期间发生变化，请重新读取后重试")
+		return 1
+	}
+	if err := after.Validate(); err != nil {
 		fmt.Fprintf(c.errOut, "修改无效，未写入: %v\n", err)
 		return 1
 	}
-	backup, err := atomicUpdate(filename, cfg)
+	backup, err := atomicUpdate(filename, after)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "配置保存失败: %v\n", err)
 		return 1

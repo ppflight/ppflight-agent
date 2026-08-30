@@ -191,11 +191,14 @@ chmod 0644 "$STAGING_DIR/$ROOT_NAME/VERSION"
 chmod 0644 "$STAGING_DIR/$ROOT_NAME/$APP.sha256"
 
 # GNU tar's sorting, numeric ownership and epoch mtime make output independent
-# of the checkout user, timestamp, and filesystem enumeration order.  gzip -n
-# removes the gzip header timestamp and original filename.
+# of the checkout user, timestamp, and filesystem enumeration order.  POSIX
+# tar otherwise writes the live atime and ctime into PAX headers, so remove
+# those fields explicitly.  gzip -n removes the gzip header timestamp and
+# original filename.
 (
   cd -- "$STAGING_DIR"
-  LC_ALL=C tar --format=posix --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cf - "$ROOT_NAME"
+  LC_ALL=C tar --format=posix --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+    --pax-option=delete=atime,delete=ctime -cf - "$ROOT_NAME"
 ) | gzip -n > "$tmp_archive"
 mv -f -- "$tmp_archive" "$archive_path"
 

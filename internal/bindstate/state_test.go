@@ -99,6 +99,51 @@ func TestRemoveWebsiteKeepsStableDeviceAndMonitoringPaths(t *testing.T) {
 	}
 }
 
+func TestWebsiteBackupRestoreAndFirstBindingRollback(t *testing.T) {
+	directory := t.TempDir()
+	original := testState("https://service.example")
+	if err := Save(directory, original); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := BackupWebsite(directory)
+	if err != nil || backup == "" {
+		t.Fatalf("backup=%q err=%v", backup, err)
+	}
+	replacement := testState("https://replacement.example")
+	replacement.BindingID = "123e4567-e89b-42d3-a456-426614174002"
+	replacement.CredentialEpoch = 2
+	if err := Save(directory, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreWebsite(directory, backup); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := Load(directory)
+	if err != nil || restored.BindingID != original.BindingID || restored.CredentialEpoch != original.CredentialEpoch {
+		t.Fatalf("restored=%#v err=%v", restored, err)
+	}
+	if err := DiscardWebsiteBackup(directory, backup); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("website backup remains: %v", err)
+	}
+
+	firstDirectory := t.TempDir()
+	if firstBackup, err := BackupWebsite(firstDirectory); err != nil || firstBackup != "" {
+		t.Fatalf("first backup=%q err=%v", firstBackup, err)
+	}
+	if err := Save(firstDirectory, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoreWebsite(firstDirectory, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(firstDirectory); !os.IsNotExist(err) {
+		t.Fatalf("first binding state remains after rollback: %v", err)
+	}
+}
+
 func TestLoadMigratesRetiredStoredServerIPv4Allowlist(t *testing.T) {
 	directory := t.TempDir()
 	state := testState("https://service.example")
@@ -205,5 +250,83 @@ func TestWriteAssignmentRejectsSymlink(t *testing.T) {
 	}
 	if err := WriteAssignment(filename, json.RawMessage(`{"schemaVersion":1}`)); err == nil {
 		t.Fatal("accepted assignment symlink")
+	}
+}
+
+func TestBindingCommitMarkersAreExclusiveStrictAndIndependent(t *testing.T) {
+	directory := t.TempDir()
+	websiteID := "550e8400-e29b-41d4-a716-446655440001"
+	monitoringID := "550e8400-e29b-41d4-a716-446655440002"
+	if err := BeginWebsiteCommit(directory, websiteID, 9); err != nil {
+		t.Fatal(err)
+	}
+	if err := BeginMonitoringCommit(directory, monitoringID, 10); err != nil {
+		t.Fatal(err)
+	}
+	website, found, err := ReadWebsiteCommit(directory)
+	if err != nil || !found || website.BindingID != websiteID || website.CredentialEpoch != 9 {
+		t.Fatalf("website marker=%#v found=%v err=%v", website, found, err)
+	}
+	monitoring, found, err := ReadMonitoringCommit(directory)
+	if err != nil || !found || monitoring.BindingID != monitoringID || monitoring.CredentialEpoch != 10 {
+		t.Fatalf("monitoring marker=%#v found=%v err=%v", monitoring, found, err)
+	}
+	if err := BeginWebsiteCommit(directory, monitoringID, 10); err == nil {
+		t.Fatal("website marker was overwritten")
+	}
+	if err := BeginMonitoringCommit(directory, websiteID, 9); err == nil {
+		t.Fatal("monitoring marker was overwritten")
+	}
+	// The rejected begin must leave the original strict identity unchanged.
+	website, found, err = ReadWebsiteCommit(directory)
+	if err != nil || !found || website.BindingID != websiteID || website.CredentialEpoch != 9 {
+		t.Fatalf("website marker changed after rejected begin: %#v found=%v err=%v", website, found, err)
+	}
+	monitoring, found, err = ReadMonitoringCommit(directory)
+	if err != nil || !found || monitoring.BindingID != monitoringID || monitoring.CredentialEpoch != 10 {
+		t.Fatalf("monitoring marker changed after rejected begin: %#v found=%v err=%v", monitoring, found, err)
+	}
+	if pending, err := WebsiteCommitPending(directory); err != nil || !pending {
+		t.Fatalf("website pending=%v err=%v", pending, err)
+	}
+	if pending, err := MonitoringCommitPending(directory); err != nil || !pending {
+		t.Fatalf("monitoring pending=%v err=%v", pending, err)
+	}
+	if err := FinishWebsiteCommit(directory); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := WebsiteCommitPending(directory); err != nil || pending {
+		t.Fatalf("website pending after finish=%v err=%v", pending, err)
+	}
+	if pending, err := MonitoringCommitPending(directory); err != nil || !pending {
+		t.Fatalf("monitoring marker was not independent: pending=%v err=%v", pending, err)
+	}
+	if err := FinishMonitoringCommit(directory); err != nil {
+		t.Fatal(err)
+	}
+	if pending, err := MonitoringCommitPending(directory); err != nil || pending {
+		t.Fatalf("monitoring pending after finish=%v err=%v", pending, err)
+	}
+	if err := BeginWebsiteCommit(directory, "not-a-uuid", 9); err == nil {
+		t.Fatal("invalid commit marker identity was accepted")
+	}
+
+	// A malformed marker cannot be read or cleared. Leaving it behind is
+	// intentional: startup must fail closed until an explicit recovery path
+	// verifies the interrupted transaction.
+	if err := os.WriteFile(monitoringCommitPath(directory), []byte(`{"schemaVersion":1,"bindingId":"550e8400-e29b-41d4-a716-446655440002","credentialEpoch":10,"unexpected":true}`), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReadMonitoringCommit(directory); err == nil {
+		t.Fatal("unknown marker field was accepted")
+	}
+	if err := BeginMonitoringCommit(directory, monitoringID, 11); err == nil {
+		t.Fatal("malformed existing marker was overwritten")
+	}
+	if err := FinishMonitoringCommit(directory); err == nil {
+		t.Fatal("malformed marker was cleared")
+	}
+	if _, err := os.Stat(monitoringCommitPath(directory)); err != nil {
+		t.Fatalf("malformed marker was removed: %v", err)
 	}
 }

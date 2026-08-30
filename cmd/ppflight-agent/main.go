@@ -58,6 +58,13 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
 		return 2
 	}
+	// Test mode exists only as an in-process unit-test fixture.  Every built
+	// executable (release and unversioned developer builds alike) must refuse it
+	// before config checks, queue creation, or any outbound delivery can occur.
+	if cfg.Mode != "production" {
+		fmt.Fprintln(os.Stderr, "configuration invalid: executable requires production mode")
+		return 2
+	}
 	lookup, err := config.ResolvePVEEnvironmentLookup(cfg, os.LookupEnv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "configuration secret error: %v\n", err)
@@ -69,8 +76,18 @@ func run() int {
 		return 2
 	}
 	if checkConfig {
+		if cfg.PVE.Source == "disabled" {
+			fmt.Println("configuration staged: PVE collection is disabled until AG local PVE preparation completes")
+			return 0
+		}
 		fmt.Printf("configuration valid: mode=%s controlEnabled=%t productionExecution=%t\n", cfg.Mode, cfg.Control.Enabled, cfg.Control.ProductionExecution)
 		return 0
+	}
+	if cfg.PVE.Source == "disabled" {
+		fmt.Fprintln(os.Stderr, "PVE collection is disabled; run AG and complete local PVE preparation before starting ppflight-agent")
+		// systemd uses this stable code as RestartPreventExitStatus so an
+		// intentionally unconfigured fresh install cannot become a restart loop.
+		return 78
 	}
 	level := new(slog.LevelVar)
 	switch cfg.Runtime.LogLevel {
@@ -85,9 +102,6 @@ func run() int {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
-	if cfg.Mode == "test" {
-		logger.Warn("agent is in test mode; metering is shadow and control execution is dry-run")
-	}
 	if cfg.Control.ProductionExecution {
 		logger.Warn("PVE production control execution is enabled", "allowedActions", cfg.Control.AllowedActions)
 	}
@@ -119,6 +133,14 @@ func runUpgradeHelper(args []string) int {
 	cfg, err := config.LoadFile(*configFile)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade helper configuration invalid")
+		return 1
+	}
+	if err := admincli.ValidateInstalledWriteTarget(*configFile, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "upgrade helper configuration or state path is unsafe")
+		return 1
+	}
+	if cfg.Mode != "production" || cfg.PVE.Source != "api" {
+		fmt.Fprintln(os.Stderr, "upgrade helper requires production local PVE configuration")
 		return 1
 	}
 	lookup, err := config.ResolvePVEEnvironmentLookup(cfg, os.LookupEnv)

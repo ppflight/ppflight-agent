@@ -64,11 +64,14 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          repository_version="$(tr -d '[:space:]' < VERSION)"
+          [[ "$repository_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || { echo 'VERSION must be X.Y.Z or X.Y.Z-rc.N' >&2; exit 1; }
           if [[ "${{ github.ref_type }}" == tag ]]; then
             version="${GITHUB_REF_NAME#v}"
             [[ "v${version}" == "$GITHUB_REF_NAME" ]] || { echo 'tag must start with v' >&2; exit 1; }
+            [[ "$version" == "$repository_version" ]] || { echo "tag version $version must exactly match VERSION $repository_version" >&2; exit 1; }
           elif [[ "${{ github.event_name }}" == push ]]; then
-            version="$(tr -d '[:space:]' < VERSION)"
+            version="$repository_version"
           else
             version="${{ inputs.version }}"
           fi

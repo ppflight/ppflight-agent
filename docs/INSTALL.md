@@ -2,7 +2,7 @@
 
 本页用于 Proxmox VE 8.x/9.x 节点。目标架构只允许 Agent 在本机连接 `https://127.0.0.1:8006`；官网不保存 PVE 地址或 Token，也不需要访问 PVE 8006。
 
-当前 Agent 侧已经包含安装、PVE Token bootstrap 和官网绑定原语，但它们是需要管理员逐步执行/验收的独立步骤，不是一键 onboarding。官网 Agent upgrade route feature flag 必须默认关闭。旧客户升级继续走既有路由，直到按资产完成对账和 cutover；不要把安装成功等同于官网控制/升级已上线。
+当前 Agent 已把安装后的真实 PVE readiness 与官网/监控绑定向导串联：绑定码读取前自动完成受控 Token bootstrap、TLS/API/权限探测、production/api 切换、服务重启和真实采集回验。安装后默认处于 disabled，服务不会启动或外发；旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会迁移为 `production+disabled`，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把安装成功等同于生产写控制已开放。
 
 ## 1. 前置条件
 
@@ -21,7 +21,7 @@
 
 ## 2. 安装已校验发布物
 
-不要执行未经校验的远程脚本，更不要使用 `curl | bash`。发布 workflow 在 `vX.Y.Z` tag push 时分别构建 Linux `amd64` 和 `arm64` 静态二进制，运行 Go/打包测试，再用 `scripts/package-release.sh` 生成 GitHub Release 的两个离线 tarball 与合并 `SHA256SUMS`；手动 dispatch 只保留 Actions artifact，绝不发布 release。包脚本不下载代码或依赖，只接受已构建的常规二进制，显式白名单 installer/config/systemd/docs/verifier/cloud-init bundle，二次验证 bundle，拒绝 symlink、secret/queue material 和覆盖既有输出；固定 archive 排序、owner、mtime 与 gzip metadata，使相同输入可复现。该流程提供 SHA-256 完整性校验，不替代组织另行要求的发布签名/来源审批。
+不要执行未经校验的远程脚本，更不要使用 `curl | bash`。发布 workflow 只在 tag `vX.Y.Z` 与仓库根 `VERSION` 完全一致时发布：它分别构建 Linux `amd64` 和 `arm64` 静态二进制，运行 Go/打包测试，再用 `scripts/package-release.sh` 生成 GitHub Release 的两个离线 tarball 与合并 `SHA256SUMS`；不一致的 tag 会失败。手动 dispatch 只保留 Actions artifact，绝不发布 release。包脚本不下载代码或依赖，只接受已构建的常规二进制，显式白名单 installer/config/systemd/docs/verifier/cloud-init bundle，二次验证 bundle，拒绝 symlink、secret/queue material 和覆盖既有输出；固定 archive 排序、owner、mtime 与 gzip metadata，使相同输入可复现。该流程提供 SHA-256 完整性校验，不替代组织另行要求的发布签名/来源审批。
 
 从 Release 或受控 artifact 下载完整包与同一版本 `SHA256SUMS` 后，先离线校验再解压；该包必须同时含 installer/config/systemd/verifier 和 `bundles/ppflight-cloudinit`：
 
@@ -102,7 +102,7 @@ ACL-only 禁止 `/` 和 `--control-global-acl`，也不能与 `--write-env` 混�
 
 ## 4. 本地配置
 
-安装器默认复制的示例是 `mode=test`、`pve.source=simulator`；即使启动也只产生模拟采集。Token bootstrap 不编辑配置，`AG` 菜单和两种 bind 也不会切换 PVE source/mode。官网 bind 不改变 service；监控 bind 仅在独立状态写入并严格回验后自动重启 unit、确认新 binding 已加载，失败则回滚。创建 Token 后，管理员可先以 root 执行下面的本地准备命令；它只允许在 `mode=test`、`control.productionExecution=false` 下运行，安全读取 root-only 环境文件，先验证只读 Token 的 PVE version/有效权限，再原子写入 API 采集所需字段。它不创建或扩大 control ACL、不打开 production、也不启动服务：
+安装器默认复制的示例是 `mode=production`、`pve.source=disabled`。disabled 只能供 `AG`/`ag-pve pve prepare` 读取，Agent service 会拒绝启动，因此不能采集或上传。旧版 `mode=test` 或 `pve.source=simulator` 会在升级时自动迁移为 `production+disabled`；发布版运行态只接受 `mode=production`、`pve.source=api`。官网与监控 bind 会在读取一次性码之前自动执行下面的真实 PVE 准备。CLI 先验证固定 service-readable CA/SNI、本机节点和 `/usr/bin/pveversion`，通过后才在 root-only 环境缺失时调用安装包内固定 Token helper；随后校验 API `/version`、`/` 上完整 read audit 权限，并实际读取本机 node status/storage。成功后原子写入 `mode=production`、`pve.source=api` 与明确 `localNode`，受控启动/重启并等待真实采集及已绑定 telemetry 上传成功。仅在**尚未向任一绑定服务端发请求**的本机 prepare 阶段，真实采集尚未成功时才恢复 disabled 配置；真实采集已成功但远端暂不可达时保持 production/api：
 
 ```bash
 sudo ag-pve pve prepare \
@@ -110,11 +110,13 @@ sudo ag-pve pve prepare \
   --ca-file /etc/ppflight-agent/pve-root-ca.pem
 ```
 
-`--tls-server-name` 必须是本机 PVE API 证书覆盖的严格 DNS 名称（不能是 IP、`localhost`、IPv6 或通配符）。它只用于 TLS SNI/证书校验；TCP 仍严格连接 `https://127.0.0.1:8006` 且 dial 为 `tcp4`。若不传且现有配置为空，命令只会尝试本机 FQDN；无法得到受信 DNS 名就拒绝写配置。管理员也可以显式编辑 `/etc/ppflight-agent/agent.yaml`，但必须得到同一结果：将 `pve.source` 改为 `api` 并保持 `mode=test`、`control.productionExecution=false` 做首轮真实只读验证：
+`--tls-server-name` 必须是本机 PVE API 证书覆盖的严格 DNS 名称（不能是 IP、`localhost`、IPv6 或通配符）。它只用于 TLS SNI/证书校验；TCP 始终严格连接 `https://127.0.0.1:8006` 且 dial 为 `tcp4`。不传时会尝试本机 FQDN，无法通过真实 TLS/API 回验就拒绝写配置。`mode=production` 在这里表示数据来自真实 PVE，不会自动允许写操作；`control.productionExecution` 保持 false，control Token 默认也没有 ACL。
+
+绑定事务与上述本机 prepare 不同：首次网络请求前，CLI 持久化仅含 `requestId` 和请求指纹的 pending 状态，并以它阻止服务在不确定状态启动。一旦官网或监控站已经签发新凭据，Agent **不会**把旧凭据、旧配置或旧 assignment 写回去，因为服务端可能已撤销旧凭据；本地写入、重启或加载回验失败时保持服务停止和 fail-closed marker。操作者必须用**同一枚绑定码**重试同一绑定请求，Agent 会复用 requestId 并由服务端返回原签发响应，完成本地恢复。绑定码原文始终不落盘。
 
 ```json
 {
-  "mode": "test",
+  "mode": "production",
   "pve": {
     "source": "api",
     "endpoint": "https://127.0.0.1:8006",
@@ -127,7 +129,7 @@ sudo ag-pve pve prepare \
     "monitoring": {"enabled": false, "url": ""}
   },
   "control": {
-    "enabled": true,
+    "enabled": false,
     "productionExecution": false,
     "pveTokenIdEnv": "PVE_CONTROL_TOKEN_ID",
     "pveTokenSecretEnv": "PVE_CONTROL_TOKEN_SECRET"
@@ -135,7 +137,7 @@ sudo ag-pve pve prepare \
 }
 ```
 
-以上是字段摘要，不是可单独加载的完整配置；请从 [config/agent.example.yaml](../config/agent.example.yaml) 开始修改持久文件。`mode=test` 或 `productionExecution=false` 时 mutation 最多只能产生 dry-run，但 dry-run 仍要求 monitoring 独立绑定和可持久化的 audit sink；缺少审计时必须返回 `AUDIT_UNAVAILABLE`，不能执行或用测试模式绕过。不得将 endpoint 改成官网可访问的 PVE 地址。
+以上是字段摘要，不是可单独加载的完整配置；CLI 会完成并校验实际持久配置。`productionExecution=false` 时 mutation 最多只能产生 dry-run，且 dry-run 仍要求 monitoring 独立绑定和可持久化 audit sink；缺少审计时必须返回 `AUDIT_UNAVAILABLE`。不得将 PVE endpoint 改成官网可访问的地址。
 
 ## 5. 使用一次性代码绑定官网
 
@@ -144,7 +146,6 @@ sudo ag-pve pve prepare \
 ```bash
 sudo ag-pve bind \
   --endpoint https://www.example/internal/v1/agents/bind \
-  --pve-version 9.0.8 \
   --node-ref pve01
 ```
 
@@ -155,15 +156,16 @@ sudo install -m 0600 /dev/null /run/ppflight-binding-code
 sudo editor /run/ppflight-binding-code
 sudo ag-pve bind \
   --endpoint https://www.example/internal/v1/agents/bind \
-  --pve-version 9.0.8 \
   --node-ref pve01 \
   --code-file /run/ppflight-binding-code
 sudo shred -u /run/ppflight-binding-code
 ```
 
-CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项；绑定 endpoint 也不得含 query。只能使用 stdin 或 `--code-file`。
+CLI 不接受人工 PVE 版本；固定 `/usr/bin/pveversion` 自动发现发生在读取 code 之前。CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项；绑定 endpoint 也不得含 query。只能使用 stdin 或 `--code-file`。
 
 `--code-file` 必须是 regular file、非 symlink，Unix 上 group/other 不得有权限。Agent 在首次请求前将 UUID `requestId` 和 canonical 请求指纹保存到 `<stateDirectory>/bindings/.website-binding-pending.json`，网络失败时相同输入复用该 ID；指纹包含 code，但 code 原文不落盘。绑定成功后，`<stateDirectory>/bindings/binding-state.json` 保存响应的 UUID `bindingId`、匹配的 `deviceId`、官网 identity、五组 endpoint-specific HMAC、Ed25519 验签公钥、initial assignment、exact `networkPolicy={agentObservedIPv4}` 和 `credentialEpoch`；输出不会显示 secret。Agent 保留 hostname 作 Host/TLS SNI/系统 CA 验证，使用 tcp4 并拒绝代理、redirect/跨 origin 与 IPv6 fallback。website policy 不能被 monitoring binding 读取或覆盖。重复绑定需要官网新 code 和显式 `--replace`，响应 epoch 必须单调前进。
+
+pending 代表未完成的同码事务，不能手工删除来绕过。服务端尚未签发响应时，网络失败可直接用相同输入重试；服务端已签发后，CLI 先写 fail-closed commit marker，再落盘 state/config/initial assignment。任一步本地失败都保持 marker 和 pending、停止 Agent，不会恢复可能被撤销的旧 website 凭据。使用同一绑定码再次运行同一命令会复用 requestId，服务端按幂等规则回放原响应并完成落盘、重启和本地状态回验；只有这些回验成功才报告绑定完成。
 
 安装脚本创建 `/var/lib/ppflight-agent/bindings` 为 `root:ppflight-agent`、`0750`，状态/device/pending 文件为 `0640`。绑定命令由 root 执行；systemd 服务只有组读权限，并以 `ReadOnlyPaths=/var/lib/ppflight-agent/bindings` 禁止写入。远端 assignment 使用独立的 `/var/lib/ppflight-agent/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`；不要把 binding 目录改成 service 可写来实现 refresh。
 
@@ -175,7 +177,7 @@ sudo ag-pve website show
 
 服务启动后可运行第 7 节的 `website status`；它同时汇总脱敏本地 binding、Agent `/status` 和固定同源 `/internal/v1/agents/status`。远端 GET 只使用 Commands HMAC 的 `website:status.read`，还必须回钉本机 binding/device/agent/epoch 和数字 assignment revision。外部 website status 服务未部署时会安全返回不可用并以非零码退出，不表示本地绑定被删除。
 
-官网 bind/replace 不得修改本地 PVE Token，也不得修改独立的监控站绑定状态；它同样不会修改 `pve.source`、`mode`、`productionExecution`、PVE ACL 或 systemd 服务状态。
+官网 bind/replace 不得修改独立监控绑定；绑定前共享的本机 readiness 流程可以创建隔离 PVE Token、切换真实只读 source/mode 并重启回验，但不会授予 control ACL 或打开 `productionExecution`。官网绑定本身只修改官网 identity、端点、凭据、initial assignment 与授权，写入后再次重启并确认新 website binding 已加载、采集/上传/任务轮询 worker 已启动。
 
 官网绑定完成后，服务端以可信连接元数据观察并冻结 `agentObservedIPv4/32`，作用域绑定到 `bindingId/deviceId/agentRef`；来源 IP 命中不能替代 TLS、HMAC、Ed25519、epoch、assignment 或时间窗校验。出口地址变化不能静默自动学习，必须显式 rebind/轮换。
 
@@ -183,7 +185,7 @@ sudo ag-pve website show
 
 监控站接口为 `POST /internal/v1/monitoring/agents/bind`，使用与官网不同的一次性 code，不要求官网先绑定。请求必须包含 UUID `requestId`、稳定 `deviceId` 和 node/capability 基础字段；响应只含 `bindingId`、匹配的 `deviceId`、`monitoringAgentRef`、ingest endpoint、`hmac-sha256`/base64 credential、`telemetry-v1` compression/大小上限、exact `networkPolicy={agentObservedIPv4}`、`credentialEpoch` 和 `issuedAt`。监控端从可信 `CF-Connecting-IP` 冻结该出口 IPv4/32；Agent 对 ingest/status hostname 使用 tcp4，保留 TLS hostname，并拒绝 proxy/redirect/IPv6 fallback。状态写入 `<stateDirectory>/bindings/monitoring-binding-state.json`；website bind/replace 不能读取、复用或覆盖该 policy。
 
-绑定前必须在将要运行 Agent 的同一台 PVE 上生成可审批的网络证据：
+可选在将要运行 Agent 的同一台 PVE 上生成网络诊断证据（不是绑定前置条件）：
 
 ```bash
 sudo ag-pve monitoring preflight \
@@ -212,7 +214,7 @@ sudo ag-pve monitoring bind \
 sudo shred -u /run/ppflight-monitoring-binding-code
 ```
 
-不要将 code 值作为位置参数或任何 argv 选项，也不要提供 `--pve-version`：CLI 在读取 code 前只调用固定 `/usr/bin/pveversion`，自动规范化可信本机 PVE 8/9 版本；失败、超时、异常输出或非 PVE 主机都会停止且不发送绑定码。成功响应验证通过后，CLI 只更新 monitoring telemetry/audit destinations 并保存独立状态；随后严格回读 config/state/runtime overlay，受控重启 `ppflight-agent.service`，并从本地 `/status` 确认新 `bindingId/credentialEpoch` 已由运行进程加载后才报告成功。失败会恢复旧 config/state、保留私有备份与可重试 pending request，并重新确认旧服务，不打印 secret。audit/status URL 都不是新增响应字段，而是从同 origin 固定派生 `/internal/v1/monitoring/audit-events/batches` 与 `/internal/v1/monitoring/agents/status`。官网 identity/credential 不变。轮换需要新 monitoring code 和 `--replace`。
+不要将 code 值作为位置参数或任何 argv 选项，也不要提供 `--pve-version`：CLI 在读取 code 前只调用固定 `/usr/bin/pveversion`，自动规范化可信本机 PVE 8/9 版本；失败、超时、异常输出或非 PVE 主机都会停止且不发送绑定码。成功响应验证通过后，CLI 只更新 monitoring telemetry/audit destinations 并保存独立状态；随后严格回读 config/state/runtime overlay，受控重启 `ppflight-agent.service`，并从本地 `/status` 确认新 `bindingId/credentialEpoch` 已由运行进程加载后才报告成功。若服务端已签发但本地写入、重启或加载失败，CLI 保留私有 pending/commit marker、停止服务，并绝不恢复可能已撤销的旧 config/state；以同一 monitoring code 重试会复用 requestId 并恢复完成。audit/status URL 都不是新增响应字段，而是从同 origin 固定派生 `/internal/v1/monitoring/audit-events/batches` 与 `/internal/v1/monitoring/agents/status`。官网 identity/credential 不变。轮换需要新 monitoring code 和 `--replace`。
 
 完成后可运行：
 
@@ -239,7 +241,7 @@ sudo systemctl start ppflight-agent
 sudo ag-pve pve status
 ```
 
-root 直接运行 `/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml --check-config` 时，会优先通过 no-follow、owner/mode/link-count 校验读取 root-only `/etc/ppflight-agent/agent.env`，并仅为四个固定 `PVE_*` 名称创建进程内 overlay；sudo 遗留的 ambient PVE 变量不能混入或覆盖该值，Token 不会写回配置、日志、argv 或子进程。非 root 的 service account 无法读取该 0600 文件，必须由 systemd manager 的 `EnvironmentFile=` 提供一套完整凭据；缺少任一所需值会 fail closed，绝不混合环境和文件来源。上面的 transient service 因此是验证实际 service 运行条件的推荐方式。不要用 `env KEY=secret ...` 或命令替换把 Token 值放进 argv。`ag-pve validate` 不替代这项 secret-aware 校验。安装、Token bootstrap、PVE prepare/手工切换 source、双绑定、config check 和 `systemctl start` 必须逐步完成，四项 `AG` 主菜单不会代替这些步骤。
+root 直接运行 `/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml --check-config` 时，会优先通过 no-follow、owner/mode/link-count 校验读取 root-only `/etc/ppflight-agent/agent.env`，并仅为四个固定 `PVE_*` 名称创建进程内 overlay；sudo 遗留的 ambient PVE 变量不能混入或覆盖该值，Token 不会写回配置、日志、argv 或子进程。非 root 的 service account 无法读取该 0600 文件，必须由 systemd manager 的 `EnvironmentFile=` 提供一套完整凭据；缺少任一所需值会 fail closed，绝不混合环境和文件来源。上面的 transient service 因此是验证实际 service 运行条件的推荐方式。不要用 `env KEY=secret ...` 或命令替换把 Token 值放进 argv。`ag-pve validate` 不替代这项 secret-aware 校验。`AG` 绑定向导会自动编排这些步骤，但 control ACL、`productionExecution` 和生产变更验收仍是独立人工安全门槛。
 
 本地 Agent ready 后可分别检查远端状态；外部 status 服务未部署时以下命令按设计非零退出，不影响本地 `/healthz` 事实：
 

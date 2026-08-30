@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "mode": "test",
+  "mode": "production",
   "identity": {
     "agentRef": "agent-example-01",
     "collectorRef": "collector-example-01",
@@ -26,7 +26,7 @@
     "guestRequestConcurrency": 4
   },
   "pve": {
-    "source": "simulator",
+    "source": "disabled",
     "endpoint": "https://127.0.0.1:8006",
     "tlsServerName": "pve01.example.invalid",
     "tokenIdEnv": "PVE_READ_TOKEN_ID",
@@ -108,7 +108,7 @@
     }
   },
   "control": {
-    "enabled": true,
+    "enabled": false,
     "pollUrl": "",
     "resultUrl": "",
     "auth": { "mode": "hmac-sha256", "keyIdEnv": "", "secretEnv": "" },

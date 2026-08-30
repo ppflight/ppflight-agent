@@ -77,4 +77,4 @@ scripts/install.sh \
   --binary-sha256 "$binary_sha256" \
   --enable
 
-printf '\n安装完成，服务尚未启动。现在输入 AG 进入 PPFlight 菜单。\n'
+printf '\n安装或更新完成。现在输入 AG 进入 PPFlight 菜单；服务会保持停止，完成本地真实 PVE 准备后才会采集或上报。\n'

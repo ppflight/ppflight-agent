@@ -94,6 +94,15 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	if version == "" {
 		version = "dev"
 	}
+	// There is no simulated source in a released binary.  A disabled source is
+	// a durable installation/AG-preparation state only and must never create a
+	// collector, queue an observation, or contact a destination.
+	if version != "test" && cfg.Mode != "production" {
+		return nil, errors.New("released agent requires production mode")
+	}
+	if cfg.PVE.Source != "api" {
+		return nil, errors.New("PVE collection is disabled; use AG to complete local PVE preparation")
+	}
 	runtimeStateDirectory := RuntimeStateDirectory(cfg.Runtime.StateDirectory)
 	if err := fsutil.EnsurePrivateDirectory(runtimeStateDirectory); err != nil {
 		return nil, fmt.Errorf("open agent runtime state directory: %w", err)

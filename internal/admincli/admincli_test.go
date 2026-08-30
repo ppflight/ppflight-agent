@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/assignment"
+	"github.com/ppflight/ppflight-agent/internal/bindingoverlay"
 	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/enrollment"
@@ -56,6 +58,9 @@ func runMonitoringBindForTest(args []string, version string, in io.Reader, out, 
 		out:     out,
 		errOut:  errOut,
 		version: version,
+		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) {
+			return cfg, nil
+		},
 		pveVersion: func(context.Context) (string, error) {
 			return "9.0.8", nil
 		},
@@ -72,8 +77,48 @@ func runMonitoringBindForTest(args []string, version string, in io.Reader, out, 
 			}
 			return nil
 		},
+		managedWritePolicy: func(string, config.Config) error { return nil },
 	}
 	return c.run(args)
+}
+
+func runWebsiteBindForTest(args []string, version string, in io.Reader, out, errOut io.Writer) int {
+	c := &cli{
+		in: in, out: out, errOut: errOut, version: version,
+		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) {
+			return cfg, nil
+		},
+		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		activateBinding: func(_ context.Context, cfg config.Config, expected bindingActivationExpectation) error {
+			if expected.BindingID == "" {
+				return nil
+			}
+			state, err := bindstate.Load(cfg.Runtime.StateDirectory)
+			if err != nil {
+				return err
+			}
+			if expected.Domain != "website" || state.BindingID != expected.BindingID || state.CredentialEpoch != expected.CredentialEpoch {
+				return errors.New("new website binding was not loaded")
+			}
+			return nil
+		},
+		managedWritePolicy: func(string, config.Config) error { return nil },
+	}
+	return c.run(args)
+}
+
+// runMutationForTest is the explicit internal test boundary for the Linux
+// production write-target gate. Tests must opt in rather than weakening the
+// real exported CLI for arbitrary --config paths.
+func runMutationForTest(args []string, version string, out, errOut io.Writer) int {
+	return (&cli{in: strings.NewReader(""), out: out, errOut: errOut, version: version, managedWritePolicy: func(string, config.Config) error { return nil }}).run(args)
+}
+
+type readTrackingReader struct{ read bool }
+
+func (r *readTrackingReader) Read([]byte) (int, error) {
+	r.read = true
+	return 0, io.EOF
 }
 
 func TestUsageListsWebsiteBindAndStatus(t *testing.T) {
@@ -226,6 +271,7 @@ func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
 }
 
 func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) {
+	filename := prepareBindConfig(t)
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
@@ -233,7 +279,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
-	if code := instance.menu("unused"); code != 0 {
+	if code := instance.menu(filename); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 	if !called || !strings.Contains(output.String(), "已完全卸载") || !strings.Contains(output.String(), "不会删除 PVE 虚拟机") {
@@ -663,7 +709,7 @@ func TestDecodeTemplateDiscoveryRequiresExactFrozenRemediation(t *testing.T) {
 func TestMonitoringSetCreatesBackupAndPreservesSafeFormat(t *testing.T) {
 	filename := writeTestConfig(t)
 	var output, errors bytes.Buffer
-	code := Run([]string{"--config", filename, "monitoring", "set", "--enabled=true", "--url=http://127.0.0.1:18080/api/ingest", "--auth-mode=none", "--payload-format=legacy-ingest-v1"}, "test", &output, &errors)
+	code := runMutationForTest([]string{"--config", filename, "monitoring", "set", "--enabled=true", "--url=http://127.0.0.1:18080/api/ingest", "--auth-mode=none", "--payload-format=legacy-ingest-v1"}, "test", &output, &errors)
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, errors.String())
 	}
@@ -677,6 +723,185 @@ func TestMonitoringSetCreatesBackupAndPreservesSafeFormat(t *testing.T) {
 	matches, err := filepath.Glob(filename + ".bak.*")
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("backups=%v err=%v", matches, err)
+	}
+}
+
+func TestPublicConfigurationMutationsRefusePendingCommitAndTransactionLock(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := bindstate.RequestFingerprint(map[string]string{"request": "same"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, pendingLock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "website", fingerprint, pendingTemplateForTest(t, cfg, "website"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pendingLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, args := range [][]string{
+		{"--config", filename, "monitoring", "set", "--enabled=true", "--url=http://127.0.0.1:18080/api/ingest", "--auth-mode=none", "--payload-format=legacy-ingest-v1"},
+		{"--config", filename, "website", "telemetry", "set", "--enabled=true", "--url=http://127.0.0.1:18080/telemetry", "--auth-mode=none", "--payload-format=legacy-ingest-v1"},
+		{"--config", filename, "website", "control", "set", "--enabled=false"},
+	} {
+		var output, stderr bytes.Buffer
+		if code := runMutationForTest(args, "test", &output, &stderr); code == 0 {
+			t.Fatalf("pending binding allowed mutation args=%v output=%s stderr=%s", args, output.String(), stderr.String())
+		}
+		after, readErr := os.ReadFile(filename)
+		if readErr != nil || !bytes.Equal(before, after) {
+			t.Fatalf("pending binding changed config args=%v err=%v", args, readErr)
+		}
+	}
+	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, "website"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, "123e4567-e89b-42d3-a456-426614174001", 1); err != nil {
+		t.Fatal(err)
+	}
+	var output, stderr bytes.Buffer
+	if code := runMutationForTest([]string{"--config", filename, "monitoring", "set", "--enabled=true", "--url=http://127.0.0.1:18080/api/ingest", "--auth-mode=none", "--payload-format=legacy-ingest-v1"}, "test", &output, &stderr); code == 0 {
+		t.Fatalf("commit marker allowed mutation output=%s stderr=%s", output.String(), stderr.String())
+	}
+	after, err := os.ReadFile(filename)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("commit marker changed config err=%v", err)
+	}
+	if err := bindstate.FinishMonitoringCommit(cfg.Runtime.StateDirectory); err != nil {
+		t.Fatal(err)
+	}
+
+	transaction, err := bindstate.AcquireTransaction(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer transaction.Close()
+	output.Reset()
+	stderr.Reset()
+	if code := runMutationForTest([]string{"--config", filename, "monitoring", "set", "--enabled=true", "--url=http://127.0.0.1:18080/api/ingest", "--auth-mode=none", "--payload-format=legacy-ingest-v1"}, "test", &output, &stderr); code == 0 {
+		t.Fatalf("held transaction allowed concurrent mutation output=%s stderr=%s", output.String(), stderr.String())
+	}
+	after, err = os.ReadFile(filename)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("concurrent mutation changed config err=%v", err)
+	}
+}
+
+func TestPVEPrepareUnbindAndUninstallRefuseIncompleteBindingTransaction(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, websiteState, _ := seedDualBindings(t, filename)
+	if err := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, "123e4567-e89b-42d3-a456-426614174001", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	pveTouched := false
+	pveCLI := &cli{
+		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
+		pveBootstrap: func(context.Context) error { pveTouched = true; return nil },
+	}
+	if code := pveCLI.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 || pveTouched {
+		t.Fatalf("incomplete binding allowed PVE prepare: code=%d touched=%t", code, pveTouched)
+	}
+
+	var output, stderr bytes.Buffer
+	unbindCLI := &cli{in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
+	if code := unbindCLI.menuRemoveBinding(bufio.NewReader(unbindCLI.in), filename, false); code == 0 {
+		t.Fatalf("incomplete binding allowed unbind output=%s stderr=%s", output.String(), stderr.String())
+	}
+	if current, err := bindstate.Load(cfg.Runtime.StateDirectory); err != nil || current.BindingID != websiteState.BindingID {
+		t.Fatalf("incomplete binding altered website state: state=%#v err=%v", current, err)
+	}
+
+	called := false
+	output.Reset()
+	stderr.Reset()
+	uninstallCLI := &cli{
+		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
+		completeUninstall: func(context.Context) error { called = true; return nil },
+	}
+	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code == 0 || called {
+		t.Fatalf("incomplete binding allowed complete uninstall: code=%d called=%t output=%s stderr=%s", code, called, output.String(), stderr.String())
+	}
+}
+
+func TestUnbindRefusesPendingRequestInEitherBindingDomain(t *testing.T) {
+	for _, pendingDomain := range []string{"website", "monitoring"} {
+		t.Run(pendingDomain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+			fingerprint, err := bindstate.RequestFingerprint(map[string]string{"bindingCode": "unresolved-code", "domain": pendingDomain})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, pendingDomain, fingerprint, pendingTemplateForTest(t, cfg, pendingDomain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Delete the other domain: the shared transaction guard must still
+			// protect an unresolved request in this one.
+			removeMonitoring := pendingDomain == "website"
+			confirmation := "DELETE WEBSITE\n"
+			if removeMonitoring {
+				confirmation = "DELETE MONITORING\n"
+			}
+			var output, stderr bytes.Buffer
+			instance := &cli{
+				in: strings.NewReader(confirmation), out: &output, errOut: &stderr,
+				effectiveUID: func() int { return 0 },
+				quiesceBinding: func(context.Context) error {
+					t.Fatal("pending binding request reached service stop")
+					return nil
+				},
+			}
+			if code := instance.menuRemoveBinding(bufio.NewReader(instance.in), filename, removeMonitoring); code == 0 {
+				t.Fatalf("pending %s request allowed unbind output=%s stderr=%s", pendingDomain, output.String(), stderr.String())
+			}
+			if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, pendingDomain); err != nil || !pending {
+				t.Fatalf("pending %s request was cleared: pending=%v err=%v", pendingDomain, pending, err)
+			}
+			if current, err := bindstate.Load(cfg.Runtime.StateDirectory); err != nil || current.BindingID != websiteState.BindingID {
+				t.Fatalf("website binding changed while %s pending: state=%#v err=%v", pendingDomain, current, err)
+			}
+			if current, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory); err != nil || current.BindingID != monitoringState.BindingID {
+				t.Fatalf("monitoring binding changed while %s pending: state=%#v err=%v", pendingDomain, current, err)
+			}
+		})
+	}
+}
+
+func TestSaveMutationRejectsStaleConfigurationSnapshot(t *testing.T) {
+	filename := prepareBindConfig(t)
+	before, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := before
+	concurrent.Identity.Site = "concurrent-change"
+	if _, err := atomicUpdate(filename, concurrent); err != nil {
+		t.Fatal(err)
+	}
+	after := before
+	after.Destinations.Monitoring.Enabled = true
+	var output, stderr bytes.Buffer
+	instance := &cli{out: &output, errOut: &stderr}
+	if code := instance.saveMutation(filename, before, after); code == 0 {
+		t.Fatalf("stale save succeeded output=%s stderr=%s", output.String(), stderr.String())
+	}
+	current, err := config.LoadFile(filename)
+	if err != nil || current.Identity.Site != "concurrent-change" || current.Destinations.Monitoring.Enabled {
+		t.Fatalf("stale save overwrote concurrent config: config=%#v err=%v", current, err)
 	}
 }
 
@@ -742,6 +967,154 @@ func prepareBindConfig(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return filename
+}
+
+func promoteBindConfigToAPI(t *testing.T, filename string) config.Config {
+	t.Helper()
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.PVE.Source = "api"
+	cfg.PVE.Endpoint = config.LocalPVEEndpoint
+	cfg.PVE.TLSServerName = "pve01.example.test"
+	cfg.PVE.CAFile = managedPVECAFile
+	cfg.PVE.TokenIDEnv = config.PVEReadTokenIDEnv
+	cfg.PVE.TokenSecretEnv = config.PVEReadTokenSecretEnv
+	cfg.Control.PVETokenIDEnv = config.PVEControlTokenIDEnv
+	cfg.Control.PVETokenSecretEnv = config.PVEControlTokenSecretEnv
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, append(raw, '\n'), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.PVEReadTokenIDEnv, "root@pam!ppflight-read")
+	t.Setenv(config.PVEReadTokenSecretEnv, "01234567-89ab-cdef-0123-456789abcdef")
+	return cfg
+}
+
+func preparePendingBindRequest(t *testing.T, cfg config.Config, domain, endpoint, code string) string {
+	t.Helper()
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request any
+	var capabilities []string
+	switch domain {
+	case "website":
+		capabilities = []string{"pve.discovery.v1", "pve.telemetry.v1"}
+		request = enrollment.Request{
+			SchemaVersion: enrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID, AgentVersion: "test", Hostname: "pve-test",
+			NodeClaim: enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, Capabilities: capabilities,
+		}
+	case "monitoring":
+		capabilities = []string{"telemetry-v1", "audit-v1", "delivery-state-v1", "ipv4-only", "mutual-whitelist-v1"}
+		request = monitorenrollment.Request{
+			SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: code, DeviceID: deviceID, AgentVersion: "test", Hostname: "pve-test",
+			NodeClaim: enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, Capabilities: capabilities,
+		}
+	default:
+		t.Fatalf("unsupported pending domain %q", domain)
+	}
+	fingerprint, err := bindstate.BindingRequestFingerprint(domain, endpoint, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := bindstate.NewBindingRequestTemplate(domain, endpoint, deviceID, "test", "pve-test", enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestID, _, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, domain, fingerprint, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return requestID
+}
+
+func pendingTemplateForTest(t *testing.T, cfg config.Config, domain string) bindstate.BindingRequestTemplate {
+	t.Helper()
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := []string{"pve.discovery.v1", "pve.telemetry.v1"}
+	if domain == "monitoring" {
+		capabilities = []string{"telemetry-v1"}
+	}
+	template, err := bindstate.NewBindingRequestTemplate(domain, "https://pending.example.test/internal/v1/agents/bind", deviceID, "test", "pve-test", enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return template
+}
+
+func prepareFinalizationFixture(t *testing.T, domain string) (string, config.Config, bindingActivationExpectation) {
+	t.Helper()
+	filename := prepareBindConfig(t)
+	cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+	expected := bindingActivationExpectation{Domain: domain}
+	if domain == "website" {
+		if err := bindstate.WriteAssignment(cfg.Assignments.File, websiteState.AssignmentDocument); err != nil {
+			t.Fatal(err)
+		}
+		expected.BindingID, expected.CredentialEpoch = websiteState.BindingID, websiteState.CredentialEpoch
+	} else if domain == "monitoring" {
+		expected.BindingID, expected.CredentialEpoch = monitoringState.BindingID, monitoringState.CredentialEpoch
+	} else {
+		t.Fatalf("unsupported finalization domain %q", domain)
+	}
+	fingerprint, err := bindstate.BindingRequestFingerprint(domain, "https://resume.example.test/internal/v1/agents/bind", map[string]string{"fixture": "pending", "domain": domain})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, domain, fingerprint, pendingTemplateForTest(t, cfg, domain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if domain == "website" {
+		err = bindstate.BeginWebsiteCommit(cfg.Runtime.StateDirectory, expected.BindingID, expected.CredentialEpoch)
+	} else {
+		err = bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, expected.BindingID, expected.CredentialEpoch)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filename, cfg, expected
+}
+
+func finalizationMarkerState(t *testing.T, stateDirectory, domain string) bool {
+	t.Helper()
+	if domain == "website" {
+		_, found, err := bindstate.ReadWebsiteCommit(stateDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return found
+	}
+	_, found, err := bindstate.ReadMonitoringCommit(stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
+func finalizeBindingForTest(c *cli, filename string, cfg config.Config, expected bindingActivationExpectation) error {
+	if expected.Domain == "website" {
+		return c.finalizeWebsiteBindingCommit(filename, cfg, expected)
+	}
+	return c.finalizeMonitoringBindingCommit(filename, cfg, expected)
 }
 
 func seedDualBindings(t *testing.T, filename string) (config.Config, bindstate.State, bindstate.MonitoringState) {
@@ -823,18 +1196,24 @@ func TestBindReadsCodeOnlyFromInputAndPersistsPrivateState(t *testing.T) {
 	defer server.Close()
 	secret := "0123456789abcdef"
 	var output, errors bytes.Buffer
-	code := RunWithInput([]string{"--config", filename, "website", "bind", "--endpoint", server.URL + "/v1/bind", "--pve-version", "8.2.2", "--hostname", "pve-test"}, "1.2.3", strings.NewReader("BINDING-123456\n"), &output, &errors)
+	code := runWebsiteBindForTest([]string{"--config", filename, "website", "bind", "--endpoint", server.URL + "/v1/bind", "--hostname", "pve-test"}, "1.2.3", strings.NewReader("BINDING-123456\n"), &output, &errors)
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, errors.String())
 	}
 	if received.BindingCode != "BINDING-123456" || received.DeviceID == "" {
 		t.Fatalf("request=%#v", received)
 	}
+	if received.NodeClaim.PVEVersion != "9.0.8" {
+		t.Fatalf("trusted automatic PVE version=%q", received.NodeClaim.PVEVersion)
+	}
 	if strings.Contains(strings.Join(received.Capabilities, ","), "pve.control.v1") {
 		t.Fatalf("simulator binding claimed unverified control capability: %v", received.Capabilities)
 	}
 	if strings.Contains(output.String(), "BINDING-123456") || strings.Contains(output.String(), secret) || strings.Contains(errors.String(), secret) {
 		t.Fatalf("binding output leaked secret: %q / %q", output.String(), errors.String())
+	}
+	if strings.Contains(output.String(), "systemctl restart") || strings.Contains(output.String(), "PVE 版本") || !strings.Contains(output.String(), "自动生效") || !strings.Contains(output.String(), "上传与任务轮询已启动") {
+		t.Fatalf("website binding did not activate automatically: %s", output.String())
 	}
 	cfg, err := config.LoadFile(filename)
 	if err != nil {
@@ -859,15 +1238,236 @@ func TestBindReadsCodeOnlyFromInputAndPersistsPrivateState(t *testing.T) {
 
 	output.Reset()
 	errors.Reset()
-	code = RunWithInput([]string{"--config", filename, "bind", "--endpoint", server.URL, "--pve-version", "8.2.2"}, "1.2.3", strings.NewReader("BINDING-654321\n"), &output, &errors)
+	code = runWebsiteBindForTest([]string{"--config", filename, "bind", "--endpoint", server.URL}, "1.2.3", strings.NewReader("BINDING-654321\n"), &output, &errors)
 	if code == 0 || requests != 1 {
 		t.Fatalf("repeat binding code=%d requests=%d stderr=%s", code, requests, errors.String())
 	}
 	output.Reset()
 	errors.Reset()
-	code = RunWithInput([]string{"--config", filename, "bind", "--endpoint", server.URL, "--pve-version", "8.2.2", "--replace"}, "1.2.3", strings.NewReader("BINDING-654321\n"), &output, &errors)
+	code = runWebsiteBindForTest([]string{"--config", filename, "bind", "--endpoint", server.URL, "--replace"}, "1.2.3", strings.NewReader("BINDING-654321\n"), &output, &errors)
 	if code != 0 || requests != 2 {
 		t.Fatalf("replace binding code=%d requests=%d stderr=%s", code, requests, errors.String())
+	}
+}
+
+func TestWebsiteBindResumesDurableCommitBeforeRestartReadiness(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg := promoteBindConfigToAPI(t, filename)
+	responseID := "123e4567-e89b-42d3-a456-426614174001"
+	var receivedRequestID string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request enrollment.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		receivedRequestID = request.RequestID
+		response := bindingResponse(server.URL)
+		response.DeviceID = request.DeviceID
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := enrollment.Request{
+		SchemaVersion: enrollment.SchemaVersion, BindingCode: "WEBSITE-RESUME-123456", DeviceID: deviceID,
+		AgentVersion: "test", Hostname: "pve-test", NodeClaim: enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"},
+		Capabilities: []string{"pve.discovery.v1", "pve.telemetry.v1"},
+	}
+	fingerprint, err := bindstate.BindingRequestFingerprint("website", server.URL, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := bindstate.NewBindingRequestTemplate("website", server.URL, deviceID, "test", "pve-test", enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, []string{"pve.discovery.v1", "pve.telemetry.v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "website", fingerprint, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var pending struct {
+		RequestID string `json:"requestId"`
+	}
+	rawPending, err := os.ReadFile(bindstate.PendingPath(cfg.Runtime.StateDirectory, "website"))
+	if err != nil || json.Unmarshal(rawPending, &pending) != nil || pending.RequestID == "" {
+		t.Fatalf("read durable website pending request: %v", err)
+	}
+	if err := bindstate.BeginWebsiteCommit(cfg.Runtime.StateDirectory, responseID, 1); err != nil {
+		t.Fatal(err)
+	}
+	var output, stderr bytes.Buffer
+	code := runWebsiteBindForTest([]string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}, "test", strings.NewReader("WEBSITE-RESUME-123456\n"), &output, &stderr)
+	if code != 0 {
+		t.Fatalf("resume code=%d stderr=%s", code, stderr.String())
+	}
+	if receivedRequestID != pending.RequestID {
+		t.Fatalf("website recovery changed durable request ID: got=%q want=%q", receivedRequestID, pending.RequestID)
+	}
+	if marker, found, err := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory); err != nil || found {
+		t.Fatalf("website marker remained after resume: marker=%#v found=%v err=%v", marker, found, err)
+	}
+	state, err := bindstate.Load(cfg.Runtime.StateDirectory)
+	if err != nil || state.BindingID != responseID || state.CredentialEpoch != 1 {
+		t.Fatalf("resumed website state=%#v err=%v", state, err)
+	}
+}
+
+func TestMonitoringBindResumesDurableCommitBeforeRestartReadiness(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg := promoteBindConfigToAPI(t, filename)
+	responseID := "123e4567-e89b-42d3-a456-426614174004"
+	var receivedRequestID string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request monitorenrollment.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		receivedRequestID = request.RequestID
+		response := monitorenrollment.Response{
+			SchemaVersion: 1, BindingID: responseID, DeviceID: request.DeviceID, MonitoringAgentRef: "monitor-agent-resume",
+			IngestEndpoint: server.URL + monitorenrollment.TelemetryPath,
+			HMACCredential: monitorenrollment.HMACCredential{Algorithm: "hmac-sha256", KeyID: "monitor-key-resume", SecretEncoding: "base64", Secret: enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("monitoring-secret-resume")))},
+			Telemetry:      monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 8 << 20, MaxUncompressedBytes: 32 << 20},
+			NetworkPolicy:  netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"}, CredentialEpoch: 1, IssuedAt: time.Now().UTC(),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+	deviceID, err := bindstate.LoadOrCreateDeviceID(cfg.Runtime.StateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := monitorenrollment.Request{
+		SchemaVersion: monitorenrollment.SchemaVersion, BindingCode: "MONITOR-RESUME-123456", DeviceID: deviceID,
+		AgentVersion: "test", Hostname: "pve-test", NodeClaim: enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"},
+		Capabilities: []string{"telemetry-v1", "audit-v1", "delivery-state-v1", "ipv4-only", "mutual-whitelist-v1"},
+	}
+	fingerprint, err := bindstate.BindingRequestFingerprint("monitoring", server.URL, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := bindstate.NewBindingRequestTemplate("monitoring", server.URL, deviceID, "test", "pve-test", enrollment.NodeClaim{NodeRef: cfg.Identity.NodeRef, PVEVersion: "9.0.8"}, []string{"telemetry-v1", "audit-v1", "delivery-state-v1", "ipv4-only", "mutual-whitelist-v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, lock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "monitoring", fingerprint, template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var pending struct {
+		RequestID string `json:"requestId"`
+	}
+	rawPending, err := os.ReadFile(bindstate.PendingPath(cfg.Runtime.StateDirectory, "monitoring"))
+	if err != nil || json.Unmarshal(rawPending, &pending) != nil || pending.RequestID == "" {
+		t.Fatalf("read durable monitoring pending request: %v", err)
+	}
+	if err := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, responseID, 1); err != nil {
+		t.Fatal(err)
+	}
+	var output, stderr bytes.Buffer
+	code := runMonitoringBindForTest([]string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}, "test", strings.NewReader("MONITOR-RESUME-123456\n"), &output, &stderr)
+	if code != 0 {
+		t.Fatalf("resume code=%d stderr=%s", code, stderr.String())
+	}
+	if receivedRequestID != pending.RequestID {
+		t.Fatalf("monitoring recovery changed durable request ID: got=%q want=%q", receivedRequestID, pending.RequestID)
+	}
+	if marker, found, err := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory); err != nil || found {
+		t.Fatalf("monitoring marker remained after resume: marker=%#v found=%v err=%v", marker, found, err)
+	}
+	state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	if err != nil || state.BindingID != responseID || state.CredentialEpoch != 1 {
+		t.Fatalf("resumed monitoring state=%#v err=%v", state, err)
+	}
+}
+
+func TestWebsiteBindActivationFailurePreservesServerIssuedState(t *testing.T) {
+	filename := prepareBindConfig(t)
+	originalConfig, originalWebsite, originalMonitoring := seedDualBindings(t, filename)
+	if err := bindstate.WriteAssignment(originalConfig.Assignments.File, originalWebsite.AssignmentDocument); err != nil {
+		t.Fatal(err)
+	}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request enrollment.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		response := bindingResponse(server.URL)
+		response.BindingID = "123e4567-e89b-42d3-a456-426614174077"
+		response.DeviceID = request.DeviceID
+		response.CredentialEpoch = originalWebsite.CredentialEpoch + 1
+		response.AssignmentDocument = json.RawMessage(`{"schemaVersion":1,"revision":"rev-new","issuedAt":"2026-08-30T00:01:00Z","assignments":[]}`)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	recoveryCalled := false
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in: strings.NewReader("WEBSITE-ROLLBACK-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
+		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
+			if expected.BindingID == "" {
+				recoveryCalled = true
+				return nil
+			}
+			return errors.New("service did not load website binding")
+		},
+	}
+	code := c.run([]string{"--config", filename, "website", "bind", "--endpoint", server.URL + "/internal/v1/agents/bind", "--hostname", "pve-test", "--replace"})
+	if code == 0 || recoveryCalled || !strings.Contains(stderr.String(), "WEBSITE_BIND_ACTIVATION_FAILED") {
+		t.Fatalf("code=%d recovery=%v stderr=%s", code, recoveryCalled, stderr.String())
+	}
+	committedConfig, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reflect.DeepEqual(committedConfig, originalConfig) {
+		t.Fatal("server-issued website config was incorrectly rolled back")
+	}
+	committedWebsite, err := bindstate.Load(originalConfig.Runtime.StateDirectory)
+	if err != nil || committedWebsite.BindingID != "123e4567-e89b-42d3-a456-426614174077" || committedWebsite.CredentialEpoch != originalWebsite.CredentialEpoch+1 {
+		t.Fatalf("website state=%#v err=%v", committedWebsite, err)
+	}
+	restoredMonitoring, err := bindstate.LoadMonitoring(originalConfig.Runtime.StateDirectory)
+	if err != nil || restoredMonitoring.BindingID != originalMonitoring.BindingID || restoredMonitoring.CredentialEpoch != originalMonitoring.CredentialEpoch {
+		t.Fatalf("monitoring state changed: %#v err=%v", restoredMonitoring, err)
+	}
+	assignment, err := os.ReadFile(originalConfig.Assignments.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAssignment, _ := compactJSON(json.RawMessage(`{"schemaVersion":1,"revision":"rev-new","issuedAt":"2026-08-30T00:01:00Z","assignments":[]}`))
+	gotAssignment, _ := compactJSON(assignment)
+	if !bytes.Equal(gotAssignment, wantAssignment) {
+		t.Fatalf("new assignment was not preserved: %s", assignment)
+	}
+	if _, err := os.Stat(bindstate.PendingPath(originalConfig.Runtime.StateDirectory, "website")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed server-issued binding kept stale pending state: %v", err)
+	}
+	if pending, err := bindstate.WebsiteCommitPending(originalConfig.Runtime.StateDirectory); err != nil || pending {
+		t.Fatalf("website commit marker survived complete durable commit: pending=%v err=%v", pending, err)
 	}
 }
 
@@ -978,7 +1578,7 @@ func TestWebsiteStatusFailurePrintsOnlySafeCode(t *testing.T) {
 func TestBindRejectsCodeArgumentAndUnsafeCodeFile(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var output, errors bytes.Buffer
-	if code := RunWithInput([]string{"--config", filename, "bind", "--endpoint", "https://service.example", "--pve-version", "8.2.2", "BINDING-123456"}, "1.2.3", strings.NewReader(""), &output, &errors); code != 2 {
+	if code := runWebsiteBindForTest([]string{"--config", filename, "bind", "--endpoint", "https://service.example", "BINDING-123456"}, "1.2.3", strings.NewReader(""), &output, &errors); code != 2 {
 		t.Fatalf("binding code argv accepted: %d (%s)", code, errors.String())
 	}
 	codeFile := filepath.Join(filepath.Dir(filename), "code")
@@ -989,8 +1589,319 @@ func TestBindRejectsCodeArgumentAndUnsafeCodeFile(t *testing.T) {
 	if err := os.Symlink(codeFile, link); err != nil {
 		t.Fatal(err)
 	}
-	if code := RunWithInput([]string{"--config", filename, "bind", "--endpoint", "https://service.example", "--pve-version", "8.2.2", "--code-file", link}, "1.2.3", strings.NewReader(""), &output, &errors); code == 0 {
+	if code := runWebsiteBindForTest([]string{"--config", filename, "bind", "--endpoint", "https://service.example", "--code-file", link}, "1.2.3", strings.NewReader(""), &output, &errors); code == 0 {
 		t.Fatal("symlink code file was accepted")
+	}
+}
+
+func TestMalformedBindingCodesDoNotPreparePersistQuiesceOrSend(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		t.Run(domain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			cfg, err := config.LoadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requests, quiesces := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				requests++
+			}))
+			defer server.Close()
+			var output, stderr bytes.Buffer
+			instance := &cli{
+				in: strings.NewReader("b^H\n"), out: &output, errOut: &stderr, version: "test",
+				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				quiesceBinding: func(context.Context) error {
+					quiesces++
+					return nil
+				},
+			}
+			args := []string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			if domain == "monitoring" {
+				args = []string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			}
+			if code := instance.run(args); code != 2 {
+				t.Fatalf("malformed %s code result=%d output=%s stderr=%s", domain, code, output.String(), stderr.String())
+			}
+			if quiesces != 0 || requests != 0 {
+				t.Fatalf("malformed %s code crossed unsafe lifecycle boundary: quiesces=%d requests=%d", domain, quiesces, requests)
+			}
+			if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain); err != nil || pending {
+				t.Fatalf("malformed %s code wrote pending state: pending=%v err=%v", domain, pending, err)
+			}
+			if strings.Contains(output.String()+stderr.String(), "b^H") {
+				t.Fatalf("malformed %s code leaked in output", domain)
+			}
+		})
+	}
+}
+
+func TestAmbiguousBindingCannotReuseRequestIDAtDifferentEndpoint(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		t.Run(domain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			cfg, err := config.LoadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstRequests, changedEndpointRequests, quiesces := 0, 0, 0
+			first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				firstRequests++
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer first.Close()
+			changed := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				changedEndpointRequests++
+			}))
+			defer changed.Close()
+			codeValue := "PPF.WEBSITE-AMBIGUOUS-123456"
+			if domain == "monitoring" {
+				codeValue = "PPF.MONITOR-AMBIGUOUS-123456"
+			}
+			var output, stderr bytes.Buffer
+			instance := &cli{
+				out: &output, errOut: &stderr, version: "test",
+				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				quiesceBinding: func(context.Context) error {
+					quiesces++
+					return nil
+				},
+			}
+			argsFor := func(endpoint string) []string {
+				if domain == "monitoring" {
+					return []string{"--config", filename, "monitoring", "bind", "--endpoint", endpoint, "--hostname", "pve-test"}
+				}
+				return []string{"--config", filename, "website", "bind", "--endpoint", endpoint, "--hostname", "pve-test"}
+			}
+			instance.in = strings.NewReader(codeValue + "\n")
+			if got := instance.run(argsFor(first.URL)); got != 1 || firstRequests != 1 || quiesces != 1 {
+				t.Fatalf("first %s ambiguous bind got=%d firstRequests=%d quiesces=%d stderr=%s", domain, got, firstRequests, quiesces, stderr.String())
+			}
+			output.Reset()
+			stderr.Reset()
+			instance.in = strings.NewReader(codeValue + "\n")
+			if got := instance.run(argsFor(changed.URL)); got == 0 {
+				t.Fatalf("changed %s endpoint unexpectedly resumed binding", domain)
+			}
+			if changedEndpointRequests != 0 || quiesces != 1 {
+				t.Fatalf("changed %s endpoint reached unsafe boundary: requests=%d quiesces=%d stderr=%s", domain, changedEndpointRequests, quiesces, stderr.String())
+			}
+			if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain); err != nil || !pending {
+				t.Fatalf("changed %s endpoint removed pending intent: pending=%v err=%v", domain, pending, err)
+			}
+		})
+	}
+}
+
+func TestBindingFinalizeFailureWindowsRemainRecoverable(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		domain := domain
+		t.Run(domain, func(t *testing.T) {
+			t.Run("clear-pending-failure-keeps-both-markers", func(t *testing.T) {
+				filename, cfg, expected := prepareFinalizationFixture(t, domain)
+				arms := 0
+				instance := &cli{
+					armBinding: func(context.Context) error {
+						arms++
+						return nil
+					},
+					clearBindingPending: func(string, string) error {
+						return errors.New("injected pending clear failure")
+					},
+				}
+				if err := finalizeBindingForTest(instance, filename, cfg, expected); err == nil {
+					t.Fatal("finalization unexpectedly succeeded after injected pending clear failure")
+				}
+				if arms != 1 {
+					t.Fatalf("activation arm calls=%d want=1", arms)
+				}
+				if !finalizationMarkerState(t, cfg.Runtime.StateDirectory, domain) {
+					t.Fatal("commit marker was removed after pending clear failure")
+				}
+				if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain); err != nil || !pending {
+					t.Fatalf("pending retry intent was lost: pending=%v err=%v", pending, err)
+				}
+			})
+
+			t.Run("finish-marker-failure-recovers-locally-without-code-or-http", func(t *testing.T) {
+				filename, cfg, expected := prepareFinalizationFixture(t, domain)
+				arms := 0
+				instance := &cli{
+					armBinding: func(context.Context) error {
+						arms++
+						return nil
+					},
+					finishBindingCommit: func(string, string) error {
+						return errors.New("injected commit marker finish failure")
+					},
+				}
+				if err := finalizeBindingForTest(instance, filename, cfg, expected); err == nil {
+					t.Fatal("finalization unexpectedly succeeded after injected marker finish failure")
+				}
+				if arms != 1 {
+					t.Fatalf("activation arm calls=%d want=1", arms)
+				}
+				if !finalizationMarkerState(t, cfg.Runtime.StateDirectory, domain) {
+					t.Fatal("commit marker was removed after injected marker finish failure")
+				}
+				if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain); err != nil || pending {
+					t.Fatalf("pending intent remained after its successful clear: pending=%v err=%v", pending, err)
+				}
+
+				requests, activations := 0, 0
+				resumeServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+					requests++
+				}))
+				defer resumeServer.Close()
+				input := &readTrackingReader{}
+				var output, stderr bytes.Buffer
+				instance.in, instance.out, instance.errOut = input, &output, &stderr
+				instance.bindingPVE = func(context.Context, string, config.Config) (config.Config, error) {
+					t.Fatal("marker-only recovery attempted PVE preparation")
+					return config.Config{}, errors.New("unexpected PVE preparation")
+				}
+				instance.finishBindingCommit = nil
+				instance.activateBinding = func(_ context.Context, got config.Config, received bindingActivationExpectation) error {
+					if received != expected || got.Runtime.StateDirectory != cfg.Runtime.StateDirectory {
+						return errors.New("marker-only recovery activated an unexpected binding")
+					}
+					activations++
+					return nil
+				}
+				args := []string{"--config", filename, "website", "bind", "--endpoint", resumeServer.URL}
+				if domain == "monitoring" {
+					args = []string{"--config", filename, "monitoring", "bind", "--endpoint", resumeServer.URL}
+				}
+				if code := instance.run(args); code != 0 {
+					t.Fatalf("marker-only %s recovery code=%d stderr=%s", domain, code, stderr.String())
+				}
+				if input.read || requests != 0 || activations != 1 || arms != 2 {
+					t.Fatalf("marker-only %s recovery crossed an unsafe boundary: input=%v requests=%d activations=%d arms=%d", domain, input.read, requests, activations, arms)
+				}
+				if finalizationMarkerState(t, cfg.Runtime.StateDirectory, domain) {
+					t.Fatal("marker-only recovery did not finish the durable commit")
+				}
+				if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain); err != nil || pending {
+					t.Fatalf("marker-only recovery left a pending request: pending=%v err=%v", pending, err)
+				}
+			})
+		})
+	}
+}
+
+func TestPendingOnlyBindingRetryReusesRequestIDAndCompletes(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		domain := domain
+		t.Run(domain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			_ = promoteBindConfigToAPI(t, filename)
+			var requestIDs []string
+			attempts, quiesces, arms, activations := 0, 0, 0, 0
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if domain == "website" {
+					var request enrollment.Request
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					requestIDs = append(requestIDs, request.RequestID)
+					if attempts == 1 {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					response := bindingResponse(server.URL)
+					response.DeviceID = request.DeviceID
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(response)
+					return
+				}
+				var request monitorenrollment.Request
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requestIDs = append(requestIDs, request.RequestID)
+				if attempts == 1 {
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				response := monitorenrollment.Response{
+					SchemaVersion: monitorenrollment.SchemaVersion, BindingID: "123e4567-e89b-42d3-a456-426614174099", DeviceID: request.DeviceID,
+					MonitoringAgentRef: "monitor-agent-replay", IngestEndpoint: server.URL + monitorenrollment.TelemetryPath,
+					HMACCredential: monitorenrollment.HMACCredential{Algorithm: "hmac-sha256", KeyID: "monitor-key-replay", SecretEncoding: "base64", Secret: enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("monitoring-secret-replay")))},
+					Telemetry:      monitorenrollment.TelemetryContract{PayloadFormat: "telemetry-v1", Compression: "gzip", MaxCompressedBytes: 8 << 20, MaxUncompressedBytes: 32 << 20},
+					NetworkPolicy:  netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"}, CredentialEpoch: 1, IssuedAt: time.Now().UTC(),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer server.Close()
+
+			codeValue := "PPF.WEBSITE-REPLAY-123456"
+			if domain == "monitoring" {
+				codeValue = "PPF.MONITOR-REPLAY-123456"
+			}
+			var output, stderr bytes.Buffer
+			instance := &cli{
+				out: &output, errOut: &stderr, version: "test", effectiveUID: func() int { return 1000 },
+				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				quiesceBinding: func(context.Context) error {
+					quiesces++
+					return nil
+				},
+				armBinding: func(context.Context) error {
+					arms++
+					return nil
+				},
+				activateBinding: func(_ context.Context, value config.Config, expected bindingActivationExpectation) error {
+					if expected.Domain != domain || expected.BindingID == "" || expected.CredentialEpoch == 0 || value.Runtime.StateDirectory == "" {
+						return errors.New("retry activation expectation is invalid")
+					}
+					activations++
+					return nil
+				},
+			}
+			args := []string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			if domain == "monitoring" {
+				args = []string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			}
+			instance.in = strings.NewReader(codeValue + "\n")
+			if code := instance.run(args); code != 1 {
+				t.Fatalf("first %s ambiguous bind code=%d stderr=%s", domain, code, stderr.String())
+			}
+			stateDirectory, err := config.LoadFile(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pending, err := bindstate.PendingRequestExists(stateDirectory.Runtime.StateDirectory, domain); err != nil || !pending {
+				t.Fatalf("first %s retry intent missing: pending=%v err=%v", domain, pending, err)
+			}
+			output.Reset()
+			stderr.Reset()
+			instance.in = strings.NewReader(codeValue + "\n")
+			if code := instance.run(args); code != 0 {
+				t.Fatalf("same %s retry code=%d stderr=%s", domain, code, stderr.String())
+			}
+			if attempts != 2 || len(requestIDs) != 2 || requestIDs[0] == "" || requestIDs[0] != requestIDs[1] {
+				t.Fatalf("same %s retry did not reuse durable request ID: attempts=%d ids=%v", domain, attempts, requestIDs)
+			}
+			if quiesces != 2 || arms != 1 || activations != 1 {
+				t.Fatalf("same %s retry lifecycle unexpected: quiesces=%d arms=%d activations=%d", domain, quiesces, arms, activations)
+			}
+			if pending, err := bindstate.PendingRequestExists(stateDirectory.Runtime.StateDirectory, domain); err != nil || pending {
+				t.Fatalf("completed %s retry retained pending request: pending=%v err=%v", domain, pending, err)
+			}
+			if finalizationMarkerState(t, stateDirectory.Runtime.StateDirectory, domain) {
+				t.Fatalf("completed %s retry retained commit marker", domain)
+			}
+		})
 	}
 }
 
@@ -1052,7 +1963,7 @@ func TestMonitoringBindUsesIndependentStateAndDoesNotOverwriteWebsite(t *testing
 	}
 }
 
-func TestMonitoringBindActivationFailureRollsBackAndKeepsRetryState(t *testing.T) {
+func TestMonitoringBindActivationFailurePreservesServerIssuedState(t *testing.T) {
 	filename := prepareBindConfig(t)
 	original, err := config.LoadFile(filename)
 	if err != nil {
@@ -1091,6 +2002,7 @@ func TestMonitoringBindActivationFailureRollsBackAndKeepsRetryState(t *testing.T
 	c := &cli{
 		in: strings.NewReader("MONITOR-ROLLBACK-123456\n"), out: &stdout, errOut: &stderr, version: "test",
 		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
 		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
 			if expected.BindingID == "" {
 				recoveryCalled = true
@@ -1100,25 +2012,228 @@ func TestMonitoringBindActivationFailureRollsBackAndKeepsRetryState(t *testing.T
 		},
 	}
 	code := c.run([]string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL + "/internal/v1/monitoring/agents/bind", "--hostname", "pve-test"})
-	if code == 0 || !recoveryCalled {
+	if code == 0 || recoveryCalled {
 		t.Fatalf("code=%d recoveryCalled=%v", code, recoveryCalled)
 	}
-	restored, err := config.LoadFile(filename)
+	committed, err := config.LoadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restored.Destinations.Monitoring.Enabled != original.Destinations.Monitoring.Enabled || restored.Destinations.MonitoringAudit.Enabled != original.Destinations.MonitoringAudit.Enabled {
-		t.Fatalf("monitoring config was not rolled back: %#v", restored.Destinations)
+	if !committed.Destinations.Monitoring.Enabled || !committed.Destinations.MonitoringAudit.Enabled || original.Destinations.Monitoring.Enabled {
+		t.Fatalf("server-issued monitoring config was not preserved: %#v", committed.Destinations)
 	}
-	if _, err := bindstate.LoadMonitoring(restored.Runtime.StateDirectory); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("first-time monitoring state remains after rollback: %v", err)
+	state, err := bindstate.LoadMonitoring(committed.Runtime.StateDirectory)
+	if err != nil || state.BindingID != "123e4567-e89b-42d3-a456-426614174004" || state.CredentialEpoch != 1 {
+		t.Fatalf("server-issued monitoring state missing: state=%#v err=%v", state, err)
 	}
 	if !strings.Contains(stderr.String(), "MONITORING_BIND_ACTIVATION_FAILED") || strings.Contains(stderr.String(), "never-print-this-secret") {
 		t.Fatalf("unsafe or unclear stderr: %s", stderr.String())
 	}
-	pendingPath := bindstate.PendingPath(restored.Runtime.StateDirectory, "monitoring")
-	if _, err := os.Stat(pendingPath); err != nil {
-		t.Fatalf("retry request state was not preserved: %v", err)
+	pendingPath := bindstate.PendingPath(committed.Runtime.StateDirectory, "monitoring")
+	if _, err := os.Stat(pendingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed server-issued binding kept stale pending state: %v", err)
+	}
+}
+
+func TestBindingFourXXNeverClearsIntentAndRestoresPreviousService(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "proxy-html-400", status: http.StatusBadRequest, body: "<html><title>proxy error</title></html>"},
+		{name: "malformed-json-401", status: http.StatusUnauthorized, body: `{"error":`},
+		{name: "claimed-service-code-403", status: http.StatusForbidden, body: `{"error":{"code":"BINDING_REJECTED","message":"not authoritative"}}`},
+	}
+	for _, domain := range []string{"website", "monitoring"} {
+		for _, responseCase := range cases {
+			responseCase := responseCase
+			t.Run(fmt.Sprintf("%s-%s", domain, responseCase.name), func(t *testing.T) {
+				filename := prepareBindConfig(t)
+				cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+				quiesced, recovered := false, 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if !quiesced {
+						t.Error("binding request reached the server before the Agent was quiesced")
+					}
+					w.Header().Set("Content-Type", "text/html")
+					w.WriteHeader(responseCase.status)
+					_, _ = w.Write([]byte(responseCase.body))
+				}))
+				defer server.Close()
+				var stdout, stderr bytes.Buffer
+				instance := &cli{
+					in: strings.NewReader("DEFINITE-REJECT-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+					bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+					pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+					quiesceBinding: func(context.Context) error {
+						quiesced = true
+						return nil
+					},
+					activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
+						if expected.BindingID != "" {
+							return errors.New("a rejected request must not activate a new binding")
+						}
+						// A pending retry in one trust domain must not make the last
+						// complete credentials of either domain unavailable. This is
+						// the runtime condition that keeps a bad website code from
+						// taking monitoring offline (and vice versa).
+						secrets, err := bindingoverlay.Resolve(loaded, func(string) (string, bool) { return "", false })
+						if err != nil {
+							return fmt.Errorf("old binding overlay did not recover: %w", err)
+						}
+						if domain == "website" && (secrets.MonitoringBindingID != monitoringState.BindingID || secrets.Monitoring.CredentialEpoch != monitoringState.CredentialEpoch) {
+							return errors.New("website rejection made monitoring binding unavailable")
+						}
+						if domain == "monitoring" && (secrets.WebsiteBindingID != websiteState.BindingID || secrets.WebsiteCredentialEpoch != websiteState.CredentialEpoch) {
+							return errors.New("monitoring rejection made website binding unavailable")
+						}
+						recovered++
+						return nil
+					},
+				}
+				args := []string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test", "--replace"}
+				if domain == "monitoring" {
+					args = []string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test", "--replace"}
+				}
+				if code := instance.run(args); code != 1 || !quiesced || recovered != 1 {
+					t.Fatalf("code=%d quiesced=%v recovered=%d stderr=%s", code, quiesced, recovered, stderr.String())
+				}
+				if _, err := os.Stat(bindstate.PendingPath(cfg.Runtime.StateDirectory, domain)); err != nil {
+					t.Fatalf("ambiguous %s %s response lost pending intent: %v", domain, responseCase.name, err)
+				}
+				if !strings.Contains(stderr.String(), "结果未确定") {
+					t.Fatalf("ambiguous %s %s response did not state recovery requirement: %s", domain, responseCase.name, stderr.String())
+				}
+				if domain == "website" {
+					websiteCurrent, err := bindstate.Load(cfg.Runtime.StateDirectory)
+					if err != nil || websiteCurrent.BindingID != websiteState.BindingID || websiteCurrent.CredentialEpoch != websiteState.CredentialEpoch {
+						t.Fatalf("website old state was changed: %#v err=%v", websiteCurrent, err)
+					}
+					monitoringCurrent, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+					if err != nil || monitoringCurrent.BindingID != monitoringState.BindingID || monitoringCurrent.CredentialEpoch != monitoringState.CredentialEpoch {
+						t.Fatalf("website rejection changed monitoring state: %#v err=%v", monitoringCurrent, err)
+					}
+				} else {
+					monitoringCurrent, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+					if err != nil || monitoringCurrent.BindingID != monitoringState.BindingID || monitoringCurrent.CredentialEpoch != monitoringState.CredentialEpoch {
+						t.Fatalf("monitoring old state was changed: %#v err=%v", monitoringCurrent, err)
+					}
+					websiteCurrent, err := bindstate.Load(cfg.Runtime.StateDirectory)
+					if err != nil || websiteCurrent.BindingID != websiteState.BindingID || websiteCurrent.CredentialEpoch != websiteState.CredentialEpoch {
+						t.Fatalf("monitoring rejection changed website state: %#v err=%v", websiteCurrent, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBindingAmbiguousFailureRetainsIntentAndKeepsAgentQuiesced(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		t.Run(domain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			cfg, _, _ := seedDualBindings(t, filename)
+			quiesced, recovered := false, false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if !quiesced {
+					t.Error("binding request reached the server before the Agent was quiesced")
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			var stdout, stderr bytes.Buffer
+			instance := &cli{
+				in: strings.NewReader("AMBIGUOUS-FAILURE-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				quiesceBinding: func(context.Context) error {
+					quiesced = true
+					return nil
+				},
+				activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
+					if expected.BindingID == "" {
+						recovered = true
+					}
+					return nil
+				},
+			}
+			args := []string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test", "--replace"}
+			if domain == "monitoring" {
+				args = []string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test", "--replace"}
+			}
+			if code := instance.run(args); code != 1 || !quiesced || !recovered {
+				t.Fatalf("code=%d quiesced=%v recovered=%v stderr=%s", code, quiesced, recovered, stderr.String())
+			}
+			if _, err := os.Stat(bindstate.PendingPath(cfg.Runtime.StateDirectory, domain)); err != nil {
+				t.Fatalf("ambiguous %s request did not retain pending intent: %v", domain, err)
+			}
+			if !strings.Contains(stderr.String(), "结果未确定") {
+				t.Fatalf("ambiguous failure did not state fail-closed recovery requirement: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestCommittedBindingFourXXDoesNotAuthorizeRollback(t *testing.T) {
+	for _, domain := range []string{"website", "monitoring"} {
+		t.Run(domain, func(t *testing.T) {
+			filename := prepareBindConfig(t)
+			cfg := promoteBindConfigToAPI(t, filename)
+			codeValue := "COMMITTED-FOURXX-123456"
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer server.Close()
+			preparePendingBindRequest(t, cfg, domain, server.URL, codeValue)
+			bindingID := "123e4567-e89b-42d3-a456-426614174088"
+			var markerErr error
+			if domain == "website" {
+				markerErr = bindstate.BeginWebsiteCommit(cfg.Runtime.StateDirectory, bindingID, 1)
+			} else {
+				markerErr = bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, bindingID, 1)
+			}
+			if markerErr != nil {
+				t.Fatal(markerErr)
+			}
+			recovered := false
+			var stdout, stderr bytes.Buffer
+			instance := &cli{
+				in: strings.NewReader(codeValue + "\n"), out: &stdout, errOut: &stderr, version: "test",
+				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				quiesceBinding: func(context.Context) error {
+					return nil
+				},
+				activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
+					if expected.BindingID == "" {
+						recovered = true
+					}
+					return nil
+				},
+			}
+			args := []string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			if domain == "monitoring" {
+				args = []string{"--config", filename, "monitoring", "bind", "--endpoint", server.URL, "--hostname", "pve-test"}
+			}
+			if got := instance.run(args); got != 1 || recovered {
+				t.Fatalf("code=%d recovered=%v stderr=%s", got, recovered, stderr.String())
+			}
+			if _, err := os.Stat(bindstate.PendingPath(cfg.Runtime.StateDirectory, domain)); err != nil {
+				t.Fatalf("committed %s fourxx cleared pending intent: %v", domain, err)
+			}
+			if domain == "website" {
+				marker, found, err := bindstate.ReadWebsiteCommit(cfg.Runtime.StateDirectory)
+				if err != nil || !found || marker.BindingID != bindingID {
+					t.Fatalf("website commit marker was lost: %#v found=%v err=%v", marker, found, err)
+				}
+			} else {
+				marker, found, err := bindstate.ReadMonitoringCommit(cfg.Runtime.StateDirectory)
+				if err != nil || !found || marker.BindingID != bindingID {
+					t.Fatalf("monitoring commit marker was lost: %#v found=%v err=%v", marker, found, err)
+				}
+			}
+		})
 	}
 }
 
@@ -1136,6 +2251,64 @@ func TestMonitoringBindRejectsUserSuppliedPVEVersion(t *testing.T) {
 	}
 }
 
+func TestWebsiteBindRejectsUserSuppliedPVEVersion(t *testing.T) {
+	filename := prepareBindConfig(t)
+	var stdout, stderr bytes.Buffer
+	code := runWebsiteBindForTest([]string{"--config", filename, "website", "bind", "--endpoint", "https://www.ppflight.com/api/pve-agent/v1/enrollments/redeem", "--pve-version", "9.0.8"}, "test", strings.NewReader("SHOULD-NOT-BE-READ\n"), &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+}
+
+func TestWebsiteBindFailsRealPVEReadinessBeforeReadingCode(t *testing.T) {
+	filename := prepareBindConfig(t)
+	reader := &readTrackingReader{}
+	versionCalled := false
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in: reader, out: &stdout, errOut: &stderr, version: "test",
+		bindingPVE: func(context.Context, string, config.Config) (config.Config, error) {
+			return config.Config{}, errors.New("simulator is forbidden")
+		},
+		pveVersion: func(context.Context) (string, error) {
+			versionCalled = true
+			return "9.0.8", nil
+		},
+	}
+	code := c.run([]string{"--config", filename, "website", "bind", "--endpoint", "https://www.ppflight.com/api/pve-agent/v1/enrollments/redeem"})
+	if code == 0 || reader.read || versionCalled || !strings.Contains(stderr.String(), "PVE_REAL_READINESS_FAILED") {
+		t.Fatalf("code=%d read=%v versionCalled=%v stderr=%s", code, reader.read, versionCalled, stderr.String())
+	}
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(bindstate.PendingPath(cfg.Runtime.StateDirectory, "website")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("readiness failure created pending request: %v", err)
+	}
+}
+
+func TestProductionBindingEndpointFailsBeforePVEReadinessOrCode(t *testing.T) {
+	filename := prepareBindConfig(t)
+	for _, args := range [][]string{
+		{"--config", filename, "website", "bind", "--endpoint", "http://example.com/internal/v1/agents/bind"},
+		{"--config", filename, "monitoring", "bind", "--endpoint", "http://example.com/internal/v1/monitoring/agents/bind"},
+	} {
+		reader := &readTrackingReader{}
+		readinessCalled := false
+		instance := &cli{
+			in: reader, out: io.Discard, errOut: io.Discard, version: "test",
+			activatePVE: func(context.Context, config.Config) error { readinessCalled = true; return nil },
+		}
+		if code := instance.run(args); code != 2 {
+			t.Fatalf("unsafe endpoint exit=%d args=%v", code, args)
+		}
+		if reader.read || readinessCalled {
+			t.Fatalf("unsafe endpoint touched code or PVE readiness: read=%v readiness=%v", reader.read, readinessCalled)
+		}
+	}
+}
+
 func TestMonitoringMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var stdout, stderr bytes.Buffer
@@ -1150,7 +2323,26 @@ func TestMonitoringMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testin
 	if strings.Contains(stdout.String(), "PVE 版本") || strings.Contains(stdout.String(), "输入一次性绑定码") {
 		t.Fatalf("monitoring menu prompted before discovery: %s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "PVE_VERSION_DISCOVERY_FAILED") {
+	if !strings.Contains(stderr.String(), "PVE_REAL_READINESS_FAILED") {
+		t.Fatalf("missing safe discovery error: %s", stderr.String())
+	}
+}
+
+func TestWebsiteMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testing.T) {
+	filename := prepareBindConfig(t)
+	var stdout, stderr bytes.Buffer
+	c := &cli{
+		in:  strings.NewReader("2\n2\nhttps://www.ppflight.com/api/pve-agent/v1/enrollments/redeem\nSHOULD-NOT-BE-READ\n"),
+		out: &stdout, errOut: &stderr, version: "test",
+		pveVersion: func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
+	}
+	if code := c.run([]string{"--config", filename}); code == 0 {
+		t.Fatal("menu accepted failed trusted PVE discovery")
+	}
+	if strings.Contains(stdout.String(), "PVE 版本") || strings.Contains(stdout.String(), "输入一次性绑定码") {
+		t.Fatalf("website menu prompted before discovery: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "PVE_REAL_READINESS_FAILED") {
 		t.Fatalf("missing safe discovery error: %s", stderr.String())
 	}
 }

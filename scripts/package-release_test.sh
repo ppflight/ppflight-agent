@@ -19,6 +19,7 @@ fail() { printf 'test failure: %s\n' "$*" >&2; exit 1; }
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ppflight-package-test.XXXXXX")"
 binary="$TMP_DIR/ppflight-agent"
 output="$TMP_DIR/output"
+repro_output="$TMP_DIR/repro-output"
 extract="$TMP_DIR/extract"
 printf 'offline test binary\n' > "$binary"
 chmod 0755 "$binary"
@@ -27,6 +28,13 @@ chmod 0755 "$binary"
 archive="$output/ppflight-agent-0.1.0-linux-amd64.tar.gz"
 [[ -f "$archive" && -f "$output/SHA256SUMS" ]] || fail 'packager did not create archive and checksums'
 (cd -- "$output" && sha256sum --check SHA256SUMS >/dev/null) || fail 'checksum file does not verify'
+
+# POSIX tar may otherwise persist fresh atime/ctime PAX metadata.  Generate a
+# second archive from the exact same binary, version, and architecture and
+# require the compressed bytes themselves to be stable.
+"$PACKAGER" --binary "$binary" --version 0.1.0 --arch amd64 --output-dir "$repro_output"
+repro_archive="$repro_output/ppflight-agent-0.1.0-linux-amd64.tar.gz"
+cmp -s "$archive" "$repro_archive" || fail 'same release input produced different archive bytes'
 
 mkdir -p -- "$extract"
 tar -xzf "$archive" -C "$extract"

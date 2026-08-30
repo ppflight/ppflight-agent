@@ -54,6 +54,13 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 		`TEMPLATE_STAGE="$(mktemp -d "$TEMPLATE_BUNDLES_DIR/.template-bootstrap-stage.XXXXXX")"`,
 		`python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_STAGE"`,
 		`mv -Tf -- "$template_link_stage" "$TEMPLATE_LINK"`,
+		`PVE_PREPARATION_REQUIRED=1`,
+		`migrate_legacy_source()`,
+		`if source == "simulator" or mode == "test":`,
+		`document["mode"] = "production"`,
+		`document["pve"]["source"] = "disabled"`,
+		`if mode != "production":`,
+		`PVE collection is disabled and the service remains stopped`,
 	} {
 		if !strings.Contains(installer, required) {
 			t.Fatalf("installer is missing deployment contract %q", required)
@@ -95,6 +102,7 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 		"WatchdogSec=60s",
 		"Restart=always",
 		"RestartSec=3s",
+		"RestartPreventExitStatus=78",
 		"StartLimitIntervalSec=0",
 		"TimeoutStopSec=30s",
 		"User=ppflight-agent",
