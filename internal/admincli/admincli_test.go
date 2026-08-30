@@ -161,8 +161,17 @@ func TestTemplateStorageRemediationPreservesExistingContent(t *testing.T) {
 		t.Fatalf("safe auto-configuration candidate was not selectable: choice=%#v err=%v", choice, err)
 	}
 	value := output.String()
-	if !strings.Contains(value, "需确认自动配置 content=backup,iso,snippets,vztmpl") {
+	if !strings.Contains(value, "选择后新增：Cloud-Init 配置 (snippets)") || !strings.Contains(value, "不会删除现有能力") {
 		t.Fatalf("safe automatic configuration candidate missing: %s", value)
+	}
+}
+
+func TestTemplateStorageDisplayUsesReadableCapacityAndLabels(t *testing.T) {
+	if got := humanAvailableBytes("229425152000", true); got != "213.7 GiB" {
+		t.Fatalf("capacity=%q", got)
+	}
+	if got := humanStorageContentCSV("backup,iso,snippets,vztmpl"); got != "备份 (backup)、ISO 镜像 (iso)、Cloud-Init 配置 (snippets)、LXC 模板 (vztmpl)" {
+		t.Fatalf("content=%q", got)
 	}
 }
 
@@ -215,14 +224,14 @@ func TestChooseTemplateStorageAppliesExactContentAndRediscovers(t *testing.T) {
 			return templatebootstrap.Result{ExitCode: 0, Stdout: discoveryRaw}, nil
 		},
 	}
-	selected, storages, err := instance.chooseTemplateStorage(context.Background(), bufio.NewReader(strings.NewReader("1\nAPPLY\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
+	selected, storages, err := instance.chooseTemplateStorage(context.Background(), bufio.NewReader(strings.NewReader("1\ny\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
 	if err != nil || selected != "local" || len(storages) != 1 || !storages[0].RoleEligibility.Image.Allowed {
 		t.Fatalf("selected=%q storages=%#v err=%v", selected, storages, err)
 	}
 	if gotStorage != "local" || gotContent != "backup,iso,snippets,vztmpl" {
 		t.Fatalf("pvesm set got storage=%q content=%q", gotStorage, gotContent)
 	}
-	for _, expected := range []string{"输入 APPLY", "pvesm set local --content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
+	for _, expected := range []string{"输入 Y", "当前能力：备份 (backup)", "需要新增：Cloud-Init 配置 (snippets)", "pvesm set local", "--content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("output missing %q: %s", expected, output.String())
 		}
@@ -261,7 +270,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var bootstrapArgs []string
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in: strings.NewReader("\n1\nAPPLY\n1\n\n1\n\n\n"), out: &output, errOut: &stderr, version: "test",
+		in: strings.NewReader("\n1\nY\n1\n\n1\n\n\n"), out: &output, errOut: &stderr, version: "test",
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {
 				t.Fatalf("unexpected storage content update: %s %s", storageID, content)

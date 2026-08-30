@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1228,6 +1229,76 @@ func roleRequiredContent(role string) []string {
 	}
 }
 
+func templateRolePurpose(role string) string {
+	switch role {
+	case "image":
+		return "保存下载的系统镜像和 Cloud-Init 配置文件"
+	case "template":
+		return "保存克隆完成后的 PVE 虚拟机模板磁盘"
+	case "backup":
+		return "保存模板创建完成后的备份文件"
+	default:
+		return "模板初始化存储"
+	}
+}
+
+func templateRoleLabel(role string) string {
+	switch role {
+	case "image":
+		return "镜像缓存"
+	case "template":
+		return "模板磁盘"
+	case "backup":
+		return "模板备份"
+	default:
+		return "存储"
+	}
+}
+
+func humanStorageContentCSV(value string) string {
+	if value == "" {
+		return "无"
+	}
+	parts := strings.Split(value, ",")
+	labels := make([]string, 0, len(parts))
+	for _, part := range parts {
+		label := map[string]string{
+			"backup":   "备份",
+			"images":   "虚拟机磁盘",
+			"iso":      "ISO 镜像",
+			"rootdir":  "容器磁盘",
+			"snippets": "Cloud-Init 配置",
+			"vztmpl":   "LXC 模板",
+		}[part]
+		if label == "" {
+			label = part
+		}
+		labels = append(labels, fmt.Sprintf("%s (%s)", label, part))
+	}
+	return strings.Join(labels, "、")
+}
+
+func humanAvailableBytes(value string, known bool) string {
+	if !known {
+		return "未知"
+	}
+	bytesValue, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return "未知"
+	}
+	const (
+		gib = uint64(1 << 30)
+		tib = uint64(1 << 40)
+	)
+	if bytesValue >= tib {
+		return fmt.Sprintf("%.2f TiB", float64(bytesValue)/float64(tib))
+	}
+	if bytesValue >= gib {
+		return fmt.Sprintf("%.1f GiB", float64(bytesValue)/float64(gib))
+	}
+	return fmt.Sprintf("%d MiB", bytesValue/(1<<20))
+}
+
 func remediationForTemplateRole(storage templateStorage, role string) *templateRemediation {
 	roleState := templateRoleState(storage, role)
 	if !storage.Active || !storage.Enabled || roleState.Allowed || len(roleState.Reasons) == 0 {
@@ -1286,19 +1357,21 @@ func (c *cli) promptTemplateStorage(reader *bufio.Reader, storages []templateSto
 		return templateStorageChoice{}, errors.New("没有符合该角色的 active/enabled 存储")
 	}
 	fmt.Fprintln(c.out, title+":")
+	fmt.Fprintf(c.out, "  用途：%s\n", templateRolePurpose(role))
 	for index, candidate := range candidates {
 		storage := candidate.Storage
-		known := "unknown"
-		if storage.AvailableBytesKnown {
-			known = storage.AvailableBytes
-		}
-		state := "可直接使用"
+		fmt.Fprintf(c.out, "\n  %d) %s\n", index+1, storage.StorageID)
+		fmt.Fprintf(c.out, "     类型：%s    共享：%s\n", storage.Type, map[bool]string{true: "是", false: "否"}[storage.Shared])
+		fmt.Fprintf(c.out, "     可用空间：%s\n", humanAvailableBytes(storage.AvailableBytes, storage.AvailableBytesKnown))
+		fmt.Fprintf(c.out, "     当前能力：%s\n", humanStorageContentCSV(strings.Join(storage.ContentTypes, ",")))
 		if candidate.Remediation != nil {
-			state = "需确认自动配置 content=" + candidate.Remediation.ProposedContent
+			fmt.Fprintf(c.out, "     选择后新增：%s（不会删除现有能力）\n", humanStorageContentCSV(candidate.Remediation.RequiredContent))
+		} else {
+			fmt.Fprintln(c.out, "     状态：可直接使用")
 		}
-		fmt.Fprintf(c.out, "  %d) %s type=%s shared=%t availableBytes=%s content=%s [%s]\n", index+1, storage.StorageID, storage.Type, storage.Shared, known, strings.Join(storage.ContentTypes, ","), state)
 	}
-	value, err := c.promptLine(reader, "输入编号或 storage ID: ")
+	fmt.Fprintln(c.out)
+	value, err := c.promptLine(reader, "请输入编号（也可输入 storage ID）: ")
 	if err != nil {
 		return templateStorageChoice{}, err
 	}
@@ -1316,13 +1389,19 @@ func (c *cli) chooseTemplateStorage(ctx context.Context, reader *bufio.Reader, s
 		return "", storages, err
 	}
 	if choice.Remediation == nil {
+		fmt.Fprintf(c.out, "已选择 %s：%s\n", templateRoleLabel(role), choice.StorageID)
 		return choice.StorageID, storages, nil
 	}
 	remediation := *choice.Remediation
-	fmt.Fprintf(c.out, "将为存储 %s 配置 content：%s -> %s\n", choice.StorageID, remediation.CurrentContent, remediation.ProposedContent)
-	fmt.Fprintf(c.out, "将执行：sudo %s\n", strings.Join(remediation.Command.Argv, " "))
-	confirmation, err := c.promptLine(reader, "输入 APPLY 确认配置；其他输入取消: ")
-	if err != nil || confirmation != "APPLY" {
+	fmt.Fprintf(c.out, "\n已选择 %s：%s\n", templateRoleLabel(role), choice.StorageID)
+	fmt.Fprintf(c.out, "  当前能力：%s\n", humanStorageContentCSV(remediation.CurrentContent))
+	fmt.Fprintf(c.out, "  需要新增：%s\n", humanStorageContentCSV(remediation.RequiredContent))
+	fmt.Fprintf(c.out, "  完成以后：%s\n", humanStorageContentCSV(remediation.ProposedContent))
+	fmt.Fprintln(c.out, "  说明：只增加上述能力，不删除当前已有内容或数据。")
+	fmt.Fprintf(c.out, "  底层命令：%s %s %s\n", remediation.Command.Argv[0], remediation.Command.Argv[1], remediation.Command.Argv[2])
+	fmt.Fprintf(c.out, "            %s %s\n", remediation.Command.Argv[3], remediation.Command.Argv[4])
+	confirmation, err := c.promptLine(reader, "输入 Y 确认配置并继续 [y/N]: ")
+	if err != nil || !strings.EqualFold(confirmation, "y") {
 		return "", storages, errors.New("未确认 storage content 配置，未执行任何变更")
 	}
 	if err := c.applyTemplateRemediation(ctx, choice.Storage, remediation); err != nil {
