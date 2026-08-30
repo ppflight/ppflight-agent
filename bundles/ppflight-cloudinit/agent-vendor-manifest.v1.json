@@ -1,0 +1,98 @@
+{
+  "schemaVersion": "ppflight.agent-vendor-manifest/v1",
+  "bundleVersion": "3.0.0",
+  "catalogRevision": "2026-08-30.1",
+  "catalogSha256": "d716522fe98baf85ab03c2760ac56c90a6f4fc73d1833bb8f4aa46c4dafb0c75",
+  "entrypoint": "tools/ppflight-template-bootstrap.py",
+  "files": [
+    {
+      "path": "build-cloud-templates.sh",
+      "sha256": "bba3fb84fc0b3255710ed19ee0e0e864c3a0f15eb4c97137f51aa4f34007a3f7",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "tools/ppflight-template-bootstrap.py",
+      "sha256": "a88b6e682e8a0ad84e7db4487f37aa685fa0a6a34f705f2b826dcce82f8975ea",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "catalog/template-catalog.v1.json",
+      "sha256": "d716522fe98baf85ab03c2760ac56c90a6f4fc73d1833bb8f4aa46c4dafb0c75",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "catalog/template-catalog.schema.json",
+      "sha256": "dad62bedb27eee96b39f66f431937b9fbe63ed928750fc3d7743945e85ad9dc1",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "contracts/template-bootstrap-request.schema.json",
+      "sha256": "69b50edd3269caefa238d8e8d32281265c8a36f9b72a9e5661a15ddfb1d3a25e",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "contracts/template-bootstrap-result.schema.json",
+      "sha256": "1fc4e52f5669b6a3e7b423e52ca0daec005d6f382ae409d2b1fb3b003f630962",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "contracts/template-storage-discovery.schema.json",
+      "sha256": "b1dfa128b4801fd48746eb12e246d3109ec06964ed8f260b3e81917e401cbf23",
+      "requiredAtRuntime": true
+    },
+    {
+      "path": "contracts/agent-vendor-manifest.schema.json",
+      "sha256": "eb7bf7dbcd670fd932abbbd698b79a099aaa908c4fc17ac890c6caffd6eb68df",
+      "requiredAtRuntime": false
+    }
+  ],
+  "dependencies": {
+    "python": ">=3.9",
+    "bash": ">=5",
+    "commands": [
+      "awk",
+      "bash",
+      "cat",
+      "chmod",
+      "curl",
+      "date",
+      "df",
+      "dirname",
+      "findmnt",
+      "flock",
+      "grep",
+      "id",
+      "install",
+      "ip",
+      "mv",
+      "perl",
+      "pvecm",
+      "pvesh",
+      "pvesm",
+      "pveversion",
+      "python3",
+      "qemu-img",
+      "qm",
+      "rm",
+      "sed",
+      "sha256sum",
+      "sha512sum",
+      "stat",
+      "vzdump"
+    ],
+    "perlModules": ["JSON::PP"]
+  },
+  "networkHosts": [
+    "cloud-images.ubuntu.com",
+    "repo.almalinux.org",
+    "cloud.debian.org",
+    "cloud.centos.org"
+  ],
+  "networkRedirectPolicy": {
+    "allowed": true,
+    "schemes": ["https"],
+    "addressFamily": "ipv4-only",
+    "hostPolicy": "upstream-selected",
+    "integrityPolicy": "catalog-sha256-and-official-checksum"
+  }
+}

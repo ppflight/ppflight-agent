@@ -17,6 +17,8 @@ import (
 	"path"
 	"strings"
 	"time"
+
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
 
 const (
@@ -29,11 +31,14 @@ const (
 // usual PVE form user@realm!token-name. CAFile is optional; system roots are
 // still used when it is empty.
 type Config struct {
-	Endpoint         string
-	TokenID          string
-	TokenSecret      string
-	CAFile           string
-	InsecureSkipTLS  bool // Only intended for an explicitly opted-in lab setup.
+	Endpoint      string
+	TokenID       string
+	TokenSecret   string
+	CAFile        string
+	TLSServerName string
+	// InsecureSkipTLS is retained only so legacy configurations fail closed.
+	// PVE API credentials must never be sent with certificate verification off.
+	InsecureSkipTLS  bool
 	Timeout          time.Duration
 	MaxResponseBytes int64
 }
@@ -45,6 +50,7 @@ type Client struct {
 	tokenID  string
 	secret   string
 	maxBytes int64
+	progress func()
 }
 
 // NewClient creates a client. It does not make a network request.
@@ -55,8 +61,11 @@ func NewClient(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.TokenID) == "" || cfg.TokenSecret == "" {
 		return nil, errors.New("pve token id and secret are required")
 	}
+	if cfg.InsecureSkipTLS {
+		return nil, errors.New("pve insecure TLS is forbidden")
+	}
 	u, err := url.Parse(cfg.Endpoint)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	if err != nil || u.Scheme == "" || u.Host == "" || netpolicy.ValidateIPv4URL(u) != nil {
 		return nil, fmt.Errorf("invalid pve endpoint %q", cfg.Endpoint)
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
@@ -72,6 +81,9 @@ func NewClient(cfg Config) (*Client, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
+	if timeout < time.Second || timeout > 30*time.Second {
+		return nil, errors.New("pve request timeout must be between 1s and 30s")
+	}
 	maxBytes := cfg.MaxResponseBytes
 	if maxBytes <= 0 {
 		maxBytes = defaultResponseSize
@@ -80,7 +92,12 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("pve max response size exceeds %d bytes", maxResponseSize)
 	}
 
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: cfg.InsecureSkipTLS} // #nosec G402 -- explicit config opt-in
+	if cfg.TLSServerName != "" {
+		if err := ValidateTLSServerName(cfg.TLSServerName); err != nil {
+			return nil, fmt.Errorf("invalid PVE TLS server name: %w", err)
+		}
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.TLSServerName}
 	if cfg.CAFile != "" {
 		pem, err := os.ReadFile(cfg.CAFile)
 		if err != nil {
@@ -97,17 +114,32 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	return &Client{
 		baseURL: u, tokenID: cfg.TokenID, secret: cfg.TokenSecret, maxBytes: maxBytes,
-		http: &http.Client{Timeout: timeout, Transport: &http.Transport{
+		http: &http.Client{Timeout: timeout, Transport: netpolicy.ApplyIPv4Only(&http.Transport{
 			TLSClientConfig: tlsConfig,
 			// PVE API credentials must not be sent through an ambient proxy.
 			Proxy: nil,
-		}},
+		}), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 	}, nil
+}
+
+// SetProgressReporter installs a data-free callback used by the process
+// watchdog. It must be called during Agent initialization, before requests are
+// started. Every completed or failed bounded API request advances progress.
+func (c *Client) SetProgressReporter(reporter func()) {
+	if c != nil {
+		c.progress = reporter
+	}
+}
+
+func (c *Client) reportProgress() {
+	if c != nil && c.progress != nil {
+		c.progress()
+	}
 }
 
 func isLoopbackHost(host string) bool {
 	host = strings.Trim(strings.ToLower(host), "[]")
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	return host == "localhost" || host == "127.0.0.1"
 }
 
 // Do requests an API path and decodes the PVE JSON envelope. apiPath must be
@@ -115,6 +147,7 @@ func isLoopbackHost(host string) bool {
 // intentionally a low-level primitive: callers issuing writes must validate
 // their own command schema, authorisation, expiry and idempotency first.
 func (c *Client) Do(ctx context.Context, method, apiPath string, query url.Values, form url.Values, out any) error {
+	defer c.reportProgress()
 	if !strings.HasPrefix(apiPath, "/") || strings.Contains(apiPath, "..") {
 		return fmt.Errorf("unsafe pve API path %q", apiPath)
 	}

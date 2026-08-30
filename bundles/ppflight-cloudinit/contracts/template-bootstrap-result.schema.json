@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ppflight.com/schemas/template-bootstrap-result.v1.json",
+  "title": "PPFlight local template bootstrap plan/result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "mode", "state", "executable", "catalog", "request", "bridge", "requiredBytes", "selectedStorages", "items", "errors", "command"],
+  "properties": {
+    "schemaVersion": {"const": "ppflight.template-bootstrap-result/v1"},
+    "mode": {"enum": ["plan", "execute"]},
+    "state": {"enum": ["ready", "blocked", "failed", "succeeded"]},
+    "executable": {"type": "boolean"},
+    "catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogId", "catalogRevision", "catalogSha256", "websitePath", "matchFields"],
+      "properties": {
+        "catalogId": {"const": "ppflight-proxmox-templates"},
+        "catalogRevision": {"type": "string"},
+        "catalogSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "websitePath": {"const": "/vps/proxmox-templates"},
+        "matchFields": {"const": ["templateRef", "version", "sha256", "architecture", "guestType"]}
+      }
+    },
+    "request": {"$ref": "https://ppflight.com/schemas/template-bootstrap-request.v1.json"},
+    "bridge": {"type": "string"},
+    "requiredBytes": {"$ref": "#/$defs/bytes"},
+    "selectedStorages": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {"$ref": "#/$defs/storage"},
+        "template": {"$ref": "#/$defs/storage"},
+        "backup": {"$ref": "#/$defs/storage"}
+      }
+    },
+    "items": {"type": "array", "items": {"$ref": "#/$defs/itemResult"}},
+    "errors": {"type": "array", "items": {"$ref": "#/$defs/error"}},
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "argv"],
+      "properties": {
+        "program": {"type": "string"},
+        "argv": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  },
+  "$defs": {
+    "bytes": {"type": "string", "pattern": "^(?:0|[1-9][0-9]*)$"},
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "reasons"],
+      "properties": {
+        "allowed": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["storageId", "type", "contentTypes", "enabled", "active", "shared", "availableBytes", "availableBytesKnown", "roleEligibility", "remediations"],
+      "properties": {
+        "storageId": {"type": "string"},
+        "type": {"type": "string"},
+        "contentTypes": {"type": "array", "items": {"type": "string"}},
+        "enabled": {"type": "boolean"},
+        "active": {"type": "boolean"},
+        "shared": {"type": "boolean"},
+        "availableBytes": {"$ref": "#/$defs/bytes"},
+        "availableBytesKnown": {"type": "boolean"},
+        "roleEligibility": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["image", "template", "backup"],
+          "properties": {
+            "image": {"$ref": "#/$defs/role"},
+            "template": {"$ref": "#/$defs/role"},
+            "backup": {"$ref": "#/$defs/role"}
+          }
+        },
+        "remediations": {"type": "array", "items": {"$ref": "#/$defs/remediation"}}
+      }
+    },
+    "itemResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["templateRef", "version", "sha256", "targetVmid", "phase", "state", "errorCode", "sourceVolume", "templateVolume", "backupVolume", "upid"],
+      "properties": {
+        "templateRef": {"type": "string"},
+        "version": {"type": "string"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "targetVmid": {"type": "integer"},
+        "phase": {"enum": ["plan", "template", "backup", "complete"]},
+        "state": {"enum": ["planned", "blocked", "running", "template-ready", "failed", "succeeded"]},
+        "errorCode": {"type": ["string", "null"]},
+        "sourceVolume": {"type": ["string", "null"]},
+        "templateVolume": {"type": ["string", "null"]},
+        "backupVolume": {"type": ["string", "null"]},
+        "upid": {"type": ["string", "null"]}
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["errorCode", "message", "details"],
+      "properties": {
+        "errorCode": {"type": "string"},
+        "message": {"type": "string"},
+        "details": {"type": "object"}
+      }
+    },
+    "remediation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "storageId", "currentContent", "requiredContent", "proposedContent", "command", "automatic"],
+      "properties": {
+        "code": {"const": "ENABLE_STORAGE_CONTENT"},
+        "storageId": {"type": "string"},
+        "currentContent": {"type": "string"},
+        "requiredContent": {"type": "string"},
+        "proposedContent": {"type": "string"},
+        "command": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["program", "argv"],
+          "properties": {
+            "program": {"const": "pvesm"},
+            "argv": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "string"}}
+          }
+        },
+        "automatic": {"const": false}
+      }
+    }
+  }
+}

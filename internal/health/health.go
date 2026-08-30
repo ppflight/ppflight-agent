@@ -19,9 +19,11 @@ import (
 type Queue interface{ Stats() store.Stats }
 
 type EventState struct {
-	LastAttempt *time.Time `json:"lastAttempt,omitempty"`
-	LastSuccess *time.Time `json:"lastSuccess,omitempty"`
-	LastError   string     `json:"lastError,omitempty"`
+	LastAttempt      *time.Time `json:"lastAttempt,omitempty"`
+	LastSuccess      *time.Time `json:"lastSuccess,omitempty"`
+	LastError        string     `json:"lastError,omitempty"`
+	AuthBlocked      bool       `json:"authBlocked"`
+	AuthBlockedSince *time.Time `json:"authBlockedSince,omitempty"`
 }
 
 type ControlState struct {
@@ -91,13 +93,27 @@ func (r *Registry) Collection(now time.Time, err error) {
 }
 
 func (r *Registry) Delivery(name string, now time.Time, delivered bool, err error) {
+	r.DeliveryState(name, now, delivered, false, err)
+}
+
+// DeliveryState records a destination authentication circuit separately from
+// ordinary transient errors. authBlocked means the durable queue is preserved
+// and delivery awaits a newer credential epoch.
+func (r *Registry) DeliveryState(name string, now time.Time, delivered, authBlocked bool, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state := r.status.Deliveries[name]
 	timestamp := now.UTC()
 	state.LastAttempt = &timestamp
+	if authBlocked && !state.AuthBlocked {
+		state.AuthBlockedSince = &timestamp
+	}
+	if !authBlocked {
+		state.AuthBlockedSince = nil
+	}
+	state.AuthBlocked = authBlocked
 	if delivered {
-		state.LastSuccess, state.LastError = &timestamp, ""
+		state.LastSuccess, state.LastError, state.AuthBlocked = &timestamp, "", false
 	} else if err != nil {
 		state.LastError = safeError(err)
 	}
@@ -182,6 +198,18 @@ func (r *Registry) metrics() string {
 		fmt.Fprintf(&b, "ppflight_agent_queue_pending_bytes{queue=%s} %d\n", label, stats.PendingBytes)
 		fmt.Fprintf(&b, "ppflight_agent_queue_dropped_items_total{queue=%s} %d\n", label, stats.DroppedItems)
 		fmt.Fprintf(&b, "ppflight_agent_queue_dead_letter_items_total{queue=%s} %d\n", label, stats.DeadLetterItems)
+	}
+	deliveryNames := make([]string, 0, len(status.Deliveries))
+	for name := range status.Deliveries {
+		deliveryNames = append(deliveryNames, name)
+	}
+	sort.Strings(deliveryNames)
+	for _, name := range deliveryNames {
+		blocked := 0
+		if status.Deliveries[name].AuthBlocked {
+			blocked = 1
+		}
+		fmt.Fprintf(&b, "ppflight_agent_delivery_auth_blocked{destination=%s} %d\n", strconv.Quote(name), blocked)
 	}
 	return b.String()
 }

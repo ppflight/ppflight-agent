@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/auditlog"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 	"github.com/ppflight/ppflight-agent/internal/store"
 	"github.com/ppflight/ppflight-agent/internal/uploader"
@@ -30,7 +31,7 @@ func TestClientSignsExactPollQuery(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(PollResponse{SchemaVersion: 1, Cursor: "cursor-2", Commands: []Command{}})
 	}))
 	defer server.Close()
-	client, err := NewClient(ClientConfig{Endpoint: server.URL, AgentRef: "agent-1", Limit: 7, AuthMode: uploader.AuthHMACSHA256, KeyID: "key-1", Secret: []byte("secret"), Now: func() time.Time { return now }, HTTPClient: server.Client()})
+	client, err := NewClient(ClientConfig{Endpoint: server.URL, AgentRef: "agent-1", Limit: 7, AuthMode: uploader.AuthHMACSHA256, KeyID: "key-1", Secret: []byte("secret"), Now: func() time.Time { return now }, HTTPClient: server.Client(), ServerIPv4Allowlist: []string{"127.0.0.1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,10 +52,18 @@ func (q *memoryReceiptQueue) Enqueue(_ string, payload []byte) (store.Item, bool
 	return store.Item{}, true, nil
 }
 
+type memoryAuditSink struct{ events []auditlog.Event }
+
+func (s *memoryAuditSink) Enqueue(event auditlog.Event) error {
+	s.events = append(s.events, event)
+	return nil
+}
+
 func TestServiceDryRunJournalsAndQueuesReceipt(t *testing.T) {
 	now := time.Now().UTC()
 	command, assignments := signedCommand(t, now)
 	queue := &memoryReceiptQueue{}
+	audit := &memoryAuditSink{}
 	directory := t.TempDir()
 	journal, err := OpenJournal(directory + "/journal")
 	if err != nil {
@@ -64,13 +73,14 @@ func TestServiceDryRunJournalsAndQueuesReceipt(t *testing.T) {
 		AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "test", CommandSecret: []byte("secret"),
 		AllowedActions: []string{"vm.start"}, Assignments: assignments,
 		Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
-		Journal: journal, Executor: Executor{Mode: "test"}, ReceiptQueue: queue, CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+		Journal: journal, Executor: Executor{Mode: "test"}, ReceiptQueue: queue, AuditSink: audit, AgentVersion: "test-version",
+		CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	processed, err := service.PollOnce(context.Background())
-	if err != nil || processed != 1 || len(queue.payloads) != 1 {
+	if err != nil || processed != 1 || len(queue.payloads) != 1 || len(audit.events) != 1 {
 		t.Fatalf("processed=%d payloads=%d err=%v", processed, len(queue.payloads), err)
 	}
 	var receipt Receipt

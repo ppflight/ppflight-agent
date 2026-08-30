@@ -8,13 +8,26 @@ umask 077
 readonly APP='ppflight-agent'
 readonly ETC_DIR='/etc/ppflight-agent'
 readonly STATE_DIR='/var/lib/ppflight-agent'
+readonly BINDINGS_DIR="$STATE_DIR/bindings"
+readonly ASSIGNMENTS_DIR="$STATE_DIR/assignments"
+readonly ASSIGNMENTS_PATH="$ASSIGNMENTS_DIR/assignments.json"
+readonly LEGACY_ASSIGNMENTS_PATH="$ETC_DIR/assignments.json"
 readonly LIB_DIR='/usr/local/lib/ppflight-agent'
+readonly TEMPLATE_BUNDLES_DIR="$LIB_DIR/template-bundles"
+readonly TEMPLATE_LINK="$LIB_DIR/template-bootstrap"
+readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"
 readonly BIN_PATH='/usr/local/bin/ppflight-agent'
 readonly SYSTEMD_DIR='/etc/systemd/system'
+readonly TMPFILES_DIR='/usr/lib/tmpfiles.d'
+readonly TMPFILES_PATH="$TMPFILES_DIR/ppflight-agent.conf"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+readonly TEMPLATE_SOURCE="$REPO_DIR/bundles/ppflight-cloudinit"
+readonly TEMPLATE_VERIFIER="$REPO_DIR/scripts/verify-template-bundle.py"
 TMP_DIR=''
+TEMPLATE_STAGE=''
+TEMPLATE_LINK_STAGE=''
 ENABLE=0
 START=0
 INSTALL_EXPORTERS=0
@@ -25,6 +38,7 @@ RELEASE_URL=''
 RELEASE_SHA256=''
 CONFIG_FILE="$REPO_DIR/config/agent.example.yaml"
 ASSIGNMENTS_FILE="$REPO_DIR/config/assignments.example.yaml"
+ASSIGNMENTS_EXPLICIT=0
 ENV_FILE="$REPO_DIR/config/agent.env.example"
 NODE_ARCHIVE=''
 NODE_SHA256=''
@@ -43,7 +57,7 @@ Required (choose one):
 
 Optional files:
   --config FILE                 Agent config; default config/agent.example.yaml.
-  --assignments FILE            Assignment file; default config/assignments.example.yaml.
+  --assignments FILE            Initial assignment file; default config/assignments.example.yaml.
   --env-file FILE               Environment-file template; default config/agent.env.example.
 
 Optional exporters (all four archive/checksum arguments are required):
@@ -59,7 +73,7 @@ Activation:
   --start                       Start units now (implies --enable).
 
 The installer never accepts an unverified network download and never replaces
-an existing /etc/ppflight-agent/{agent.yaml,assignments.json,agent.env}.
+an existing agent.yaml, agent.env, or state assignments/assignments.json.
 EOF
 }
 
@@ -67,6 +81,20 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
 
 cleanup() {
+  if [[ -n "$TEMPLATE_LINK_STAGE" ]]; then
+    case "$TEMPLATE_LINK_STAGE" in
+      "$LIB_DIR"/.template-bootstrap-link.*)
+        [[ -L "$TEMPLATE_LINK_STAGE" ]] && rm -f -- "$TEMPLATE_LINK_STAGE"
+        ;;
+    esac
+  fi
+  if [[ -n "$TEMPLATE_STAGE" ]]; then
+    case "$TEMPLATE_STAGE" in
+      "$TEMPLATE_BUNDLES_DIR"/.template-bootstrap-stage.*)
+        [[ ! -L "$TEMPLATE_STAGE" && -d "$TEMPLATE_STAGE" ]] && rm -rf -- "$TEMPLATE_STAGE"
+        ;;
+    esac
+  fi
   if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
     rm -rf -- "$TMP_DIR"
   fi
@@ -84,7 +112,7 @@ while [[ $# -gt 0 ]]; do
     --release-url) need_value "$@"; RELEASE_URL=$2; shift 2 ;;
     --release-sha256) need_value "$@"; RELEASE_SHA256=$2; shift 2 ;;
     --config) need_value "$@"; CONFIG_FILE=$2; shift 2 ;;
-    --assignments) need_value "$@"; ASSIGNMENTS_FILE=$2; shift 2 ;;
+    --assignments) need_value "$@"; ASSIGNMENTS_FILE=$2; ASSIGNMENTS_EXPLICIT=1; shift 2 ;;
     --env-file) need_value "$@"; ENV_FILE=$2; shift 2 ;;
     --install-exporters) INSTALL_EXPORTERS=1; shift ;;
     --node-exporter-archive) need_value "$@"; NODE_ARCHIVE=$2; shift 2 ;;
@@ -101,10 +129,14 @@ done
 
 [[ $EUID -eq 0 ]] || die 'run as root on the target PVE host'
 command -v systemctl >/dev/null || die 'systemd is required'
+command -v systemd-tmpfiles >/dev/null || die 'systemd-tmpfiles is required'
 command -v install >/dev/null || die 'install command is required'
 command -v sha256sum >/dev/null || die 'sha256sum is required'
 command -v tar >/dev/null || die 'tar is required'
+command -v python3 >/dev/null || die 'python3 is required for the bundled template workflow'
 command -v pveversion >/dev/null || die 'this installer must run on Proxmox VE 8 or 9'
+(( BASH_VERSINFO[0] >= 5 )) || die 'bash 5 or newer is required for the bundled template workflow'
+python3 -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' || die 'python 3.9 or newer is required for the bundled template workflow'
 
 pve_version="$(pveversion | sed -n 's/^pve-manager\/\([0-9]\+\).*/\1/p')"
 [[ "$pve_version" == '8' || "$pve_version" == '9' ]] || die "unsupported PVE major version ${pve_version:-unknown}; expected 8 or 9"
@@ -124,19 +156,38 @@ verify_sha256() {
 }
 
 TMP_DIR="$(mktemp -d /tmp/ppflight-agent-install.XXXXXX)"
+[[ -f "$TEMPLATE_VERIFIER" && ! -L "$TEMPLATE_VERIFIER" ]] || die 'template bundle verifier is missing or unsafe'
+[[ -d "$TEMPLATE_SOURCE" && ! -L "$TEMPLATE_SOURCE" ]] || die 'vendored template bundle is missing or unsafe'
+python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_SOURCE" >/dev/null || die 'vendored template bundle verification failed'
+TEMPLATE_BUNDLE_ID="$(python3 -I "$TEMPLATE_VERIFIER" bundle-id "$TEMPLATE_SOURCE")" || die 'cannot identify vendored template bundle'
+[[ "$TEMPLATE_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{1,127}$ ]] || die 'vendored template bundle ID is invalid'
+python3 -I "$TEMPLATE_VERIFIER" list "$TEMPLATE_SOURCE" > "$TMP_DIR/template-files" || die 'cannot list vendored template files'
+python3 -I "$TEMPLATE_VERIFIER" commands "$TEMPLATE_SOURCE" > "$TMP_DIR/template-commands" || die 'cannot list template dependencies'
+python3 -I "$TEMPLATE_VERIFIER" perl-modules "$TEMPLATE_SOURCE" > "$TMP_DIR/template-perl-modules" || die 'cannot list template Perl dependencies'
+while IFS= read -r dependency; do
+  [[ -n "$dependency" ]] || die 'template command dependency is empty'
+  command -v "$dependency" >/dev/null || die "template workflow dependency is missing: $dependency"
+done < "$TMP_DIR/template-commands"
+while IFS= read -r module; do
+  [[ -n "$module" ]] || die 'template Perl module dependency is empty'
+  perl "-M$module" -e 1 >/dev/null 2>&1 || die "template Perl dependency is missing: $module"
+done < "$TMP_DIR/template-perl-modules"
 if [[ -n "$RELEASE_URL" ]]; then
   [[ "$RELEASE_URL" =~ ^https:// ]] || die '--release-url must use HTTPS'
   [[ -n "$RELEASE_SHA256" ]] || die '--release-sha256 is required with --release-url'
   command -v curl >/dev/null || die 'curl is required for --release-url'
   BINARY="$TMP_DIR/$APP"
-  curl --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --output "$BINARY" "$RELEASE_URL"
+  curl --disable --ipv4 --fail --location --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 300 --output "$BINARY" "$RELEASE_URL"
   verify_sha256 "$BINARY" "$RELEASE_SHA256"
 else
   [[ -n "$BINARY_SHA256" ]] || die '--binary-sha256 is required with --binary'
   [[ -f "$BINARY" ]] || die "agent binary is missing: $BINARY"
   verify_sha256 "$BINARY" "$BINARY_SHA256"
 fi
-[[ -f "$BINARY" && -x "$BINARY" ]] || die "agent binary is not executable: $BINARY"
+# The source mode is not authoritative: curl and ordinary release downloads
+# commonly create a verified binary as 0600/0644. The root-owned destination is
+# made executable explicitly by install(1) below, after SHA-256 verification.
+[[ -f "$BINARY" ]] || die "agent binary is not a regular file: $BINARY"
 
 if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
   [[ -n "$NODE_ARCHIVE" && -n "$NODE_SHA256" && -n "$SMART_ARCHIVE" && -n "$SMART_SHA256" ]] || die '--install-exporters requires both local exporter archives and their SHA-256 values'
@@ -156,14 +207,67 @@ getent passwd ppflight-agent >/dev/null || useradd --system --gid ppflight-agent
 getent group ppflight-nodeexp >/dev/null || groupadd --system ppflight-nodeexp
 getent passwd ppflight-nodeexp >/dev/null || useradd --system --gid ppflight-nodeexp --no-create-home --shell /usr/sbin/nologin ppflight-nodeexp
 
+for managed_directory in "$ETC_DIR" "$STATE_DIR" "$BINDINGS_DIR" "$ASSIGNMENTS_DIR"; do
+  [[ ! -L "$managed_directory" ]] || die "refusing symlink at managed directory: $managed_directory"
+  [[ ! -e "$managed_directory" || -d "$managed_directory" ]] || die "managed path is not a directory: $managed_directory"
+done
 install -d -o root -g ppflight-agent -m 0750 "$ETC_DIR"
 install -d -o ppflight-agent -g ppflight-agent -m 0750 "$STATE_DIR"
+# Binding credentials are written by the root-run ag-pve command and read by
+# the service. The service group deliberately has no write permission here.
+install -d -o root -g ppflight-agent -m 0750 "$BINDINGS_DIR"
+install -d -o ppflight-agent -g ppflight-agent -m 0750 "$ASSIGNMENTS_DIR"
 install -d -o root -g root -m 0755 "$LIB_DIR"
+install -d -o root -g root -m 0755 "$TEMPLATE_BUNDLES_DIR"
+install -d -o root -g root -m 0755 "$TMPFILES_DIR"
 install -m 0755 "$BINARY" "$BIN_PATH"
+install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag-pve
+ln -sfn -- "$BIN_PATH" /usr/local/bin/ag
+ln -sfn -- "$BIN_PATH" /usr/local/bin/AG
+
+# Install the complete hash-verified cloud-template bundle into an immutable
+# version directory. Switching the root-owned symlink is atomic, so AG never
+# observes files from two bundle versions during an Agent upgrade. Old version
+# directories are intentionally retained; an in-flight privileged helper may
+# still have resolved one of them before the switch.
+TEMPLATE_STAGE="$(mktemp -d "$TEMPLATE_BUNDLES_DIR/.template-bootstrap-stage.XXXXXX")"
+chmod 0755 "$TEMPLATE_STAGE"
+while IFS= read -r relative; do
+  [[ -n "$relative" && "$relative" != /* && "$relative" != *'..'* && "$relative" != *'\\'* ]] || die 'template file list contains an unsafe path'
+  destination="$TEMPLATE_STAGE/$relative"
+  install -d -o root -g root -m 0755 "$(dirname -- "$destination")"
+  file_mode=0644
+  case "$relative" in
+    *.sh|*.py) file_mode=0755 ;;
+  esac
+  install -o root -g root -m "$file_mode" "$TEMPLATE_SOURCE/$relative" "$destination"
+done < "$TMP_DIR/template-files"
+install -o root -g root -m 0644 "$TEMPLATE_SOURCE/agent-vendor-manifest.v1.json" "$TEMPLATE_STAGE/agent-vendor-manifest.v1.json"
+python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_STAGE" >/dev/null || die 'staged template bundle verification failed'
+TEMPLATE_TARGET="$TEMPLATE_BUNDLES_DIR/$TEMPLATE_BUNDLE_ID"
+if [[ -e "$TEMPLATE_TARGET" ]]; then
+  [[ ! -L "$TEMPLATE_TARGET" && -d "$TEMPLATE_TARGET" ]] || die 'existing template bundle target is unsafe'
+  python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_TARGET" >/dev/null || die 'existing template bundle target failed verification'
+  rm -rf -- "$TEMPLATE_STAGE"
+  TEMPLATE_STAGE=''
+else
+  mv -- "$TEMPLATE_STAGE" "$TEMPLATE_TARGET"
+  TEMPLATE_STAGE=''
+fi
+[[ ! -e "$TEMPLATE_LINK" || -L "$TEMPLATE_LINK" ]] || die 'refusing to replace a non-symlink template bundle path'
+template_link_stage="$LIB_DIR/.template-bootstrap-link.$$"
+[[ ! -e "$template_link_stage" && ! -L "$template_link_stage" ]] || die 'temporary template link already exists'
+ln -s -- "$TEMPLATE_TARGET" "$template_link_stage"
+TEMPLATE_LINK_STAGE="$template_link_stage"
+mv -Tf -- "$template_link_stage" "$TEMPLATE_LINK"
+TEMPLATE_LINK_STAGE=''
+install -o root -g root -m 0644 "$REPO_DIR/packaging/tmpfiles.d/ppflight-agent.conf" "$TMPFILES_PATH"
+systemd-tmpfiles --create "$TMPFILES_PATH"
 
 install_if_absent() {
   local source=$1 target=$2 mode=$3 owner=$4 group=$5
+  [[ ! -L "$target" ]] || die "refusing symlink at managed file: $target"
   if [[ -e "$target" ]]; then
     note "preserved existing $target"
   else
@@ -171,9 +275,38 @@ install_if_absent() {
   fi
 }
 install_if_absent "$CONFIG_FILE" "$ETC_DIR/agent.yaml" 0640 root ppflight-agent
-install_if_absent "$ASSIGNMENTS_FILE" "$ETC_DIR/assignments.json" 0640 root ppflight-agent
 install_if_absent "$ENV_FILE" "$ETC_DIR/agent.env" 0600 root root
 install_if_absent /etc/pve/pve-root-ca.pem "$ETC_DIR/pve-root-ca.pem" 0644 root root
+
+assignment_source="$ASSIGNMENTS_FILE"
+if [[ $ASSIGNMENTS_EXPLICIT -eq 0 && ! -e "$ASSIGNMENTS_PATH" && -e "$LEGACY_ASSIGNMENTS_PATH" ]]; then
+  [[ ! -L "$LEGACY_ASSIGNMENTS_PATH" && -f "$LEGACY_ASSIGNMENTS_PATH" ]] || die "legacy assignment path is unsafe: $LEGACY_ASSIGNMENTS_PATH"
+  assignment_source="$LEGACY_ASSIGNMENTS_PATH"
+  note "migrating existing assignments from $LEGACY_ASSIGNMENTS_PATH"
+fi
+install_if_absent "$assignment_source" "$ASSIGNMENTS_PATH" 0640 ppflight-agent ppflight-agent
+
+ensure_regular_metadata() {
+  local target=$1 mode=$2 owner=$3 group=$4
+  [[ ! -L "$target" ]] || die "refusing symlink at managed file: $target"
+  [[ ! -e "$target" || -f "$target" ]] || die "managed path is not a regular file: $target"
+  if [[ -e "$target" ]]; then
+    chown -- "$owner:$group" "$target"
+    chmod -- "$mode" "$target"
+  fi
+}
+
+# Preserve file contents on upgrades while repairing the exact metadata that
+# permits the unprivileged service to read root-written state.
+ensure_regular_metadata "$ASSIGNMENTS_PATH" 0640 ppflight-agent ppflight-agent
+for binding_file in \
+  binding-state.json \
+  monitoring-binding-state.json \
+  device-id \
+  .website-binding-pending.json \
+  .monitoring-binding-pending.json; do
+  ensure_regular_metadata "$BINDINGS_DIR/$binding_file" 0640 root ppflight-agent
+done
 
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent.service" "$SYSTEMD_DIR/ppflight-agent.service"
 
@@ -194,6 +327,8 @@ if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
 fi
 
 systemctl daemon-reload
+service_user="$(systemctl show --property=User --value ppflight-agent.service)"
+[[ "$service_user" == 'ppflight-agent' ]] || die "ppflight-agent.service must run as User=ppflight-agent (effective User=${service_user:-unset})"
 if [[ $ENABLE -eq 1 ]]; then
   systemctl enable ppflight-agent.service
   if [[ $INSTALL_EXPORTERS -eq 1 ]]; then

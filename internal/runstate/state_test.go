@@ -28,7 +28,28 @@ func TestSequencesPersistAndBootChanges(t *testing.T) {
 	if value, err := second.NextWebsite(); err != nil || value != 2 {
 		t.Fatalf("value=%d err=%v", value, err)
 	}
-	if value, err := second.NextMonitoring(); err != nil || value != 1 {
+	if value, err := second.NextMonitoring(); err != nil || value != 2 {
 		t.Fatalf("value=%d err=%v", value, err)
+	}
+}
+
+func TestMonitoringAuditSequenceIsIndependentAndPersistent(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "run-state.json")
+	state, err := Open(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := state.NextMonitoringAudit(); err != nil || got != 1 {
+		t.Fatalf("first audit sequence=%d err=%v", got, err)
+	}
+	if got, err := state.NextMonitoring(); err != nil || got != 1 {
+		t.Fatalf("telemetry sequence=%d err=%v", got, err)
+	}
+	reopened, err := Open(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := reopened.NextMonitoringAudit(); err != nil || got != 2 {
+		t.Fatalf("reopened audit sequence=%d err=%v", got, err)
 	}
 }

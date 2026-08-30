@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 )
 
@@ -22,10 +23,11 @@ type State struct {
 }
 
 type document struct {
-	Version            int    `json:"version"`
-	BootID             string `json:"bootId"`
-	WebsiteSequence    uint64 `json:"websiteSequence,string"`
-	MonitoringSequence uint64 `json:"monitoringSequence,string"`
+	Version                 int    `json:"version"`
+	BootID                  string `json:"bootId"`
+	WebsiteSequence         uint64 `json:"websiteSequence,string"`
+	MonitoringSequence      uint64 `json:"monitoringSequence,string"`
+	MonitoringAuditSequence uint64 `json:"monitoringAuditSequence,string"`
 }
 
 func Open(filename string) (*State, error) {
@@ -45,7 +47,10 @@ func Open(filename string) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
-	result.value.BootID, result.value.MonitoringSequence = bootID, 0
+	// BootID deliberately changes on every process start, but destination
+	// sequences remain monotonic across restarts so a receiver can distinguish
+	// durable backlog from an out-of-order batch.
+	result.value.BootID = bootID
 	if err := result.persist(); err != nil {
 		return nil, err
 	}
@@ -57,6 +62,9 @@ func (s *State) BootID() string { s.mu.Lock(); defer s.mu.Unlock(); return s.val
 func (s *State) NextWebsite() (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.value.WebsiteSequence == ^uint64(0) {
+		return 0, errors.New("website sequence exhausted")
+	}
 	s.value.WebsiteSequence++
 	if err := s.persist(); err != nil {
 		s.value.WebsiteSequence--
@@ -68,6 +76,9 @@ func (s *State) NextWebsite() (uint64, error) {
 func (s *State) NextMonitoring() (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.value.MonitoringSequence == ^uint64(0) {
+		return 0, errors.New("monitoring sequence exhausted")
+	}
 	s.value.MonitoringSequence++
 	if err := s.persist(); err != nil {
 		s.value.MonitoringSequence--
@@ -76,8 +87,25 @@ func (s *State) NextMonitoring() (uint64, error) {
 	return s.value.MonitoringSequence, nil
 }
 
+// NextMonitoringAudit advances the audit-only wire sequence. Audit and
+// telemetry use separate endpoints and idempotency domains, so sharing a
+// counter would make one stream's gaps dependent on the other's delivery.
+func (s *State) NextMonitoringAudit() (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.value.MonitoringAuditSequence == ^uint64(0) {
+		return 0, errors.New("monitoring audit sequence exhausted")
+	}
+	s.value.MonitoringAuditSequence++
+	if err := s.persist(); err != nil {
+		s.value.MonitoringAuditSequence--
+		return 0, err
+	}
+	return s.value.MonitoringAuditSequence, nil
+}
+
 func (s *State) persist() error {
-	if err := os.MkdirAll(filepath.Dir(s.filename), 0o750); err != nil {
+	if err := fsutil.EnsurePrivateDirectory(filepath.Dir(s.filename)); err != nil {
 		return err
 	}
 	raw, err := json.Marshal(s.value)
@@ -108,10 +136,5 @@ func (s *State) persist() error {
 	if err := os.Rename(name, s.filename); err != nil {
 		return err
 	}
-	directory, err := os.Open(filepath.Dir(s.filename))
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	return fsutil.SyncDir(filepath.Dir(s.filename))
 }

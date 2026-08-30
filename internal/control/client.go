@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 	"github.com/ppflight/ppflight-agent/internal/uploader"
 )
@@ -30,16 +31,17 @@ type Poller interface {
 }
 
 type ClientConfig struct {
-	Endpoint    string
-	AgentRef    string
-	Limit       int
-	AuthMode    uploader.AuthMode
-	KeyID       string
-	Secret      []byte
-	BearerToken string
-	Timeout     time.Duration
-	HTTPClient  *http.Client
-	Now         func() time.Time
+	Endpoint            string
+	AgentRef            string
+	Limit               int
+	AuthMode            uploader.AuthMode
+	KeyID               string
+	Secret              []byte
+	BearerToken         string
+	Timeout             time.Duration
+	HTTPClient          *http.Client
+	ServerIPv4Allowlist []string
+	Now                 func() time.Time
 }
 
 type Client struct {
@@ -56,7 +58,7 @@ type Client struct {
 
 func NewClient(cfg ClientConfig) (*Client, error) {
 	parsed, err := url.Parse(cfg.Endpoint)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || cfg.AgentRef == "" {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || cfg.AgentRef == "" || netpolicy.ValidateIPv4URL(parsed) != nil {
 		return nil, errors.New("control poll endpoint and agent ref are required")
 	}
 	if cfg.Limit < 1 || cfg.Limit > 100 {
@@ -78,8 +80,16 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
 	}
+	if err := netpolicy.ValidateNetworkPolicy(netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: cfg.ServerIPv4Allowlist}); err != nil {
+		return nil, errors.New("control server IPv4 allowlist is invalid")
+	}
 	if cfg.HTTPClient == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
+		var policyErr error
+		transport, policyErr = netpolicy.ApplyIPv4Allowlist(transport, cfg.ServerIPv4Allowlist)
+		if policyErr != nil {
+			return nil, errors.New("control server IPv4 allowlist is invalid")
+		}
 		transport.Proxy = nil
 		if transport.TLSClientConfig == nil {
 			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -92,6 +102,34 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 			Transport:     transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		}
+	} else if transport, ok := cfg.HTTPClient.Transport.(*http.Transport); ok {
+		clone := netpolicy.ApplyIPv4Only(transport.Clone())
+		var policyErr error
+		clone, policyErr = netpolicy.ApplyIPv4Allowlist(clone, cfg.ServerIPv4Allowlist)
+		if policyErr != nil {
+			return nil, errors.New("control server IPv4 allowlist is invalid")
+		}
+		clone.Proxy = nil
+		client := *cfg.HTTPClient
+		client.Timeout = cfg.Timeout
+		client.Transport = clone
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		cfg.HTTPClient = &client
+	} else if cfg.HTTPClient.Transport == nil {
+		clone := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
+		var policyErr error
+		clone, policyErr = netpolicy.ApplyIPv4Allowlist(clone, cfg.ServerIPv4Allowlist)
+		if policyErr != nil {
+			return nil, errors.New("control server IPv4 allowlist is invalid")
+		}
+		clone.Proxy = nil
+		client := *cfg.HTTPClient
+		client.Timeout = cfg.Timeout
+		client.Transport = clone
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		cfg.HTTPClient = &client
+	} else {
+		return nil, errors.New("control HTTP transport must be *http.Transport")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -142,6 +180,9 @@ func (c *Client) Poll(ctx context.Context, after string) (PollResponse, error) {
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return PollResponse{}, fmt.Errorf("control API returned HTTP %d%s", response.StatusCode, safeAPIErrorCode(body))
+	}
+	if err := validateJSONObject(body); err != nil {
+		return PollResponse{}, fmt.Errorf("decode control response: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()

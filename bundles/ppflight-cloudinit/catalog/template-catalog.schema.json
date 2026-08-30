@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ppflight.com/schemas/template-catalog.v1.json",
+  "title": "PPFlight Proxmox template catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "catalogId", "catalogRevision", "issuedAt", "websitePath", "items"],
+  "properties": {
+    "schemaVersion": {"const": "ppflight.template-catalog/v1"},
+    "catalogId": {"const": "ppflight-proxmox-templates"},
+    "catalogRevision": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[1-9][0-9]*$"},
+    "issuedAt": {"type": "string", "format": "date-time"},
+    "websitePath": {"const": "/vps/proxmox-templates"},
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/item"}
+    }
+  },
+  "$defs": {
+    "safeKey": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"},
+    "digest256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest512": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["templateRef", "version", "displayName", "aliases", "architecture", "guestType", "source", "target", "minimumBytes", "build"],
+      "properties": {
+        "templateRef": {"$ref": "#/$defs/safeKey"},
+        "version": {"type": "string", "pattern": "^[0-9]+(?:[.-][a-z0-9]+)*$"},
+        "displayName": {"type": "string", "minLength": 1, "maxLength": 80},
+        "aliases": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/safeKey"}},
+        "architecture": {"const": "amd64"},
+        "guestType": {"const": "qemu"},
+        "source": {"$ref": "#/$defs/source"},
+        "target": {"$ref": "#/$defs/target"},
+        "minimumBytes": {"type": "integer", "minimum": 67108864},
+        "build": {"$ref": "#/$defs/build"}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "urlKey", "sha256", "format", "upstreamChecksum"],
+      "properties": {
+        "kind": {"const": "official-cloud-image"},
+        "urlKey": {"$ref": "#/$defs/safeKey"},
+        "sha256": {"$ref": "#/$defs/digest256"},
+        "format": {"const": "qcow2"},
+        "upstreamChecksum": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "value"],
+          "properties": {
+            "algorithm": {"enum": ["sha256", "sha512"]},
+            "value": {"type": "string", "pattern": "^(?:[0-9a-f]{64}|[0-9a-f]{128})$"}
+          },
+          "oneOf": [
+            {
+              "properties": {
+                "algorithm": {"const": "sha256"},
+                "value": {"$ref": "#/$defs/digest256"}
+              }
+            },
+            {
+              "properties": {
+                "algorithm": {"const": "sha512"},
+                "value": {"$ref": "#/$defs/digest512"}
+              }
+            }
+          ]
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vmid", "osType", "diskBus", "agentEnabled"],
+      "properties": {
+        "vmid": {"type": "integer", "minimum": 100, "maximum": 999999999},
+        "osType": {"const": "l26"},
+        "diskBus": {"const": "scsi0"},
+        "agentEnabled": {"const": true}
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["family", "templateName", "placeholderIPv4", "description"],
+      "properties": {
+        "family": {"enum": ["debian", "rhel"]},
+        "templateName": {"$ref": "#/$defs/safeKey"},
+        "placeholderIPv4": {"type": "string", "pattern": "^192\\.0\\.2\\.(?:[1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-4])$"},
+        "description": {"type": "string", "minLength": 1, "maxLength": 240}
+      }
+    }
+  }
+}

@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -42,6 +43,26 @@ func TestWebsiteTelemetryStringEncodesCumulativeCounters(t *testing.T) {
 	}
 }
 
+func TestWebsiteTelemetryCarriesObservedAndSentTimes(t *testing.T) {
+	observed := time.Date(2026, 8, 30, 1, 2, 3, 0, time.UTC)
+	sent := observed.Add(45 * time.Second)
+	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: observed}
+	batch, err := BuildWebsiteTelemetryAt(snapshot, nil, "source", 7, sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !batch.ObservedAt.Equal(observed) || !batch.SentAt.Equal(sent) || uint64(batch.Sequence) != 7 {
+		t.Fatalf("unexpected time/sequence contract: %#v", batch)
+	}
+	raw, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"sequence":"7"`)) || !bytes.Contains(raw, []byte(`"sentAt":`)) {
+		t.Fatalf("wire contract missing string sequence/sentAt: %s", raw)
+	}
+}
+
 func TestWebsiteTelemetryCarriesManagedIdentity(t *testing.T) {
 	now := time.Now().UTC()
 	store := inventory.NewStore(inventory.Document{SchemaVersion: 1, Revision: "rev", IssuedAt: now, Assignments: []inventory.Assignment{{ServiceRef: "service", ClusterRef: "cluster", VMID: 101, Generation: 1, InstanceUUID: "instance", GuestType: "qemu", BillingState: "shadow"}}})
@@ -52,6 +73,67 @@ func TestWebsiteTelemetryCarriesManagedIdentity(t *testing.T) {
 	}
 	if !batch.Guests[0].Managed || batch.Guests[0].Identity.ServiceRef != "service" {
 		t.Fatalf("identity missing: %#v", batch.Guests[0])
+	}
+}
+
+func TestWebsiteTelemetryExposesNICPolicyAndSafeMeteringCapability(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	mtu := 1500
+	store := inventory.NewStore(inventory.Document{SchemaVersion: 1, Revision: "rev", IssuedAt: now, Assignments: []inventory.Assignment{{
+		ServiceRef: "service", ClusterRef: "cluster", VMID: 101, Generation: 1, InstanceUUID: "instance", GuestType: "qemu", BillingState: "shadow",
+		NICBindings: []inventory.NICBinding{
+			{Interface: "net0", Role: "public", Primary: true, Metered: true, Monitoring: true, ExpectedMAC: "02:00:00:00:01:01", Bridge: "vmbr0", MTU: &mtu, IPFilterPolicy: "required"},
+			{Interface: "net1", Role: "private", Metered: false, ExpectedMAC: "02:00:00:00:01:02", Bridge: "vmbr1", IPFilterPolicy: "required"},
+		},
+	}}})
+	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: now, Guests: []observation.Guest{{
+		VMID: 101, GuestType: "qemu", ObservedAt: now,
+		Networks: []observation.Network{{Index: 0, Interface: "net0", MAC: "02:00:00:00:01:01", Bridge: "vmbr0", MTU: "1500", Firewall: "1"}, {Index: 1, Interface: "net1", MAC: "02:00:00:00:01:02", Bridge: "vmbr1", Firewall: "1"}},
+	}}}
+	batch, err := BuildWebsiteTelemetryAt(snapshot, store, "source", 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest := batch.Guests[0]
+	if guest.Capabilities.Metering.Supported || guest.Capabilities.Metering.Reason != "multi_nic_pve_aggregate_only" {
+		t.Fatalf("mixed NIC policy was treated as exact metering: %#v", guest.Capabilities.Metering)
+	}
+	if len(guest.Networks) != 2 || guest.Networks[0].Binding == nil || guest.Networks[0].Binding.Role != "public" || !guest.Networks[0].PolicyMatch.Supported {
+		t.Fatalf("NIC binding was not correlated with PVE config: %#v", guest.Networks)
+	}
+}
+
+func TestQGARemovalFreezesDependentActionsButNotLifecycle(t *testing.T) {
+	now := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	store := inventory.NewStore(inventory.Document{SchemaVersion: 1, Revision: "rev", IssuedAt: now, Assignments: []inventory.Assignment{{ServiceRef: "service", ClusterRef: "cluster", VMID: 101, Generation: 1, InstanceUUID: "instance", GuestType: "qemu", BillingState: "shadow"}}})
+	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: now, Guests: []observation.Guest{{
+		VMID: 101, GuestType: "qemu", ObservedAt: now,
+		QGA: observation.QGAView{Availability: observation.Availability{Available: false, ObservedAt: now, UnavailableReason: "guest-agent-unavailable"}},
+	}}}
+	batch, err := BuildWebsiteTelemetryAt(snapshot, store, "source", 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capabilities := batch.Guests[0].Capabilities
+	if !capabilities.Lifecycle.Available || capabilities.RootPasswordReset.Available || capabilities.GuestNetworkVerify.Available || capabilities.RootPasswordReset.Reason != "guest-agent-unavailable" {
+		t.Fatalf("unexpected QGA action gate: %#v", capabilities)
+	}
+
+	freshUntil := now.Add(time.Minute)
+	snapshot.Guests[0].QGA.Availability = observation.Availability{Available: true, ObservedAt: now, FreshUntil: freshUntil}
+	batch, err = BuildWebsiteTelemetryAt(snapshot, store, "source", 2, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !batch.Guests[0].Capabilities.RootPasswordReset.Available || !batch.Guests[0].Capabilities.RootPasswordReset.ExecutionPreflight {
+		t.Fatalf("fresh QGA capability missing: %#v", batch.Guests[0].Capabilities)
+	}
+	batch, err = BuildWebsiteTelemetryAt(snapshot, store, "source", 3, freshUntil.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.Guests[0].Capabilities.RootPasswordReset.Available || batch.Guests[0].Capabilities.RootPasswordReset.Reason != "qga_stale" {
+		t.Fatalf("stale QGA did not freeze reset: %#v", batch.Guests[0].Capabilities)
 	}
 }
 

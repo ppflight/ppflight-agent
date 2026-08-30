@@ -4,15 +4,20 @@ Documentation=https://github.com/ppflight/ppflight-agent
 Wants=network-online.target
 After=network-online.target pve-cluster.service
 ConditionPathExists=/etc/ppflight-agent/agent.yaml
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+WatchdogSec=60s
 User=ppflight-agent
 Group=ppflight-agent
 EnvironmentFile=-/etc/ppflight-agent/agent.env
 ExecStart=/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml
-Restart=on-failure
-RestartSec=5s
+# Explicit systemctl stop/disable remains authoritative; this restart policy
+# only applies while systemd considers the unit started.
+Restart=always
+RestartSec=3s
 TimeoutStopSec=30s
 UMask=0077
 NoNewPrivileges=true
@@ -27,11 +32,11 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictRealtime=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
 SystemCallFilter=@system-service @network-io
 ReadWritePaths=/var/lib/ppflight-agent
-ReadOnlyPaths=/etc/ppflight-agent
+ReadOnlyPaths=/etc/ppflight-agent /var/lib/ppflight-agent/bindings
 
 [Install]
 WantedBy=multi-user.target

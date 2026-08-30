@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/inventory"
@@ -16,37 +17,64 @@ import (
 )
 
 type WebsiteTelemetryBatch struct {
-	SchemaVersion int                                 `json:"schemaVersion"`
-	BatchID       string                              `json:"batchId"`
-	AgentRef      string                              `json:"agentRef"`
-	CollectorRef  string                              `json:"collectorRef"`
-	SourceRef     string                              `json:"sourceRef"`
-	ClusterRef    string                              `json:"clusterRef"`
-	Mode          string                              `json:"mode"`
-	Sequence      protocol.Counter                    `json:"sequence"`
-	ObservedAt    time.Time                           `json:"observedAt"`
-	PVEVersion    any                                 `json:"pveVersion"`
-	Components    map[string]observation.Availability `json:"components"`
-	Nodes         []observation.Node                  `json:"nodes"`
-	Storages      []observation.Storage               `json:"storages"`
-	Tasks         []observation.Task                  `json:"tasks"`
-	Guests        []WebsiteGuest                      `json:"guests"`
-	Host          any                                 `json:"host,omitempty"`
-	SMART         any                                 `json:"smart,omitempty"`
+	SchemaVersion int              `json:"schemaVersion"`
+	BatchID       string           `json:"batchId"`
+	AgentRef      string           `json:"agentRef"`
+	CollectorRef  string           `json:"collectorRef"`
+	SourceRef     string           `json:"sourceRef"`
+	ClusterRef    string           `json:"clusterRef"`
+	Mode          string           `json:"mode"`
+	Sequence      protocol.Counter `json:"sequence"`
+	ObservedAt    time.Time        `json:"observedAt"`
+	// SentAt is fixed when the durable payload is created. The receiver adds
+	// receivedAt; retries keep the same body and batch ID.
+	SentAt     time.Time                           `json:"sentAt"`
+	PVEVersion any                                 `json:"pveVersion"`
+	Components map[string]observation.Availability `json:"components"`
+	Nodes      []observation.Node                  `json:"nodes"`
+	Storages   []observation.Storage               `json:"storages"`
+	Tasks      []observation.Task                  `json:"tasks"`
+	Guests     []WebsiteGuest                      `json:"guests"`
+	Host       any                                 `json:"host,omitempty"`
+	SMART      any                                 `json:"smart,omitempty"`
 }
 
 type WebsiteGuest struct {
-	Managed    bool                  `json:"managed"`
-	Identity   *inventory.Assignment `json:"identity,omitempty"`
-	VMID       int                   `json:"vmid"`
-	GuestType  string                `json:"guestType"`
-	Name       string                `json:"name"`
-	Node       string                `json:"node"`
-	Template   bool                  `json:"template"`
-	PVE        WebsitePVEGuestView   `json:"pveObserved"`
-	QGA        observation.QGAView   `json:"guestObserved"`
-	Networks   []observation.Network `json:"networks,omitempty"`
-	ObservedAt time.Time             `json:"observedAt"`
+	Managed      bool                  `json:"managed"`
+	Identity     *inventory.Assignment `json:"identity,omitempty"`
+	VMID         int                   `json:"vmid"`
+	GuestType    string                `json:"guestType"`
+	Name         string                `json:"name"`
+	Node         string                `json:"node"`
+	Template     bool                  `json:"template"`
+	PVE          WebsitePVEGuestView   `json:"pveObserved"`
+	QGA          observation.QGAView   `json:"guestObserved"`
+	Networks     []WebsiteNetwork      `json:"networks,omitempty"`
+	Capabilities GuestCapabilities     `json:"capabilities"`
+	ObservedAt   time.Time             `json:"observedAt"`
+}
+
+type WebsiteNetwork struct {
+	observation.Network
+	Binding     *inventory.NICBinding `json:"binding,omitempty"`
+	PolicyMatch inventory.Capability  `json:"policyMatch"`
+}
+
+type GuestCapabilities struct {
+	Lifecycle          ActionCapability     `json:"lifecycle"`
+	RootPasswordReset  ActionCapability     `json:"rootPasswordReset"`
+	GuestNetworkVerify ActionCapability     `json:"guestNetworkVerify"`
+	Metering           inventory.Capability `json:"metering"`
+}
+
+// ActionCapability is an APP-facing availability snapshot. The command worker
+// performs a fresh QGA preflight again immediately before every mutation.
+type ActionCapability struct {
+	Available          bool      `json:"available"`
+	Reason             string    `json:"reason,omitempty"`
+	ObservedAt         time.Time `json:"observedAt,omitempty"`
+	FreshUntil         time.Time `json:"freshUntil,omitempty"`
+	ExecutionPreflight bool      `json:"executionPreflight"`
 }
 
 // WebsitePVEGuestView string-encodes cumulative counters so a JavaScript API
@@ -69,6 +97,15 @@ type WebsitePVEGuestView struct {
 }
 
 func BuildWebsiteTelemetry(snapshot observation.Snapshot, assignments *inventory.Store, sourceRef string, sequence uint64) (WebsiteTelemetryBatch, error) {
+	return BuildWebsiteTelemetryAt(snapshot, assignments, sourceRef, sequence, time.Now().UTC())
+}
+
+// BuildWebsiteTelemetryAt is the deterministic form used when the caller has
+// already captured the payload creation timestamp.
+func BuildWebsiteTelemetryAt(snapshot observation.Snapshot, assignments *inventory.Store, sourceRef string, sequence uint64, sentAt time.Time) (WebsiteTelemetryBatch, error) {
+	if sentAt.IsZero() {
+		return WebsiteTelemetryBatch{}, fmt.Errorf("telemetry sentAt is required")
+	}
 	batchID, err := protocol.NewID()
 	if err != nil {
 		return WebsiteTelemetryBatch{}, err
@@ -76,21 +113,106 @@ func BuildWebsiteTelemetry(snapshot observation.Snapshot, assignments *inventory
 	result := WebsiteTelemetryBatch{
 		SchemaVersion: 1, BatchID: batchID, AgentRef: snapshot.AgentRef, CollectorRef: snapshot.CollectorRef,
 		SourceRef: sourceRef, ClusterRef: snapshot.ClusterRef, Mode: snapshot.Mode,
-		Sequence: protocol.Counter(sequence), ObservedAt: snapshot.ObservedAt, PVEVersion: snapshot.PVEVersion,
+		Sequence: protocol.Counter(sequence), ObservedAt: snapshot.ObservedAt, SentAt: sentAt.UTC(), PVEVersion: snapshot.PVEVersion,
 		Components: snapshot.Components, Nodes: snapshot.Nodes, Storages: snapshot.Storages,
 		Tasks: snapshot.Tasks, Host: snapshot.Host, SMART: snapshot.SMART,
 	}
 	for _, guest := range snapshot.Guests {
-		item := WebsiteGuest{VMID: guest.VMID, GuestType: guest.GuestType, Name: guest.Name, Node: guest.Node, Template: guest.Template, PVE: websitePVEView(guest.PVE), QGA: guest.QGA, Networks: guest.Networks, ObservedAt: guest.ObservedAt}
+		item := WebsiteGuest{VMID: guest.VMID, GuestType: guest.GuestType, Name: guest.Name, Node: guest.Node, Template: guest.Template, PVE: websitePVEView(guest.PVE), QGA: guest.QGA, Networks: websiteNetworks(guest.Networks, nil), Capabilities: guestCapabilities(guest, nil, sentAt), ObservedAt: guest.ObservedAt}
 		if assignments != nil {
 			if assignment, ok := assignments.Lookup(snapshot.ClusterRef, guest.GuestType, guest.VMID); ok {
 				copyValue := assignment
 				item.Managed, item.Identity = true, &copyValue
+				item.Networks = websiteNetworks(guest.Networks, assignment.NICBindings)
+				item.Capabilities = guestCapabilities(guest, &assignment, sentAt)
 			}
 		}
 		result.Guests = append(result.Guests, item)
 	}
 	return result, nil
+}
+
+func guestCapabilities(guest observation.Guest, assignment *inventory.Assignment, now time.Time) GuestCapabilities {
+	result := GuestCapabilities{Lifecycle: ActionCapability{Available: true}}
+	if assignment == nil {
+		result.Metering = inventory.Capability{Reason: "assignment_required", Source: "pve-guest-aggregate"}
+	} else {
+		result.Metering = assignment.AggregateMeteringCapability()
+	}
+	if guest.GuestType != "qemu" {
+		result.RootPasswordReset = ActionCapability{Reason: "lxc_password_reset_not_implemented"}
+		result.GuestNetworkVerify = ActionCapability{Reason: "qga_not_applicable"}
+		return result
+	}
+	availability := guest.QGA.Availability
+	qga := ActionCapability{ObservedAt: availability.ObservedAt, FreshUntil: availability.FreshUntil, ExecutionPreflight: true}
+	switch {
+	case !availability.Available:
+		qga.Reason = firstNonempty(availability.UnavailableReason, "qga_unavailable")
+	case availability.FreshUntil.IsZero():
+		qga.Reason = "qga_freshness_unknown"
+	case now.After(availability.FreshUntil):
+		qga.Reason = "qga_stale"
+	default:
+		qga.Available = true
+	}
+	result.RootPasswordReset, result.GuestNetworkVerify = qga, qga
+	return result
+}
+
+func websiteNetworks(observed []observation.Network, bindings []inventory.NICBinding) []WebsiteNetwork {
+	result := make([]WebsiteNetwork, 0, len(observed)+len(bindings))
+	byInterface := make(map[string]inventory.NICBinding, len(bindings))
+	for _, binding := range bindings {
+		byInterface[binding.Interface] = binding
+	}
+	seen := make(map[string]bool, len(observed))
+	for _, network := range observed {
+		if network.Interface == "" {
+			network.Interface = "net" + strconv.Itoa(network.Index)
+		}
+		item := WebsiteNetwork{Network: network, PolicyMatch: inventory.Capability{Reason: "binding_missing", Source: "pve-config"}}
+		if binding, ok := byInterface[network.Interface]; ok {
+			copyValue := binding
+			item.Binding = &copyValue
+			item.PolicyMatch = matchNetworkPolicy(network, binding)
+			seen[network.Interface] = true
+		}
+		result = append(result, item)
+	}
+	for _, binding := range bindings {
+		if seen[binding.Interface] {
+			continue
+		}
+		copyValue := binding
+		result = append(result, WebsiteNetwork{
+			Network: observation.Network{Interface: binding.Interface}, Binding: &copyValue,
+			PolicyMatch: inventory.Capability{Reason: "interface_missing", Source: "pve-config"},
+		})
+	}
+	sort.SliceStable(result, func(i, j int) bool { return result[i].Interface < result[j].Interface })
+	return result
+}
+
+func matchNetworkPolicy(observed observation.Network, binding inventory.NICBinding) inventory.Capability {
+	attachment := binding.Bridge
+	if binding.VNet != "" {
+		attachment = binding.VNet
+	}
+	switch {
+	case !strings.EqualFold(observed.MAC, binding.ExpectedMAC):
+		return inventory.Capability{Reason: "mac_mismatch", Source: "pve-config"}
+	case observed.Bridge != attachment:
+		return inventory.Capability{Reason: "attachment_mismatch", Source: "pve-config"}
+	case binding.VLAN != nil && observed.VLAN != strconv.Itoa(*binding.VLAN):
+		return inventory.Capability{Reason: "vlan_mismatch", Source: "pve-config"}
+	case binding.MTU != nil && observed.MTU != strconv.Itoa(*binding.MTU):
+		return inventory.Capability{Reason: "mtu_mismatch", Source: "pve-config"}
+	case binding.IPFilterPolicy == "required" && observed.Firewall != "1":
+		return inventory.Capability{Reason: "nic_firewall_disabled", Source: "pve-config"}
+	default:
+		return inventory.Capability{Supported: true, Source: "pve-config"}
+	}
 }
 
 func websitePVEView(value observation.PVEGuestView) WebsitePVEGuestView {

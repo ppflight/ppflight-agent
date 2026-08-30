@@ -1,0 +1,123 @@
+name: Release PPFlight Agent
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric semantic version to package (manual dispatch never publishes)
+        required: true
+        type: string
+
+# A tag build creates an immutable GitHub Release.  Manual dispatch only
+# packages and retains an Actions artifact; it deliberately never publishes.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify race and vet
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          check-latest: false
+      - name: Race detector and static analysis
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go test -race -count=1 ./...
+          go vet ./...
+
+  package:
+    name: package (${{ matrix.arch }})
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          check-latest: false
+      - name: Resolve and validate release version
+        id: version
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ "${{ github.event_name }}" == push ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            [[ "v${version}" == "$GITHUB_REF_NAME" ]] || { echo 'tag must start with v' >&2; exit 1; }
+          else
+            version="${{ inputs.version }}"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'version must be X.Y.Z' >&2; exit 1; }
+          printf 'value=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Test release packaging policy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash -n scripts/package-release.sh scripts/package-release_test.sh
+          go test ./...
+          bash scripts/package-release_test.sh
+      - name: Build static Linux binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist/release
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.version.outputs.value }}" -o dist/ppflight-agent ./cmd/ppflight-agent
+          scripts/package-release.sh --binary dist/ppflight-agent --version "${{ steps.version.outputs.value }}" --arch "${{ matrix.arch }}" --output-dir dist/release
+          mv dist/release/SHA256SUMS "dist/release/SHA256SUMS-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: ppflight-release-${{ matrix.arch }}
+          if-no-files-found: error
+          path: dist/release/
+
+  publish:
+    name: publish GitHub release
+    needs: package
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          pattern: ppflight-release-*
+          path: release
+          merge-multiple: true
+      - name: Combine checksums and publish immutable assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd release
+          cat SHA256SUMS-amd64 SHA256SUMS-arm64 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          gh release create "$TAG" \
+            ppflight-agent-*-linux-*.tar.gz SHA256SUMS \
+            --verify-tag \
+            --title "PPFlight Agent $TAG" \
+            --generate-notes

@@ -14,10 +14,13 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 	"github.com/ppflight/ppflight-agent/internal/store"
 )
@@ -39,7 +42,11 @@ type Destination struct {
 	KeyID       string
 	Secret      []byte
 	BearerToken string
-	Compression string
+	// CredentialEpoch is issued by the binding authority. Increasing it is the
+	// only in-process way to clear an authentication circuit breaker.
+	CredentialEpoch     uint64
+	Compression         string
+	ServerIPv4Allowlist []string
 }
 
 type Queue interface {
@@ -54,29 +61,46 @@ type Config struct {
 	Queue          Queue
 	HTTPClient     *http.Client
 	RequestTimeout time.Duration
-	Now            func() time.Time
-	BaseDelay      time.Duration
-	MaxDelay       time.Duration
-	TLSDelay       time.Duration
+	// MaxResponseBytes bounds API response bodies that must be inspected for
+	// machine-readable errors. Zero (or a negative value) uses the 2 MiB
+	// default; values above the 8 MiB hard limit are rejected by New.
+	MaxResponseBytes     int64
+	MaxCompressedBytes   int64
+	MaxUncompressedBytes int64
+	Now                  func() time.Time
+	BaseDelay            time.Duration
+	MaxDelay             time.Duration
+	TLSDelay             time.Duration
 	// Jitter returns a delay in [0, maximum]. Inject a deterministic function
 	// in tests; nil uses full jitter to avoid synchronized retry storms.
 	Jitter func(maximum time.Duration) time.Duration
 }
 
 type Uploader struct {
-	destination Destination
-	queue       Queue
-	client      *http.Client
-	now         func() time.Time
-	baseDelay   time.Duration
-	maxDelay    time.Duration
-	tlsDelay    time.Duration
-	jitter      func(maximum time.Duration) time.Duration
+	mu                   sync.RWMutex
+	destination          Destination
+	authBlocked          bool
+	queue                Queue
+	client               *http.Client
+	maxResponseBytes     int64
+	maxCompressedBytes   int64
+	maxUncompressedBytes int64
+	now                  func() time.Time
+	baseDelay            time.Duration
+	maxDelay             time.Duration
+	tlsDelay             time.Duration
+	jitter               func(maximum time.Duration) time.Duration
 }
+
+var ErrAuthBlocked = errors.New("destination authentication is blocked pending credential rotation")
 
 func New(config Config) (*Uploader, error) {
 	if config.Destination.ID == "" || config.Destination.Endpoint == "" || config.Queue == nil {
 		return nil, errors.New("destination ID, endpoint and queue are required")
+	}
+	parsedEndpoint, err := url.Parse(config.Destination.Endpoint)
+	if err != nil || netpolicy.ValidateIPv4URL(parsedEndpoint) != nil {
+		return nil, errors.New("destination endpoint must have an IPv4-capable host")
 	}
 	switch config.Destination.AuthMode {
 	case AuthHMACSHA256:
@@ -97,8 +121,45 @@ func New(config Config) (*Uploader, error) {
 	if config.Destination.Compression != "none" && config.Destination.Compression != "gzip" {
 		return nil, fmt.Errorf("unknown compression %q", config.Destination.Compression)
 	}
+	if err := netpolicy.ValidateNetworkPolicy(netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1", ServerIPv4Allowlist: config.Destination.ServerIPv4Allowlist}); err != nil {
+		return nil, errors.New("destination server IPv4 allowlist is invalid")
+	}
 	if config.HTTPClient == nil {
-		config.HTTPClient = secureHTTPClient(config.RequestTimeout)
+		config.HTTPClient, err = secureHTTPClient(config.RequestTimeout, config.Destination.ServerIPv4Allowlist)
+		if err != nil {
+			return nil, errors.New("destination server IPv4 allowlist is invalid")
+		}
+	} else if transport, ok := config.HTTPClient.Transport.(*http.Transport); ok {
+		clone := transport.Clone()
+		clone.Proxy = nil
+		clone, err = netpolicy.ApplyIPv4Allowlist(netpolicy.ApplyIPv4Only(clone), config.Destination.ServerIPv4Allowlist)
+		if err != nil {
+			return nil, errors.New("destination server IPv4 allowlist is invalid")
+		}
+		config.HTTPClient = cloneHTTPClient(config.HTTPClient, clone, config.RequestTimeout)
+	} else if config.HTTPClient.Transport == nil {
+		clone, policyErr := netpolicy.ApplyIPv4Allowlist(netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone()), config.Destination.ServerIPv4Allowlist)
+		if policyErr != nil {
+			return nil, errors.New("destination server IPv4 allowlist is invalid")
+		}
+		config.HTTPClient = cloneHTTPClient(config.HTTPClient, clone, config.RequestTimeout)
+	} else {
+		return nil, errors.New("uploader HTTP transport must be *http.Transport")
+	}
+	if config.MaxResponseBytes <= 0 {
+		config.MaxResponseBytes = defaultMaxResponseBytes
+	}
+	if config.MaxResponseBytes > maxResponseBytesLimit {
+		return nil, fmt.Errorf("uploader max response size exceeds %d bytes", maxResponseBytesLimit)
+	}
+	if config.MaxCompressedBytes <= 0 {
+		config.MaxCompressedBytes = 64 << 20
+	}
+	if config.MaxUncompressedBytes <= 0 {
+		config.MaxUncompressedBytes = 256 << 20
+	}
+	if config.MaxCompressedBytes > 64<<20 || config.MaxUncompressedBytes > 256<<20 || config.MaxUncompressedBytes < config.MaxCompressedBytes {
+		return nil, errors.New("uploader request size limits are invalid")
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -120,16 +181,18 @@ func New(config Config) (*Uploader, error) {
 			return time.Duration(rand.Int64N(int64(maximum) + 1))
 		}
 	}
-	return &Uploader{destination: config.Destination, queue: config.Queue, client: config.HTTPClient, now: config.Now, baseDelay: config.BaseDelay, maxDelay: config.MaxDelay, tlsDelay: config.TLSDelay, jitter: config.Jitter}, nil
+	config.Destination.Secret = append([]byte(nil), config.Destination.Secret...)
+	return &Uploader{destination: config.Destination, queue: config.Queue, client: config.HTTPClient, maxResponseBytes: config.MaxResponseBytes, maxCompressedBytes: config.MaxCompressedBytes, maxUncompressedBytes: config.MaxUncompressedBytes, now: config.Now, baseDelay: config.BaseDelay, maxDelay: config.MaxDelay, tlsDelay: config.TLSDelay, jitter: config.Jitter}, nil
 }
 
 type Result struct {
-	Delivered  bool
-	Pending    bool
-	BatchID    string
-	StatusCode int
-	RetryAt    time.Time
-	Err        error
+	Delivered   bool
+	Pending     bool
+	BatchID     string
+	StatusCode  int
+	RetryAt     time.Time
+	AuthBlocked bool
+	Err         error
 }
 
 // DeliverOne makes at most one request. Each destination owns an independent
@@ -140,42 +203,70 @@ func (u *Uploader) DeliverOne(ctx context.Context) Result {
 		return Result{}
 	}
 	result := Result{Pending: true, BatchID: item.BatchID}
-	payload, err := encodePayload(item.Payload, u.destination.Compression)
+	destination, blocked := u.destinationState()
+	if blocked {
+		result.AuthBlocked, result.Err = true, ErrAuthBlocked
+		return result
+	}
+	if int64(len(item.Payload)) > u.maxUncompressedBytes {
+		return u.quarantine(item, result, "PAYLOAD_UNCOMPRESSED_TOO_LARGE")
+	}
+	payload, err := encodePayload(item.Payload, destination.Compression)
 	if err != nil {
 		return u.retry(item, result, 0, err, time.Time{}, false)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.destination.Endpoint, bytes.NewReader(payload))
+	if int64(len(payload)) > u.maxCompressedBytes {
+		return u.quarantine(item, result, "PAYLOAD_COMPRESSED_TOO_LARGE")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, destination.Endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return u.retry(item, result, 0, err, time.Time{}, false)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if u.destination.Compression == "gzip" {
+	if destination.Compression == "gzip" {
 		req.Header.Set("Content-Encoding", "gzip")
 	}
 	req.Header.Set("Idempotency-Key", item.BatchID)
-	switch u.destination.AuthMode {
+	switch destination.AuthMode {
 	case AuthHMACSHA256:
-		if err := protocol.SignRequest(req, payload, u.destination.KeyID, u.destination.Secret, u.now(), ""); err != nil {
+		if err := protocol.SignRequest(req, payload, destination.KeyID, destination.Secret, u.now(), ""); err != nil {
 			return u.retry(item, result, 0, err, time.Time{}, false)
 		}
 	case AuthBearer:
-		req.Header.Set("Authorization", "Bearer "+u.destination.BearerToken)
+		req.Header.Set("Authorization", "Bearer "+destination.BearerToken)
 	}
 	response, err := u.client.Do(req)
 	if err != nil {
 		return u.retry(item, result, 0, err, time.Time{}, isTLSError(err))
 	}
 	defer response.Body.Close()
-	apiResponse, bodyErr := parseAPIResponse(response.Body)
 	result.StatusCode = response.StatusCode
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		u.blockAuthentication()
+		result.AuthBlocked, result.Err = true, ErrAuthBlocked
+		// Do not Nack or Quarantine. The queue head and every following batch stay
+		// untouched until a newer credential epoch is installed.
+		return result
+	}
+	// Success is determined by HTTP status. Response bodies on successful
+	// uploads are advisory and cannot turn an accepted batch back into a retry.
+	if response.StatusCode >= 200 && response.StatusCode < 300 {
+		if err := u.queue.Ack(item.BatchID); err != nil {
+			result.Err = err
+			return result
+		}
+		result.Delivered, result.Pending = true, false
+		return result
+	}
+	apiResponse, bodyErr := parseAPIResponse(response.Body, u.maxResponseBytes)
 	if bodyErr != nil {
-		if response.StatusCode >= 200 && response.StatusCode < 300 || retryableStatus(response.StatusCode) {
+		if retryableStatus(response.StatusCode) {
 			return u.retry(item, result, response.StatusCode, bodyErr, retryAfterAt(response.Header.Get("Retry-After"), u.now()), false)
 		}
 		return u.quarantine(item, result, bodyErr.Error())
 	}
-	duplicate := response.StatusCode == http.StatusConflict && strings.EqualFold(apiResponse.Code, "DUPLICATE")
-	if (response.StatusCode >= 200 && response.StatusCode < 300) || duplicate {
+	duplicate := response.StatusCode == http.StatusConflict && strings.EqualFold(apiResponse.machineCode(), "DUPLICATE")
+	if duplicate {
 		if err := u.queue.Ack(item.BatchID); err != nil {
 			result.Err = err
 			return result
@@ -188,6 +279,55 @@ func (u *Uploader) DeliverOne(ctx context.Context) Result {
 		return u.retry(item, result, response.StatusCode, errors.New(message), retryAfterAt(response.Header.Get("Retry-After"), u.now()), false)
 	}
 	return u.quarantine(item, result, message)
+}
+
+func (u *Uploader) destinationState() (Destination, bool) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	value := u.destination
+	value.Secret = append([]byte(nil), value.Secret...)
+	return value, u.authBlocked
+}
+
+func (u *Uploader) blockAuthentication() {
+	u.mu.Lock()
+	u.authBlocked = true
+	u.mu.Unlock()
+}
+
+// RotateCredentials installs credentials issued by the same destination's
+// binding authority. A strictly newer epoch is required, preventing old
+// credential material or a local rollback from reopening a blocked channel.
+func (u *Uploader) RotateCredentials(epoch uint64, keyID string, secret []byte, bearer string) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if epoch == 0 || epoch <= u.destination.CredentialEpoch {
+		return errors.New("credential epoch did not advance")
+	}
+	switch u.destination.AuthMode {
+	case AuthHMACSHA256:
+		if strings.TrimSpace(keyID) == "" || len(secret) == 0 || bearer != "" {
+			return errors.New("invalid HMAC credential rotation")
+		}
+		u.destination.KeyID = keyID
+		u.destination.Secret = append(u.destination.Secret[:0], secret...)
+	case AuthBearer:
+		if strings.TrimSpace(bearer) == "" || keyID != "" || len(secret) != 0 {
+			return errors.New("invalid bearer credential rotation")
+		}
+		u.destination.BearerToken = bearer
+	case AuthNone:
+		return errors.New("unauthenticated destination has no rotatable credential")
+	}
+	u.destination.CredentialEpoch = epoch
+	u.authBlocked = false
+	return nil
+}
+
+func (u *Uploader) AuthenticationBlocked() bool {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.authBlocked
 }
 
 func encodePayload(payload []byte, compression string) ([]byte, error) {
@@ -278,29 +418,87 @@ func retryAfterAt(raw string, now time.Time) time.Time {
 	return time.Time{}
 }
 
-const maxResponseBytes = 64 << 10
+const (
+	defaultMaxResponseBytes = int64(2 << 20)
+	maxResponseBytesLimit   = int64(8 << 20)
+)
 
 type apiResponse struct {
+	Code    string   `json:"code"`
+	Error   apiError `json:"error"`
+	Message string   `json:"message"`
+}
+
+type apiError struct {
 	Code    string `json:"code"`
-	Error   string `json:"error"`
 	Message string `json:"message"`
 }
 
-func (r apiResponse) message(status int) string {
-	for _, text := range []string{r.Message, r.Error, r.Code} {
-		if strings.TrimSpace(text) != "" {
-			return fmt.Sprintf("HTTP %d: %s", status, text)
+func (e *apiError) UnmarshalJSON(raw []byte) error {
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		*e = apiError{}
+		return nil
+	}
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var message string
+		if err := json.Unmarshal(trimmed, &message); err != nil {
+			return err
 		}
+		*e = apiError{Message: message}
+		return nil
+	}
+	type plainAPIError apiError
+	var nested plainAPIError
+	if err := json.Unmarshal(trimmed, &nested); err != nil {
+		return errors.New("API error must be an object or string")
+	}
+	*e = apiError(nested)
+	return nil
+}
+
+// machineCode returns an unambiguous machine-readable error code. Conflicting
+// flat and nested codes are deliberately treated as unknown so a contradictory
+// 409 response can never acknowledge data as a duplicate.
+func (r apiResponse) machineCode() string {
+	flat := strings.TrimSpace(r.Code)
+	nested := strings.TrimSpace(r.Error.Code)
+	if flat != "" && nested != "" && !strings.EqualFold(flat, nested) {
+		return ""
+	}
+	if nested != "" {
+		return nested
+	}
+	return flat
+}
+
+func (r apiResponse) message(status int) string {
+	code := strings.TrimSpace(r.Error.Code)
+	if code == "" {
+		code = strings.TrimSpace(r.Code)
+	}
+	detail := strings.TrimSpace(r.Error.Message)
+	if detail == "" {
+		detail = strings.TrimSpace(r.Message)
+	}
+	if code != "" && detail != "" {
+		return fmt.Sprintf("HTTP %d: %s: %s", status, code, detail)
+	}
+	if detail != "" {
+		return fmt.Sprintf("HTTP %d: %s", status, detail)
+	}
+	if code != "" {
+		return fmt.Sprintf("HTTP %d: %s", status, code)
 	}
 	return fmt.Sprintf("HTTP %d", status)
 }
-func parseAPIResponse(body io.Reader) (apiResponse, error) {
-	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+func parseAPIResponse(body io.Reader, maxBytes int64) (apiResponse, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
 	if err != nil {
 		return apiResponse{}, fmt.Errorf("read API response: %w", err)
 	}
-	if len(raw) > maxResponseBytes {
-		return apiResponse{}, errors.New("API response exceeds 64 KiB")
+	if int64(len(raw)) > maxBytes {
+		return apiResponse{}, fmt.Errorf("API response exceeds %d bytes", maxBytes)
 	}
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return apiResponse{}, nil
@@ -312,11 +510,16 @@ func parseAPIResponse(body io.Reader) (apiResponse, error) {
 	return response, nil
 }
 
-func secureHTTPClient(timeout time.Duration) *http.Client {
+func secureHTTPClient(timeout time.Duration, allowlist []string) (*http.Client, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
+	var err error
+	transport, err = netpolicy.ApplyIPv4Allowlist(transport, allowlist)
+	if err != nil {
+		return nil, err
+	}
 	transport.Proxy = nil
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}
@@ -324,7 +527,17 @@ func secureHTTPClient(timeout time.Duration) *http.Client {
 		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 	}
 	transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
+}
+
+func cloneHTTPClient(source *http.Client, transport *http.Transport, timeout time.Duration) *http.Client {
+	clone := *source
+	if timeout > 0 {
+		clone.Timeout = timeout
+	}
+	clone.Transport = transport
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &clone
 }
 
 func isTLSError(err error) bool {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"regexp"
 	"sort"
@@ -22,7 +23,12 @@ const (
 	maxAssignments = 100000
 )
 
-var safeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{1,191}$`)
+var (
+	safeRef       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{1,191}$`)
+	networkRef    = regexp.MustCompile(`^net(?:[0-9]|[12][0-9]|3[01])$`)
+	attachmentRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`)
+	canonicalMAC  = regexp.MustCompile(`(?i)^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$`)
+)
 
 type Document struct {
 	SchemaVersion int          `json:"schemaVersion"`
@@ -32,15 +38,42 @@ type Document struct {
 }
 
 type Assignment struct {
-	ServiceRef   string     `json:"serviceRef"`
-	ClusterRef   string     `json:"clusterRef"`
-	NodeRef      string     `json:"nodeRef,omitempty"`
-	VMID         int        `json:"vmid"`
-	Generation   uint64     `json:"generation"`
-	InstanceUUID string     `json:"instanceUuid"`
-	GuestType    string     `json:"guestType"`
-	BillingState string     `json:"billingState"`
-	CutoverAt    *time.Time `json:"cutoverAt,omitempty"`
+	ServiceRef   string       `json:"serviceRef"`
+	ClusterRef   string       `json:"clusterRef"`
+	NodeRef      string       `json:"nodeRef,omitempty"`
+	VMID         int          `json:"vmid"`
+	Generation   uint64       `json:"generation"`
+	InstanceUUID string       `json:"instanceUuid"`
+	GuestType    string       `json:"guestType"`
+	BillingState string       `json:"billingState"`
+	CutoverAt    *time.Time   `json:"cutoverAt,omitempty"`
+	NICBindings  []NICBinding `json:"nicBindings,omitempty"`
+}
+
+// NICBinding is the website-authoritative network role and policy for one
+// stable PVE netN interface. PVE/QGA enumeration order is never an identity.
+// VLAN and MTU are pointers so an explicit zero cannot be confused with a
+// missing value during policy reconciliation.
+type NICBinding struct {
+	Interface      string `json:"interface"`
+	Role           string `json:"role"`
+	Primary        bool   `json:"primary"`
+	Metered        bool   `json:"metered"`
+	Monitoring     bool   `json:"monitoring"`
+	ExpectedMAC    string `json:"expectedMac"`
+	Bridge         string `json:"bridge,omitempty"`
+	VNet           string `json:"vnet,omitempty"`
+	VLAN           *int   `json:"vlan,omitempty"`
+	MTU            *int   `json:"mtu,omitempty"`
+	IPFilterPolicy string `json:"ipFilterPolicy"`
+}
+
+// Capability is deliberately typed so the website and APP can distinguish a
+// safe aggregate counter from a merely present PVE counter.
+type Capability struct {
+	Supported bool   `json:"supported"`
+	Reason    string `json:"reason,omitempty"`
+	Source    string `json:"source,omitempty"`
 }
 
 func (a Assignment) Key() string {
@@ -49,6 +82,24 @@ func (a Assignment) Key() string {
 
 func (a Assignment) PVEKey() string {
 	return fmt.Sprintf("%s/%s/%d", a.ClusterRef, a.GuestType, a.VMID)
+}
+
+// AggregateMeteringCapability reports whether PVE guest-level netin/netout can
+// satisfy the signed NIC policy. It is safe only when every configured NIC is
+// explicitly metered; otherwise private traffic cannot be separated.
+func (a Assignment) AggregateMeteringCapability() Capability {
+	if len(a.NICBindings) == 0 {
+		return Capability{Reason: "nic_binding_required", Source: "pve-guest-aggregate"}
+	}
+	for _, binding := range a.NICBindings {
+		if !binding.Metered {
+			if len(a.NICBindings) > 1 {
+				return Capability{Reason: "multi_nic_pve_aggregate_only", Source: "pve-guest-aggregate"}
+			}
+			return Capability{Reason: "no_metered_nic", Source: "pve-guest-aggregate"}
+		}
+	}
+	return Capability{Supported: true, Source: "pve-guest-aggregate"}
 }
 
 func Parse(contents []byte, expectedClusterRef string) (Document, error) {
@@ -128,7 +179,88 @@ func (a Assignment) validate(expectedClusterRef string) error {
 	if a.BillingState == "active" && a.CutoverAt == nil {
 		return errors.New("active billing requires cutoverAt")
 	}
+	if err := validateNICBindings(a.NICBindings); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateNICBindings(bindings []NICBinding) error {
+	if len(bindings) > 32 {
+		return errors.New("nicBindings exceeds 32 interfaces")
+	}
+	if len(bindings) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(bindings))
+	primary, monitoring, public := 0, 0, 0
+	for index, binding := range bindings {
+		if !networkRef.MatchString(binding.Interface) {
+			return fmt.Errorf("nicBindings[%d].interface must be net0-net31", index)
+		}
+		if _, ok := seen[binding.Interface]; ok {
+			return fmt.Errorf("nicBindings[%d].interface is duplicated", index)
+		}
+		seen[binding.Interface] = struct{}{}
+		if binding.Role != "public" && binding.Role != "private" {
+			return fmt.Errorf("nicBindings[%d].role must be public or private", index)
+		}
+		if binding.Role == "public" {
+			public++
+		}
+		if binding.Primary {
+			primary++
+			if binding.Role != "public" {
+				return fmt.Errorf("nicBindings[%d].primary must have public role", index)
+			}
+		}
+		if binding.Monitoring {
+			monitoring++
+		}
+		if !validMAC(binding.ExpectedMAC) {
+			return fmt.Errorf("nicBindings[%d].expectedMac must be a canonical unicast MAC", index)
+		}
+		if binding.Bridge != "" && binding.VNet != "" {
+			return fmt.Errorf("nicBindings[%d] cannot set both bridge and vnet", index)
+		}
+		if binding.Bridge == "" && binding.VNet == "" {
+			return fmt.Errorf("nicBindings[%d] requires bridge or vnet", index)
+		}
+		if binding.Bridge != "" && !attachmentRef.MatchString(binding.Bridge) || binding.VNet != "" && !attachmentRef.MatchString(binding.VNet) {
+			return fmt.Errorf("nicBindings[%d] has an invalid bridge or vnet", index)
+		}
+		if binding.VLAN != nil && (*binding.VLAN < 0 || *binding.VLAN > 4094) {
+			return fmt.Errorf("nicBindings[%d].vlan must be 0-4094", index)
+		}
+		if binding.MTU != nil && (*binding.MTU < 576 || *binding.MTU > 9216) {
+			return fmt.Errorf("nicBindings[%d].mtu must be 576-9216", index)
+		}
+		if binding.IPFilterPolicy != "required" && binding.IPFilterPolicy != "disabled" {
+			return fmt.Errorf("nicBindings[%d].ipFilterPolicy must be required or disabled", index)
+		}
+	}
+	if primary != 1 || public == 0 {
+		return errors.New("nicBindings requires exactly one primary public interface")
+	}
+	if monitoring != 1 {
+		return errors.New("nicBindings requires exactly one monitoring interface")
+	}
+	return nil
+}
+
+func validMAC(value string) bool {
+	if !canonicalMAC.MatchString(value) {
+		return false
+	}
+	parsed, err := net.ParseMAC(value)
+	if err != nil || len(parsed) != 6 || parsed[0]&1 != 0 {
+		return false
+	}
+	allZero := true
+	for _, part := range parsed {
+		allZero = allZero && part == 0
+	}
+	return !allZero
 }
 
 func LoadFile(filename, expectedClusterRef string) (Document, error) {

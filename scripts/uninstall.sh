@@ -13,6 +13,8 @@ Usage: sudo scripts/uninstall.sh [--remove-exporters] [--purge]
 
 Stops and disables PPFlight units, then removes installed binaries and unit
 files. --remove-exporters also removes PPFlight's private exporter binaries.
+The Agent-owned, immutable cloud-template helper bundle is removed with the
+Agent binary; PVE templates and image/backup data created by it are untouched.
 --purge additionally removes /etc/ppflight-agent and /var/lib/ppflight-agent;
 that destroys the local durable queue and should only be used after it has
 drained or has been backed up.
@@ -35,11 +37,15 @@ for unit in ppflight-agent.service ppflight-node-exporter.service ppflight-smart
   systemctl disable --now "$unit" 2>/dev/null || true
 done
 rm -f -- /etc/systemd/system/ppflight-agent.service
+rm -f -- /usr/lib/tmpfiles.d/ppflight-agent.conf
 if [[ $REMOVE_EXPORTERS -eq 1 ]]; then
   rm -f -- /etc/systemd/system/ppflight-node-exporter.service /etc/systemd/system/ppflight-smartctl-exporter.service
   rm -f -- /usr/local/lib/ppflight-agent/node_exporter /usr/local/lib/ppflight-agent/smartctl_exporter
 fi
-rm -f -- /usr/local/bin/ppflight-agent /usr/local/bin/ag-pve
+rm -f -- /usr/local/bin/ppflight-agent /usr/local/bin/ag-pve /usr/local/bin/ag /usr/local/bin/AG
+rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap
+rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh
+rm -rf -- /usr/local/lib/ppflight-agent/template-bundles
 systemctl daemon-reload
 
 if [[ $PURGE -eq 1 ]]; then

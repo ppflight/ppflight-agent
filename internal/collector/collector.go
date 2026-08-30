@@ -32,13 +32,20 @@ type Source interface {
 	PVEClient() *pve.Client
 }
 
+// ProgressSource lets the Agent watchdog observe bounded forward progress
+// inside a long collection round. The callback carries no data and may be
+// invoked concurrently by per-node/per-guest workers.
+type ProgressSource interface {
+	SetProgressReporter(func())
+}
+
 func New(cfg config.Config, secrets config.Secrets) (Source, error) {
 	if cfg.PVE.Source == "simulator" {
 		return NewSimulator(cfg), nil
 	}
 	client, err := pve.NewClient(pve.Config{
 		Endpoint: cfg.PVE.Endpoint, TokenID: secrets.PVETokenID, TokenSecret: secrets.PVETokenSecret,
-		CAFile: cfg.PVE.CAFile, InsecureSkipTLS: cfg.PVE.InsecureSkipTLS,
+		CAFile: cfg.PVE.CAFile, TLSServerName: cfg.PVE.TLSServerName, InsecureSkipTLS: cfg.PVE.InsecureSkipTLS,
 		Timeout: cfg.PVE.Timeout.Duration, MaxResponseBytes: cfg.PVE.MaxResponseBytes,
 	})
 	if err != nil {
@@ -72,13 +79,26 @@ type PVECollector struct {
 	host       *exporter.HostObservation
 	smart      *exporter.SmartObservation
 	components map[string]observation.Availability
+	progress   func()
 }
 
 func (c *PVECollector) PVEClient() *pve.Client { return c.client }
 
+func (c *PVECollector) SetProgressReporter(reporter func()) {
+	c.progress = reporter
+	c.client.SetProgressReporter(reporter)
+}
+
+func (c *PVECollector) madeProgress() {
+	if c.progress != nil {
+		c.progress()
+	}
+}
+
 func (c *PVECollector) Collect(ctx context.Context, now time.Time, due Due) (observation.Snapshot, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.madeProgress()
 	now = now.UTC()
 	if c.version.Version == "" || due.Inventory {
 		if version, err := c.client.Version(ctx); err == nil {
@@ -87,8 +107,10 @@ func (c *PVECollector) Collect(ctx context.Context, now time.Time, due Due) (obs
 		} else {
 			c.setUnavailable("pveVersion", now, safeReason(err))
 		}
+		c.madeProgress()
 	}
 	resources, err := c.client.ClusterResources(ctx)
+	c.madeProgress()
 	if err != nil {
 		c.setUnavailable("pve", now, safeReason(err))
 		return c.snapshot(now, nil), fmt.Errorf("collect PVE resources: %w", err)
@@ -156,6 +178,7 @@ func (c *PVECollector) localResources(resources []pve.Resource) []pve.Resource {
 
 func (c *PVECollector) collectInventory(ctx context.Context, now time.Time) {
 	nodes, err := c.client.Nodes(ctx)
+	c.madeProgress()
 	if err != nil {
 		c.setUnavailable("pveNodes", now, safeReason(err))
 		return
@@ -187,8 +210,11 @@ func (c *PVECollector) collectInventory(ctx context.Context, now time.Time) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			status, statusErr := c.client.NodeStatus(ctx, node.Node)
+			c.madeProgress()
 			storageRows, storageErr := c.client.NodeStorage(ctx, node.Node)
+			c.madeProgress()
 			tasks, taskErr := c.client.NodeTasks(ctx, node.Node, 100)
+			c.madeProgress()
 			results[index] = nodeResult{index: index, status: status, storages: storageRows, tasks: tasks, err: errors.Join(statusErr, storageErr, taskErr)}
 		}()
 	}
@@ -261,13 +287,15 @@ func (c *PVECollector) collectGuestDetails(ctx context.Context, now time.Time, r
 			defer func() { <-sem }()
 			key := guestKey(resource.Type, resource.VMID)
 			configValue, configErr := c.client.GuestConfig(ctx, resource.Type, resource.Node, resource.VMID)
+			c.madeProgress()
 			networks := []observation.Network(nil)
 			if configErr == nil {
-				networks = safeNetworks(configValue.Raw)
+				networks = safeNetworks(configValue.Raw, resource.Type)
 			}
 			qgaView := observation.QGAView{Availability: observation.Availability{Available: false, ObservedAt: now, FreshUntil: now.Add(c.cfg.Collection.GuestInterval.Duration), UnavailableReason: "not-applicable-to-lxc"}}
 			if resource.Type == "qemu" && resource.Status == "running" {
 				guest, _ := c.client.ProbeGuestAgent(ctx, resource.Node, resource.VMID)
+				c.madeProgress()
 				available := guest.Availability["info"] == pve.Available
 				reason := "guest-agent-unavailable"
 				if available {
@@ -293,6 +321,7 @@ func (c *PVECollector) collectGuestDetails(ctx context.Context, now time.Time, r
 
 func (c *PVECollector) collectHost(ctx context.Context, now time.Time) {
 	samples, err := exporter.Fetch(ctx, exporter.FetchConfig{URL: c.cfg.Exporters.Node.URL, Timeout: c.cfg.Exporters.Node.Timeout.Duration, MaxBodyBytes: c.cfg.Exporters.Node.MaxResponseBytes})
+	c.madeProgress()
 	if err != nil {
 		c.setUnavailable("nodeExporter", now, safeReason(err))
 		return
@@ -304,6 +333,7 @@ func (c *PVECollector) collectHost(ctx context.Context, now time.Time) {
 
 func (c *PVECollector) collectSMART(ctx context.Context, now time.Time) {
 	samples, err := exporter.Fetch(ctx, exporter.FetchConfig{URL: c.cfg.Exporters.SMART.URL, Timeout: c.cfg.Exporters.SMART.Timeout.Duration, MaxBodyBytes: c.cfg.Exporters.SMART.MaxResponseBytes})
+	c.madeProgress()
 	if err != nil {
 		c.setUnavailable("smartctlExporter", now, safeReason(err))
 		return
@@ -344,7 +374,7 @@ func (c *PVECollector) setUnavailable(component string, now time.Time, reason st
 
 func guestKey(kind string, vmid int) string { return kind + "/" + strconv.Itoa(vmid) }
 
-func safeNetworks(raw map[string]json.RawMessage) []observation.Network {
+func safeNetworks(raw map[string]json.RawMessage, guestType string) []observation.Network {
 	var result []observation.Network
 	for index := 0; index < 32; index++ {
 		value, ok := raw["net"+strconv.Itoa(index)]
@@ -355,22 +385,30 @@ func safeNetworks(raw map[string]json.RawMessage) []observation.Network {
 		if json.Unmarshal(value, &text) != nil || len(text) > 4096 {
 			continue
 		}
-		network := observation.Network{Index: index}
+		network := observation.Network{Index: index, Interface: "net" + strconv.Itoa(index)}
 		for position, part := range strings.Split(text, ",") {
 			pieces := strings.SplitN(part, "=", 2)
 			if len(pieces) != 2 {
 				continue
 			}
 			key, item := strings.TrimSpace(pieces[0]), strings.TrimSpace(pieces[1])
-			if position == 0 {
+			if guestType == "qemu" && position == 0 {
 				network.Model, network.MAC = safeText(key, 32), safeText(item, 64)
 				continue
 			}
 			switch key {
+			case "name":
+				network.GuestName = safeText(item, 32)
+			case "type":
+				network.Model = safeText(item, 32)
+			case "hwaddr":
+				network.MAC = safeText(item, 64)
 			case "bridge":
 				network.Bridge = safeText(item, 64)
 			case "tag":
 				network.VLAN = safeText(item, 16)
+			case "mtu":
+				network.MTU = safeText(item, 16)
 			case "rate":
 				network.RateMbps = safeText(item, 32)
 			case "firewall":

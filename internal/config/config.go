@@ -12,15 +12,21 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ppflight/ppflight-agent/internal/control"
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
+	"github.com/ppflight/ppflight-agent/internal/pve"
 )
 
 const (
-	SchemaVersion  = 1
-	maxConfigBytes = 1 << 20
+	SchemaVersion    = 1
+	maxConfigBytes   = 1 << 20
+	LocalPVEEndpoint = "https://127.0.0.1:8006"
 )
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$`)
@@ -89,6 +95,7 @@ type PVEConfig struct {
 	TokenIDEnv         string   `json:"tokenIdEnv"`
 	TokenSecretEnv     string   `json:"tokenSecretEnv"`
 	CAFile             string   `json:"caFile"`
+	TLSServerName      string   `json:"tlsServerName"`
 	InsecureSkipTLS    bool     `json:"insecureSkipTls"`
 	Timeout            Duration `json:"timeout"`
 	MaxResponseBytes   int64    `json:"maxResponseBytes"`
@@ -118,17 +125,20 @@ type DestinationsConfig struct {
 	WebsiteMetering  DestinationConfig `json:"websiteMetering"`
 	WebsiteTelemetry DestinationConfig `json:"websiteTelemetry"`
 	Monitoring       DestinationConfig `json:"monitoring"`
+	MonitoringAudit  DestinationConfig `json:"monitoringAudit"`
 }
 
 type DestinationConfig struct {
-	Enabled          bool       `json:"enabled"`
-	URL              string     `json:"url"`
-	Auth             AuthConfig `json:"auth"`
-	Timeout          Duration   `json:"timeout"`
-	MaxResponseBytes int64      `json:"maxResponseBytes"`
-	MaxQueueBytes    int64      `json:"maxQueueBytes"`
-	Compression      string     `json:"compression"`
-	PayloadFormat    string     `json:"payloadFormat"`
+	Enabled              bool       `json:"enabled"`
+	URL                  string     `json:"url"`
+	Auth                 AuthConfig `json:"auth"`
+	Timeout              Duration   `json:"timeout"`
+	MaxResponseBytes     int64      `json:"maxResponseBytes"`
+	MaxCompressedBytes   int64      `json:"maxCompressedBytes"`
+	MaxUncompressedBytes int64      `json:"maxUncompressedBytes"`
+	MaxQueueBytes        int64      `json:"maxQueueBytes"`
+	Compression          string     `json:"compression"`
+	PayloadFormat        string     `json:"payloadFormat"`
 }
 
 type AuthConfig struct {
@@ -139,37 +149,51 @@ type AuthConfig struct {
 }
 
 type ControlConfig struct {
-	Enabled             bool       `json:"enabled"`
-	PollURL             string     `json:"pollUrl"`
-	ResultURL           string     `json:"resultUrl"`
-	Auth                AuthConfig `json:"auth"`
-	PollInterval        Duration   `json:"pollInterval"`
-	RequestTimeout      Duration   `json:"requestTimeout"`
-	CommandSecretEnv    string     `json:"commandSecretEnv"`
-	PVETokenIDEnv       string     `json:"pveTokenIdEnv"`
-	PVETokenSecretEnv   string     `json:"pveTokenSecretEnv"`
-	MaxCommandsPerPoll  int        `json:"maxCommandsPerPoll"`
-	AllowedActions      []string   `json:"allowedActions"`
-	ProductionExecution bool       `json:"productionExecution"`
+	Enabled        bool       `json:"enabled"`
+	PollURL        string     `json:"pollUrl"`
+	ResultURL      string     `json:"resultUrl"`
+	Auth           AuthConfig `json:"auth"`
+	PollInterval   Duration   `json:"pollInterval"`
+	RequestTimeout Duration   `json:"requestTimeout"`
+	// CommandSecretEnv is a legacy HMAC verifier accepted only in test mode.
+	CommandSecretEnv       string   `json:"commandSecretEnv"`
+	CommandSigningKeyIDEnv string   `json:"commandSigningKeyIdEnv"`
+	CommandPublicKeyEnv    string   `json:"commandPublicKeyEnv"`
+	PVETokenIDEnv          string   `json:"pveTokenIdEnv"`
+	PVETokenSecretEnv      string   `json:"pveTokenSecretEnv"`
+	MaxCommandsPerPoll     int      `json:"maxCommandsPerPoll"`
+	AllowedActions         []string `json:"allowedActions"`
+	ProductionExecution    bool     `json:"productionExecution"`
 }
 
 // Secrets is populated from environment variables after config validation.
 type Secrets struct {
-	PVETokenID            string
-	PVETokenSecret        string
-	WebsiteMetering       DestinationSecret
-	WebsiteTelemetry      DestinationSecret
-	Monitoring            DestinationSecret
-	ControlAPI            DestinationSecret
-	ControlCommandSecret  []byte
-	ControlPVETokenID     string
-	ControlPVETokenSecret string
+	PVETokenID             string
+	PVETokenSecret         string
+	WebsiteMetering        DestinationSecret
+	WebsiteTelemetry       DestinationSecret
+	Monitoring             DestinationSecret
+	MonitoringAudit        DestinationSecret
+	Assignments            DestinationSecret
+	ControlAPI             DestinationSecret
+	ControlReceipts        DestinationSecret
+	ControlCommandSecret   []byte
+	ControlSigningKeyID    string
+	ControlPublicKey       []byte
+	ControlPVETokenID      string
+	ControlPVETokenSecret  string
+	DeviceID               string
+	WebsiteBindingID       string
+	WebsiteCredentialEpoch uint64
+	MonitoringAgentRef     string
+	MonitoringBindingID    string
 }
 
 type DestinationSecret struct {
-	KeyID  string
-	Secret []byte
-	Bearer string
+	KeyID           string
+	Secret          []byte
+	Bearer          string
+	CredentialEpoch uint64
 }
 
 func defaults() Config {
@@ -188,18 +212,19 @@ func defaults() Config {
 			RequestConcurrency: 8, GuestRequestConcurrency: 4,
 		},
 		PVE: PVEConfig{
-			Source: "simulator", Endpoint: "https://127.0.0.1:8006", CAFile: "/etc/ppflight-agent/pve-root-ca.pem",
+			Source: "simulator", Endpoint: LocalPVEEndpoint, CAFile: "/etc/ppflight-agent/pve-root-ca.pem",
 			Timeout: Duration{10 * time.Second}, MaxResponseBytes: 8 << 20, LocalNode: "auto",
 		},
 		Exporters: ExportersConfig{
 			Node:  ExporterConfig{Enabled: true, URL: "http://127.0.0.1:9100/metrics", Timeout: Duration{5 * time.Second}, MaxResponseBytes: 16 << 20},
 			SMART: ExporterConfig{Enabled: true, URL: "http://127.0.0.1:9633/metrics", Timeout: Duration{15 * time.Second}, MaxResponseBytes: 32 << 20},
 		},
-		Assignments: AssignmentsConfig{File: "/etc/ppflight-agent/assignments.json", RefreshInterval: Duration{5 * time.Minute}},
+		Assignments: AssignmentsConfig{File: "/var/lib/ppflight-agent/assignments/assignments.json", RefreshInterval: Duration{5 * time.Minute}},
 		Destinations: DestinationsConfig{
 			WebsiteMetering:  defaultDestination(64<<20, "usage-v1"),
 			WebsiteTelemetry: defaultDestination(256<<20, "telemetry-v1"),
 			Monitoring:       defaultDestination(512<<20, "legacy-ingest-v1"),
+			MonitoringAudit:  defaultDestination(512<<20, "audit-v1"),
 		},
 		Control: ControlConfig{
 			Enabled: true, PollInterval: Duration{30 * time.Second}, RequestTimeout: Duration{10 * time.Second},
@@ -213,6 +238,7 @@ func defaults() Config {
 func defaultDestination(maxQueueBytes int64, payloadFormat string) DestinationConfig {
 	return DestinationConfig{
 		Timeout: Duration{15 * time.Second}, MaxResponseBytes: 2 << 20,
+		MaxCompressedBytes: 64 << 20, MaxUncompressedBytes: 256 << 20,
 		MaxQueueBytes: maxQueueBytes, Compression: "none", PayloadFormat: payloadFormat, Auth: AuthConfig{Mode: "hmac-sha256"},
 	}
 }
@@ -279,7 +305,7 @@ func (c Config) Validate() error {
 	if c.Identity.NodeRef != "auto" && !safeID.MatchString(c.Identity.NodeRef) {
 		return errors.New("identity.nodeRef must be auto or a safe identifier")
 	}
-	if c.Runtime.StateDirectory == "" || !filepath.IsAbs(c.Runtime.StateDirectory) || filepath.Clean(c.Runtime.StateDirectory) == string(filepath.Separator) {
+	if !isAbsoluteNonRootPath(c.Runtime.StateDirectory) {
 		return errors.New("runtime.stateDirectory must be an absolute non-root path")
 	}
 	listenHost, _, err := net.SplitHostPort(c.Runtime.ListenAddress)
@@ -302,15 +328,33 @@ func (c Config) Validate() error {
 		return errors.New("pve.source must be api or simulator")
 	}
 	if c.PVE.Source == "api" {
+		if c.PVE.Endpoint != LocalPVEEndpoint {
+			return fmt.Errorf("pve.endpoint must be exactly %s for api source", LocalPVEEndpoint)
+		}
 		if err := validateURL(c.PVE.Endpoint, c.Mode, true); err != nil {
 			return fmt.Errorf("pve.endpoint: %w", err)
 		}
 		if c.PVE.TokenIDEnv == "" || c.PVE.TokenSecretEnv == "" {
 			return errors.New("pve tokenIdEnv and tokenSecretEnv are required for api source")
 		}
-	}
-	if c.PVE.InsecureSkipTLS && c.Mode != "test" {
-		return errors.New("pve.insecureSkipTls is forbidden in production mode")
+		if c.PVE.TokenIDEnv != PVEReadTokenIDEnv || c.PVE.TokenSecretEnv != PVEReadTokenSecretEnv {
+			return fmt.Errorf("pve api source must use %s and %s from the root-only environment file", PVEReadTokenIDEnv, PVEReadTokenSecretEnv)
+		}
+		if c.PVE.Timeout.Duration < time.Second || c.PVE.Timeout.Duration > 30*time.Second {
+			return errors.New("pve.timeout must be between 1s and 30s")
+		}
+		if c.PVE.MaxResponseBytes < 1<<10 || c.PVE.MaxResponseBytes > 32<<20 {
+			return errors.New("pve.maxResponseBytes must be between 1 KiB and 32 MiB")
+		}
+		if c.PVE.InsecureSkipTLS {
+			return errors.New("pve.insecureSkipTls is forbidden for api source")
+		}
+		if c.PVE.TLSServerName == "" {
+			return errors.New("pve.tlsServerName is required for api source")
+		}
+		if err := pve.ValidateTLSServerName(c.PVE.TLSServerName); err != nil {
+			return fmt.Errorf("pve.tlsServerName: %w", err)
+		}
 	}
 	if c.PVE.Source == "api" && c.Mode == "production" && (c.PVE.LocalNode == "" || c.PVE.LocalNode == "auto") {
 		return errors.New("pve.localNode must be explicit in production to avoid hostname/PVE-node mismatches")
@@ -325,11 +369,15 @@ func (c Config) Validate() error {
 		if exporter.MaxResponseBytes < 1024 || exporter.MaxResponseBytes > 64<<20 {
 			return fmt.Errorf("%s.maxResponseBytes must be between 1 KiB and 64 MiB", label)
 		}
+		if exporter.Timeout.Duration < time.Second || exporter.Timeout.Duration > 30*time.Second {
+			return fmt.Errorf("%s.timeout must be between 1s and 30s", label)
+		}
 	}
 	for label, destination := range map[string]DestinationConfig{
 		"destinations.websiteMetering":  c.Destinations.WebsiteMetering,
 		"destinations.websiteTelemetry": c.Destinations.WebsiteTelemetry,
 		"destinations.monitoring":       c.Destinations.Monitoring,
+		"destinations.monitoringAudit":  c.Destinations.MonitoringAudit,
 	} {
 		if err := validateDestination(label, destination, c.Mode); err != nil {
 			return err
@@ -345,12 +393,8 @@ func (c Config) Validate() error {
 		if c.Control.ProductionExecution && c.PVE.Source != "api" {
 			return errors.New("control.productionExecution requires pve.source=api")
 		}
-		if c.Control.ProductionExecution {
-			for _, action := range c.Control.AllowedActions {
-				if action != "vm.start" && action != "vm.shutdown" && action != "vm.reboot" {
-					return fmt.Errorf("control action %q is dry-run/reserved in v0.1 and cannot be enabled for production execution", action)
-				}
-			}
+		if c.Control.ProductionExecution && (!c.Destinations.Monitoring.Enabled || !c.Destinations.MonitoringAudit.Enabled) {
+			return errors.New("control.productionExecution requires bound monitoring telemetry and audit destinations")
 		}
 		configured := c.Control.PollURL != "" || c.Control.ResultURL != ""
 		if configured {
@@ -363,8 +407,11 @@ func (c Config) Validate() error {
 			if err := validateURL(c.Control.ResultURL, c.Mode, false); err != nil {
 				return fmt.Errorf("control.resultUrl: %w", err)
 			}
-			if c.Control.CommandSecretEnv == "" {
-				return errors.New("control.commandSecretEnv is required when control API is configured")
+			if c.Mode == "production" && (c.Control.CommandSigningKeyIDEnv == "" || c.Control.CommandPublicKeyEnv == "") {
+				return errors.New("production control requires commandSigningKeyIdEnv and commandPublicKeyEnv")
+			}
+			if c.Mode == "test" && c.Control.CommandSecretEnv == "" && (c.Control.CommandSigningKeyIDEnv == "" || c.Control.CommandPublicKeyEnv == "") {
+				return errors.New("test control requires a legacy commandSecretEnv or Ed25519 verification key")
 			}
 			if c.Control.Auth.Mode != "hmac-sha256" && c.Control.Auth.Mode != "bearer" && !(c.Mode == "test" && c.Control.Auth.Mode == "none") {
 				return errors.New("control API authentication mode is unsupported")
@@ -385,14 +432,37 @@ func (c Config) Validate() error {
 		if c.Control.ProductionExecution && (c.Control.PVETokenIDEnv == "" || c.Control.PVETokenSecretEnv == "") {
 			return errors.New("production control execution requires separate PVE token environment names")
 		}
+		if c.Control.ProductionExecution && (c.Control.PVETokenIDEnv != PVEControlTokenIDEnv || c.Control.PVETokenSecretEnv != PVEControlTokenSecretEnv) {
+			return fmt.Errorf("production control execution must use %s and %s from the root-only environment file", PVEControlTokenIDEnv, PVEControlTokenSecretEnv)
+		}
 		if err := validateActions(c.Control.AllowedActions); err != nil {
 			return err
 		}
 	}
 	if c.Assignments.RefreshURL != "" {
-		return errors.New("assignments.refreshUrl is reserved and not implemented in v0.1; use an atomically replaced local file")
+		if err := validateURL(c.Assignments.RefreshURL, c.Mode, false); err != nil {
+			return fmt.Errorf("assignments.refreshUrl: %w", err)
+		}
 	}
 	return nil
+}
+
+// isAbsoluteNonRootPath accepts the POSIX paths used by Linux deployments even
+// when validation runs on a Windows development machine. Native Windows paths
+// remain supported when the agent is tested there.
+func isAbsoluteNonRootPath(value string) bool {
+	if value == "" {
+		return false
+	}
+	if strings.HasPrefix(value, "/") {
+		return path.Clean(value) != "/"
+	}
+	if !filepath.IsAbs(value) {
+		return false
+	}
+	clean := filepath.Clean(value)
+	volume := filepath.VolumeName(clean)
+	return clean != volume+string(filepath.Separator) && clean != string(filepath.Separator)
 }
 
 func validateIntervals(c CollectionConfig) error {
@@ -421,6 +491,12 @@ func validateDestination(label string, d DestinationConfig, mode string) error {
 	if d.MaxQueueBytes < 1<<20 || d.MaxQueueBytes > 64<<30 {
 		return fmt.Errorf("%s.maxQueueBytes must be between 1 MiB and 64 GiB", label)
 	}
+	if d.MaxResponseBytes < 1<<10 || d.MaxResponseBytes > 8<<20 {
+		return fmt.Errorf("%s.maxResponseBytes must be between 1 KiB and 8 MiB", label)
+	}
+	if d.MaxCompressedBytes < 1<<20 || d.MaxCompressedBytes > 64<<20 || d.MaxUncompressedBytes < d.MaxCompressedBytes || d.MaxUncompressedBytes > 256<<20 {
+		return fmt.Errorf("%s request size limits are invalid", label)
+	}
 	if d.Auth.Mode != "hmac-sha256" && d.Auth.Mode != "bearer" && !(mode == "test" && d.Auth.Mode == "none") {
 		return fmt.Errorf("%s.auth.mode is unsupported", label)
 	}
@@ -435,7 +511,8 @@ func validateDestination(label string, d DestinationConfig, mode string) error {
 	}
 	validFormat := label == "destinations.websiteMetering" && d.PayloadFormat == "usage-v1" ||
 		label == "destinations.websiteTelemetry" && d.PayloadFormat == "telemetry-v1" ||
-		label == "destinations.monitoring" && (d.PayloadFormat == "legacy-ingest-v1" || d.PayloadFormat == "telemetry-v1")
+		label == "destinations.monitoring" && (d.PayloadFormat == "legacy-ingest-v1" || d.PayloadFormat == "telemetry-v1") ||
+		label == "destinations.monitoringAudit" && d.PayloadFormat == "audit-v1"
 	if !validFormat {
 		return fmt.Errorf("%s.payloadFormat is unsupported", label)
 	}
@@ -444,7 +521,7 @@ func validateDestination(label string, d DestinationConfig, mode string) error {
 
 func validateURL(value, mode string, allowPVEHTTP bool) error {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || netpolicy.ValidateIPv4URL(parsed) != nil {
 		return errors.New("invalid URL")
 	}
 	if parsed.User != nil || parsed.Fragment != "" {
@@ -464,7 +541,7 @@ func validateURL(value, mode string, allowPVEHTTP bool) error {
 
 func validateLoopbackURL(value string) error {
 	parsed, err := url.Parse(value)
-	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || !isLoopback(parsed.Hostname()) {
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || netpolicy.ValidateIPv4URL(parsed) != nil || !isLoopback(parsed.Hostname()) {
 		return errors.New("exporter must use a loopback HTTP URL")
 	}
 	if parsed.User != nil || parsed.Fragment != "" {
@@ -478,16 +555,16 @@ func isLoopback(host string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && ip.To4() != nil && ip.IsLoopback()
 }
 
 func validateActions(actions []string) error {
-	if len(actions) == 0 || len(actions) > 32 {
-		return errors.New("control.allowedActions must contain 1-32 actions")
+	if len(actions) == 0 || len(actions) > 64 {
+		return errors.New("control.allowedActions must contain 1-64 actions")
 	}
 	seen := make(map[string]bool, len(actions))
 	for _, action := range actions {
-		if !regexp.MustCompile(`^vm\.[a-z][a-z-]{1,31}$`).MatchString(action) || seen[action] {
+		if !control.KnownAction(action) || seen[action] {
 			return fmt.Errorf("invalid or duplicate control action %q", action)
 		}
 		seen[action] = true
@@ -513,6 +590,7 @@ func (c Config) ResolveSecrets(lookup func(string) (string, bool)) (Secrets, err
 		&c.Destinations.WebsiteMetering:  &result.WebsiteMetering,
 		&c.Destinations.WebsiteTelemetry: &result.WebsiteTelemetry,
 		&c.Destinations.Monitoring:       &result.Monitoring,
+		&c.Destinations.MonitoringAudit:  &result.MonitoringAudit,
 	} {
 		if !item.Enabled {
 			continue
@@ -529,6 +607,18 @@ func (c Config) ResolveSecrets(lookup func(string) (string, bool)) (Secrets, err
 			return Secrets{}, resolveErr
 		}
 		result.ControlCommandSecret = []byte(value)
+	}
+	if c.Control.Enabled && c.Control.PollURL != "" && c.Control.CommandSigningKeyIDEnv != "" {
+		if result.ControlSigningKeyID, err = requiredEnv(lookup, c.Control.CommandSigningKeyIDEnv); err != nil {
+			return Secrets{}, err
+		}
+	}
+	if c.Control.Enabled && c.Control.PollURL != "" && c.Control.CommandPublicKeyEnv != "" {
+		value, resolveErr := requiredEnv(lookup, c.Control.CommandPublicKeyEnv)
+		if resolveErr != nil {
+			return Secrets{}, resolveErr
+		}
+		result.ControlPublicKey = []byte(value)
 	}
 	if c.Control.Enabled && c.Control.PollURL != "" {
 		controlDestination := DestinationConfig{Enabled: true, Auth: c.Control.Auth}

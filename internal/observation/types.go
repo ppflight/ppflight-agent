@@ -114,12 +114,15 @@ type QGAView struct {
 }
 
 type Network struct {
-	Index    int    `json:"index"`
-	Model    string `json:"model,omitempty"`
-	MAC      string `json:"mac,omitempty"`
-	Bridge   string `json:"bridge,omitempty"`
-	VLAN     string `json:"vlan,omitempty"`
-	RateMbps string `json:"rateMbps,omitempty"`
-	Firewall string `json:"firewall,omitempty"`
-	LinkDown string `json:"linkDown,omitempty"`
+	Index     int    `json:"index"`
+	Interface string `json:"interface"`
+	GuestName string `json:"guestName,omitempty"`
+	Model     string `json:"model,omitempty"`
+	MAC       string `json:"mac,omitempty"`
+	Bridge    string `json:"bridge,omitempty"`
+	VLAN      string `json:"vlan,omitempty"`
+	MTU       string `json:"mtu,omitempty"`
+	RateMbps  string `json:"rateMbps,omitempty"`
+	Firewall  string `json:"firewall,omitempty"`
+	LinkDown  string `json:"linkDown,omitempty"`
 }

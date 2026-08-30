@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ppflight/ppflight-agent/internal/fsutil"
 )
 
 type Kind string
@@ -21,14 +23,23 @@ type Kind string
 const (
 	Metering  Kind = "metering"
 	Telemetry Kind = "telemetry"
+	// Audit is a monitoring-only, non-evicting outbox. It is intentionally a
+	// different on-disk kind from telemetry so neither destination can
+	// acknowledge, quarantine, or apply retention policy to the other.
+	Audit Kind = "audit"
 )
 
-func (k Kind) Valid() bool { return k == Metering || k == Telemetry }
+func (k Kind) Valid() bool { return k == Metering || k == Telemetry || k == Audit }
 
 var ErrCapacity = errors.New("persistent queue capacity reached")
 
+// AuditEnqueueDelay closes the small durability window between Queue.Enqueue
+// and the control journal's MarkAuditQueued. The control reconciler runs
+// before delivery starts, while other queue kinds remain immediately due.
+const AuditEnqueueDelay = 5 * time.Second
+
 // Policy applies to a single destination and kind. Zero limits mean unbounded.
-// Metering queues never evict; capacity is returned to the caller as ErrCapacity.
+// Metering and audit queues never evict; capacity is returned to the caller as ErrCapacity.
 // Telemetry queues can evict their oldest pending records when DropOldest is true.
 type Policy struct {
 	MaxItems   int
@@ -83,17 +94,17 @@ func Open(config Config) (*Queue, error) {
 	if strings.Contains(config.Destination, "/") || config.Destination == "." || config.Destination == ".." {
 		return nil, errors.New("destination must be a simple identifier")
 	}
-	if config.Kind == Metering && config.Policy.DropOldest {
-		return nil, errors.New("metering must not use an eviction policy")
+	if (config.Kind == Metering || config.Kind == Audit) && config.Policy.DropOldest {
+		return nil, fmt.Errorf("%s must not use an eviction policy", config.Kind)
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
 	dir := filepath.Join(config.Root, config.Destination, string(config.Kind))
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := fsutil.EnsurePrivateDirectory(dir); err != nil {
 		return nil, fmt.Errorf("create queue directory: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, ".dead-letter"), 0o750); err != nil {
+	if err := fsutil.EnsurePrivateDirectory(filepath.Join(dir, ".dead-letter")); err != nil {
 		return nil, fmt.Errorf("create dead-letter directory: %w", err)
 	}
 	q := &Queue{dir: dir, kind: config.Kind, policy: config.Policy, now: config.Now, items: make(map[string]Item)}
@@ -116,7 +127,12 @@ func (q *Queue) Enqueue(batchID string, payload []byte) (Item, bool, error) {
 		return Item{}, false, err
 	}
 	q.stats.NextSequence++
-	item := Item{BatchID: batchID, Sequence: q.stats.NextSequence, Payload: append([]byte(nil), payload...), CreatedAt: q.now().UTC(), NextAttempt: q.now().UTC()}
+	now := q.now().UTC()
+	nextAttempt := now
+	if q.kind == Audit {
+		nextAttempt = nextAttempt.Add(AuditEnqueueDelay)
+	}
+	item := Item{BatchID: batchID, Sequence: q.stats.NextSequence, Payload: append([]byte(nil), payload...), CreatedAt: now, NextAttempt: nextAttempt}
 	if err := q.writeItem(item); err != nil {
 		q.stats.NextSequence--
 		return Item{}, false, err
@@ -360,12 +376,7 @@ func atomicWrite(path string, body []byte, mode fs.FileMode) error {
 }
 
 func syncDir(dir string) error {
-	handle, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return fsutil.SyncDir(dir)
 }
 func safeID(id string) string { sum := sha256.Sum256([]byte(id)); return hex.EncodeToString(sum[:16]) }
 func truncate(value string, size int) string {

@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
 
 const (
@@ -31,9 +33,10 @@ type FetchConfig struct {
 	MaxBodyBytes int64
 }
 type Sample struct {
-	Name   string
-	Labels map[string]string
-	Value  float64
+	Name     string
+	Labels   map[string]string
+	Value    float64
+	RawValue string
 }
 
 // Fetch reads a local /metrics endpoint and returns valid Prometheus samples.
@@ -65,7 +68,7 @@ func Fetch(ctx context.Context, cfg FetchConfig) ([]Sample, error) {
 	if limit > maxBody {
 		return nil, fmt.Errorf("exporter response limit exceeds %d bytes", maxBody)
 	}
-	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil}}
+	client := &http.Client{Timeout: timeout, Transport: netpolicy.ApplyIPv4Only(&http.Transport{Proxy: nil})}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, err
@@ -88,7 +91,7 @@ func loopback(host string) bool {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && ip.To4() != nil && ip.IsLoopback()
 }
 
 // Parse parses the Prometheus text exposition format needed by standard node
@@ -155,7 +158,7 @@ func parseLine(line string) (Sample, error) {
 	if err != nil {
 		return Sample{}, err
 	}
-	return Sample{Name: name, Labels: labels, Value: value}, nil
+	return Sample{Name: name, Labels: labels, Value: value, RawValue: fields[0]}, nil
 }
 func parseSeries(series string) (string, map[string]string, error) {
 	open := strings.IndexByte(series, '{')

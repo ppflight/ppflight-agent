@@ -11,7 +11,32 @@
       "generation": 1,
       "instanceUuid": "instance-example-01",
       "guestType": "qemu",
-      "billingState": "shadow"
+      "billingState": "shadow",
+      "nicBindings": [
+        {
+          "interface": "net0",
+          "role": "public",
+          "primary": true,
+          "metered": true,
+          "monitoring": true,
+          "expectedMac": "02:00:00:00:01:01",
+          "bridge": "vmbr0",
+          "vlan": 100,
+          "mtu": 1500,
+          "ipFilterPolicy": "required"
+        },
+        {
+          "interface": "net1",
+          "role": "private",
+          "primary": false,
+          "metered": false,
+          "monitoring": false,
+          "expectedMac": "02:00:00:00:01:02",
+          "bridge": "vmbr1",
+          "mtu": 1500,
+          "ipFilterPolicy": "required"
+        }
+      ]
     }
   ]
 }

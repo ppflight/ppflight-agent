@@ -12,6 +12,7 @@ import (
 
 	"github.com/ppflight/ppflight-agent/internal/admincli"
 	"github.com/ppflight/ppflight-agent/internal/agent"
+	"github.com/ppflight/ppflight-agent/internal/bindingoverlay"
 	"github.com/ppflight/ppflight-agent/internal/config"
 )
 
@@ -22,7 +23,7 @@ func main() {
 }
 
 func run() int {
-	if filepath.Base(os.Args[0]) == "ag-pve" {
+	if base := filepath.Base(os.Args[0]); base == "ag-pve" || base == "ag" || base == "AG" {
 		return admincli.Run(os.Args[1:], version, os.Stdout, os.Stderr)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "admin" {
@@ -48,7 +49,12 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
 		return 2
 	}
-	secrets, err := cfg.ResolveSecrets(os.LookupEnv)
+	lookup, err := config.ResolvePVEEnvironmentLookup(cfg, os.LookupEnv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "configuration secret error: %v\n", err)
+		return 2
+	}
+	secrets, err := bindingoverlay.Resolve(cfg, lookup)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "configuration secret error: %v\n", err)
 		return 2

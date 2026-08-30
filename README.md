@@ -1,215 +1,121 @@
 # PPFlight PVE Agent
 
-ppflight-agent 是部署在每台 Proxmox VE 宿主机上的全功能采集与受控执行 Agent。它统一采集客户 VPS、PVE 节点/集群、宿主机和物理磁盘健康，并将数据主动推送至官网业务 API 与本机监控站 API。
+ppflight-agent 部署在 Proxmox VE 8.x/9.x 节点上，由 Agent 主动连接 PPFlight 服务，并仅在本机访问 PVE API。迁移的目标状态是：**官网不保存 PVE 地址或 PVE API Token，也不连接客户 PVE 的 8006 端口**；Agent 使用 `https://127.0.0.1:8006` 和本地专用最小权限 Token 完成读取与受控写入。
 
-首版目标平台为 **Proxmox VE 8.x / 9.x（Debian 系）**。它不会替换官网当前通过 PVE API 创建、重装、改密码的流程；控制通道是额外且可审计的路径，可逐步接入。
+```text
+PPFlight 官网  <── Agent 主动出站 HTTPS ──>  ppflight-agent  ──> 127.0.0.1:8006
+                                                     ├──> 127.0.0.1:9100
+                                                     └──> 127.0.0.1:9633
+```
 
-> 边界说明：Agent 端采集、队列、签名协议与控制执行器在本仓库开发；官网接收 API、不可变 clusterRef、映射下发与最终流量账本仍需官网端实现。本文的“建议端点”不表示官网已上线服务。
+PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网开放。官网持有业务资产、IPAM、套餐、审批、`generation` 和操作线程；Agent 持有本地 PVE 凭据并执行固定 schema 的 PVE 原语。两侧都不能只用 VMID 代表客户资产。
 
-## 架构
+官网、监控站和 PVE 外连的目标合同是 IPv4-only：DNS 仅使用获准 A 记录，dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网绑定和 monitoring 绑定分别返回并持久化独立 `networkPolicy={agentObservedIPv4,serverIPv4Allowlist}`：两者均为 canonical IPv4，allowlist 为 1..16 项。对 DNS endpoint，Agent 只直拨 `A 记录 ∩ allowlist`，保留 URL hostname 作 HTTP Host/TLS SNI 与证书校验；禁代理和 redirect，绝不把解析结果改写成 URL hostname。`agentObservedIPv4` 是各服务端观察到的本次绑定出口地址，只作该 trust domain 的服务端元数据，不能从本地网络学习或当作目的地。IP 命中只是 TLS、绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、time、action allowlist 和审计可用性之外的附加门槛，不能替代加密身份。Agent 的严格 response 校验、private-state 保存及 tcp4 pinning 已接线；官网/监控服务端生成、持久化和部署这两套 policy 仍待各自任务完成。
 
-~~~text
-PVE API / 本机 PVE 数据 ──┐
-QEMU Guest Agent（可选） ─┼─> PPFlight Agent ─> 官网计费 API
-node_exporter :9100 ─────┼─>                 ─> 官网业务遥测 API
-smartctl_exporter :9633 ─┘                    └> 监控站 API
-                                                    ↑
-官网控制 API（轮询） ──> 已签名命令 ─> Agent（默认启用）
-~~~
+> 上线状态：Agent 侧绑定、发现、assignment、受控执行和 UPID 恢复所需的代码与资源原语已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
 
-每个目的地有独立持久化队列、重试和幂等批次。PVE 不必向公网暴露 8006、9100、9633；官网和监控站不需要反向连入宿主机。
+发布物由 tag `vX.Y.Z` workflow 分别构建 Linux `amd64`/`arm64`、离线可复现打包并发布 tarball 与 `SHA256SUMS`；手动触发只生成 artifact，不发布。目标节点必须先校验 checksum、再解压并运行包内 installer，绝不使用 `curl | bash`。发布脚本不会下载代码或把运行时凭据/队列打入包；具体校验和本地重建方式见[安装文档](docs/INSTALL.md#2-安装已校验发布物)。
 
-## 采集范围与来源
+## 安全绑定与本地凭据
 
-| 范围 | 指标 | 来源 | 使用方式 |
-| --- | --- | --- | --- |
-| VPS/PVE 视图 | 开关机、CPU、内存、虚拟盘、I/O、累计网卡字节、运行时间 | PVE API | 每台 QEMU/LXC 的平台主视图。 |
-| 客体增强视图 | OS、文件系统已用、客体网卡/IP、QGA 信息 | QEMU Guest Agent | 仅 QEMU 且 Agent 可用；缺失不等于 0。 |
-| 流量计费 | ingress / egress 64 位累计计数 | **PVE API** | 官网计算差值与最终账本。QGA 永不参与计费。 |
-| PVE 节点/集群 | 版本、CPU/内存、存储池、任务、集群状态 | PVE API | 可配置本机或集群范围。 |
-| Linux 宿主机 | CPU、load、内存、swap、FS、网卡、PSI、ZFS | node_exporter :9100 | Agent 仅从 loopback 拉取。 |
-| 物理磁盘 | SMART、温度、介质错误、NVMe 寿命 | smartctl_exporter :9633 | HDD/SSD/NVMe 硬件健康。 |
+官网管理员创建一次性绑定码，操作者在 PVE 本机执行：
 
-### PVE 与 QGA 双视图
+```bash
+# 自动创建相互隔离的只读/受控写 PVE Token，并只写入本机 root-only 环境文件。
+sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
+  --write-env /etc/ppflight-agent/agent.env
 
-PVE 是虚拟化平台外部视图，适合平台监控、资源管理和计费；QGA 是客户系统内部视图，适合文件系统、IP 和 OS 详情。二者不同是正常的：虚拟盘容量不等于客体文件系统已用，PVE 内存也不等于客体 OS 报告值。
+# 绑定码从标准输入读取，不得放在 argv、URL、日志或 shell history 中。
+sudo ag-pve bind \
+  --endpoint https://www.example/internal/v1/agents/bind \
+  --pve-version "$(pveversion | sed -n 's/^pve-manager\/\([^/]*\).*/\1/p')"
+```
 
-官网和监控站必须分别存储/展示 guest.pve.* 与 guest.qga.*，并保存来源、可用性和采样时间。QGA 不可用时不能以 0 覆盖 PVE 指标。
+这不是一键 onboarding。安装器默认复制的样例仍是 `mode=test`、`pve.source=simulator`；Token bootstrap 只创建本地身份/环境文件，官网 bind 只写官网 identity、endpoint/credential、assignment 和授权，不会把 source 改成 `api`、切换 `mode`/`productionExecution`、授予 control ACL 或启动/重启服务。操作者必须按安装文档显式编辑并校验配置。五项 `AG` 菜单同样不包含 Token bootstrap、source/mode 切换或服务启停。
 
-### 流量计费的硬规则
+完成 bootstrap 后，root 可用 `ag-pve pve prepare --tls-server-name <PVE证书DNS名>` 将仍为 test 的本机配置安全准备为 API 采集：它固定 TCP 为 `https://127.0.0.1:8006`/`tcp4`，并单独使用 `pve.tlsServerName` 做 TLS SNI/证书校验。后者必须是证书中的 DNS 名，不能是 `127.0.0.1`、`localhost`、IPv6 或通配符。prepare 先探测只读 Token 的 PVE version/有效权限，控制 Token 仅作 readiness 探测；不会授予 ACL、打开 production 或启动服务。`ag-pve pve status` 只输出脱敏的本地 read/control 探测与 readiness，不能证明官网、监控站或任一生产写路由已上线。
 
-- 上报 PVE 的原始累计 ingressBytes、egressBytes；JSON 采用十进制字符串，避免 JavaScript 丢失 uint64 精度。
-- 官网是账本权威方：负责差值、账期、计费方向、去重、乱序和最终 usedBytes。Agent 不计算客户欠费或超额。
-- 当前 500G 应明确为 500,000,000,000 bytes（500 GB 十进制），不是 500 GiB。
-- 当前方向是 ingress + egress；严格 usedBytes > 500000000000 才触发限速，等于不触发。
-- 未映射、disabled、身份不匹配或 PVE 计数缺失的 VPS 不能进入计费事件；不是“0 流量”。
+也可用 `--code-file FILE` 读取仅 owner 可读、非符号链接的私密文件；CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项。Agent 在发送前持久化 UUID `requestId` 与 canonical 请求指纹以便安全重试，绑定码参与 hash 但原文不落盘。绑定成功后，官网必须返回 `bindingId`、匹配的 `deviceId`、身份、同源 HTTPS 端点、分用途 HMAC 凭据、Ed25519 命令验签公钥、初始 assignment、`networkPolicy` 和 `credentialEpoch`，并保存到 `<stateDirectory>/bindings/binding-state.json`；稳定 device ID 和 pending 幂等状态也在该私有子目录，PVE Token 永不上传官网。
 
-## 身份、重装与来源切换
+监控站采用另一套一次性绑定码和独立信任域。Agent 已提供严格客户端、独立 `<stateDirectory>/bindings/monitoring-binding-state.json`、运行时 private-state credential overlay 和 `ag-pve monitoring bind`；响应只签发 monitoring `bindingId/deviceId/monitoringAgentRef`、ingest endpoint、`hmac-sha256` credential、`telemetry-v1` 传输上限、独立 `networkPolicy` 和 `credentialEpoch`。该 key 只能按服务端逐路由 scope 用于 `monitoring:telemetry.write`、`monitoring:audit.write` 和固定同源的 `monitoring:status.read`，不能授权官网 API 或 PVE mutation。官网 bind/replace 不得创建、覆盖、轮换或复用监控站凭据/`networkPolicy`。监控服务端路由和其 networkPolicy 发放/持久化由另一交付任务实现；没有已部署 endpoint 时样例保持 `enabled=false`，不能据此宣称监控站服务已经上线。
 
-VMID 不是客户身份。官网映射并由 Agent 校验的主键是：
+首台真实 PVE 在 monitoring bind 前运行 `sudo ag-pve monitoring preflight --endpoint https://<监控域名>/internal/v1/monitoring/agents/bind`。该只读命令从当前 PVE 解析全部 A 记录，并逐个直接执行 `tcp4` 与原 hostname/SNI 的系统 CA TLS 验证，输出 `resolvedA`、逐地址结果及 `eligibleServerIPv4Allowlist`。只有 `readyForOperatorApproval=true` 时输出才可交给操作员审批；命令不会访问 HTTP 路由、写配置、自动批准地址或执行绑定。
 
-~~~text
-clusterRef + guestType + VMID + generation
-~~~
+生产安装将 `<stateDirectory>/bindings` 建为 `root:ppflight-agent`、`0750`，状态文件为 `0640`；root 管理命令原子更新，systemd 服务只有组读取权限，并通过 `ReadOnlyPaths` 禁止写入。远端 assignment 则写入独立的 `<stateDirectory>/assignments/assignments.json`，目录/文件为 `ppflight-agent:ppflight-agent`、`0750/0640`，不能通过放宽 binding 目录权限来实现 refresh。
 
-每条记录还必须有 serviceRef（当前官网事实为 billing_subscriptions.uuid）和 instanceUuid。重装或 VMID 重用时，官网必须让 generation + 1；旧 generation 的计费事件和控制命令必须拒绝。
+完整步骤见 [安装与迁移](docs/INSTALL.md)，严格接口见 [Agent API v1 目标契约](docs/AGENT-API-V1.md)。
 
-clusterRef 必须是官网创建的不可变 UUID/安全标识，不能是可改的 cluster slug 或自增 ID。新 Agent 替换官网旧轮询采集器时，官网需下发 sourceRef 与 cutoverAt，保证任一时刻仅一个来源成为 active，防止双计费。
+`ag-pve website status` 与 `ag-pve monitoring status` 会分别读取本地 binding/Agent 健康，并用各自 trust domain 的 HMAC 查询固定同源只读状态端点；响应必须逐项匹配本机 binding/device/agent/epoch（官网还匹配 assignment revision）。Agent 客户端已实现，外部 website/monitoring status 服务端仍待各自任务交付。
 
-映射文件及完整字段见 [API 契约](docs/API.md#映射文件)。
+## 多轮发现与操作线程
 
-## 控制模块：默认启用，默认 dry-run
+添加 PVE 不是一次扫描。官网以持久 `operationId` 下发只读 `pve.discover`，分轮执行 `version`、`permissions`、`nodes`、`storage`、`templates`、`networks`、`capacity`、`firewall`、`readiness`。`limit` 省略时为 20，合法范围为 1..50；通过 `cursor` 继续分页。发现不得夹带 firewall 或其他写操作。
 
-控制模块默认开启，但默认全局模式是：
+绑定后的 assignment 客户端支持最长 25 秒的长轮询。命令通道也以持久 cursor/operation 设计；PVE 返回 UPID 只表示任务已提交。Agent journal 保存 UPID，重启后通过 `task.status` 对应的 PVE task status 读取继续对账，不重新提交原 mutation。当前接线状态与服务端仍需实现的部分见契约中的[实现状态](docs/AGENT-API-V1.md#11-实现状态与上线门槛)。
 
-~~~json
-{"mode":"test","control":{"enabled":true,"productionExecution":false}}
-~~~
+模板初始化是另一条仅限 PVE 本机 root 管理员的流程，不是官网远程 command。cloud-init helper bundle 作为同一 Agent 发布/安装包内的 `bundles/ppflight-cloudinit` 交付，不在安装时从任意 URL 拉代码；缺失或摘要不符时安装失败。安装后的 `AG`/`ag`/`ag-pve` 不带参数会显示五项交互菜单，其中模板向导会选择模板、镜像/模板/备份 storage 和 bridge，先输出无副作用 plan，只有操作者原样输入 `EXECUTE` 才按该 plan 的 `requestId/operationId/catalogRevision/catalogSha256` 执行。安装器已校验 bundle、运行依赖、逐文件摘要和 `networkRedirectPolicy.addressFamily=ipv4-only`，以版本目录加原子 managed symlink 提供 `/usr/local/lib/ppflight-agent/template-bootstrap`；helper 的镜像连接固定 `curl --disable --ipv4`、HTTPS-only redirect 和 catalog/official-checksum 完整性链。Agent 每次调用前再次校验，再以 `/usr/bin/python3 -I` 和受限环境执行唯一入口。真实 PVE 上会创建模板/备份的 plan/execute 尚未完成破坏性发布验收；它不新增 control action，更不表示 `vm.reinstall` 或远程 Agent 自升级已经实现。
 
-在该状态下 Agent 可以轮询、验签、校验映射并回传回执，但只回传 dry-run，不会改变 PVE。代码保留固定动作 schema：启动、优雅关机、停止、重启、创建、克隆、受限更新、只增不减扩盘、保护式删除、限速、QGA 密码重置；它不接受任意 PVE URL、shell 或脚本。v0.1 的默认 allowlist 只有 `vm.start`、`vm.shutdown`、`vm.reboot`，且生产校验也只允许这三项；其余高风险动作当前只能用于 test/dry-run 契约联调，待资源 allowlist、任务终态跟踪和审批闭环完成后再开放。
+## 连续性与离线边界
 
-真实执行必须同时完成：
+生产 unit 已使用 `Type=notify`、`WatchdogSec=60s`、`Restart=always` 和 `RestartSec=3s`。Agent 只在本地 health listener 可访问后发送 `READY=1`，并且只有采集循环仍在产生请求级 progress 时才继续发送 watchdog heartbeat；卡死后返回错误、保留未清理的 lifecycle session，由 systemd 重启。正常停止发送 `STOPPING=1` 并写入 clean marker。watchdog 只是本机进程监督，不会绕过 command/audit gate 或自行执行 PVE mutation，也不能被描述成远端服务 SLA。
 
-1. mode 改为 production。
-2. control.productionExecution 改为 true。
-3. HTTPS 控制轮询/回执 URL、API HMAC 凭据、命令签名密钥均已配置。
-4. 创建独立的**写 PVE Token**，填入 control.pveTokenIdEnv 和 control.pveTokenSecretEnv；绝不复用采集 Token。
-5. action 必须属于 v0.1 生产白名单，且 serviceRef/instanceUuid/generation 与当前映射完全匹配。
-6. 先在测试节点验证 dry-run、签名、幂等回放与回执。
+下一次启动会在访问 PVE 前把上一进程未正常退出转换为 `agent.previousExit.<eventId>` / `previous_unclean_exit` 可用性事件，并为已启用的 website 与 monitoring telemetry 分别写入不可淘汰的 lifecycle 队列；未启用的一域继续留在 lifecycle state 等待以后启用。两个 trust domain 的 queued 状态独立，一个成功不能清掉另一个。Agent 侧持久化与双域入队已实现，外部接收、展示和告警仍须官网/监控站部署验证。
 
-即使 Agent 运行在 PVE 本机，采集也始终使用独立的**只读 PVE Token**，而不是 root shell 权限；这样可最小授权、撤销和审计。
+Agent 或官网离线时都不得回退为官网直连 PVE。目标官网服务应持久排队尚未过期的已签命令，Agent 恢复后继续主动轮询；Agent 一旦领取命令，则由本地 journal、UPID reconcile 和 receipt queue 保证恢复。服务端离线队列与 command `wait` 尚待官网实现/联调，旧客户兼容写路径也只能按资产显式 cutover，不能因 Agent 暂时不可达而自动启用。
 
-## 安装与联调
+## 固定动作面
 
-完整步骤在 [安装与运维](docs/INSTALL.md)。生产前建议在一台测试 PVE 完成：
+Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代码中的动作名是：
 
-1. 验证 PVE 8.x/9.x、本机 CA、NTP 和只读 Token。
-2. 验证 QGA 缺失的 VM 仍正确上报 PVE 视图。
-3. 验证 127.0.0.1:9100/metrics 与 127.0.0.1:9633/metrics。
-4. 先让官网接收 shadow 计费事件，核对累计字节、epoch、幂等和 cutoverAt。
-5. 控制命令先只做 test/dry-run，最后才批准生产执行。
+- 生命周期/资源：`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot`、`vm.create`、`vm.clone`、`vm.set-resources`、`vm.resize`、`vm.set-network`、`vm.set-rate`、`vm.delete`、`vm.reset-password`。
+- 快照/备份：`snapshot.create`、`snapshot.delete`、`snapshot.rollback`、`backup.create`、`backup.delete`、`backup.restore`。
+- PVE 任务：`task.status`。
+- 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`、`firewall.guest.set-ipfilter`。
+- 只读发现：`pve.discover`。
 
-配置为严格 JSON，未知字段会报错。密钥只放在权限 0600 的 systemd 环境文件或密钥系统，不能写入 JSON、Git、日志或回执。
+当前 33 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`vm.reinstall` 和远程 Agent 自升级不在当前动作表中，不能用 create/upgrade 原语推断它们已经实现；尤其 `vm.reinstall` 仍因 PVE 恢复流程非事务性，且没有可被命令签名/校验的安装介质 allowlist，而刻意不实现。
 
-### SSH 本机管理命令：ag-pve
+所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；只允许冻结的 command/action/scope/typed target/outcome 元数据和 SHA-256 digest，严禁 secret、root 密码、Token、完整 command parameters/result 或原始 UPID。monitoring audit schema 不含 `operationId`/`executionMode`；精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；监控服务端存储和可查询 UI 仍由另一任务交付。官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
 
-安装器只安装一份 Agent 二进制，并创建 /usr/local/bin/ag-pve 到 /usr/local/bin/ppflight-agent 的软链接。通过 SSH 登录 PVE 后，可用 ag-pve 管理本机 Agent 配置；它不需要、也不会调用官网或监控站的资产管理 API。
+## NIC 角色、IP、网络与防盗用
 
-~~~bash
-# 查看本机 Agent 的 /status JSON；Agent 没启动时会失败，不会启动服务
-ag-pve status
+`vm.set-network` 只更新既有 `net0`..`net31`，支持固定 MAC、bridge、VLAN tag、MTU、NIC firewall、rate、IPv4/IPv6 和 gateway。QEMU 的 IP 字段写入对应 `ipconfigN`；LXC 写入 `netN`。QEMU Cloud-Init 配置写入不等于客户系统已经实时换 IP，官网必须在同一 `operationId` 中完成状态等待和回读后再提交 IPAM。
 
-# 严格校验配置和所引用的环境变量是否存在，不发送网络业务数据
-ag-pve validate
+向导的 `networks` phase 后必须显式保存每张 NIC 的 `interface=netN`、`role=public|private`、`primary`、`metered`、`monitoring`、expected MAC、bridge/vnet、VLAN、MTU 和 IPFilter policy，不能依赖 NIC 顺序。Agent 的 strict assignment 已验证 interface 唯一、恰有一个 primary public NIC 和一个 monitoring NIC、canonical unicast MAC、bridge xor vnet 和范围；telemetry 会把 observed `netN` 与 binding 关联并返回 policy match/mismatch reason。
 
-# 查看或连通性检测监控站配置
-ag-pve monitoring show
-ag-pve monitoring test
-ag-pve monitoring set --enabled=true --url=https://monitor.example/api/ingest \
-  --auth-mode=bearer --bearer-token-env=MONITORING_BEARER_TOKEN \
-  --payload-format=legacy-ingest-v1 --compression=gzip
+当前 PVE status 只有 guest aggregate `netin/netout`。Agent meter 对无 binding、单 NIC 不计费或 mixed metering 多 NIC 强制 shadow；只有每张绑定 NIC 都显式 `metered=true` 才可能 active，禁止把 private 流量算作 public。QGA per-interface stats 只用于观测，不能用于权威计费。
 
-# 查看或连通性检测官网目标
-ag-pve website show
-ag-pve website test
+IP 切换应先保留新地址，再按操作线程更新 NIC/`ipconfigN`、`ipfilter-netN` 和防火墙，验证成功后才释放旧地址。防盗用需要组合：
 
-# 配置官网计费与遥测目标
-ag-pve website metering set --enabled=true --url=https://www.example/internal/v1/metering/usage-batches \
-  --auth-mode=hmac-sha256 --key-id-env=WEBSITE_METERING_KEY_ID --secret-env=WEBSITE_METERING_SECRET
-ag-pve website telemetry set --enabled=true --url=https://www.example/internal/v1/telemetry/batches \
-  --auth-mode=hmac-sha256 --key-id-env=WEBSITE_TELEMETRY_KEY_ID --secret-env=WEBSITE_TELEMETRY_SECRET
+1. `vm.set-network` 设置受管固定 MAC 并启用 NIC firewall；
+2. 创建 PVE 约定名称 `ipfilter-netN` 的 guest IPSet；用 `firewall.ipset.entry.create` 先加入新 CIDR，`entry.update` 只改该 CIDR 的 comment/`noSubnet`，验证切换后才用 `entry.delete` 移除旧 CIDR；
+3. 用 `firewall.guest.set-options` 和 `firewall.guest.set-ipfilter` 启用 guest firewall/IPFilter；
+4. 必要时单独审批 cluster/node firewall options，并回读验证。
 
-# 配置控制轮询和回执；默认仍只 dry-run，除非显式 production-execution=true
-ag-pve website control set --enabled=true \
-  --poll-url=https://www.example/internal/v1/agents/commands \
-  --result-url=https://www.example/internal/v1/agents/agent-pve-test-01/command-receipts \
-  --auth-mode=hmac-sha256 --key-id-env=CONTROL_API_KEY_ID --secret-env=CONTROL_API_SECRET \
-  --command-secret-env=CONTROL_COMMAND_SECRET --production-execution=false
-~~~
+这些是可编排原语，不是“一次调用即可无缝切换”的承诺。官网必须负责 IPAM 预留、顺序、补偿、digest/read-back、审批和防自锁。
 
-show 只展示配置与密钥的环境变量名，不会输出 secret。test 只做 DNS 解析、TCP 建连和 HTTPS TLS 握手（HTTP 地址只做 TCP），不发送 HTTP 请求、不上传任何监控或计费数据。每个 set 都会先校验、以原子方式写入配置，并创建带时间戳的 .bak 备份；它不会重启 Agent。完成后执行 ag-pve validate，确认后由管理员手动执行 systemctl restart ppflight-agent。当前监控站 `/api/ingest` 使用 `legacy-ingest-v1`；未来新监控 API 使用 `telemetry-v1`，两者不能配错。
+website telemetry 已输出 `lifecycle/rootPasswordReset/guestNetworkVerify/metering` capabilities；原始 QGA availability 含 `available/observedAt/freshUntil/unavailableReason`，依赖动作 capability 含 `available/observedAt/freshUntil/reason/executionPreflight`。QEMU Guest Agent 被卸载、停止或数据过期时，password reset/guest-network verify capability 会冻结，纯 PVE lifecycle 保持可用；Executor 还会在 `vm.reset-password` 前读取并检查具体 QGA 命令，缺少 `guest-set-user-password` 时拒绝执行。APP 对这些字段的展示与 guest-network verify 编排仍待远端官网合并，不能从 Agent 字段推断 UI 已上线。
 
-可在任意命令前加 --config FILE 指定另一份配置。destination 的 set 命令都支持 --enabled、--url、--auth-mode、--key-id-env、--secret-env、--bearer-token-env、--compression（none 或 gzip）和 --payload-format；控制 set 支持 --enabled、--poll-url、--result-url、--auth-mode、--key-id-env、--secret-env、--bearer-token-env、--command-secret-env、--production-execution。
+## 采集与计费边界
 
-官网/监控站的远程资产查询、修改或创建接口目前仅预留；`ag-pve monitoring query|modify` 与 `ag-pve website query|modify` 会明确返回“未实现”且不发请求。代码已保留 typed `remote.AssetClient` 边界，后续可在不改变 SSH 命令分组的前提下接入正式 API；不能把上述本机配置命令理解为远程资产管理已可用。
+- 流量计费只使用 PVE 的 ingress/egress 64 位累计计数；JSON 用十进制字符串，QGA 永不参与计费。
+- 官网是账本权威方，负责差值、重放、乱序、counter reset、账期和最终 `usedBytes`；Agent 不计算欠费。
+- 资产键至少包含 `clusterRef + guestType + vmid + generation`，并校验 `serviceRef` 与 `instanceUuid`。VMID 重用或重装必须推进 generation。
+- PVE 与 QGA 是不同来源。QGA 缺失不能以 0 覆盖 PVE 视图，未映射或身份不匹配的 VPS 不能进入计费。
 
-关键测试配置：
+## 开发与发布
 
-~~~json
-{
-  "schemaVersion": 1,
-  "mode": "test",
-  "identity": {
-    "agentRef": "agent-pve-test-01",
-    "collectorRef": "collector-pve-test-01",
-    "sourceRef": "pve-agent-v1",
-    "clusterRef": "cluster-immutable-uuid-01",
-    "nodeRef": "auto",
-    "site": "primary"
-  },
-  "pve": {
-    "source": "api",
-    "endpoint": "https://127.0.0.1:8006",
-    "tokenIdEnv": "PVE_READ_TOKEN_ID",
-    "tokenSecretEnv": "PVE_READ_TOKEN_SECRET",
-    "caFile": "/etc/ppflight-agent/pve-root-ca.pem",
-    "localNode": "pve01"
-  },
-  "exporters": {
-    "node": {"enabled": true, "url": "http://127.0.0.1:9100/metrics"},
-    "smart": {"enabled": true, "url": "http://127.0.0.1:9633/metrics"}
-  },
-  "control": {"enabled": true, "productionExecution": false}
-}
-~~~
-
-## API 对接与官网待实现项
-
-建议目标端点：
-
-- POST /internal/v1/metering/usage-batches：精确计费累计值（不可丢弃）。
-- POST /internal/v1/telemetry/batches：官网 VPS/PVE 双视图业务遥测。
-- POST /internal/v1/monitoring/batches：监控站新遥测（配置 `payloadFormat=telemetry-v1`）；现有 `/api/ingest` 兼容桥使用 `legacy-ingest-v1`。
-- GET /internal/v1/agents/commands?agentRef={agentRef}&after=...&limit=...：控制轮询。
-- POST /internal/v1/agents/{agentRef}/command-receipts：控制回执。
-
-这是**建议契约，不表示官网已实现**；完整 JSON、HMAC、响应语义、映射和命令格式见 [API 契约](docs/API.md)。
-
-官网端仍必须实现：
-
-1. 不可变 clusterRef、Agent 注册及每集群 HMAC key。
-2. 映射文件和 serviceRef + instanceUuid + VMID + generation 生命周期；重装增加 generation。
-3. 计费批次验证、nonce 防重放、幂等、来源切换、累计计数差值与权威 traffic_usage_periods.billable_bytes。
-4. PVE/QGA 分离的遥测存储和访问控制。
-5. 控制命令的审批、二次签名、审计、轮询和回执。
-6. 限速/恢复策略队列。Agent 只提供数据和受控执行，不自行改账期或套餐。
-
-旧监控接口 /api/ingest 只能作为经过确认的兼容桥。若它仍会把 networkRxBytes/networkTxBytes 写入旧流量计费器，禁止与新计费 API 同时启用，避免重复计费。
-
-## GitHub 发布
-
-发布前至少运行：
-
-~~~bash
+```bash
 go test ./...
 go vet ./...
 go build ./...
-~~~
+```
 
-GitHub Release 应包含 Linux amd64/arm64 二进制、SHA-256、示例配置、systemd 单元和安装脚本。不得发布真实 token、环境文件、PVE 备份、映射文件或队列目录。建议先标记 v0.1.0；只有官网 API、断网补传和生产切换都完成联调后，才宣称可用于生产计费。
+配置使用严格 JSON（示例保留 `.yaml` 文件名），未知字段会被拒绝。真实 Token、绑定码、HMAC secret、assignment、控制 journal 和队列不得提交 Git 或出现在工单/日志中。
 
-## 安全与故障处理
+更多文档：
 
-- health/status 默认仅监听 127.0.0.1，不能直接公开。
-- PVE/QGA/exporter 故障要保留“不可用原因 + 采样时间”，不能伪造 0。
-- 计费队列不可静默淘汰；遥测队列可有界淘汰，但必须告警。
-- 生产禁用 insecureSkipTls；exporter 只允许 loopback HTTP。
-- HMAC 覆盖 method、path/query、key ID、Unix 时间戳、nonce、body SHA-256。
-- 日志和控制 journal 不得记录 Token、HMAC secret、密码或完整敏感参数。
-- 本项目不是 BGP 路由/会话控制器；它提供 PVE/VPS/硬件观测与受控 PVE 操作。
-
-## 文档
-
-- [安装与运维](docs/INSTALL.md)
-- [官网与监控 API 契约](docs/API.md)
-- [历史协议审阅记录（非规范）](docs/CONTRACT-REVIEW.md)
+- [安装与迁移](docs/INSTALL.md)
+- [Agent API v1 目标契约](docs/AGENT-API-V1.md)
+- [现有数据面 API 与兼容说明](docs/API.md)
+- [历史审阅输入（非规范）](docs/CONTRACT-REVIEW.md)

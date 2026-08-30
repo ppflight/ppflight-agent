@@ -10,9 +10,19 @@ import (
 // means unavailable, never a measured zero.
 type Value struct {
 	Value *float64 `json:"value,omitempty"`
+	// Raw is the exact Prometheus text value. It is intentionally not exposed in
+	// the legacy observation JSON; monitoring-v1 uses it to string-encode large
+	// byte/cumulative metrics without first rounding them through float64.
+	Raw string `json:"-"`
 }
 
-func number(v float64) Value { return Value{Value: &v} }
+func number(v float64, raw ...string) Value {
+	value := Value{Value: &v}
+	if len(raw) > 0 {
+		value.Raw = raw[0]
+	}
+	return value
+}
 
 type FilesystemObservation struct {
 	Device         string `json:"device"`
@@ -101,28 +111,28 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 		switch s.Name {
 		case "node_load1":
 			if o.Load1.Value == nil {
-				o.Load1 = number(s.Value)
+				o.Load1 = number(s.Value, s.RawValue)
 			}
 		case "node_memory_MemTotal_bytes":
 			if o.MemoryTotalBytes.Value == nil {
-				o.MemoryTotalBytes = number(s.Value)
+				o.MemoryTotalBytes = number(s.Value, s.RawValue)
 			}
 		case "node_memory_MemAvailable_bytes":
 			if o.MemoryAvailableBytes.Value == nil {
-				o.MemoryAvailableBytes = number(s.Value)
+				o.MemoryAvailableBytes = number(s.Value, s.RawValue)
 			}
 		case "node_memory_SwapTotal_bytes":
 			if o.SwapTotalBytes.Value == nil {
-				o.SwapTotalBytes = number(s.Value)
+				o.SwapTotalBytes = number(s.Value, s.RawValue)
 			}
 		case "node_memory_SwapFree_bytes":
 			if o.SwapFreeBytes.Value == nil {
-				o.SwapFreeBytes = number(s.Value)
+				o.SwapFreeBytes = number(s.Value, s.RawValue)
 			}
 		case "node_cpu_seconds_total":
 			cpu, mode := s.Labels["cpu"], s.Labels["mode"]
 			if cpu != "" && mode != "" {
-				o.CPUSeconds = append(o.CPUSeconds, CPUSecondsObservation{CPU: cpu, Mode: mode, Seconds: number(s.Value)})
+				o.CPUSeconds = append(o.CPUSeconds, CPUSecondsObservation{CPU: cpu, Mode: mode, Seconds: number(s.Value, s.RawValue)})
 			}
 		case "node_filesystem_size_bytes", "node_filesystem_avail_bytes", "node_filesystem_readonly":
 			device, mount := s.Labels["device"], s.Labels["mountpoint"]
@@ -136,11 +146,11 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 				fs[key] = v
 			}
 			if s.Name == "node_filesystem_size_bytes" {
-				v.SizeBytes = number(s.Value)
+				v.SizeBytes = number(s.Value, s.RawValue)
 			} else if s.Name == "node_filesystem_avail_bytes" {
-				v.AvailableBytes = number(s.Value)
+				v.AvailableBytes = number(s.Value, s.RawValue)
 			} else {
-				v.ReadOnly = number(s.Value)
+				v.ReadOnly = number(s.Value, s.RawValue)
 			}
 		case "node_network_receive_bytes_total", "node_network_transmit_bytes_total", "node_network_receive_errs_total", "node_network_transmit_errs_total", "node_network_receive_drop_total", "node_network_transmit_drop_total", "node_network_up":
 			device := s.Labels["device"]
@@ -154,30 +164,30 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 			}
 			switch s.Name {
 			case "node_network_receive_bytes_total":
-				v.ReceiveBytes = number(s.Value)
+				v.ReceiveBytes = number(s.Value, s.RawValue)
 			case "node_network_transmit_bytes_total":
-				v.TransmitBytes = number(s.Value)
+				v.TransmitBytes = number(s.Value, s.RawValue)
 			case "node_network_receive_errs_total":
-				v.ReceiveErrors = number(s.Value)
+				v.ReceiveErrors = number(s.Value, s.RawValue)
 			case "node_network_transmit_errs_total":
-				v.TransmitErrors = number(s.Value)
+				v.TransmitErrors = number(s.Value, s.RawValue)
 			case "node_network_receive_drop_total":
-				v.ReceiveDrops = number(s.Value)
+				v.ReceiveDrops = number(s.Value, s.RawValue)
 			case "node_network_transmit_drop_total":
-				v.TransmitDrops = number(s.Value)
+				v.TransmitDrops = number(s.Value, s.RawValue)
 			case "node_network_up":
-				v.LinkUp = number(s.Value)
+				v.LinkUp = number(s.Value, s.RawValue)
 			}
 		case "node_pressure_cpu_waiting_seconds_total", "node_pressure_io_waiting_seconds_total", "node_pressure_io_stalled_seconds_total", "node_pressure_memory_waiting_seconds_total", "node_pressure_memory_stalled_seconds_total":
 			parts := strings.Split(strings.TrimPrefix(strings.TrimSuffix(s.Name, "_seconds_total"), "node_pressure_"), "_")
 			if len(parts) == 2 {
 				key := parts[0] + "\x00" + parts[1]
-				pressure[key] = &PressureObservation{Resource: parts[0], State: parts[1], SecondsTotal: number(s.Value)}
+				pressure[key] = &PressureObservation{Resource: parts[0], State: parts[1], SecondsTotal: number(s.Value, s.RawValue)}
 			}
 		case "node_hwmon_temp_celsius":
 			chip, sensor := s.Labels["chip"], s.Labels["sensor"]
 			if chip != "" && sensor != "" {
-				hwmon[chip+"\x00"+sensor] = &HardwareTemperatureObservation{Chip: chip, Sensor: sensor, Celsius: number(s.Value)}
+				hwmon[chip+"\x00"+sensor] = &HardwareTemperatureObservation{Chip: chip, Sensor: sensor, Celsius: number(s.Value, s.RawValue)}
 			}
 		case "node_zfs_zpool_size", "node_zfs_zpool_allocated", "node_zfs_zpool_free", "node_zfs_zpool_state":
 			pool := s.Labels["zpool"]
@@ -197,14 +207,14 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 			}
 			switch s.Name {
 			case "node_zfs_zpool_size":
-				v.SizeBytes = number(s.Value)
+				v.SizeBytes = number(s.Value, s.RawValue)
 			case "node_zfs_zpool_allocated":
-				v.AllocatedBytes = number(s.Value)
+				v.AllocatedBytes = number(s.Value, s.RawValue)
 			case "node_zfs_zpool_free":
-				v.FreeBytes = number(s.Value)
+				v.FreeBytes = number(s.Value, s.RawValue)
 			case "node_zfs_zpool_state":
 				if s.Labels["state"] == "ONLINE" {
-					v.Healthy = number(s.Value)
+					v.Healthy = number(s.Value, s.RawValue)
 				}
 			}
 		}
@@ -251,21 +261,21 @@ func NormalizeSMART(samples []Sample, observedAt time.Time) SmartObservation {
 		}
 		switch s.Name {
 		case "smartctl_device_smart_status":
-			d.Healthy = number(s.Value)
+			d.Healthy = number(s.Value, s.RawValue)
 		case "smartctl_device_temperature":
-			d.TemperatureCelsius = number(s.Value)
+			d.TemperatureCelsius = number(s.Value, s.RawValue)
 		case "smartctl_device_power_on_hours":
-			d.PowerOnHours = number(s.Value)
+			d.PowerOnHours = number(s.Value, s.RawValue)
 		case "smartctl_device_data_units_read":
-			d.DataUnitsRead = number(s.Value)
+			d.DataUnitsRead = number(s.Value, s.RawValue)
 		case "smartctl_device_data_units_written":
-			d.DataUnitsWritten = number(s.Value)
+			d.DataUnitsWritten = number(s.Value, s.RawValue)
 		case "smartctl_device_media_errors":
-			d.MediaErrors = number(s.Value)
+			d.MediaErrors = number(s.Value, s.RawValue)
 		case "smartctl_device_percentage_used":
-			d.PercentageUsed = number(s.Value)
+			d.PercentageUsed = number(s.Value, s.RawValue)
 		case "smartctl_device_capacity":
-			d.CapacityBytes = number(s.Value)
+			d.CapacityBytes = number(s.Value, s.RawValue)
 		case "smartctl_device_info":
 			if d.Model == "" {
 				d.Model = firstLabel(s.Labels, "model_name", "model")

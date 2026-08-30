@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ppflight.com/schemas/template-storage-discovery.v1.json",
+  "title": "PPFlight local PVE storage discovery",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "mode", "state", "storages"],
+  "properties": {
+    "schemaVersion": {"const": "ppflight.template-bootstrap-result/v1"},
+    "mode": {"const": "discover"},
+    "state": {"const": "succeeded"},
+    "storages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["storageId", "type", "contentTypes", "enabled", "active", "shared", "availableBytes", "availableBytesKnown", "roleEligibility", "remediations"],
+        "properties": {
+          "storageId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+          "type": {"type": "string"},
+          "contentTypes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+          "enabled": {"type": "boolean"},
+          "active": {"type": "boolean"},
+          "shared": {"type": "boolean"},
+          "availableBytes": {"type": "string", "pattern": "^(?:0|[1-9][0-9]*)$"},
+          "availableBytesKnown": {"type": "boolean"},
+          "roleEligibility": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["image", "template", "backup"],
+            "properties": {
+              "image": {"$ref": "#/$defs/role"},
+              "template": {"$ref": "#/$defs/role"},
+              "backup": {"$ref": "#/$defs/role"}
+            }
+          },
+          "remediations": {"type": "array", "items": {"$ref": "#/$defs/remediation"}}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "reasons"],
+      "properties": {
+        "allowed": {"type": "boolean"},
+        "reasons": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "remediation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "storageId", "currentContent", "requiredContent", "proposedContent", "command", "automatic"],
+      "properties": {
+        "code": {"const": "ENABLE_STORAGE_CONTENT"},
+        "storageId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+        "currentContent": {"type": "string", "pattern": "^(?:[a-z][a-z0-9_-]*(?:,[a-z][a-z0-9_-]*)*)?$"},
+        "requiredContent": {"type": "string", "pattern": "^(?:iso|snippets)(?:,(?:iso|snippets))?$"},
+        "proposedContent": {"type": "string", "pattern": "^[a-z][a-z0-9_-]*(?:,[a-z][a-z0-9_-]*)*$"},
+        "command": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["program", "argv"],
+          "properties": {
+            "program": {"const": "pvesm"},
+            "argv": {
+              "type": "array",
+              "minItems": 5,
+              "maxItems": 5,
+              "prefixItems": [
+                {"const": "pvesm"},
+                {"const": "set"},
+                {"type": "string"},
+                {"const": "--content"},
+                {"type": "string"}
+              ]
+            }
+          }
+        },
+        "automatic": {"const": false}
+      }
+    }
+  }
+}

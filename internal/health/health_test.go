@@ -1,6 +1,7 @@
 package health
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,5 +23,27 @@ func TestReadinessAndMetrics(t *testing.T) {
 	registry.Handler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "ppflight_agent_ready 1") {
 		t.Fatalf("body=%s", response.Body.String())
+	}
+}
+
+func TestAuthenticationBlockedIsVisibleAndClearsOnSuccess(t *testing.T) {
+	registry := New("0.1.0", "production", "agent-1", "cluster-1", "pve-1", true, true, false, time.Now())
+	now := time.Now().UTC()
+	registry.DeliveryState("monitoring", now, false, true, fmt.Errorf("destination authentication is blocked"))
+	status := registry.Snapshot()
+	if !status.Deliveries["monitoring"].AuthBlocked || status.Deliveries["monitoring"].AuthBlockedSince == nil || !status.Deliveries["monitoring"].AuthBlockedSince.Equal(now) {
+		t.Fatalf("status=%#v", status.Deliveries["monitoring"])
+	}
+	registry.DeliveryState("monitoring", now.Add(500*time.Millisecond), false, true, fmt.Errorf("destination authentication is blocked"))
+	if since := registry.Snapshot().Deliveries["monitoring"].AuthBlockedSince; since == nil || !since.Equal(now) {
+		t.Fatalf("authentication block start moved: %v", since)
+	}
+	if metrics := registry.metrics(); !strings.Contains(metrics, `ppflight_agent_delivery_auth_blocked{destination="monitoring"} 1`) {
+		t.Fatalf("metrics=%s", metrics)
+	}
+	registry.DeliveryState("monitoring", now.Add(time.Second), true, false, nil)
+	cleared := registry.Snapshot().Deliveries["monitoring"]
+	if cleared.AuthBlocked || cleared.AuthBlockedSince != nil {
+		t.Fatal("successful delivery did not clear auth block")
 	}
 }

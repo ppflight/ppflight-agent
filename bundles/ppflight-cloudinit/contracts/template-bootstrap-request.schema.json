@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ppflight.com/schemas/template-bootstrap-request.v1.json",
+  "title": "PPFlight local template bootstrap request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "requestId", "operationId", "catalogRevision", "imageStorage", "templateStorage", "backupPolicy", "items"],
+  "properties": {
+    "schemaVersion": {"const": "ppflight.template-bootstrap-request/v1"},
+    "requestId": {"type": "string", "format": "uuid"},
+    "operationId": {"type": "string", "format": "uuid"},
+    "catalogRevision": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[1-9][0-9]*$"},
+    "imageStorage": {"$ref": "#/$defs/storageId"},
+    "templateStorage": {"$ref": "#/$defs/storageId"},
+    "backupStorage": {"$ref": "#/$defs/storageId"},
+    "backupPolicy": {"enum": ["required", "disabled"]},
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["templateRef", "version", "sha256", "targetVmid"],
+        "properties": {
+          "templateRef": {"type": "string", "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"},
+          "version": {"type": "string", "minLength": 1, "maxLength": 40},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "targetVmid": {"type": "integer", "minimum": 100, "maximum": 999999999}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"backupPolicy": {"const": "required"}}},
+      "then": {"required": ["backupStorage"]},
+      "else": {"not": {"required": ["backupStorage"]}}
+    }
+  ],
+  "$defs": {
+    "storageId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"}
+  }
+}

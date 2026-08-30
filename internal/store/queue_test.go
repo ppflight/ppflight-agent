@@ -55,6 +55,39 @@ func TestMeteringCapacityNeverEvicts(t *testing.T) {
 	}
 }
 
+func TestAuditQueueNeverEvictsAndSurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 30, 1, 2, 3, 0, time.UTC)
+	config := Config{Root: root, Destination: "monitoring-audit", Kind: Audit, Policy: Policy{MaxItems: 1}, Now: func() time.Time { return now }}
+	queue, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := queue.Enqueue("event-1", []byte(`{"event":1}`)); err != nil || !created {
+		t.Fatalf("first enqueue created=%v err=%v", created, err)
+	}
+	if _, due := queue.Next(now); due {
+		t.Fatal("new audit item was deliverable before journal acknowledgement window")
+	}
+	if item, due := queue.Next(now.Add(AuditEnqueueDelay)); !due || item.BatchID != "event-1" {
+		t.Fatalf("audit item due=%v item=%#v", due, item)
+	}
+	if _, _, err := queue.Enqueue("event-2", []byte(`{"event":2}`)); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("audit capacity err=%v", err)
+	}
+	if _, err := Open(Config{Root: root, Destination: "monitoring-audit-evict", Kind: Audit, Policy: Policy{DropOldest: true}}); err == nil {
+		t.Fatal("audit queue accepted an eviction policy")
+	}
+	reopened, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := reopened.Snapshot()
+	if len(items) != 1 || items[0].BatchID != "event-1" || string(items[0].Payload) != `{"event":1}` {
+		t.Fatalf("reopened audit queue=%#v", items)
+	}
+}
+
 func TestTelemetryEvictsAndCountsDrops(t *testing.T) {
 	queue, err := Open(Config{Root: t.TempDir(), Destination: "monitoring", Kind: Telemetry, Policy: Policy{MaxItems: 1, DropOldest: true}})
 	if err != nil {

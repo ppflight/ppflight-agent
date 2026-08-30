@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/observation"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
@@ -76,7 +77,7 @@ func Open(cfg Config) (*Manager, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if err := os.MkdirAll(cfg.Directory, 0o750); err != nil {
+	if err := fsutil.EnsurePrivateDirectory(cfg.Directory); err != nil {
 		return nil, fmt.Errorf("create meter directory: %w", err)
 	}
 	result := &Manager{
@@ -171,7 +172,8 @@ func (m *Manager) Observe(snapshot observation.Snapshot, assignments *inventory.
 			continue
 		}
 		billingState := assignment.BillingState
-		if m.cfg.Mode != "production" || assignment.CutoverAt == nil || snapshot.ObservedAt.Before(*assignment.CutoverAt) {
+		meteringCapability := assignment.AggregateMeteringCapability()
+		if !meteringCapability.Supported || m.cfg.Mode != "production" || assignment.CutoverAt == nil || snapshot.ObservedAt.Before(*assignment.CutoverAt) {
 			billingState = "shadow"
 		}
 		key := assignment.Key()
@@ -297,10 +299,5 @@ func atomicJSON(filename string, value any) error {
 }
 
 func syncDirectory(directory string) error {
-	handle, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return fsutil.SyncDir(directory)
 }

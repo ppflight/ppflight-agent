@@ -10,3 +10,5 @@ assignments.json
 state/
 secrets/
 test-output/
+__pycache__/
+*.py[cod]

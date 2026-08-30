@@ -28,6 +28,7 @@
   "pve": {
     "source": "simulator",
     "endpoint": "https://127.0.0.1:8006",
+    "tlsServerName": "pve01.example.invalid",
     "tokenIdEnv": "PVE_READ_TOKEN_ID",
     "tokenSecretEnv": "PVE_READ_TOKEN_SECRET",
     "caFile": "/etc/ppflight-agent/pve-root-ca.pem",
@@ -52,7 +53,7 @@
     }
   },
   "assignments": {
-    "file": "/etc/ppflight-agent/assignments.json",
+    "file": "/var/lib/ppflight-agent/assignments/assignments.json",
     "refreshUrl": "",
     "refreshInterval": "5m"
   },
@@ -63,6 +64,8 @@
       "auth": { "mode": "none" },
       "timeout": "15s",
       "maxResponseBytes": 2097152,
+      "maxCompressedBytes": 67108864,
+      "maxUncompressedBytes": 268435456,
       "maxQueueBytes": 67108864,
       "compression": "none",
       "payloadFormat": "usage-v1"
@@ -73,6 +76,8 @@
       "auth": { "mode": "none" },
       "timeout": "15s",
       "maxResponseBytes": 2097152,
+      "maxCompressedBytes": 67108864,
+      "maxUncompressedBytes": 268435456,
       "maxQueueBytes": 268435456,
       "compression": "none",
       "payloadFormat": "telemetry-v1"
@@ -83,19 +88,35 @@
       "auth": { "mode": "none" },
       "timeout": "15s",
       "maxResponseBytes": 2097152,
+      "maxCompressedBytes": 67108864,
+      "maxUncompressedBytes": 268435456,
       "maxQueueBytes": 536870912,
       "compression": "none",
-      "payloadFormat": "legacy-ingest-v1"
+      "payloadFormat": "telemetry-v1"
+    },
+    "monitoringAudit": {
+      "enabled": false,
+      "url": "",
+      "auth": { "mode": "none" },
+      "timeout": "15s",
+      "maxResponseBytes": 2097152,
+      "maxCompressedBytes": 4194304,
+      "maxUncompressedBytes": 16777216,
+      "maxQueueBytes": 536870912,
+      "compression": "none",
+      "payloadFormat": "audit-v1"
     }
   },
   "control": {
     "enabled": true,
     "pollUrl": "",
     "resultUrl": "",
-    "auth": { "mode": "hmac-sha256", "keyIdEnv": "CONTROL_API_KEY_ID", "secretEnv": "CONTROL_API_SECRET" },
+    "auth": { "mode": "hmac-sha256", "keyIdEnv": "", "secretEnv": "" },
     "pollInterval": "30s",
     "requestTimeout": "10s",
-    "commandSecretEnv": "CONTROL_COMMAND_SECRET",
+    "commandSecretEnv": "",
+    "commandSigningKeyIdEnv": "",
+    "commandPublicKeyEnv": "",
     "pveTokenIdEnv": "PVE_CONTROL_TOKEN_ID",
     "pveTokenSecretEnv": "PVE_CONTROL_TOKEN_SECRET",
     "maxCommandsPerPoll": 20,
