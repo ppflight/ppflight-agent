@@ -114,6 +114,7 @@ jobs:
       - name: Combine checksums and publish immutable assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         shell: bash
         run: |
@@ -124,5 +125,6 @@ jobs:
           gh release create "$TAG" \
             ppflight-agent-*-linux-*.tar.gz SHA256SUMS \
             --verify-tag \
+            --prerelease \
             --title "PPFlight Agent $TAG" \
             --generate-notes
