@@ -27,6 +27,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/monitorenrollment"
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
+	"github.com/ppflight/ppflight-agent/internal/templatebootstrap"
 )
 
 func writeTestConfig(t *testing.T) string {
@@ -155,12 +156,13 @@ func TestTemplateStorageRemediationPreservesExistingContent(t *testing.T) {
 	}}
 	var output, stderr bytes.Buffer
 	instance := &cli{in: strings.NewReader(""), out: &output, errOut: &stderr, version: "test"}
-	if _, err := instance.promptTemplateStorage(bufio.NewReader(strings.NewReader("")), []templateStorage{storage}, "image", "选择镜像缓存存储"); err == nil {
-		t.Fatal("ineligible image storage was accepted")
+	choice, err := instance.promptTemplateStorage(bufio.NewReader(strings.NewReader("1\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
+	if err != nil || choice.StorageID != "local" || choice.Remediation == nil {
+		t.Fatalf("safe auto-configuration candidate was not selectable: choice=%#v err=%v", choice, err)
 	}
 	value := output.String()
-	if !strings.Contains(value, "sudo pvesm set local --content backup,iso,snippets,vztmpl") || !strings.Contains(value, "Agent 绝不自动执行") || !strings.Contains(value, "不会静默开启") {
-		t.Fatalf("safe remediation missing: %s", value)
+	if !strings.Contains(value, "需确认自动配置 content=backup,iso,snippets,vztmpl") {
+		t.Fatalf("safe automatic configuration candidate missing: %s", value)
 	}
 }
 
@@ -177,8 +179,131 @@ func TestTemplateStorageRejectsMismatchedFrozenRemediation(t *testing.T) {
 	if _, err := instance.promptTemplateStorage(bufio.NewReader(strings.NewReader("")), []templateStorage{storage}, "image", "选择镜像缓存存储"); err == nil {
 		t.Fatal("ineligible image storage was accepted")
 	}
-	if strings.Contains(output.String(), "sudo pvesm") || !strings.Contains(output.String(), "已拒绝显示") {
+	if strings.Contains(output.String(), "sudo pvesm") || !strings.Contains(output.String(), "已拒绝使用") {
 		t.Fatalf("mismatched frozen remediation was rendered: %s", output.String())
+	}
+}
+
+func TestChooseTemplateStorageAppliesExactContentAndRediscovers(t *testing.T) {
+	automatic := false
+	storage := templateStorage{StorageID: "local", Type: "dir", ContentTypes: []string{"backup", "iso", "vztmpl"}, Enabled: true, Active: true}
+	storage.RoleEligibility.Image = templateRole{Allowed: false, Reasons: []string{"MISSING_CONTENT_SNIPPETS"}}
+	storage.Remediations = []templateRemediation{{
+		Code: "ENABLE_STORAGE_CONTENT", StorageID: "local", CurrentContent: "backup,iso,vztmpl", RequiredContent: "snippets", ProposedContent: "backup,iso,snippets,vztmpl", Automatic: &automatic,
+		Command: templateRemediationCommand{Program: "pvesm", Argv: []string{"pvesm", "set", "local", "--content", "backup,iso,snippets,vztmpl"}},
+	}}
+	refreshed := storage
+	refreshed.ContentTypes = []string{"backup", "iso", "snippets", "vztmpl"}
+	refreshed.RoleEligibility.Image = templateRole{Allowed: true, Reasons: []string{}}
+	refreshed.Remediations = []templateRemediation{}
+	discoveryRaw, err := json.Marshal(templateDiscovery{SchemaVersion: "ppflight.template-bootstrap-result/v1", Mode: "discover", State: "succeeded", Storages: []templateStorage{refreshed}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	var gotStorage, gotContent string
+	instance := &cli{
+		in: strings.NewReader(""), out: &output, errOut: io.Discard, version: "test",
+		pvesmSetContent: func(_ context.Context, storageID, content string) error {
+			gotStorage, gotContent = storageID, content
+			return nil
+		},
+		templateRun: func(_ context.Context, args []string, _ io.Writer) (templatebootstrap.Result, error) {
+			if !slices.Equal(args, []string{"discover"}) {
+				t.Fatalf("unexpected helper args: %v", args)
+			}
+			return templatebootstrap.Result{ExitCode: 0, Stdout: discoveryRaw}, nil
+		},
+	}
+	selected, storages, err := instance.chooseTemplateStorage(context.Background(), bufio.NewReader(strings.NewReader("1\nAPPLY\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
+	if err != nil || selected != "local" || len(storages) != 1 || !storages[0].RoleEligibility.Image.Allowed {
+		t.Fatalf("selected=%q storages=%#v err=%v", selected, storages, err)
+	}
+	if gotStorage != "local" || gotContent != "backup,iso,snippets,vztmpl" {
+		t.Fatalf("pvesm set got storage=%q content=%q", gotStorage, gotContent)
+	}
+	for _, expected := range []string{"输入 APPLY", "pvesm set local --content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("output missing %q: %s", expected, output.String())
+		}
+	}
+}
+
+func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
+	automatic := false
+	local := templateStorage{StorageID: "local", Type: "dir", ContentTypes: []string{"backup", "iso", "vztmpl"}, Enabled: true, Active: true, AvailableBytes: "1000", AvailableBytesKnown: true, Remediations: []templateRemediation{}}
+	local.RoleEligibility.Image = templateRole{Allowed: false, Reasons: []string{"MISSING_CONTENT_SNIPPETS"}}
+	local.RoleEligibility.Template = templateRole{Allowed: false, Reasons: []string{"MISSING_CONTENT_IMAGES"}}
+	local.RoleEligibility.Backup = templateRole{Allowed: true, Reasons: []string{}}
+	local.Remediations = []templateRemediation{{
+		Code: "ENABLE_STORAGE_CONTENT", StorageID: "local", CurrentContent: "backup,iso,vztmpl", RequiredContent: "snippets", ProposedContent: "backup,iso,snippets,vztmpl", Automatic: &automatic,
+		Command: templateRemediationCommand{Program: "pvesm", Argv: []string{"pvesm", "set", "local", "--content", "backup,iso,snippets,vztmpl"}},
+	}}
+	localZFS := templateStorage{StorageID: "local-zfs", Type: "zfspool", ContentTypes: []string{"images", "rootdir"}, Enabled: true, Active: true, AvailableBytes: "2000", AvailableBytesKnown: true, Remediations: []templateRemediation{}}
+	localZFS.RoleEligibility.Image = templateRole{Allowed: false, Reasons: []string{"MISSING_CONTENT_ISO", "MISSING_CONTENT_SNIPPETS"}}
+	localZFS.RoleEligibility.Template = templateRole{Allowed: true, Reasons: []string{}}
+	localZFS.RoleEligibility.Backup = templateRole{Allowed: false, Reasons: []string{"MISSING_CONTENT_BACKUP"}}
+	initialRaw, err := json.Marshal(templateDiscovery{SchemaVersion: "ppflight.template-bootstrap-result/v1", Mode: "discover", State: "succeeded", Storages: []templateStorage{local, localZFS}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshedLocal := local
+	refreshedLocal.ContentTypes = []string{"backup", "iso", "snippets", "vztmpl"}
+	refreshedLocal.RoleEligibility.Image = templateRole{Allowed: true, Reasons: []string{}}
+	refreshedLocal.Remediations = []templateRemediation{}
+	refreshedRaw, err := json.Marshal(templateDiscovery{SchemaVersion: "ppflight.template-bootstrap-result/v1", Mode: "discover", State: "succeeded", Storages: []templateStorage{refreshedLocal, localZFS}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogRaw := []byte(`{"catalogSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","catalog":{"catalogRevision":"test-1","items":[{"templateRef":"ubuntu-24.04","version":"24.04","displayName":"Ubuntu 24.04","aliases":[],"target":{"vmid":9001}}]}}`)
+	planRaw := []byte(`{"state":"ready","executable":true,"catalog":{"catalogRevision":"test-1","catalogSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}`)
+	discoverCalls := 0
+	var bootstrapArgs []string
+	var output, stderr bytes.Buffer
+	instance := &cli{
+		in: strings.NewReader("\n1\nAPPLY\n1\n\n1\n\n\n"), out: &output, errOut: &stderr, version: "test",
+		pvesmSetContent: func(_ context.Context, storageID, content string) error {
+			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {
+				t.Fatalf("unexpected storage content update: %s %s", storageID, content)
+			}
+			return nil
+		},
+		templateRun: func(_ context.Context, args []string, _ io.Writer) (templatebootstrap.Result, error) {
+			switch args[0] {
+			case "discover":
+				discoverCalls++
+				raw := initialRaw
+				if discoverCalls > 1 {
+					raw = refreshedRaw
+				}
+				return templatebootstrap.Result{ExitCode: 0, Stdout: raw}, nil
+			case "catalog":
+				return templatebootstrap.Result{ExitCode: 0, Stdout: catalogRaw}, nil
+			case "bootstrap":
+				bootstrapArgs = append([]string(nil), args...)
+				return templatebootstrap.Result{ExitCode: 0, Stdout: planRaw}, nil
+			default:
+				t.Fatalf("unexpected helper args: %v", args)
+				return templatebootstrap.Result{}, nil
+			}
+		},
+	}
+	if code := instance.templateInit(); code != 0 {
+		t.Fatalf("code=%d stderr=%s output=%s", code, stderr.String(), output.String())
+	}
+	if discoverCalls != 2 {
+		t.Fatalf("discover calls=%d", discoverCalls)
+	}
+	joined := strings.Join(bootstrapArgs, " ")
+	for _, expected := range []string{"--items all", "--image-storage local", "--template-storage local-zfs", "--backup-policy required", "--backup-storage local"} {
+		if !strings.Contains(joined, expected) {
+			t.Fatalf("bootstrap args missing %q: %v", expected, bootstrapArgs)
+		}
+	}
+	for _, expected := range []string{"选择镜像缓存存储", "选择模板磁盘存储", "选择模板备份存储", "未执行任何模板变更"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("output missing %q: %s", expected, output.String())
+		}
 	}
 }
 

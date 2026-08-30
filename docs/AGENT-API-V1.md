@@ -281,7 +281,7 @@ manifest 的 `networkRedirectPolicy` 也是 strict 合同：只能是 `allowed=t
 
 `bootstrap` 默认只做 plan。显式 `--execute` 必须使用与已确认 plan 相同的 storage/items/bridge，并原样带回 plan 的 UUID `requestId`、UUID `operationId`、`catalogRevision` 和 `catalogSha256`；任一 catalog 漂移都必须在 PVE mutation 前拒绝。helper 退出码固定为：0 表示 catalog/discovery 成功、plan ready 或 execute 全部成功；1 表示已进入执行后 builder/template/backup 失败；2 表示参数、catalog、storage、PVE preflight 或 VMID 冲突拒绝。调用方优先读取 strict JSON `state/errorCode`，不得解析 stderr 人类日志。
 
-storage discovery 若给出 content remediation，管理 CLI 只在 `program=pvesm`，且 `argv/storageId/current/required/proposed content` 全部通过 strict 交叉校验后打印冻结命令；不会自动执行。管理员必须单独审阅/执行，再重新 discovery，不能让模板向导静默扩展 storage content。
+storage discovery 若给出 content remediation，管理 CLI 只在 `program=pvesm`，且 `argv/storageId/current/required/proposed content` 全部通过 strict 交叉校验，存储 active/enabled，角色失败原因仅为缺 content 时允许选择。CLI 显示精确变更后要求原样输入 `APPLY`，再以固定绝对路径执行且不经 shell；完成后必须重新 discovery 并确认该角色 `allowed=true` 才继续。未确认、执行失败或回读不一致均 fail closed。
 
 这条本地流程仅说明 Agent runner/CLI 与 vendored helper 的合同。安装器已强制验证 vendored bundle、Python/Bash 版本、manifest command/Perl module 依赖，复制到 manifest 派生的不可变版本目录，二次验证 staged 内容，再原子切换 managed symlink；旧版本保留，避免 in-flight runner 在切换时观察到混合文件。它不是 `vm.reinstall`、不是远程模板创建 action，也不授权网站执行 PVE mutation；真实 PVE 8/9 plan/execute 仍须随发布物验收。
 

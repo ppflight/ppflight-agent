@@ -283,9 +283,9 @@ sudo ag-pve template init
 
 安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一五项菜单：模板初始化、官网绑定、监控站绑定、官网通信状态、监控站通信状态。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。
 
-向导会读取本地 catalog 和 PVE storage discovery，让管理员选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）和 bridge。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略后精确输入 `EXECUTE` 才执行，直接回车不修改 PVE。
+向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）和 bridge。选择 `all` 也不会跳过任一 storage 选择。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略后精确输入 `EXECUTE` 才执行，直接回车不创建模板。
 
-若 discovery 返回 storage content remediation，`ag` 只会在 `program=pvesm` 且 argv、storage ID、current/required/proposed content 全部严格匹配时打印冻结命令，永不自动执行。管理员应单独审阅并执行该命令，再重新 discovery；不要把模板向导当作隐式 storage 配置工具。
+若 discovery 返回 storage content remediation，`ag` 只会在 `program=pvesm` 且 argv、storage ID、current/required/proposed content 全部严格匹配，存储 active/enabled，且该角色没有其他阻断原因时把它列为“需确认自动配置”的候选项。选中后会显示精确 content 变更和固定命令；只有原样输入 `APPLY` 才以固定绝对路径执行，不经 shell，并立即重新 discovery。取消、命令失败或重新检测仍不合格都会停止向导，不会进入模板 plan/execute。
 
 自动化可调用以下固定子命令；不能传 URL、catalog 路径、cache 路径、shell 片段或 replace 选项：
 

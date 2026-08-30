@@ -40,13 +40,15 @@ import (
 )
 
 type cli struct {
-	in             io.Reader
-	out, errOut    io.Writer
-	version        string
-	pveEnvironment func(string) (map[string]string, error)
-	pveProbe       func(context.Context, pve.Config, bool) (rawCredentialProbe, error)
-	effectiveUID   func() int
-	tlsServerName  func() string
+	in              io.Reader
+	out, errOut     io.Writer
+	version         string
+	pveEnvironment  func(string) (map[string]string, error)
+	pveProbe        func(context.Context, pve.Config, bool) (rawCredentialProbe, error)
+	effectiveUID    func() int
+	tlsServerName   func() string
+	templateRun     func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
+	pvesmSetContent func(context.Context, string, string) error
 }
 
 func Run(args []string, version string, out, errOut io.Writer) int {
@@ -1049,22 +1051,17 @@ func (c *cli) template(args []string) int {
 }
 
 func (c *cli) templateInit() int {
-	runner := templatebootstrap.Runner{}
-	discoveryResult, err := runner.Run(context.Background(), []string{"discover"}, c.errOut)
+	ctx := context.Background()
+	discovery, code, err := c.discoverTemplateStorages(ctx)
 	if err != nil {
-		fmt.Fprintf(c.errOut, "存储发现工具不可用: %v\n", err)
+		fmt.Fprintf(c.errOut, "PVE 存储发现失败: %v\n", err)
+		return code
+	}
+	if len(discovery.Storages) == 0 {
+		fmt.Fprintln(c.errOut, "PVE 没有返回任何存储")
 		return 1
 	}
-	if discoveryResult.ExitCode != 0 {
-		_, _ = c.out.Write(discoveryResult.Stdout)
-		return discoveryResult.ExitCode
-	}
-	discovery, err := decodeTemplateDiscovery(discoveryResult.Stdout)
-	if err != nil || len(discovery.Storages) == 0 {
-		fmt.Fprintln(c.errOut, "PVE 存储发现结果无效")
-		return 1
-	}
-	catalogResult, err := runner.Run(context.Background(), []string{"catalog"}, c.errOut)
+	catalogResult, err := c.runTemplateBootstrap(ctx, []string{"catalog"})
 	if err != nil || catalogResult.ExitCode != 0 {
 		fmt.Fprintln(c.errOut, "内置模板目录校验失败")
 		return 1
@@ -1084,16 +1081,18 @@ func (c *cli) templateInit() int {
 		fmt.Fprintf(c.errOut, "模板选择无效: %v\n", err)
 		return 2
 	}
-	imageStorage, err := c.promptTemplateStorage(reader, discovery.Storages, "image", "选择镜像缓存存储")
+	imageStorage, refreshed, err := c.chooseTemplateStorage(ctx, reader, discovery.Storages, "image", "选择镜像缓存存储")
 	if err != nil {
 		fmt.Fprintf(c.errOut, "镜像存储选择失败: %v\n", err)
 		return 2
 	}
-	templateStorage, err := c.promptTemplateStorage(reader, discovery.Storages, "template", "选择模板磁盘存储")
+	discovery.Storages = refreshed
+	templateStorage, refreshed, err := c.chooseTemplateStorage(ctx, reader, discovery.Storages, "template", "选择模板磁盘存储")
 	if err != nil {
 		fmt.Fprintf(c.errOut, "模板存储选择失败: %v\n", err)
 		return 2
 	}
+	discovery.Storages = refreshed
 	backupAnswer, err := c.promptLine(reader, "创建完成后备份模板？[Y/n]: ")
 	if err != nil {
 		return 2
@@ -1102,11 +1101,12 @@ func (c *cli) templateInit() int {
 	if strings.EqualFold(backupAnswer, "n") || strings.EqualFold(backupAnswer, "no") {
 		backupPolicy = "disabled"
 	} else {
-		backupStorage, err = c.promptTemplateStorage(reader, discovery.Storages, "backup", "选择模板备份存储")
+		backupStorage, refreshed, err = c.chooseTemplateStorage(ctx, reader, discovery.Storages, "backup", "选择模板备份存储")
 		if err != nil {
 			fmt.Fprintf(c.errOut, "备份存储选择失败: %v\n", err)
 			return 2
 		}
+		discovery.Storages = refreshed
 	}
 	bridge, err := c.promptLine(reader, "模板默认网桥 [vmbr0]: ")
 	if err != nil {
@@ -1127,7 +1127,7 @@ func (c *cli) templateInit() int {
 	if backupPolicy == "required" {
 		baseArgs = append(baseArgs, "--backup-storage", backupStorage)
 	}
-	planResult, err := runner.Run(context.Background(), baseArgs, c.errOut)
+	planResult, err := c.runTemplateBootstrap(ctx, baseArgs)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "模板计划失败: %v\n", err)
 		return 1
@@ -1143,13 +1143,36 @@ func (c *cli) templateInit() int {
 		return 0
 	}
 	executeArgs := append(append([]string(nil), baseArgs...), "--execute", "--expected-catalog-revision", plan.Catalog.CatalogRevision, "--expected-catalog-sha256", plan.Catalog.CatalogSHA256)
-	executeResult, err := runner.Run(context.Background(), executeArgs, c.errOut)
+	executeResult, err := c.runTemplateBootstrap(ctx, executeArgs)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "模板执行器失败: %v\n", err)
 		return 1
 	}
 	_, _ = c.out.Write(executeResult.Stdout)
 	return executeResult.ExitCode
+}
+
+func (c *cli) runTemplateBootstrap(ctx context.Context, args []string) (templatebootstrap.Result, error) {
+	if c.templateRun != nil {
+		return c.templateRun(ctx, args, c.errOut)
+	}
+	return (templatebootstrap.Runner{}).Run(ctx, args, c.errOut)
+}
+
+func (c *cli) discoverTemplateStorages(ctx context.Context) (templateDiscovery, int, error) {
+	result, err := c.runTemplateBootstrap(ctx, []string{"discover"})
+	if err != nil {
+		return templateDiscovery{}, 1, fmt.Errorf("存储发现工具不可用: %w", err)
+	}
+	if result.ExitCode != 0 {
+		_, _ = c.out.Write(result.Stdout)
+		return templateDiscovery{}, result.ExitCode, errors.New("存储发现命令失败")
+	}
+	discovery, err := decodeTemplateDiscovery(result.Stdout)
+	if err != nil {
+		return templateDiscovery{}, 1, errors.New("存储发现结果无效")
+	}
+	return discovery, 0, nil
 }
 
 func (c *cli) promptTemplateItems(reader *bufio.Reader, catalog templateCatalog) (string, error) {
@@ -1175,60 +1198,173 @@ func (c *cli) promptTemplateItems(reader *bufio.Reader, catalog templateCatalog)
 	return strings.Join(parts, ","), nil
 }
 
-func (c *cli) promptTemplateStorage(reader *bufio.Reader, storages []templateStorage, role, title string) (string, error) {
-	eligible := make([]templateStorage, 0, len(storages))
-	for _, storage := range storages {
-		allowed := storage.RoleEligibility.Image.Allowed
-		if role == "template" {
-			allowed = storage.RoleEligibility.Template.Allowed
-		} else if role == "backup" {
-			allowed = storage.RoleEligibility.Backup.Allowed
-		}
-		if allowed {
-			eligible = append(eligible, storage)
+type templateStorageChoice struct {
+	StorageID   string
+	Storage     templateStorage
+	Remediation *templateRemediation
+}
+
+func templateRoleState(storage templateStorage, role string) templateRole {
+	switch role {
+	case "template":
+		return storage.RoleEligibility.Template
+	case "backup":
+		return storage.RoleEligibility.Backup
+	default:
+		return storage.RoleEligibility.Image
+	}
+}
+
+func roleRequiredContent(role string) []string {
+	switch role {
+	case "image":
+		return []string{"iso", "snippets"}
+	case "template":
+		return []string{"images"}
+	case "backup":
+		return []string{"backup"}
+	default:
+		return nil
+	}
+}
+
+func remediationForTemplateRole(storage templateStorage, role string) *templateRemediation {
+	roleState := templateRoleState(storage, role)
+	if !storage.Active || !storage.Enabled || roleState.Allowed || len(roleState.Reasons) == 0 {
+		return nil
+	}
+	for _, reason := range roleState.Reasons {
+		if !strings.HasPrefix(reason, "MISSING_CONTENT_") {
+			return nil
 		}
 	}
-	if len(eligible) == 0 {
-		fmt.Fprintf(c.out, "%s：当前没有符合条件的存储。Agent 未修改任何 PVE storage 配置。\n", title)
-		for _, storage := range storages {
-			roleState := storage.RoleEligibility.Image
-			if role == "template" {
-				roleState = storage.RoleEligibility.Template
-			} else if role == "backup" {
-				roleState = storage.RoleEligibility.Backup
+	for index := range storage.Remediations {
+		remediation := &storage.Remediations[index]
+		if !validTemplateRemediation(storage, *remediation) {
+			continue
+		}
+		proposed, ok := parseContentCSV(remediation.ProposedContent, false)
+		if !ok {
+			continue
+		}
+		matches := true
+		for _, required := range roleRequiredContent(role) {
+			if _, exists := proposed[required]; !exists {
+				matches = false
+				break
 			}
+		}
+		if matches {
+			copy := *remediation
+			copy.Command.Argv = append([]string(nil), remediation.Command.Argv...)
+			return &copy
+		}
+	}
+	return nil
+}
+
+func (c *cli) promptTemplateStorage(reader *bufio.Reader, storages []templateStorage, role, title string) (templateStorageChoice, error) {
+	candidates := make([]templateStorageChoice, 0, len(storages))
+	for _, storage := range storages {
+		if templateRoleState(storage, role).Allowed {
+			candidates = append(candidates, templateStorageChoice{StorageID: storage.StorageID, Storage: storage})
+		} else if remediation := remediationForTemplateRole(storage, role); remediation != nil {
+			candidates = append(candidates, templateStorageChoice{StorageID: storage.StorageID, Storage: storage, Remediation: remediation})
+		}
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintf(c.out, "%s：当前没有符合条件或可安全配置的存储。Agent 未修改任何 PVE storage 配置。\n", title)
+		for _, storage := range storages {
+			roleState := templateRoleState(storage, role)
 			fmt.Fprintf(c.out, "  - %s active=%t enabled=%t content=%s 原因=%s\n", storage.StorageID, storage.Active, storage.Enabled, strings.Join(storage.ContentTypes, ","), strings.Join(roleState.Reasons, ","))
-			if role == "image" {
-				for _, remediation := range storage.Remediations {
-					if !validTemplateRemediation(storage, remediation) {
-						fmt.Fprintln(c.out, "    存储发现返回了不安全或不一致的修复建议，Agent 已拒绝显示。")
-						continue
-					}
-					fmt.Fprintf(c.out, "    冻结的修复建议（仅供手工核对执行，Agent 绝不自动执行）：sudo %s\n", strings.Join(remediation.Command.Argv, " "))
+			for _, remediation := range storage.Remediations {
+				if !validTemplateRemediation(storage, remediation) {
+					fmt.Fprintln(c.out, "    存储发现返回了不安全或不一致的配置建议，Agent 已拒绝使用。")
 				}
 			}
 		}
-		fmt.Fprintln(c.out, "完成明确的存储配置后重新运行 AG 并选择 1；Agent 不会静默开启 content 类型。")
-		return "", errors.New("没有符合该角色的 active/enabled 存储")
+		return templateStorageChoice{}, errors.New("没有符合该角色的 active/enabled 存储")
 	}
 	fmt.Fprintln(c.out, title+":")
-	for index, storage := range eligible {
+	for index, candidate := range candidates {
+		storage := candidate.Storage
 		known := "unknown"
 		if storage.AvailableBytesKnown {
 			known = storage.AvailableBytes
 		}
-		fmt.Fprintf(c.out, "  %d) %s type=%s shared=%t availableBytes=%s content=%s\n", index+1, storage.StorageID, storage.Type, storage.Shared, known, strings.Join(storage.ContentTypes, ","))
+		state := "可直接使用"
+		if candidate.Remediation != nil {
+			state = "需确认自动配置 content=" + candidate.Remediation.ProposedContent
+		}
+		fmt.Fprintf(c.out, "  %d) %s type=%s shared=%t availableBytes=%s content=%s [%s]\n", index+1, storage.StorageID, storage.Type, storage.Shared, known, strings.Join(storage.ContentTypes, ","), state)
 	}
 	value, err := c.promptLine(reader, "输入编号或 storage ID: ")
 	if err != nil {
-		return "", err
+		return templateStorageChoice{}, err
 	}
-	for index, storage := range eligible {
-		if value == storage.StorageID || value == fmt.Sprintf("%d", index+1) {
-			return storage.StorageID, nil
+	for index, candidate := range candidates {
+		if value == candidate.StorageID || value == fmt.Sprintf("%d", index+1) {
+			return candidate, nil
 		}
 	}
-	return "", errors.New("选择不在可用列表中")
+	return templateStorageChoice{}, errors.New("选择不在可用列表中")
+}
+
+func (c *cli) chooseTemplateStorage(ctx context.Context, reader *bufio.Reader, storages []templateStorage, role, title string) (string, []templateStorage, error) {
+	choice, err := c.promptTemplateStorage(reader, storages, role, title)
+	if err != nil {
+		return "", storages, err
+	}
+	if choice.Remediation == nil {
+		return choice.StorageID, storages, nil
+	}
+	remediation := *choice.Remediation
+	fmt.Fprintf(c.out, "将为存储 %s 配置 content：%s -> %s\n", choice.StorageID, remediation.CurrentContent, remediation.ProposedContent)
+	fmt.Fprintf(c.out, "将执行：sudo %s\n", strings.Join(remediation.Command.Argv, " "))
+	confirmation, err := c.promptLine(reader, "输入 APPLY 确认配置；其他输入取消: ")
+	if err != nil || confirmation != "APPLY" {
+		return "", storages, errors.New("未确认 storage content 配置，未执行任何变更")
+	}
+	if err := c.applyTemplateRemediation(ctx, choice.Storage, remediation); err != nil {
+		return "", storages, err
+	}
+	refreshed, _, err := c.discoverTemplateStorages(ctx)
+	if err != nil {
+		return "", storages, fmt.Errorf("storage content 已提交，但重新检测失败: %w", err)
+	}
+	for _, storage := range refreshed.Storages {
+		if storage.StorageID == choice.StorageID {
+			if !storage.Active || !storage.Enabled || !templateRoleState(storage, role).Allowed {
+				return "", refreshed.Storages, errors.New("重新检测后所选存储仍不满足该用途")
+			}
+			fmt.Fprintf(c.out, "存储 %s 已配置并通过重新检测。\n", choice.StorageID)
+			return choice.StorageID, refreshed.Storages, nil
+		}
+	}
+	return "", refreshed.Storages, errors.New("重新检测后所选存储不存在")
+}
+
+func (c *cli) applyTemplateRemediation(ctx context.Context, storage templateStorage, remediation templateRemediation) error {
+	if !validTemplateRemediation(storage, remediation) {
+		return errors.New("storage content 配置指令未通过安全校验")
+	}
+	if c.pvesmSetContent != nil {
+		return c.pvesmSetContent(ctx, storage.StorageID, remediation.ProposedContent)
+	}
+	command := exec.CommandContext(ctx, "/usr/sbin/pvesm", "set", storage.StorageID, "--content", remediation.ProposedContent)
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8"}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if len(message) > 4096 {
+			message = message[:4096]
+		}
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("pvesm 配置失败: %s", message)
+	}
+	return nil
 }
 
 func safeStorageID(value string) bool {
