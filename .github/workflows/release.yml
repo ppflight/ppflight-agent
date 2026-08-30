@@ -3,6 +3,7 @@ name: Release PPFlight Agent
 on:
   push:
     branches:
+      - 'main'
       - 'agent-v1-rc'
     tags:
       - 'v*'
@@ -13,8 +14,8 @@ on:
         required: true
         type: string
 
-# A stable tag build creates an immutable GitHub Release.  The RC branch and
-# manual dispatch only package and retain Actions artifacts; they never publish.
+# A stable tag build creates an immutable GitHub Release.  Integration branch
+# pushes and manual dispatch only package and retain Actions artifacts; they never publish.
 permissions:
   contents: read
 
