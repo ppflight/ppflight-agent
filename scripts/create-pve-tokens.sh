@@ -436,7 +436,8 @@ ensure_user() {
 }
 
 create_token() {
-  local user=$1 token=$2 label=$3 out="$TMPDIR_BOOTSTRAP/${label}.json"
+  local user=$1 token=$2 label=$3
+  local out="$TMPDIR_BOOTSTRAP/${label}.json"
   MUTATIONS_STARTED=1
   # pveum emits the secret only in this JSON response. It stays in a private
   # temporary file, never stdout, stderr, or argv.
