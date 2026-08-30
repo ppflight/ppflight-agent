@@ -189,6 +189,38 @@ func TestPromptYesNoRejectsInvalidAndControlCharacterInput(t *testing.T) {
 	}
 }
 
+func TestPromptPlanExecutionAcceptsYesOrNoAndRejectsOtherInput(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		want      bool
+		invalid   bool
+		promptCnt int
+	}{
+		{name: "yes", input: "YES\n", want: true, promptCnt: 1},
+		{name: "no", input: "no\n", want: false, promptCnt: 1},
+		{name: "empty cancels", input: "\n", want: false, promptCnt: 1},
+		{name: "invalid then yes", input: "EXECUTE\nYES\n", want: true, invalid: true, promptCnt: 2},
+		{name: "control character then no", input: "b\x08\nno\n", want: false, invalid: true, promptCnt: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			instance := &cli{out: &output, errOut: io.Discard}
+			got, err := instance.promptPlanExecution(bufio.NewReader(strings.NewReader(test.input)))
+			if err != nil || got != test.want {
+				t.Fatalf("got=%t want=%t err=%v", got, test.want, err)
+			}
+			if strings.Contains(output.String(), "输入无效") != test.invalid {
+				t.Fatalf("invalid message mismatch: %q", output.String())
+			}
+			if count := strings.Count(output.String(), "确认执行以上模板计划？"); count != test.promptCnt {
+				t.Fatalf("prompt count=%d want=%d output=%q", count, test.promptCnt, output.String())
+			}
+		})
+	}
+}
+
 func TestTemplateStorageRejectsMismatchedFrozenRemediation(t *testing.T) {
 	automatic := false
 	storage := templateStorage{StorageID: "local", Type: "dir", ContentTypes: []string{"iso"}, Enabled: true, Active: true}

@@ -1135,8 +1135,8 @@ func (c *cli) templateInit() int {
 	if json.Unmarshal(planResult.Stdout, &plan) != nil || planResult.ExitCode != 0 || !plan.Executable || plan.State != "ready" || plan.Catalog.CatalogRevision == "" || plan.Catalog.CatalogSHA256 == "" {
 		return max(planResult.ExitCode, 1)
 	}
-	confirmation, err := c.promptLine(reader, "核对以上计划后输入 EXECUTE 执行；直接回车仅保留计划: ")
-	if err != nil || confirmation != "EXECUTE" {
+	confirmed, err := c.promptPlanExecution(reader)
+	if err != nil || !confirmed {
 		fmt.Fprintln(c.out, "未执行任何模板变更。")
 		return 0
 	}
@@ -1600,6 +1600,23 @@ func (c *cli) promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) 
 			return false, nil
 		default:
 			fmt.Fprintln(c.out, "输入无效：只接受回车、Y 或 N，请重新输入。")
+		}
+	}
+}
+
+func (c *cli) promptPlanExecution(reader *bufio.Reader) (bool, error) {
+	for {
+		value, err := c.promptLine(reader, "确认执行以上模板计划？请输入 YES 执行，输入 no 或直接回车取消: ")
+		if err != nil {
+			return false, err
+		}
+		switch {
+		case strings.EqualFold(value, "yes"):
+			return true, nil
+		case value == "" || strings.EqualFold(value, "no"):
+			return false, nil
+		default:
+			fmt.Fprintln(c.out, "输入无效：只接受 YES 或 no，请重新输入。")
 		}
 	}
 }

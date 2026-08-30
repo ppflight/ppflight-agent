@@ -271,7 +271,7 @@ monitoring 响应中的三个 last-verified/received 时间和两个 batch ID ke
 
 ### 4.1 本地模板 bootstrap（非远程 action）
 
-模板 catalog/storage 发现和首次创建模板属于 PVE 节点上的 root 管理流程，不进入第 7 节的远程 command registry。固定命令是 `ag-pve template catalog|discover|bootstrap`；推荐入口 `ag-pve template init` 会交互选择 catalog item、image/template/backup storage、backup policy 和 bridge，先生成 plan，只有操作者精确输入 `EXECUTE` 后才执行。`backupPolicy=required` 必须选择支持 `backup` content 的 storage；不备份必须显式选择 `disabled`，不能从空值推断。
+模板 catalog/storage 发现和首次创建模板属于 PVE 节点上的 root 管理流程，不进入第 7 节的远程 command registry。固定命令是 `ag-pve template catalog|discover|bootstrap`；推荐入口 `ag-pve template init` 会交互选择 catalog item、image/template/backup storage、backup policy 和 bridge，先生成 plan，只有操作者输入完整单词 `YES` 后才执行；输入 `no` 或直接回车会取消。`backupPolicy=required` 必须选择支持 `backup` content 的 storage；不备份必须显式选择 `disabled`，不能从空值推断。
 
 受信 bundle 与 Agent 使用同一发布/安装包交付，仓内固定源为 `bundles/ppflight-cloudinit`；安装器不从网络下载 helper 代码，bundle 缺失、多文件或摘要不符都会 fail closed。安装后的默认根目录是 root-owned managed symlink `/usr/local/lib/ppflight-agent/template-bootstrap`；它只能解析到 `/usr/local/lib/ppflight-agent/template-bundles/<manifest-derived-id>` 的单层受管版本目录。自定义 root 不允许 symlink，受管 target 与内部组件也不得可被 group/other 写入或再含 symlink。入口固定为 `tools/ppflight-template-bootstrap.py`。Runner 每次特权调用前严格解析 `agent-vendor-manifest.v1.json`，拒绝 unknown/版本混装/摘要不符，校验 catalog revision/SHA-256，再用 `/usr/bin/python3 -I`、固定 PATH、无 stdin、受限环境和有界 stdout 调用唯一入口；不能下载或执行官网传来的脚本、URL、catalog 路径或 shell 片段。
 
