@@ -1800,6 +1800,10 @@ func (c *cli) bind(filename string, args []string) int {
 				fmt.Fprintln(c.errOut, "官网拒绝绑定：此 PVE 设备仍有未归档的有效绑定；本次绑定码未消费。请先在官网归档旧设备，再使用该绑定码重新绑定")
 				return 1
 			}
+			if rejection.Code == "invalid_enrollment_code" {
+				fmt.Fprintln(c.errOut, "官网拒绝绑定：绑定码无效、已过期或已撤销；本次请求未签发新凭据。请在官网生成新的绑定码后重试")
+				return 1
+			}
 			fmt.Fprintf(c.errOut, "官网拒绝绑定（%s）；本次绑定码未消费，已恢复原 Agent\n", rejection.Code)
 			return 1
 		}

@@ -135,6 +135,7 @@ func TestBindRecognizesOnlyExactDefinitiveActiveBindingRejection(t *testing.T) {
 		definitive  bool
 	}{
 		{name: "exact", status: http.StatusConflict, contentType: "application/json; charset=utf-8", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first."}}`, definitive: true},
+		{name: "expired-code", status: http.StatusUnauthorized, contentType: "application/json", body: `{"error":{"code":"invalid_enrollment_code","message":"The code is invalid."}}`, definitive: true},
 		{name: "wrong-status", status: http.StatusBadRequest, contentType: "application/json", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first."}}`},
 		{name: "unknown-code", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"other_conflict","message":"not allowlisted"}}`},
 		{name: "unknown-field", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first.","detail":"unsafe"}}`},
@@ -161,8 +162,8 @@ func TestBindRecognizesOnlyExactDefinitiveActiveBindingRejection(t *testing.T) {
 			if got := errors.As(err, &rejection); got != test.definitive {
 				t.Fatalf("definitive=%v want=%v err=%v", got, test.definitive, err)
 			}
-			if test.definitive && (rejection.Code != "binding_already_active" || rejection.StatusCode != http.StatusConflict) {
-				t.Fatalf("rejection=%#v", rejection)
+			if test.definitive && (rejection.Code == "" || rejection.StatusCode != test.status) {
+				t.Fatalf("rejection=%#v status=%d", rejection, test.status)
 			}
 			if strings.Contains(err.Error(), "Archive the old device first") || strings.Contains(err.Error(), "unsafe") {
 				t.Fatalf("remote response detail leaked: %v", err)

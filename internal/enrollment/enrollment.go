@@ -242,7 +242,7 @@ func parseDefinitiveRejection(statusCode int, contentType string, body []byte) *
 	// one-time code is consumed or any binding credential is issued. Keep this
 	// allowlist intentionally narrow; new codes require a matching server
 	// transaction guarantee and a regression test before they are added.
-	if statusCode != http.StatusConflict || !isJSON(contentType) || len(body) == 0 || len(body) > MaxResponseBytes {
+	if !isJSON(contentType) || len(body) == 0 || len(body) > MaxResponseBytes {
 		return nil
 	}
 	if err := rejectDuplicateKeys(body); err != nil {
@@ -254,7 +254,12 @@ func parseDefinitiveRejection(statusCode int, contentType string, body []byte) *
 	if err := decoder.Decode(&envelope); err != nil || onlyOneJSONValue(decoder) != nil {
 		return nil
 	}
-	if envelope.Error.Code != "binding_already_active" || strings.TrimSpace(envelope.Error.Message) == "" || len(envelope.Error.Message) > 1024 {
+	if strings.TrimSpace(envelope.Error.Message) == "" || len(envelope.Error.Message) > 1024 {
+		return nil
+	}
+	allowed := (statusCode == http.StatusConflict && envelope.Error.Code == "binding_already_active") ||
+		(statusCode == http.StatusUnauthorized && envelope.Error.Code == "invalid_enrollment_code")
+	if !allowed {
 		return nil
 	}
 	return &RejectionError{Code: envelope.Error.Code, StatusCode: statusCode}
