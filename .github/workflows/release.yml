@@ -132,3 +132,68 @@ jobs:
             --prerelease \
             --title "PPFlight Agent $TAG" \
             --generate-notes
+
+  publish-rolling-main:
+    name: publish rolling main assets
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          pattern: ppflight-release-*
+          path: release
+          merge-multiple: true
+      - name: Publish one force-updated integration snapshot without a GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd release
+          cat SHA256SUMS-amd64 SHA256SUMS-arm64 > SHA256SUMS.source
+          sha256sum --check SHA256SUMS.source
+          amd64_source="$(find . -maxdepth 1 -type f -name 'ppflight-agent-*-linux-amd64.tar.gz' -print)"
+          arm64_source="$(find . -maxdepth 1 -type f -name 'ppflight-agent-*-linux-arm64.tar.gz' -print)"
+          [[ $(printf '%s\n' "$amd64_source" | grep -c .) -eq 1 && $(printf '%s\n' "$arm64_source" | grep -c .) -eq 1 ]]
+          mkdir rolling
+          cp -- "$amd64_source" rolling/ppflight-agent-main-linux-amd64.tar.gz
+          cp -- "$arm64_source" rolling/ppflight-agent-main-linux-arm64.tar.gz
+          cd rolling
+          sha256sum ppflight-agent-main-linux-amd64.tar.gz ppflight-agent-main-linux-arm64.tar.gz > SHA256SUMS
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+
+          repository = os.environ['REPOSITORY']
+          commit = os.environ['SOURCE_COMMIT']
+          artifacts = []
+          for arch in ('amd64', 'arm64'):
+              name = f'ppflight-agent-main-linux-{arch}.tar.gz'
+              raw = Path(name).read_bytes()
+              artifacts.append({
+                  'arch': arch,
+                  'name': name,
+                  'url': f'https://raw.githubusercontent.com/{repository}/rolling-main/{name}',
+                  'size': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+              })
+          manifest = {
+              'schemaVersion': 1,
+              'channel': 'main',
+              'sourceCommitSha': commit,
+              'artifacts': artifacts,
+          }
+          Path('manifest.json').write_text(json.dumps(manifest, sort_keys=True, separators=(',', ':')) + '\n', encoding='utf-8')
+          PY
+          touch .nojekyll
+          git init --initial-branch=rolling-main
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add .nojekyll SHA256SUMS manifest.json ppflight-agent-main-linux-*.tar.gz
+          git commit -m "Rolling main ${SOURCE_COMMIT}"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" HEAD:refs/heads/rolling-main

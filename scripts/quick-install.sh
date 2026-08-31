@@ -6,9 +6,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly RELEASE_TAG='v0.1.0-rc.20'
-readonly RELEASE_VERSION='0.1.0-rc.20'
-readonly RELEASE_BASE="https://github.com/ppflight/ppflight-agent/releases/download/$RELEASE_TAG"
+readonly RELEASE_CHANNEL='main'
+readonly RELEASE_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent/rolling-main'
 readonly NODE_EXPORTER_VERSION='1.12.1'
 readonly NODE_EXPORTER_BASE="https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION"
 readonly SMARTCTL_EXPORTER_VERSION='0.14.0'
@@ -28,13 +27,11 @@ done
 case "$(uname -m)" in
   x86_64|amd64)
     readonly RELEASE_ARCH='amd64'
-    readonly RELEASE_SHA256='bcade48b3cb1d7aec6e3bbbecdac4b7b6ee994b679201c8ad9476d7f56404435'
     readonly NODE_EXPORTER_SHA256='b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63'
     readonly SMARTCTL_EXPORTER_SHA256='875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3'
     ;;
   aarch64|arm64)
     readonly RELEASE_ARCH='arm64'
-    readonly RELEASE_SHA256='d0d1406b78d1cd47628376227a314a9fd142ab17e16ccb9d8410d9a0d713f9a5'
     readonly NODE_EXPORTER_SHA256='ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7'
     readonly SMARTCTL_EXPORTER_SHA256='27353b3adca7f54dd486417412041a17260709c724ea63f5138df2612ecf4299'
     ;;
@@ -43,7 +40,7 @@ case "$(uname -m)" in
     ;;
 esac
 
-readonly ARCHIVE="ppflight-agent-${RELEASE_VERSION}-linux-${RELEASE_ARCH}.tar.gz"
+readonly ARCHIVE="ppflight-agent-main-linux-${RELEASE_ARCH}.tar.gz"
 readonly NODE_EXPORTER_ARCHIVE="node_exporter-${NODE_EXPORTER_VERSION}.linux-${RELEASE_ARCH}.tar.gz"
 readonly SMARTCTL_EXPORTER_ARCHIVE="smartctl_exporter-${SMARTCTL_EXPORTER_VERSION}.linux-${RELEASE_ARCH}.tar.gz"
 INSTALL_TEMP_DIR="$(mktemp -d /tmp/ppflight-agent-install.XXXXXX)"
@@ -55,27 +52,55 @@ cleanup() {
 trap cleanup EXIT
 
 cd -- "$INSTALL_TEMP_DIR"
-printf '正在下载 PPFlight Agent %s (%s)...\n' "$RELEASE_TAG" "$RELEASE_ARCH"
-curl \
-  --disable \
-  --ipv4 \
-  --fail \
-  --show-error \
-  --silent \
-  --location \
-  --max-redirs 5 \
-  --proto '=https' \
-  --proto-redir '=https' \
-  --tlsv1.2 \
-  --connect-timeout 15 \
-  --max-time 180 \
-  --retry 3 \
-  --retry-all-errors \
-  "$RELEASE_BASE/$ARCHIVE" \
-  --output "$ARCHIVE"
-
-printf '%s  %s\n' "$RELEASE_SHA256" "$ARCHIVE" | sha256sum --check --status - \
-  || die '发布包 SHA-256 校验失败'
+printf '正在下载 PPFlight Agent %s 滚动最新版 (%s)...\n' "$RELEASE_CHANNEL" "$RELEASE_ARCH"
+rolling_verified=0
+for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
+  curl \
+    --disable \
+    --ipv4 \
+    --fail \
+    --show-error \
+    --silent \
+    --location \
+    --max-redirs 5 \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --tlsv1.2 \
+    --connect-timeout 15 \
+    --max-time 180 \
+    --retry 3 \
+    --retry-all-errors \
+    "$RELEASE_BASE/SHA256SUMS" \
+    --output SHA256SUMS
+  [[ $(wc -l < SHA256SUMS) -eq 2 ]] || die '滚动发布校验清单行数无效'
+  if grep -Evq '^[0-9a-f]{64}  ppflight-agent-main-linux-(amd64|arm64)\.tar\.gz$' SHA256SUMS; then
+    die '滚动发布校验清单格式无效'
+  fi
+  release_sha256="$(awk -v name="$ARCHIVE" '$2 == name {print $1}' SHA256SUMS)"
+  [[ $release_sha256 =~ ^[0-9a-f]{64}$ ]] || die '滚动发布缺少当前架构的 SHA-256'
+  curl \
+    --disable \
+    --ipv4 \
+    --fail \
+    --show-error \
+    --silent \
+    --location \
+    --max-redirs 5 \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --tlsv1.2 \
+    --connect-timeout 15 \
+    --max-time 180 \
+    --retry 3 \
+    --retry-all-errors \
+    "$RELEASE_BASE/$ARCHIVE" \
+    --output "$ARCHIVE"
+  if printf '%s  %s\n' "$release_sha256" "$ARCHIVE" | sha256sum --check --status -; then
+    rolling_verified=1
+    break
+  fi
+done
+[[ $rolling_verified -eq 1 ]] || die '滚动发布包 SHA-256 校验失败；可能正逢 main 更新，请稍后重试'
 
 tar -xzf "$ARCHIVE"
 cd ppflight-agent

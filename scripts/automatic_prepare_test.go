@@ -13,27 +13,21 @@ import (
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
 		repositoryVersion = "0.1.0-rc.21"
-		// quick-install is advanced only after the immutable GitHub assets for
-		// the repository version exist and their complete archive digests have
-		// been verified. During the release commit it therefore still pins the
-		// most recent published version.
-		quickInstallVersion = "0.1.0-rc.20"
-		expectedAMD64       = "bcade48b3cb1d7aec6e3bbbecdac4b7b6ee994b679201c8ad9476d7f56404435"
-		expectedARM64       = "d0d1406b78d1cd47628376227a314a9fd142ab17e16ccb9d8410d9a0d713f9a5"
-		nodeAMD64           = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
-		nodeARM64           = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
-		smartAMD64          = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
-		smartARM64          = "27353b3adca7f54dd486417412041a17260709c724ea63f5138df2612ecf4299"
+		nodeAMD64         = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
+		nodeARM64         = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
+		smartAMD64        = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
+		smartARM64        = "27353b3adca7f54dd486417412041a17260709c724ea63f5138df2612ecf4299"
 	)
 	if version := strings.TrimSpace(readDeploymentFile(t, "..", "VERSION")); version != repositoryVersion {
 		t.Fatalf("repository VERSION=%q, want release candidate %q", version, repositoryVersion)
 	}
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	for _, required := range []string{
-		"readonly RELEASE_TAG='v" + quickInstallVersion + "'",
-		"readonly RELEASE_VERSION='" + quickInstallVersion + "'",
-		"readonly RELEASE_SHA256='" + expectedAMD64 + "'",
-		"readonly RELEASE_SHA256='" + expectedARM64 + "'",
+		"readonly RELEASE_CHANNEL='main'",
+		"readonly RELEASE_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent/rolling-main'",
+		`readonly ARCHIVE="ppflight-agent-main-linux-${RELEASE_ARCH}.tar.gz"`,
+		`grep -Evq '^[0-9a-f]{64}  ppflight-agent-main-linux-(amd64|arm64)\.tar\.gz$' SHA256SUMS`,
+		`sha256sum --check --status -`,
 		"readonly NODE_EXPORTER_VERSION='1.12.1'",
 		"readonly SMARTCTL_EXPORTER_VERSION='0.14.0'",
 		"readonly NODE_EXPORTER_SHA256='" + nodeAMD64 + "'",
@@ -43,6 +37,27 @@ func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T)
 	} {
 		if !strings.Contains(quickInstall, required) {
 			t.Fatalf("quick installer is not pinned to verified published value %q", required)
+		}
+	}
+	for _, forbidden := range []string{"github.com/ppflight/ppflight-agent/releases/download", "readonly RELEASE_TAG=", "readonly RELEASE_SHA256="} {
+		if strings.Contains(quickInstall, forbidden) {
+			t.Fatalf("rolling installer still depends on versioned GitHub Release material %q", forbidden)
+		}
+	}
+}
+
+func TestWorkflowPublishesRollingMainWithoutCreatingRelease(t *testing.T) {
+	workflow := readDeploymentFile(t, "..", ".github", "workflows", "release.yml")
+	for _, required := range []string{
+		"publish-rolling-main:",
+		"github.ref == 'refs/heads/main'",
+		"HEAD:refs/heads/rolling-main",
+		"manifest.json",
+		"ppflight-agent-main-linux-amd64.tar.gz",
+		"ppflight-agent-main-linux-arm64.tar.gz",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Fatalf("rolling-main publisher is missing %q", required)
 		}
 	}
 }
