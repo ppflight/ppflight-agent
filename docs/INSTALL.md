@@ -2,7 +2,7 @@
 
 本页用于 Proxmox VE 8.x/9.x 节点。目标架构只允许 Agent 在本机连接 `https://127.0.0.1:8006`；官网不保存 PVE 地址或 Token，也不需要访问 PVE 8006。
 
-当前 `main` 一键安装会自动完成受控 Token bootstrap、固定版本及 SHA-256 的 `node_exporter`/`smartctl_exporter` 安装、真实网卡与磁盘 IO 指标回验、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及全部相关 systemd unit 的开机启用；安装成功即表示本机真实 PVE、宿主机、网卡、磁盘 IO 与 SMART 读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
+当前 `main` 一键安装会自动完成受控 Token bootstrap、固定版本及 SHA-256 的 `node_exporter`/`smartctl_exporter` 安装、真实网卡、磁盘 IO 与至少一块 SMART 设备的指标回验、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及全部相关 systemd unit 的开机启用；安装成功即表示本机真实 PVE、宿主机、网卡、磁盘 IO 与 SMART 读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
 
 ## 1. 前置条件
 

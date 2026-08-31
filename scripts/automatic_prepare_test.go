@@ -17,9 +17,9 @@ func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T)
 		// the repository version exist and their complete archive digests have
 		// been verified. During the release commit it therefore still pins the
 		// most recent published version.
-		quickInstallVersion = "0.1.0-rc.16"
-		expectedAMD64       = "ac60196c28e5713e113eea874ebb61d83dac933a8ed16fc1341b410e915d02d7"
-		expectedARM64       = "8fedd724818dc0d746ea5e1cf381238211ab39f9d9804e0025aa59c2190c8b53"
+		quickInstallVersion = "0.1.0-rc.18"
+		expectedAMD64       = "4836b8508776173a18b5659dc87321b3893f1a812cab154a346f1c61967cf73d"
+		expectedARM64       = "284805c5218d7f89aa32bad71462c84ba528e899637200b196acb99a6717d6d4"
 		nodeAMD64           = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
 		nodeARM64           = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
 		smartAMD64          = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
@@ -80,6 +80,9 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 		if !strings.Contains(compact, metric) {
 			t.Fatalf("quick installer must verify real node_exporter metric %q before reporting success", metric)
 		}
+	}
+	if !strings.Contains(compact, "smartctl_device_(info|smart_status)") || !strings.Contains(compact, "127.0.0.1:9633/metrics") {
+		t.Fatal("quick installer must verify at least one real SMART device before reporting success")
 	}
 	if strings.Contains(compact, "source=simulator") || strings.Contains(compact, "--source simulator") {
 		t.Fatal("quick installer must never select a simulator collection path")
@@ -215,7 +218,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	}
 	ag := filepath.Join(root, "ag-pve")
 	writeQuickInstallMock(t, ag, "#!/usr/bin/env bash\nprintf 'prepare:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nexit \"${TEST_PREPARE_EXIT:?}\"\n")
-	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\n' >\"$out\"\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\nsmartctl_device_info{device=\"/dev/sda\"} 1\\n' >\"$out\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf 'binary\\n' >ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")

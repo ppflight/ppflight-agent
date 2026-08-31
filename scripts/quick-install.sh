@@ -6,8 +6,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly RELEASE_TAG='v0.1.0-rc.16'
-readonly RELEASE_VERSION='0.1.0-rc.16'
+readonly RELEASE_TAG='v0.1.0-rc.18'
+readonly RELEASE_VERSION='0.1.0-rc.18'
 readonly RELEASE_BASE="https://github.com/ppflight/ppflight-agent/releases/download/$RELEASE_TAG"
 readonly NODE_EXPORTER_VERSION='1.12.1'
 readonly NODE_EXPORTER_BASE="https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION"
@@ -28,13 +28,13 @@ done
 case "$(uname -m)" in
   x86_64|amd64)
     readonly RELEASE_ARCH='amd64'
-    readonly RELEASE_SHA256='ac60196c28e5713e113eea874ebb61d83dac933a8ed16fc1341b410e915d02d7'
+    readonly RELEASE_SHA256='4836b8508776173a18b5659dc87321b3893f1a812cab154a346f1c61967cf73d'
     readonly NODE_EXPORTER_SHA256='b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63'
     readonly SMARTCTL_EXPORTER_SHA256='875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3'
     ;;
   aarch64|arm64)
     readonly RELEASE_ARCH='arm64'
-    readonly RELEASE_SHA256='8fedd724818dc0d746ea5e1cf381238211ab39f9d9804e0025aa59c2190c8b53'
+    readonly RELEASE_SHA256='284805c5218d7f89aa32bad71462c84ba528e899637200b196acb99a6717d6d4'
     readonly NODE_EXPORTER_SHA256='ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7'
     readonly SMARTCTL_EXPORTER_SHA256='27353b3adca7f54dd486417412041a17260709c724ea63f5138df2612ecf4299'
     ;;
@@ -146,6 +146,20 @@ for ((attempt = 0; attempt < 15; attempt++)); do
 done
 [[ $node_network_ready -eq 1 ]] \
   || die 'node_exporter 未提供网卡与硬盘累计字节指标，Agent 不能报告真实带宽或硬盘 IO'
+
+smart_metrics="$INSTALL_TEMP_DIR/smartctl-exporter.metrics"
+smart_ready=0
+for ((attempt = 0; attempt < 15; attempt++)); do
+  if curl --disable --ipv4 --fail --silent --show-error --max-time 10 \
+      http://127.0.0.1:9633/metrics --output "$smart_metrics" \
+      && grep -Eq '^smartctl_device_(info|smart_status)\{' "$smart_metrics"; then
+    smart_ready=1
+    break
+  fi
+  sleep 1
+done
+[[ $smart_ready -eq 1 ]] \
+  || die 'smartctl_exporter 未发现任何可读硬盘；请先确认 smartctl --scan-open 能识别物理磁盘，然后重新安装'
 
 printf '\n正在自动准备本机真实 PVE 读取、启动服务并校验首次采集...\n'
 /usr/local/bin/ag-pve pve prepare --local-only \
