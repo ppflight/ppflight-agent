@@ -42,10 +42,10 @@ func TestDiscoverTemplatesIsBoundedAndPageable(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/api2/json/cluster/resources":
-			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Get("start") != "0" || r.URL.Query().Get("limit") != "2" {
+			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Has("start") || r.URL.Query().Has("limit") {
 				t.Errorf("query %s", r.URL.RawQuery)
 			}
-			fmt.Fprint(w, `{"data":[{"id":"qemu/101","type":"qemu","node":"pve1","vmid":101,"name":"golden","template":1},{"id":"lxc/102","type":"lxc","node":"pve1","vmid":102,"template":0}]}`)
+			fmt.Fprint(w, `{"data":[{"id":"qemu/101","type":"qemu","node":"pve1","vmid":101,"name":"golden","template":1},{"id":"lxc/102","type":"lxc","node":"pve1","vmid":102,"template":0},{"id":"qemu/103","type":"qemu","node":"pve1","vmid":103,"template":0}]}`)
 		case "/api2/json/nodes/pve1/qemu/101/config":
 			fmt.Fprint(w, `{"data":{"scsi2":"fast:cloudinit","net0":"virtio=aa"}}`)
 		default:

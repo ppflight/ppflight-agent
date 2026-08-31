@@ -54,6 +54,7 @@ type cli struct {
 	pvesmSetContent   func(context.Context, string, string) error
 	pveVersion        func(context.Context) (string, error)
 	pveBootstrap      func(context.Context) error
+	pveReadACL        func(context.Context) error
 	pveControlACL     func(context.Context) error
 	pveNodeName       func() (string, error)
 	pveTLSPreflight   func(context.Context, string, string) error

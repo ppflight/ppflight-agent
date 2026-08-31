@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"strconv"
 	"strings"
 )
 
@@ -203,14 +202,24 @@ func firewallBase(ref FirewallRef) (string, error) {
 	return guest + "/firewall", nil
 }
 
-// ClusterResourcesPage returns a bounded slice of VM/LXC resources. PVE
-// supports start/limit, keeping discovery work finite on large clusters.
+// ClusterResourcesPage returns a locally bounded slice of VM/LXC resources.
+// /cluster/resources does not accept the generic start/limit parameters on
+// supported PVE releases, so the client fetches its bounded API response and
+// applies the discovery cursor locally.
 func (c *Client) ClusterResourcesPage(ctx context.Context, start, limit int) ([]Resource, error) {
 	if start < 0 || limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("invalid resource page")
 	}
 	var result []Resource
-	query := url.Values{"type": {"vm"}, "start": {strconv.Itoa(start)}, "limit": {strconv.Itoa(limit)}}
-	err := c.get(ctx, "/cluster/resources", query, &result)
-	return result, err
+	if err := c.get(ctx, "/cluster/resources", url.Values{"type": {"vm"}}, &result); err != nil {
+		return nil, err
+	}
+	if start >= len(result) {
+		return []Resource{}, nil
+	}
+	end := start + limit
+	if end > len(result) {
+		end = len(result)
+	}
+	return append([]Resource(nil), result[start:end]...), nil
 }

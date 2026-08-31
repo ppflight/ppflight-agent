@@ -61,7 +61,7 @@ type rawCredentialProbe struct {
 	storageVerified    bool
 }
 
-var requiredPVEReadPrivileges = []string{"Sys.Audit", "VM.Audit", "VM.Monitor", "Datastore.Audit"}
+var requiredPVEReadPrivileges = []string{"Sys.Audit", "VM.Audit", "VM.Monitor", "Datastore.Audit", "SDN.Audit"}
 
 var requiredPVEControlPrivileges = strings.Fields("Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use")
 
@@ -246,6 +246,12 @@ func (c *cli) prepareRealPVEWithRequirement(ctx context.Context, filename string
 		}
 	}
 	read, err := c.runPVEProbe(ctx, pveConfig(prepared, values[config.PVEReadTokenIDEnv], values[config.PVEReadTokenSecretEnv]), true, localNode)
+	if err == nil && read.version.Version != "" && containsLocalPVENode(read.nodes, localNode) && read.nodeStatusVerified && read.storageVerified && !hasRequiredPVEReadPermissions(read.permissions) {
+		if err := c.ensureGlobalPVEReadACL(ctx); err != nil {
+			return realPVEPreparation{}, errors.New("refresh dedicated PVE read role and ACL")
+		}
+		read, err = c.runPVEProbe(ctx, pveConfig(prepared, values[config.PVEReadTokenIDEnv], values[config.PVEReadTokenSecretEnv]), true, localNode)
+	}
 	readCounts := permissionCounts(read.permissions)
 	if err != nil || read.version.Version == "" || !hasRequiredPVEReadPermissions(read.permissions) || !containsLocalPVENode(read.nodes, localNode) || !read.nodeStatusVerified || !read.storageVerified {
 		return realPVEPreparation{}, errors.New("PVE read probe did not verify required audit privileges, local node status, and storage inventory")
@@ -345,6 +351,19 @@ func (c *cli) ensureGlobalPVEControlACL(ctx context.Context) error {
 	// The helper owns its rollback traps. As with initial bootstrap, do not use
 	// CommandContext: a forced kill could interrupt a two-subject ACL update.
 	command := exec.Command(pveBootstrapHelper, "--acl-only", "--control-global-acl")
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	command.Stdout = c.out
+	command.Stderr = c.errOut
+	return command.Run()
+}
+
+func (c *cli) ensureGlobalPVEReadACL(ctx context.Context) error {
+	if c.pveReadACL != nil {
+		return c.pveReadACL(ctx)
+	}
+	// The helper accepts only the exact current read role or the single known
+	// pre-SDN legacy role and owns rollback if the role/ACL refresh is interrupted.
+	command := exec.Command(pveBootstrapHelper, "--acl-only", "--read-global-acl")
 	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 	command.Stdout = c.out
 	command.Stderr = c.errOut

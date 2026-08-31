@@ -77,7 +77,7 @@ func prepareProbe(controlPermissions bool) func(context.Context, pve.Config, boo
 			result.version = pve.Version{Version: "9.0.3", Release: "9.0"}
 			result.nodes = []string{"pve01"}
 			result.nodeStatusVerified, result.storageVerified = true, true
-			result.permissions.Paths["/"] = map[string]int{"Sys.Audit": 1, "VM.Audit": 1, "VM.Monitor": 1, "Datastore.Audit": 1}
+			result.permissions.Paths["/"] = map[string]int{"Sys.Audit": 1, "VM.Audit": 1, "VM.Monitor": 1, "Datastore.Audit": 1, "SDN.Audit": 1}
 		} else if controlPermissions {
 			if cfg.TokenID != "ppflight-control@pve!executor" || cfg.TokenSecret != "control-secret-0123456789" {
 				return rawCredentialProbe{}, io.ErrUnexpectedEOF
@@ -273,6 +273,40 @@ func TestPVEPrepareAutomaticallyGrantsAndVerifiesDedicatedControlACL(t *testing.
 	}
 	if aclCalls != 1 {
 		t.Fatalf("control ACL helper calls=%d, want 1", aclCalls)
+	}
+}
+
+func TestPVEPrepareAutomaticallyMigratesLegacyReadRoleForSDNDiscovery(t *testing.T) {
+	filename := writeTestConfig(t)
+	readReady := false
+	readACLCalls := 0
+	probe := prepareProbe(true)
+	instance := &cli{
+		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
+		pveEnvironment: func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe: func(ctx context.Context, cfg pve.Config, includeVersion bool, localNode string) (rawCredentialProbe, error) {
+			result, err := probe(ctx, cfg, includeVersion, localNode)
+			if includeVersion && !readReady {
+				delete(result.permissions.Paths["/"], "SDN.Audit")
+			}
+			return result, err
+		},
+		pveReadACL: func(context.Context) error {
+			readACLCalls++
+			readReady = true
+			return nil
+		},
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
+	}
+	if code := instance.pve(filename, []string{"prepare", "--local-only", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code != 0 {
+		t.Fatalf("automatic read role migration failed: code=%d", code)
+	}
+	if readACLCalls != 1 {
+		t.Fatalf("read ACL helper calls=%d, want 1", readACLCalls)
 	}
 }
 

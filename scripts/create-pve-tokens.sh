@@ -14,12 +14,14 @@ readonly CONTROL_USER='ppflight-control@pve'
 readonly CONTROL_TOKEN='executor'
 readonly READ_ROLE='PPFlightAgentAudit'
 readonly CONTROL_ROLE='PPFlightAgentControl'
-readonly READ_PRIVILEGES='Sys.Audit VM.Audit VM.Monitor Datastore.Audit'
+readonly READ_PRIVILEGES='Sys.Audit VM.Audit VM.Monitor Datastore.Audit SDN.Audit'
+readonly LEGACY_READ_PRIVILEGES='Sys.Audit VM.Audit VM.Monitor Datastore.Audit'
 readonly CONTROL_PRIVILEGES='Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use'
 
 ENV_FILE=''
 DRY_RUN=0
 ACL_ONLY=0
+READ_GLOBAL_ACL=0
 CONTROL_GLOBAL_ACL=0
 declare -a CONTROL_SCOPES=()
 
@@ -42,8 +44,10 @@ Options:
                            rejected; use --control-global-acl explicitly.
   --control-pool NAME      Shorthand for --control-scope /pool/NAME.
   --acl-only               Do not create credentials or write secrets. Require
-                           the existing dedicated control role, user and token,
-                           then add the requested control ACLs.
+                           the existing dedicated identities, then perform only
+                           the explicitly requested read/control ACL refresh.
+  --read-global-acl        With --acl-only, verify or migrate the dedicated
+                           read role and ensure its user/token ACL at /.
   --control-global-acl     Grant the dedicated VPS-control role at /. This does
                            not grant user/RBAC or host power/console privileges.
   --dry-run                Show intended work without invoking pveum.
@@ -80,6 +84,7 @@ while [[ $# -gt 0 ]]; do
       CONTROL_SCOPES+=("/pool/$2"); shift
       ;;
     --acl-only) ACL_ONLY=1 ;;
+    --read-global-acl) READ_GLOBAL_ACL=1 ;;
     --control-global-acl) CONTROL_GLOBAL_ACL=1 ;;
     --create-control-token) : ;; # Compatibility; control is now always created.
     --dry-run) DRY_RUN=1 ;;
@@ -91,9 +96,10 @@ done
 
 [[ $CONTROL_GLOBAL_ACL -eq 0 || ${#CONTROL_SCOPES[@]} -eq 0 ]] || \
   die 'use either --control-global-acl or --control-scope options, not both'
+[[ $READ_GLOBAL_ACL -eq 0 || $ACL_ONLY -eq 1 ]] || die '--read-global-acl requires --acl-only'
 if [[ $ACL_ONLY -eq 1 ]]; then
   [[ -z $ENV_FILE ]] || die '--acl-only does not create or recover secrets and cannot use --write-env'
-  [[ $CONTROL_GLOBAL_ACL -eq 1 || ${#CONTROL_SCOPES[@]} -gt 0 ]] || die '--acl-only requires --control-global-acl, --control-scope or --control-pool'
+  [[ $READ_GLOBAL_ACL -eq 1 || $CONTROL_GLOBAL_ACL -eq 1 || ${#CONTROL_SCOPES[@]} -gt 0 ]] || die '--acl-only requires --read-global-acl, --control-global-acl, --control-scope or --control-pool'
 fi
 
 # Avoid repeating identical pveum ACL mutations while preserving CLI order.
@@ -111,7 +117,8 @@ fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $ACL_ONLY -eq 1 ]]; then
-    printf '%s\n' 'dry-run: would verify the existing dedicated control role/user/token and add the requested ACLs.'
+    printf '%s\n' 'dry-run: would verify the requested existing dedicated role/user/token and add the requested ACLs.'
+    [[ $READ_GLOBAL_ACL -eq 1 ]] && printf '%s\n' 'dry-run: would verify or migrate the dedicated read role and ensure its ACL at /.'
     [[ $CONTROL_GLOBAL_ACL -eq 1 ]] && printf '%s\n' 'dry-run: would grant the dedicated VPS-control role at /.'
   else
     printf '%s\n' 'dry-run: would preflight the environment target, both token IDs, roles and users, then create both tokens with compensating rollback for resources created by this run.'
@@ -139,6 +146,7 @@ chmod 700 "$TMPDIR_BOOTSTRAP"
 declare -a CREATED_TOKENS=()
 declare -a CREATED_USERS=()
 declare -a CREATED_ROLES=()
+declare -a MODIFIED_ROLES=()
 declare -a CREATED_ACLS=()
 MUTATIONS_STARTED=0
 ENV_REPLACED=0
@@ -218,6 +226,12 @@ rollback_created_objects() {
     [[ $kind == token ]] && subject_option='--tokens'
     pveum acl delete "$path" "$subject_option" "$identity" --roles "$role" >/dev/null 2>&1 || \
       printf 'warning: could not roll back newly added %s ACL for %s at %s\n' "$kind" "$identity" "$path" >&2
+  done
+  for (( index=${#MODIFIED_ROLES[@]}-1; index>=0; index-- )); do
+    record=${MODIFIED_ROLES[$index]}
+    IFS='|' read -r role privileges <<<"$record"
+    pveum role modify "$role" -privs "$privileges" >/dev/null 2>&1 || \
+      printf 'warning: could not roll back updated role %s; inspect it manually\n' "$role" >&2
   done
   for (( index=${#CREATED_TOKENS[@]}-1; index>=0; index-- )); do
     identity=${CREATED_TOKENS[$index]}
@@ -674,13 +688,38 @@ PY
   printf 'Wrote token IDs and secrets to root-only environment file: %s\n' "$target"
 }
 
-role_state=0
-inspect_role "$CONTROL_ROLE" "$CONTROL_PRIVILEGES" || role_state=$?
 if [[ $ACL_ONLY -eq 1 ]]; then
-  [[ $role_state -eq 0 ]] || die "--acl-only requires existing exact-match PVE role $CONTROL_ROLE"
-  user_exists "$CONTROL_USER" || die "--acl-only requires existing dedicated PVE user $CONTROL_USER"
-  token_exists "$CONTROL_USER" "$CONTROL_TOKEN" || die "--acl-only requires existing dedicated token $CONTROL_USER!$CONTROL_TOKEN"
+  READ_ROLE_MIGRATION=0
+  if [[ $READ_GLOBAL_ACL -eq 1 ]]; then
+    role_state=0
+    role_privileges_status "$READ_ROLE" "$READ_PRIVILEGES" || role_state=$?
+    if [[ $role_state -ne 0 ]]; then
+      legacy_state=0
+      role_privileges_status "$READ_ROLE" "$LEGACY_READ_PRIVILEGES" || legacy_state=$?
+      [[ $legacy_state -eq 0 ]] || die "--acl-only requires the exact current or known legacy PVE role $READ_ROLE"
+      READ_ROLE_MIGRATION=1
+    fi
+    user_exists "$READ_USER" || die "--acl-only requires existing dedicated PVE user $READ_USER"
+    token_exists "$READ_USER" "$READ_TOKEN" || die "--acl-only requires existing dedicated token $READ_USER!$READ_TOKEN"
+  fi
+  if [[ $CONTROL_GLOBAL_ACL -eq 1 || ${#CONTROL_SCOPES[@]} -gt 0 ]]; then
+    role_state=0
+    inspect_role "$CONTROL_ROLE" "$CONTROL_PRIVILEGES" || role_state=$?
+    [[ $role_state -eq 0 ]] || die "--acl-only requires existing exact-match PVE role $CONTROL_ROLE"
+    user_exists "$CONTROL_USER" || die "--acl-only requires existing dedicated PVE user $CONTROL_USER"
+    token_exists "$CONTROL_USER" "$CONTROL_TOKEN" || die "--acl-only requires existing dedicated token $CONTROL_USER!$CONTROL_TOKEN"
+  fi
   load_acl_snapshot
+  if [[ $READ_ROLE_MIGRATION -eq 1 ]]; then
+    MUTATIONS_STARTED=1
+    MODIFIED_ROLES+=("$READ_ROLE|$LEGACY_READ_PRIVILEGES")
+    pveum role modify "$READ_ROLE" -privs "$READ_PRIVILEGES" >/dev/null
+    printf 'Migrated dedicated PVE read role for SDN discovery: %s\n' "$READ_ROLE"
+  fi
+  if [[ $READ_GLOBAL_ACL -eq 1 ]]; then
+    apply_acl / user "$READ_USER" "$READ_ROLE"
+    apply_acl / token "$READ_USER!$READ_TOKEN" "$READ_ROLE"
+  fi
   if [[ $CONTROL_GLOBAL_ACL -eq 1 ]]; then
     CONTROL_SCOPES=(/)
   fi
@@ -689,9 +728,12 @@ if [[ $ACL_ONLY -eq 1 ]]; then
     apply_acl "$scope" token "$CONTROL_USER!$CONTROL_TOKEN" "$CONTROL_ROLE"
   done
   MUTATIONS_STARTED=0
-  printf '%s\n' 'PVE control ACL-only update completed; no credentials or secrets were created.'
+  printf '%s\n' 'PVE ACL-only update completed; no credentials or secrets were created.'
   exit 0
 fi
+
+role_state=0
+inspect_role "$CONTROL_ROLE" "$CONTROL_PRIVILEGES" || role_state=$?
 
 # The destination write/rename/fsync contract is tested before *any* PVE RBAC
 # mutation. The same invariants are checked again at commit to close TOCTOU.

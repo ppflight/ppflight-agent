@@ -24,10 +24,10 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 		case "/api2/json/nodes/pve1/qemu/101/config":
 			fmt.Fprint(w, `{"data":{"ide2":"local:cloudinit","net0":"virtio=aa"}}`)
 		case "/api2/json/cluster/resources":
-			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Get("start") != "0" || r.URL.Query().Get("limit") != "10" {
+			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Has("start") || r.URL.Query().Has("limit") {
 				t.Errorf("unexpected page query %s", r.URL.RawQuery)
 			}
-			fmt.Fprint(w, `{"data":[]}`)
+			fmt.Fprint(w, `{"data":[{"id":"qemu/100","type":"qemu","vmid":100},{"id":"qemu/101","type":"qemu","vmid":101}]}`)
 		case "/api2/json/cluster/firewall/options", "/api2/json/nodes/pve1/firewall/options", "/api2/json/nodes/pve1/qemu/101/firewall/options":
 			fmt.Fprint(w, `{"data":{"enable":1}}`)
 		case "/api2/json/cluster/firewall/rules", "/api2/json/nodes/pve1/firewall/rules", "/api2/json/nodes/pve1/qemu/101/firewall/rules":
@@ -53,8 +53,8 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 {
 		t.Fatalf("template %#v: %v", got, err)
 	}
-	if _, err := c.ClusterResourcesPage(ctx, 0, 10); err != nil {
-		t.Fatal(err)
+	if got, err := c.ClusterResourcesPage(ctx, 1, 1); err != nil || len(got) != 1 || got[0].VMID != 101 {
+		t.Fatalf("local resource page %#v: %v", got, err)
 	}
 	for _, ref := range []FirewallRef{{}, {Node: "pve1"}, {Node: "pve1", Kind: "qemu", VMID: 101}} {
 		if _, err := c.FirewallOptions(ctx, ref); err != nil {

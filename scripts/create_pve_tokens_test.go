@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	readPrivileges    = "Sys.Audit VM.Audit VM.Monitor Datastore.Audit"
-	controlPrivileges = "Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use"
+	readPrivileges       = "Sys.Audit VM.Audit VM.Monitor Datastore.Audit SDN.Audit"
+	legacyReadPrivileges = "Sys.Audit VM.Audit VM.Monitor Datastore.Audit"
+	controlPrivileges    = "Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use"
 )
 
 type bootstrapFixture struct {
@@ -475,6 +476,56 @@ func TestPVEBootstrapACLOnlyCanGrantDedicatedGlobalControlWithoutSecrets(t *test
 	}
 }
 
+func TestPVEBootstrapACLOnlyMigratesKnownLegacyReadRoleAndKeepsToken(t *testing.T) {
+	fixture := newBootstrapFixture(t)
+	fixture.putRole(t, "PPFlightAgentAudit", legacyReadPrivileges)
+	fixture.putUser(t, "ppflight-agent@pve")
+	fixture.putToken(t, "ppflight-agent@pve", "collector")
+	output, err := fixture.run(t, nil, "--acl-only", "--read-global-acl")
+	if err != nil {
+		t.Fatalf("read role migration failed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
+	}
+	raw, err := os.ReadFile(filepath.Join(fixture.state, "roles", "PPFlightAgentAudit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != readPrivileges {
+		t.Fatalf("migrated privileges=%q, want %q", got, readPrivileges)
+	}
+	log := fixture.logText(t)
+	for _, required := range []string{
+		"role\tmodify\tPPFlightAgentAudit\t-privs\t" + readPrivileges,
+		"acl\tmodify\t/\t--users\tppflight-agent@pve\t--roles\tPPFlightAgentAudit",
+		"acl\tmodify\t/\t--tokens\tppflight-agent@pve!collector\t--roles\tPPFlightAgentAudit",
+	} {
+		if !strings.Contains(log, required) {
+			t.Fatalf("read migration log is missing %q:\n%s", required, log)
+		}
+	}
+	for _, forbidden := range []string{"user\ttoken\tadd", "user\ttoken\tremove", "SECRET-"} {
+		if strings.Contains(log+output, forbidden) {
+			t.Fatalf("read migration performed forbidden operation %q:\n%s", forbidden, log)
+		}
+	}
+}
+
+func TestPVEBootstrapACLOnlyRejectsUnknownReadRoleWithoutMutation(t *testing.T) {
+	fixture := newBootstrapFixture(t)
+	fixture.putRole(t, "PPFlightAgentAudit", "Sys.Audit Permissions.Modify")
+	fixture.putUser(t, "ppflight-agent@pve")
+	fixture.putToken(t, "ppflight-agent@pve", "collector")
+	output, err := fixture.run(t, nil, "--acl-only", "--read-global-acl")
+	if err == nil {
+		t.Fatalf("unknown read role unexpectedly migrated: %s", output)
+	}
+	log := fixture.logText(t)
+	for _, forbidden := range []string{"role\tmodify", "acl\tmodify", "token\tadd", "token\tremove"} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("unknown role caused mutation %q:\n%s", forbidden, log)
+		}
+	}
+}
+
 func TestPVEBootstrapEnvironmentSymlinkFailsBeforeRBACMutation(t *testing.T) {
 	fixture := newBootstrapFixture(t)
 	if err := os.Symlink("/dev/null", fixture.environment); err != nil {
@@ -578,6 +629,7 @@ remove_acl() {
 case "${1:-} ${2:-} ${3:-}" in
   'role list '*) emit_roles ;;
   'role add '*) printf '%s' "$5" >"$MOCK_STATE/roles/$3" ;;
+  'role modify '*) printf '%s' "$5" >"$MOCK_STATE/roles/$3" ;;
   'role delete '*) rm -f -- "$MOCK_STATE/roles/$3" ;;
   'user list '*) emit_users ;;
   'user add '*) : >"$MOCK_STATE/users/$3" ;;
