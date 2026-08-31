@@ -19,8 +19,8 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 			fmt.Fprint(w, `{"data":{"/":{"Sys.Audit":1}}}`)
 		case "/api2/json/nodes/pve1/network":
 			fmt.Fprint(w, `{"data":[{"iface":"vmbr0","type":"bridge","active":1,"bridge_ports":"eno1","hwaddress":"02:00:00:00:00:01","cidr":"192.0.2.10/24","gateway":"192.0.2.1","mtu":1500,"bridge_vlan_aware":1,"comments":"public uplink"}]}`)
-		case "/api2/json/cluster/sdn":
-			fmt.Fprint(w, `{"data":[{"type":"vnet","vnet":"blue","ipam":"pve"}]}`)
+		case "/api2/json/cluster/sdn/vnets":
+			fmt.Fprint(w, `{"data":[{"vnet":"blue","zone":"public"}]}`)
 		case "/api2/json/nodes/pve1/qemu/101/config":
 			fmt.Fprint(w, `{"data":{"ide2":"local:cloudinit","net0":"virtio=aa"}}`)
 		case "/api2/json/cluster/resources":
@@ -47,7 +47,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 	if got, err := c.NodeNetworks(ctx, "pve1"); err != nil || len(got) != 1 || got[0].Type != "bridge" || got[0].BridgePorts != "eno1" || got[0].HardwareAddress != "02:00:00:00:00:01" || got[0].MTU == nil || *got[0].MTU != 1500 || got[0].BridgeVLANAware == nil || *got[0].BridgeVLANAware != 1 {
 		t.Fatalf("networks %#v: %v", got, err)
 	}
-	if got, err := c.ClusterSDN(ctx); err != nil || len(got) != 1 || got[0].IPAM != "pve" {
+	if got, err := c.ClusterSDN(ctx); err != nil || len(got) != 1 || got[0].Type != "vnet" || got[0].VNet != "blue" || got[0].Zone != "public" {
 		t.Fatalf("sdn %#v: %v", got, err)
 	}
 	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 {
@@ -69,6 +69,39 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 	}
 	if len(seen) != 14 {
 		t.Fatalf("saw %d fixed paths, want 14", len(seen))
+	}
+}
+
+func TestClusterSDNReadsVNetCollectionNotAPIDirectory(t *testing.T) {
+	calledRoot := false
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/sdn":
+			calledRoot = true
+			fmt.Fprint(w, `{"data":[{"id":"vnets"},{"id":"zones"},{"id":"controllers"},{"id":"ipams"},{"id":"dns"}]}`)
+		case "/api2/json/cluster/sdn/vnets":
+			fmt.Fprint(w, `{"data":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	got, err := c.ClusterSDN(context.Background())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("empty SDN VNet catalog = %#v, %v", got, err)
+	}
+	if calledRoot {
+		t.Fatal("ClusterSDN read the /cluster/sdn API directory")
+	}
+}
+
+func TestClusterSDNRejectsVNetWithoutIdentity(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":[{"zone":"public"}]}`)
+	}))
+	defer server.Close()
+	if _, err := c.ClusterSDN(context.Background()); err == nil {
+		t.Fatal("ClusterSDN accepted a VNet row without vnet")
 	}
 }
 

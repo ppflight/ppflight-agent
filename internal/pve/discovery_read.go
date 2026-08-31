@@ -60,20 +60,37 @@ func (c *Client) NodeNetworks(ctx context.Context, node string) ([]NetworkInterf
 	return result, err
 }
 
-// SDNConfig is a cluster SDN item. PVE returns different fields for vnets,
-// zones and controllers; these are the common public capability fields.
+// SDNConfig is one configured cluster SDN VNet. Type is a wire discriminator
+// set by the Agent; PVE's /cluster/sdn/vnets response does not consistently
+// include a type field across supported releases.
 type SDNConfig struct {
 	Type string `json:"type"`
 	Zone string `json:"zone,omitempty"`
 	VNet string `json:"vnet,omitempty"`
-	IPAM string `json:"ipam,omitempty"`
-	DNS  string `json:"dns,omitempty"`
 }
 
 func (c *Client) ClusterSDN(ctx context.Context) ([]SDNConfig, error) {
-	var result []SDNConfig
-	err := c.get(ctx, "/cluster/sdn", nil, &result)
-	return result, err
+	// /cluster/sdn is an API directory. On PVE 8 it returns rows such as
+	// {"id":"vnets"}, {"id":"zones"}, ... rather than configured SDN
+	// resources. Decoding that directory as SDNConfig produced meaningless
+	// {"type":""} rows. Read the fixed VNet collection endpoint instead: it
+	// is the resource the website needs to match a configured Zone/VNet and it
+	// returns an empty list when SDN is not configured.
+	var rows []struct {
+		Zone string `json:"zone"`
+		VNet string `json:"vnet"`
+	}
+	if err := c.get(ctx, "/cluster/sdn/vnets", nil, &rows); err != nil {
+		return nil, err
+	}
+	result := make([]SDNConfig, 0, len(rows))
+	for _, row := range rows {
+		if strings.TrimSpace(row.VNet) == "" {
+			return nil, fmt.Errorf("PVE SDN VNet response is missing vnet")
+		}
+		result = append(result, SDNConfig{Type: "vnet", Zone: row.Zone, VNet: row.VNet})
+	}
+	return result, nil
 }
 
 // TemplateInfo is a template inventory row. CloudInit is inferred from the
