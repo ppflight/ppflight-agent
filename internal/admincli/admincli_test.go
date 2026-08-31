@@ -262,6 +262,55 @@ func TestBindingSettingsSubmenusMoveStatusAndShowContextualActions(t *testing.T)
 	}
 }
 
+func TestBindingSettingsExplicitlyDiscardRevokedWebsitePendingWithoutTouchingMonitoring(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	websiteHash, _ := bindstate.RequestFingerprint(map[string]string{"bindingCode": "website-old-code"})
+	_, _, websiteLock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "website", websiteHash, pendingTemplateForTest(t, cfg, "website"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = websiteLock.Close()
+	monitoringHash, _ := bindstate.RequestFingerprint(map[string]string{"bindingCode": "monitoring-pending-code"})
+	_, _, monitoringLock, err := bindstate.PreparePending(cfg.Runtime.StateDirectory, "monitoring", monitoringHash, pendingTemplateForTest(t, cfg, "monitoring"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = monitoringLock.Close()
+
+	var output, stderr bytes.Buffer
+	instance := &cli{
+		in:           strings.NewReader("2\n3\nDISCARD WEBSITE PENDING\n0\n"),
+		out:          &output,
+		errOut:       &stderr,
+		effectiveUID: func() int { return 0 },
+		managedWritePolicy: func(string, config.Config) error {
+			return nil
+		},
+	}
+	if code := instance.menu(filename); code != 0 {
+		t.Fatalf("code=%d stderr=%s output=%s", code, stderr.String(), output.String())
+	}
+	for _, expected := range []string{
+		"存在上一次结果未确定的绑定请求",
+		"3) 清除未决绑定请求",
+		"PPFlight 官网未决绑定请求已清除",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("output missing %q: %s", expected, output.String())
+		}
+	}
+	if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "website"); err != nil || pending {
+		t.Fatalf("website pending remains: pending=%v err=%v", pending, err)
+	}
+	if pending, err := bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, "monitoring"); err != nil || !pending {
+		t.Fatalf("monitoring pending was changed: pending=%v err=%v", pending, err)
+	}
+}
+
 func TestSystemOverviewShowsCoreSectionsWithoutSecrets(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var output, stderr bytes.Buffer

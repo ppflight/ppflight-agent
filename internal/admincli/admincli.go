@@ -352,6 +352,7 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 	bound := false
 	bindingID := ""
 	credentialEpoch := uint64(0)
+	pending := false
 	if monitoring {
 		target = "监控站"
 		state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
@@ -370,21 +371,46 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 			return 1, false
 		}
 	}
+	if !bound {
+		domain := "website"
+		if monitoring {
+			domain = "monitoring"
+		}
+		var err error
+		pending, err = bindstate.PendingRequestExists(cfg.Runtime.StateDirectory, domain)
+		if err != nil {
+			fmt.Fprintf(c.errOut, "%s绑定 pending 状态不安全或损坏；拒绝继续\n", target)
+			return 1, false
+		}
+	}
 
 	fmt.Fprintf(c.out, "\n%s绑定设置\n", target)
 	if bound {
 		fmt.Fprintf(c.out, "当前状态：已绑定  bindingId=%s  credentialEpoch=%d\n", bindingID, credentialEpoch)
 	} else {
-		fmt.Fprintln(c.out, "当前状态：未绑定")
+		if pending {
+			fmt.Fprintln(c.out, "当前状态：未绑定（存在上一次结果未确定的绑定请求）")
+		} else {
+			fmt.Fprintln(c.out, "当前状态：未绑定")
+		}
 	}
 	fmt.Fprintln(c.out, "  1) 查看绑定与通信状态")
 	if bound {
 		fmt.Fprintln(c.out, "  2) 删除绑定")
 	} else {
-		fmt.Fprintln(c.out, "  2) 添加绑定")
+		if pending {
+			fmt.Fprintln(c.out, "  2) 使用上一次原绑定码重试")
+			fmt.Fprintln(c.out, "  3) 清除未决绑定请求（仅在服务端已撤销后）")
+		} else {
+			fmt.Fprintln(c.out, "  2) 添加绑定")
+		}
 	}
 	fmt.Fprintln(c.out, "  0) 返回主菜单")
-	choice, err := c.promptLine(reader, "请选择 [0-2]: ")
+	choiceRange := "[0-2]"
+	if pending {
+		choiceRange = "[0-3]"
+	}
+	choice, err := c.promptLine(reader, "请选择 "+choiceRange+": ")
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法读取绑定设置选择")
 		return 2, false
@@ -402,10 +428,88 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 			return c.menuRemoveBinding(reader, filename, monitoring), false
 		}
 		return c.menuBind(reader, filename, monitoring, false, ""), false
+	case "3":
+		if pending && !bound {
+			return c.menuDiscardPendingBinding(reader, filename, monitoring), false
+		}
+		fmt.Fprintln(c.errOut, "绑定设置选择无效")
+		return 2, false
 	default:
 		fmt.Fprintln(c.errOut, "绑定设置选择无效")
 		return 2, false
 	}
+}
+
+// menuDiscardPendingBinding is the explicit recovery boundary for an
+// enrollment request whose response was ambiguous and which the operator has
+// since revoked on the authoritative service. It never removes a completed
+// binding and never mutates the independent trust domain.
+func (c *cli) menuDiscardPendingBinding(reader *bufio.Reader, filename string, monitoring bool) int {
+	if !c.isRoot() {
+		fmt.Fprintln(c.errOut, "清除未决绑定请求必须由 PVE root 显式执行")
+		return 1
+	}
+	cfg, ok := c.load(filename)
+	if !ok {
+		return 1
+	}
+	if err := c.requireManagedWriteTarget(filename, cfg); err != nil {
+		fmt.Fprintln(c.errOut, "清除未决绑定请求已拒绝：生产管理配置或状态目录不安全")
+		return 1
+	}
+	domain, target, confirmation := "website", "PPFlight 官网", "DISCARD WEBSITE PENDING"
+	if monitoring {
+		domain, target, confirmation = "monitoring", "监控站", "DISCARD MONITORING PENDING"
+	}
+	fmt.Fprintf(c.out, "仅当你已在%s确认撤销旧请求后才能继续；不会删除另一侧绑定、PVE 凭据或运行数据。\n", target)
+	value, err := c.promptLine(reader, fmt.Sprintf("输入 %s 确认清除未决请求（其他输入取消）: ", confirmation))
+	if err != nil || value != confirmation {
+		fmt.Fprintln(c.out, "已取消，未修改本机。")
+		return 0
+	}
+	transaction, err := bindstate.AcquireTransaction(cfg.Runtime.StateDirectory)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "另一个 Agent 管理事务正在执行；未修改本机")
+		return 1
+	}
+	defer transaction.Close()
+	latest, err := config.LoadFile(filename)
+	if err != nil || latest.Runtime.StateDirectory != cfg.Runtime.StateDirectory {
+		fmt.Fprintln(c.errOut, "配置在清除未决请求前发生变化；请重试")
+		return 1
+	}
+	if err := requireNoUnbindTransaction(latest.Runtime.StateDirectory); err != nil {
+		fmt.Fprintln(c.errOut, "绑定删除事务尚未完成；拒绝清除未决请求")
+		return 1
+	}
+	if _, found, markerErr := bindstate.ReadWebsiteCommit(latest.Runtime.StateDirectory); markerErr != nil || found {
+		fmt.Fprintln(c.errOut, "官网绑定提交事务尚未完成；拒绝清除未决请求")
+		return 1
+	}
+	if _, found, markerErr := bindstate.ReadMonitoringCommit(latest.Runtime.StateDirectory); markerErr != nil || found {
+		fmt.Fprintln(c.errOut, "监控绑定提交事务尚未完成；拒绝清除未决请求")
+		return 1
+	}
+	if monitoring {
+		if _, stateErr := bindstate.LoadMonitoring(latest.Runtime.StateDirectory); stateErr == nil || !errors.Is(stateErr, os.ErrNotExist) {
+			fmt.Fprintln(c.errOut, "监控站当前已绑定或绑定状态不安全；拒绝清除未决请求")
+			return 1
+		}
+	} else if _, stateErr := bindstate.Load(latest.Runtime.StateDirectory); stateErr == nil || !errors.Is(stateErr, os.ErrNotExist) {
+		fmt.Fprintln(c.errOut, "PPFlight 官网当前已绑定或绑定状态不安全；拒绝清除未决请求")
+		return 1
+	}
+	present, pendingErr := bindstate.PendingRequestExists(latest.Runtime.StateDirectory, domain)
+	if pendingErr != nil || !present {
+		fmt.Fprintln(c.errOut, "未找到可安全清除的未决绑定请求；未修改本机")
+		return 1
+	}
+	if err := bindstate.ClearPending(latest.Runtime.StateDirectory, domain); err != nil {
+		fmt.Fprintln(c.errOut, "清除未决绑定请求失败；未修改另一侧绑定或 PVE 配置")
+		return 1
+	}
+	fmt.Fprintf(c.out, "%s未决绑定请求已清除；另一侧绑定、PVE 凭据和 Agent 服务保持不变。现在可使用新的绑定码重新绑定。\n", target)
+	return 0
 }
 
 func (c *cli) menuBind(reader *bufio.Reader, filename string, monitoring, replace bool, currentEndpoint string) int {
@@ -1660,6 +1764,10 @@ func (c *cli) bind(filename string, args []string) int {
 	}
 	requestID, storedTemplate, err := bindstate.PreparePendingLocked(cfg.Runtime.StateDirectory, "website", fingerprint, requestTemplate)
 	if err != nil {
+		if errors.Is(err, bindstate.ErrPendingRequestConflict) {
+			fmt.Fprintln(c.errOut, "存在上一次结果未确定的官网绑定请求；本次新绑定码未发送。请使用上一次的原绑定码重试，或先在官网确认并撤销旧请求后再处理本机未决状态")
+			return 1
+		}
 		fmt.Fprintln(c.errOut, "无法持久化绑定请求；未发送绑定码")
 		return 1
 	}
@@ -2269,6 +2377,10 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	}
 	requestID, storedTemplate, err := bindstate.PreparePendingLocked(cfg.Runtime.StateDirectory, "monitoring", fingerprint, requestTemplate)
 	if err != nil {
+		if errors.Is(err, bindstate.ErrPendingRequestConflict) {
+			fmt.Fprintln(c.errOut, "存在上一次结果未确定的监控绑定请求；本次新绑定码未发送。请使用上一次的原绑定码重试，或先在监控站确认并撤销旧请求后再处理本机未决状态")
+			return 1
+		}
 		fmt.Fprintln(c.errOut, "无法持久化监控绑定请求；未发送绑定码")
 		return 1
 	}

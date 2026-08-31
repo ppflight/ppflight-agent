@@ -22,6 +22,12 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 )
 
+// ErrPendingRequestConflict means an unresolved enrollment request already
+// exists for the trust domain, but the caller is trying to replace it with a
+// different code/claim fingerprint. The original request may already have
+// been accepted remotely, so callers must not silently overwrite it.
+var ErrPendingRequestConflict = errors.New("pending binding request conflicts with unresolved request")
+
 const (
 	pendingSchemaVersion   = 2
 	pendingTemplateVersion = 1
@@ -276,7 +282,7 @@ func PreparePendingLocked(stateDirectory, kind, fingerprint string, template Bin
 		if existing.Kind == kind && existing.Fingerprint == fingerprint {
 			return existing.RequestID, existing.Template, nil
 		}
-		return "", BindingRequestTemplate{}, errors.New("pending binding request differs from the unresolved request")
+		return "", BindingRequestTemplate{}, ErrPendingRequestConflict
 	} else if !errors.Is(loadErr, os.ErrNotExist) {
 		return "", BindingRequestTemplate{}, loadErr
 	}

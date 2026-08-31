@@ -73,6 +73,8 @@ func TestPendingBindingChangedRequestIsRejectedUntilCleared(t *testing.T) {
 	if second, _, secondLock, err := PreparePending(directory, "monitoring", secondHash, testPendingTemplate(t, "monitoring")); err == nil {
 		_ = secondLock.Close()
 		t.Fatalf("changed unresolved request was accepted with id %q after %q", second, first)
+	} else if !errors.Is(err, ErrPendingRequestConflict) {
+		t.Fatalf("changed unresolved request error = %v", err)
 	}
 	if pending, err := PendingRequestExists(directory, "monitoring"); err != nil || !pending {
 		t.Fatalf("original pending request was not preserved: pending=%v err=%v", pending, err)
