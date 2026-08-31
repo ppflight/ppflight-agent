@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.0-rc.18"
+		repositoryVersion = "0.1.0-rc.19"
 		// quick-install is advanced only after the immutable GitHub assets for
 		// the repository version exist and their complete archive digests have
 		// been verified. During the release commit it therefore still pins the
@@ -95,6 +95,12 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 		if !strings.Contains(compact, metric) {
 			t.Fatalf("quick installer must verify real node_exporter metric %q before reporting success", metric)
 		}
+	}
+	if !strings.Contains(compact, "systemctl restart ppflight-node-exporter.service ppflight-smartctl-exporter.service") {
+		t.Fatal("quick installer must restart exporters so updated systemd hardening is applied")
+	}
+	if !strings.Contains(quickInstall, "journalctl --no-pager -u") {
+		t.Fatal("quick installer must expose bounded exporter diagnostics after readiness failure")
 	}
 	if !strings.Contains(compact, "smartctl_device_(info|smart_status)") || !strings.Contains(compact, "127.0.0.1:9633/metrics") {
 		t.Fatal("quick installer must verify at least one real SMART device before reporting success")

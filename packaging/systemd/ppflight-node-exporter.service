@@ -25,7 +25,12 @@ MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
-SystemCallFilter=@system-service @network-io
+# node_exporter probes a wide range of procfs/sysfs kernel interfaces.  A
+# positive syscall allow-list is too brittle across PVE 8/9 kernels and Go
+# runtime releases and can terminate the exporter during its first scrape.
+# Keep an explicit deny-list for syscall families the unprivileged service
+# never needs while allowing read-only host metric discovery to work.
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @memlock @module @mount @obsolete @raw-io @reboot @swap
 
 [Install]
 WantedBy=multi-user.target

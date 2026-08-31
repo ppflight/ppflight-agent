@@ -25,7 +25,10 @@ MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictAddressFamilies=AF_UNIX AF_INET
 SystemCallArchitectures=native
-SystemCallFilter=@system-service @network-io
+# smartctl_exporter must exec smartctl and issue device ioctls.  A narrow
+# positive syscall allow-list breaks on some PVE kernels/Go releases, so deny
+# only syscall families that metric collection never needs.
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @memlock @module @mount @obsolete @reboot @swap
 
 [Install]
 WantedBy=multi-user.target

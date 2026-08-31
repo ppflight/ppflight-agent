@@ -157,17 +157,20 @@ scripts/install.sh \
   --smartctl-exporter-sha256 "$SMARTCTL_EXPORTER_SHA256" \
   --enable
 
-systemctl start ppflight-node-exporter.service ppflight-smartctl-exporter.service \
+systemctl restart ppflight-node-exporter.service ppflight-smartctl-exporter.service \
   || die '启动本机指标采集服务失败'
-systemctl is-active --quiet ppflight-node-exporter.service \
-  || die 'ppflight-node-exporter.service 未成功启动'
-systemctl is-active --quiet ppflight-smartctl-exporter.service \
-  || die 'ppflight-smartctl-exporter.service 未成功启动'
+
+exporter_diagnostics() {
+  local unit=$1
+  printf '\n%s 启动/采集失败，systemd 诊断：\n' "$unit" >&2
+  systemctl --no-pager --full status "$unit" >&2 || true
+  journalctl --no-pager -u "$unit" -n 40 >&2 || true
+}
 
 node_metrics="$INSTALL_TEMP_DIR/node-exporter.metrics"
 node_network_ready=0
 for ((attempt = 0; attempt < 15; attempt++)); do
-  if curl --disable --ipv4 --fail --silent --show-error --max-time 5 \
+  if curl --disable --ipv4 --fail --silent --max-time 5 \
       http://127.0.0.1:9100/metrics --output "$node_metrics" \
       && grep -q '^node_network_receive_bytes_total{' "$node_metrics" \
       && grep -q '^node_network_transmit_bytes_total{' "$node_metrics" \
@@ -178,13 +181,15 @@ for ((attempt = 0; attempt < 15; attempt++)); do
   fi
   sleep 1
 done
-[[ $node_network_ready -eq 1 ]] \
-  || die 'node_exporter 未提供网卡与硬盘累计字节指标，Agent 不能报告真实带宽或硬盘 IO'
+if [[ $node_network_ready -ne 1 ]]; then
+  exporter_diagnostics ppflight-node-exporter.service
+  die 'node_exporter 未提供网卡与硬盘累计字节指标，Agent 不能报告真实带宽或硬盘 IO'
+fi
 
 smart_metrics="$INSTALL_TEMP_DIR/smartctl-exporter.metrics"
 smart_ready=0
 for ((attempt = 0; attempt < 15; attempt++)); do
-  if curl --disable --ipv4 --fail --silent --show-error --max-time 10 \
+  if curl --disable --ipv4 --fail --silent --max-time 10 \
       http://127.0.0.1:9633/metrics --output "$smart_metrics" \
       && grep -Eq '^smartctl_device_(info|smart_status)\{' "$smart_metrics"; then
     smart_ready=1
@@ -192,8 +197,10 @@ for ((attempt = 0; attempt < 15; attempt++)); do
   fi
   sleep 1
 done
-[[ $smart_ready -eq 1 ]] \
-  || die 'smartctl_exporter 未发现任何可读硬盘；请先确认 smartctl --scan-open 能识别物理磁盘，然后重新安装'
+if [[ $smart_ready -ne 1 ]]; then
+  exporter_diagnostics ppflight-smartctl-exporter.service
+  die 'smartctl_exporter 未发现任何可读硬盘；请先确认 smartctl --scan-open 能识别物理磁盘，然后重新安装'
+fi
 
 printf '\n正在自动准备本机真实 PVE 读取、启动服务并校验首次采集...\n'
 /usr/local/bin/ag-pve pve prepare --local-only \
