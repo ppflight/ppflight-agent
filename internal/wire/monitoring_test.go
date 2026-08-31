@@ -64,6 +64,14 @@ func TestMonitoringTelemetryPreservesAllLargeValuesAsStrings(t *testing.T) {
 	}
 }
 
+func TestMonitoringMetricCanonicalizesScientificIntegerText(t *testing.T) {
+	value := 7023254379.0
+	metric := monitoringMetric(exporter.Value{Value: &value, Raw: "7.023254379e+09"})
+	if metric == nil || metric.Decimal != "7023254379" {
+		t.Fatalf("metric=%#v", metric)
+	}
+}
+
 func TestMonitoringTelemetryRejectsMissingBindingAuthority(t *testing.T) {
 	_, err := BuildMonitoringTelemetry(observation.Snapshot{ObservedAt: time.Now().UTC()}, nil, MonitoringBuildContext{})
 	if err == nil {

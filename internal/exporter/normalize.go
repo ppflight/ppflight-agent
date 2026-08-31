@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,9 +20,99 @@ type Value struct {
 func number(v float64, raw ...string) Value {
 	value := Value{Value: &v}
 	if len(raw) > 0 {
-		value.Raw = raw[0]
+		value.Raw = strings.TrimSpace(raw[0])
+		if canonical, ok := CanonicalUnsignedInteger(value.Raw); ok {
+			value.Raw = canonical
+		}
 	}
 	return value
+}
+
+// CanonicalUnsignedInteger converts an exact Prometheus decimal/scientific
+// value to an unsigned base-10 integer without passing through float64. This
+// keeps cumulative byte/counter values lossless for monitoring-v1, whose wire
+// contract deliberately rejects exponent notation and JSON numbers.
+func CanonicalUnsignedInteger(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	if s[0] == '+' {
+		s = s[1:]
+	} else if s[0] == '-' {
+		return "", false
+	}
+	if s == "" {
+		return "", false
+	}
+
+	exponent := int64(0)
+	if index := strings.IndexAny(s, "eE"); index >= 0 {
+		if strings.IndexAny(s[index+1:], "eE") >= 0 {
+			return "", false
+		}
+		parsed, err := strconv.ParseInt(s[index+1:], 10, 32)
+		if err != nil {
+			return "", false
+		}
+		exponent = parsed
+		s = s[:index]
+	}
+
+	if strings.Count(s, ".") > 1 {
+		return "", false
+	}
+	integerPart, fractionalPart := s, ""
+	if index := strings.IndexByte(s, '.'); index >= 0 {
+		integerPart, fractionalPart = s[:index], s[index+1:]
+	}
+	digits := integerPart + fractionalPart
+	if digits == "" {
+		return "", false
+	}
+	for _, digit := range digits {
+		if digit < '0' || digit > '9' {
+			return "", false
+		}
+	}
+	if strings.Trim(digits, "0") == "" {
+		return "0", true
+	}
+
+	shift := exponent - int64(len(fractionalPart))
+	if shift >= 0 {
+		digits = strings.TrimLeft(digits, "0")
+		if shift > 20 || int64(len(digits))+shift > 20 {
+			return "", false
+		}
+		digits += strings.Repeat("0", int(shift))
+	} else {
+		remove := -shift
+		if remove > int64(len(digits)) {
+			return "", false
+		}
+		cut := len(digits) - int(remove)
+		if strings.Trim(digits[cut:], "0") != "" {
+			return "", false
+		}
+		digits = strings.TrimLeft(digits[:cut], "0")
+		if digits == "" {
+			digits = "0"
+		}
+	}
+	if _, err := strconv.ParseUint(digits, 10, 64); err != nil {
+		return "", false
+	}
+	return digits, true
+}
+
+// CounterText reports whether a normalized exporter value can be represented
+// by monitoring-v1's exact unsigned-decimal counter contract.
+func CounterText(value Value) (string, bool) {
+	if value.Value == nil {
+		return "", false
+	}
+	return CanonicalUnsignedInteger(value.Raw)
 }
 
 type FilesystemObservation struct {

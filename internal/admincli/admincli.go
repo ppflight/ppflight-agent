@@ -108,14 +108,20 @@ func verifyLocalExporterData(ctx context.Context, exporters config.ExportersConf
 	host := exporter.NormalizeHost(nodeSamples, time.Now().UTC())
 	hasInterface := false
 	for _, item := range host.Interfaces {
-		if item.ReceiveBytes.Value != nil && item.TransmitBytes.Value != nil {
+		if _, receiveOK := exporter.CounterText(item.ReceiveBytes); receiveOK {
+			if _, transmitOK := exporter.CounterText(item.TransmitBytes); !transmitOK {
+				continue
+			}
 			hasInterface = true
 			break
 		}
 	}
 	hasDisk := false
 	for _, item := range host.Disks {
-		if item.ReadBytes.Value != nil && item.WrittenBytes.Value != nil {
+		if _, readOK := exporter.CounterText(item.ReadBytes); readOK {
+			if _, writeOK := exporter.CounterText(item.WrittenBytes); !writeOK {
+				continue
+			}
 			hasDisk = true
 			break
 		}

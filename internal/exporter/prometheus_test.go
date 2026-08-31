@@ -26,6 +26,66 @@ func TestParseAndNormalizeHost(t *testing.T) {
 		t.Fatalf("disks %#v", result.Disks)
 	}
 }
+
+func TestNormalizeHostCanonicalizesScientificCountersWithoutFloatRounding(t *testing.T) {
+	metrics := strings.Join([]string{
+		`node_network_receive_bytes_total{device="vmbr0"} 7.023254379e+09`,
+		`node_network_transmit_bytes_total{device="vmbr0"} 1.045301233e+09`,
+		`node_network_receive_errs_total{device="vmbr0"} 0e+00`,
+		`node_network_transmit_errs_total{device="vmbr0"} 0`,
+		`node_network_receive_drop_total{device="vmbr0"} 0`,
+		`node_network_transmit_drop_total{device="vmbr0"} 0`,
+		`node_network_up{device="vmbr0"} 1e0`,
+		`node_disk_read_bytes_total{device="sda"} 1.8446744073709551615e+19`,
+		`node_disk_written_bytes_total{device="sda"} 9.007199254740993e+15`,
+	}, "\n") + "\n"
+	samples, err := Parse(strings.NewReader(metrics), 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := NormalizeHost(samples, time.Unix(10, 0))
+	if len(host.Interfaces) != 1 {
+		t.Fatalf("interfaces=%#v", host.Interfaces)
+	}
+	if got := host.Interfaces[0].ReceiveBytes.Raw; got != "7023254379" {
+		t.Fatalf("receive counter=%q", got)
+	}
+	if got := host.Interfaces[0].TransmitBytes.Raw; got != "1045301233" {
+		t.Fatalf("transmit counter=%q", got)
+	}
+	if got := host.Interfaces[0].LinkUp.Raw; got != "1" {
+		t.Fatalf("link state=%q", got)
+	}
+	if got := host.Disks[0].ReadBytes.Raw; got != "18446744073709551615" {
+		t.Fatalf("uint64 maximum=%q", got)
+	}
+	if got := host.Disks[0].WrittenBytes.Raw; got != "9007199254740993" {
+		t.Fatalf("large exact counter=%q", got)
+	}
+}
+
+func TestCanonicalUnsignedInteger(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+		ok   bool
+	}{
+		{"7.023254379e+09", "7023254379", true},
+		{"1.5e1", "15", true},
+		{"0e-999", "0", true},
+		{"001.000", "1", true},
+		{"1.5", "", false},
+		{"1e-1", "", false},
+		{"-1", "", false},
+		{"1.8446744073709551616e+19", "", false},
+	}
+	for _, test := range tests {
+		got, ok := CanonicalUnsignedInteger(test.raw)
+		if got != test.want || ok != test.ok {
+			t.Errorf("CanonicalUnsignedInteger(%q)=(%q,%v), want (%q,%v)", test.raw, got, ok, test.want, test.ok)
+		}
+	}
+}
 func TestMissingMetricIsUnavailable(t *testing.T) {
 	result := NormalizeHost(nil, time.Time{})
 	if result.MemoryTotalBytes.Value != nil || result.Load1.Value != nil {

@@ -472,6 +472,9 @@ func monitoringMetric(value exporter.Value) *MonitoringMetric {
 	if raw == "" {
 		raw = strconv.FormatFloat(*value.Value, 'g', -1, 64)
 	}
+	if canonical, ok := exporter.CanonicalUnsignedInteger(raw); ok {
+		raw = canonical
+	}
 	return &MonitoringMetric{Decimal: raw}
 }
 func monitoringHost(value exporter.HostObservation) MonitoringHost {
