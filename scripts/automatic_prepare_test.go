@@ -17,9 +17,9 @@ func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T)
 		// the repository version exist and their complete archive digests have
 		// been verified. During the release commit it therefore still pins the
 		// most recent published version.
-		quickInstallVersion = "0.1.0-rc.19"
-		expectedAMD64       = "63a43e7b37d1e65b87b87e8a15e7855703c095c9bd1b669857b602535c470431"
-		expectedARM64       = "25e809e24daeb053e9ee610e4c8655d5d7146222338a315ebf2ec80e9b974259"
+		quickInstallVersion = "0.1.0-rc.20"
+		expectedAMD64       = "bcade48b3cb1d7aec6e3bbbecdac4b7b6ee994b679201c8ad9476d7f56404435"
+		expectedARM64       = "d0d1406b78d1cd47628376227a314a9fd142ab17e16ccb9d8410d9a0d713f9a5"
 		nodeAMD64           = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
 		nodeARM64           = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
 		smartAMD64          = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
