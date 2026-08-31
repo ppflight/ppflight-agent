@@ -117,6 +117,21 @@ func (fixture *bootstrapFixture) logText(t *testing.T) string {
 	return string(raw)
 }
 
+func assertLogOrder(t *testing.T, log string, commands ...string) {
+	t.Helper()
+	last := -1
+	for _, command := range commands {
+		position := strings.Index(log, command)
+		if position < 0 {
+			t.Fatalf("missing command %q:\n%s", command, log)
+		}
+		if position <= last {
+			t.Fatalf("command ordering violated at %q:\n%s", command, log)
+		}
+		last = position
+	}
+}
+
 func (fixture *bootstrapFixture) putRole(t *testing.T, name, privileges string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(fixture.state, "roles", name), []byte(privileges), 0o600); err != nil {
@@ -506,6 +521,32 @@ func TestPVEBootstrapACLOnlyMigratesKnownLegacyReadRoleAndKeepsToken(t *testing.
 		if strings.Contains(log+output, forbidden) {
 			t.Fatalf("read migration performed forbidden operation %q:\n%s", forbidden, log)
 		}
+	}
+}
+
+func TestPVEBootstrapFreshInstallMigratesKnownLegacyReadRoleAfterCompleteUninstall(t *testing.T) {
+	fixture := newBootstrapFixture(t)
+	fixture.putRole(t, "PPFlightAgentAudit", legacyReadPrivileges)
+
+	output, err := fixture.run(t, nil, "--write-env", fixture.environment)
+	if err != nil {
+		t.Fatalf("fresh bootstrap with legacy role failed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
+	}
+	raw, err := os.ReadFile(filepath.Join(fixture.state, "roles", "PPFlightAgentAudit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != readPrivileges {
+		t.Fatalf("migrated privileges=%q, want %q", got, readPrivileges)
+	}
+	log := fixture.logText(t)
+	assertLogOrder(t, log,
+		"role\tmodify\tPPFlightAgentAudit\t-privs\t"+readPrivileges,
+		"user\tadd\tppflight-agent@pve",
+		"user\ttoken\tadd\tppflight-agent@pve\tcollector",
+	)
+	if !strings.Contains(output, "Migrated dedicated PVE read role for SDN discovery") {
+		t.Fatalf("missing fresh migration confirmation: %s", output)
 	}
 }
 

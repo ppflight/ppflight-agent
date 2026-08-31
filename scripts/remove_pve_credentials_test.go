@@ -13,20 +13,24 @@ import (
 )
 
 const (
-	removeReadUser     = "ppflight-agent@pve"
-	removeReadToken    = "collector"
-	removeControlUser  = "ppflight-control@pve"
-	removeControlToken = "executor"
-	removeReadRole     = "PPFlightAgentAudit"
-	removeControlRole  = "PPFlightAgentControl"
+	removeReadUser                 = "ppflight-agent@pve"
+	removeReadToken                = "collector"
+	removeControlUser              = "ppflight-control@pve"
+	removeControlToken             = "executor"
+	removeReadRole                 = "PPFlightAgentAudit"
+	removeControlRole              = "PPFlightAgentControl"
+	removeLegacyReadPrivileges     = "Sys.Audit VM.Audit VM.Monitor Datastore.Audit"
+	removeCurrentReadPrivileges    = "Sys.Audit VM.Audit VM.Monitor Datastore.Audit SDN.Audit"
+	removeCurrentControlPrivileges = "Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use"
 )
 
 type removeCredentialsFixture struct {
-	root   string
-	state  string
-	log    string
-	mock   string
-	script string
+	root        string
+	state       string
+	log         string
+	mock        string
+	roleCleaner string
+	script      string
 }
 
 func newRemoveCredentialsFixture(t *testing.T) *removeCredentialsFixture {
@@ -64,12 +68,17 @@ func newRemoveCredentialsFixture(t *testing.T) *removeCredentialsFixture {
 	if err := os.WriteFile(mock, []byte(removeCredentialsMockPVEUM), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	roleCleaner := filepath.Join(root, "mock-role-cleaner")
+	if err := os.WriteFile(roleCleaner, []byte(removeCredentialsMockRoleCleaner), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	return &removeCredentialsFixture{
-		root:   root,
-		state:  state,
-		log:    filepath.Join(root, "pveum.log"),
-		mock:   mock,
-		script: script,
+		root:        root,
+		state:       state,
+		log:         filepath.Join(root, "pveum.log"),
+		mock:        mock,
+		roleCleaner: roleCleaner,
+		script:      script,
 	}
 }
 
@@ -91,6 +100,7 @@ func (fixture *removeCredentialsFixture) run(t *testing.T, extraEnvironment ...s
 	command := exec.Command(testBash(t), fixture.script)
 	command.Env = append(os.Environ(),
 		"PVEUM_BIN="+fixture.mock,
+		"PVE_ROLE_CLEANER_BIN="+fixture.roleCleaner,
 		"MOCK_REMOVE_STATE="+fixture.state,
 		"MOCK_REMOVE_LOG="+fixture.log,
 	)
@@ -113,7 +123,16 @@ func (fixture *removeCredentialsFixture) logText(t *testing.T) string {
 
 func (fixture *removeCredentialsFixture) putRole(t *testing.T, role string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(fixture.state, "roles", role), []byte("privileges"), 0o600); err != nil {
+	privileges := removeCurrentReadPrivileges
+	if role == removeControlRole {
+		privileges = removeCurrentControlPrivileges
+	}
+	fixture.putRolePrivileges(t, role, privileges)
+}
+
+func (fixture *removeCredentialsFixture) putRolePrivileges(t *testing.T, role, privileges string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(fixture.state, "roles", role), []byte(privileges), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -201,6 +220,8 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 		{"users", removeControlUser},
 		{"tokens", removeReadUser + "!" + removeReadToken},
 		{"tokens", removeControlUser + "!" + removeControlToken},
+		{"roles", removeReadRole},
+		{"roles", removeControlRole},
 	} {
 		if fixture.hasState(t, state.kind, state.name) {
 			t.Fatalf("PPFlight state %s/%s remains after removal", state.kind, state.name)
@@ -213,8 +234,6 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 		{"users", "operator@pve"},
 		{"roles", "OperatorRole"},
 		{"roles", "ManuallyAssignedRole"},
-		{"roles", removeReadRole},
-		{"roles", removeControlRole},
 	} {
 		if !fixture.hasState(t, state.kind, state.name) {
 			t.Fatalf("unrelated PVE state %s/%s was removed", state.kind, state.name)
@@ -223,7 +242,7 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 	if got, want := fixture.aclText(t), "/vms/100\tuser\toperator@pve\tOperatorRole\n"; got != want {
 		t.Fatalf("unexpected ACL cleanup:\n got %q\nwant %q", got, want)
 	}
-	if !strings.Contains(output, "credentials and owned ACLs have been revoked") {
+	if !strings.Contains(output, "unshared known role definitions have been removed") {
 		t.Fatalf("missing successful credential-revocation confirmation: %s", output)
 	}
 
@@ -264,7 +283,7 @@ func TestRemovePVECredentialsIsIdempotentAfterCompleteRemoval(t *testing.T) {
 	}
 }
 
-func TestRemovePVECredentialsRetainsRoleDefinitionsAndForeignACLs(t *testing.T) {
+func TestRemovePVECredentialsRetainsSharedRoleAndDeletesUnsharedRole(t *testing.T) {
 	fixture := newRemoveCredentialsFixture(t)
 	fixture.seedCompletePPFlightState(t)
 	fixture.putUser(t, "auditor@pve")
@@ -277,8 +296,8 @@ func TestRemovePVECredentialsRetainsRoleDefinitionsAndForeignACLs(t *testing.T) 
 	if !fixture.hasState(t, "roles", removeReadRole) {
 		t.Fatal("shared PPFlight role was force-deleted")
 	}
-	if !fixture.hasState(t, "roles", removeControlRole) {
-		t.Fatal("PPFlight control role definition was deleted")
+	if fixture.hasState(t, "roles", removeControlRole) {
+		t.Fatal("unshared PPFlight control role definition was retained")
 	}
 	for _, name := range []string{
 		removeReadUser,
@@ -297,9 +316,92 @@ func TestRemovePVECredentialsRetainsRoleDefinitionsAndForeignACLs(t *testing.T) 
 	if got, want := fixture.aclText(t), "/\tuser\tauditor@pve\t"+removeReadRole+"\n"; got != want {
 		t.Fatalf("shared role ACL was changed:\n got %q\nwant %q", got, want)
 	}
-	log := fixture.logText(t)
-	if strings.Contains(log, "role\t") {
-		t.Fatalf("script inspected or mutated role definitions:\n%s", log)
+	if !strings.Contains(output, "preserved PVE role "+removeReadRole+" because another ACL still references it") {
+		t.Fatalf("missing shared-role preservation warning: %s", output)
+	}
+}
+
+func TestRemovePVECredentialsDeletesUnreferencedKnownLegacyRoleAfterOldUninstall(t *testing.T) {
+	fixture := newRemoveCredentialsFixture(t)
+	fixture.putRolePrivileges(t, removeReadRole, removeLegacyReadPrivileges)
+
+	output, err := fixture.run(t)
+	if err != nil {
+		t.Fatalf("legacy role cleanup failed: %v\n%s", err, output)
+	}
+	if fixture.hasState(t, "roles", removeReadRole) {
+		t.Fatal("known pre-SDN PPFlight read role remained after complete uninstall")
+	}
+	if !strings.Contains(output, "unshared known role definitions have been removed") {
+		t.Fatalf("missing complete role cleanup confirmation: %s", output)
+	}
+}
+
+func TestRemovePVECredentialsPreservesCustomizedUnreferencedRole(t *testing.T) {
+	fixture := newRemoveCredentialsFixture(t)
+	fixture.putRolePrivileges(t, removeReadRole, "Sys.Audit Permissions.Modify")
+
+	output, err := fixture.run(t)
+	if err != nil {
+		t.Fatalf("custom role preservation failed: %v\n%s", err, output)
+	}
+	if !fixture.hasState(t, "roles", removeReadRole) {
+		t.Fatal("customized same-name role was deleted")
+	}
+	if !strings.Contains(output, "privileges are not an exact published PPFlight contract") {
+		t.Fatalf("missing customized-role warning: %s", output)
+	}
+}
+
+func TestRemovePVECredentialsUsesAtomicPVEUserConfigRoleCleanup(t *testing.T) {
+	source := readDeploymentFile(t, "remove-pve-credentials.sh")
+	for _, required := range []string{
+		"PVE::AccessControl::lock_user_config",
+		"cfs_read_file('user.cfg')",
+		"cfs_write_file('user.cfg', $usercfg)",
+		"acl_references_role($usercfg->{acl_root}, $role)",
+		removeLegacyReadPrivileges,
+		removeCurrentReadPrivileges,
+	} {
+		if !strings.Contains(source, required) {
+			t.Fatalf("atomic role cleanup source is missing %q", required)
+		}
+	}
+	if strings.Contains(source, "pveum role delete \"$role\"") {
+		t.Fatal("uninstaller must not use the non-atomic pveum role delete path")
+	}
+}
+
+func TestRemovePVECredentialsRoleCleanupFailureIsRetryableAfterCredentialRevocation(t *testing.T) {
+	fixture := newRemoveCredentialsFixture(t)
+	fixture.seedCompletePPFlightState(t)
+
+	output, err := fixture.run(t, "MOCK_REMOVE_FAIL=role-cleaner")
+	if err == nil {
+		t.Fatalf("role cleanup failure unexpectedly succeeded: %s", output)
+	}
+	for _, name := range []string{removeReadUser, removeControlUser} {
+		if fixture.hasState(t, "users", name) {
+			t.Fatalf("dedicated user %s remained after earlier credential revocation succeeded", name)
+		}
+	}
+	for _, role := range []string{removeReadRole, removeControlRole} {
+		if !fixture.hasState(t, "roles", role) {
+			t.Fatalf("role %s disappeared after atomic cleaner failure", role)
+		}
+	}
+	if !strings.Contains(output, "could not atomically clean up unused PPFlight PVE roles") {
+		t.Fatalf("missing retryable role cleanup diagnostic: %s", output)
+	}
+
+	output, err = fixture.run(t)
+	if err != nil {
+		t.Fatalf("role cleanup retry failed: %v\n%s", err, output)
+	}
+	for _, role := range []string{removeReadRole, removeControlRole} {
+		if fixture.hasState(t, "roles", role) {
+			t.Fatalf("role %s remained after successful retry", role)
+		}
 	}
 }
 
@@ -554,4 +656,46 @@ case "${1:-} ${2:-} ${3:-}" in
     ;;
   *) printf 'unexpected mock pveum invocation: %s\n' "$*" >&2; exit 97 ;;
 esac
+`
+
+const removeCredentialsMockRoleCleaner = `#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+: "${MOCK_REMOVE_STATE:?}"
+
+readonly READ_ROLE='PPFlightAgentAudit'
+readonly CONTROL_ROLE='PPFlightAgentControl'
+readonly LEGACY_READ='Sys.Audit VM.Audit VM.Monitor Datastore.Audit'
+readonly CURRENT_READ='Sys.Audit VM.Audit VM.Monitor Datastore.Audit SDN.Audit'
+readonly LEGACY_CONTROL='VM.Allocate VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.Monitor VM.PowerMgmt Datastore.AllocateSpace'
+readonly CURRENT_CONTROL='Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use'
+
+[[ ${MOCK_REMOVE_FAIL:-} != role-cleaner ]] || exit 46
+
+role_is_referenced() {
+  local role=$1
+  awk -F '\t' -v role="$role" '$4 == role { found=1 } END { exit(found ? 0 : 1) }' "$MOCK_REMOVE_STATE/acls"
+}
+
+cleanup_role() {
+  local role=$1 legacy=$2 current=$3 file="$MOCK_REMOVE_STATE/roles/$role" privileges
+  if [[ ! -f $file ]]; then
+    printf 'absent\t%s\n' "$role"
+    return
+  fi
+  privileges=$(<"$file")
+  if [[ $privileges != "$legacy" && $privileges != "$current" ]]; then
+    printf 'preserved-custom\t%s\n' "$role"
+    return
+  fi
+  if role_is_referenced "$role"; then
+    printf 'preserved-shared\t%s\n' "$role"
+    return
+  fi
+  rm -f -- "$file"
+  printf 'removed\t%s\n' "$role"
+}
+
+cleanup_role "$READ_ROLE" "$LEGACY_READ" "$CURRENT_READ"
+cleanup_role "$CONTROL_ROLE" "$LEGACY_CONTROL" "$CURRENT_CONTROL"
 `

@@ -745,9 +745,27 @@ preflight_environment "$ENV_FILE"
 CONTROL_ROLE_EXISTING=0
 [[ $role_state -eq 0 ]] && CONTROL_ROLE_EXISTING=1
 READ_ROLE_EXISTING=0
+READ_ROLE_MIGRATION=0
 role_state=0
-inspect_role "$READ_ROLE" "$READ_PRIVILEGES" || role_state=$?
-[[ $role_state -eq 0 ]] && READ_ROLE_EXISTING=1
+role_privileges_status "$READ_ROLE" "$READ_PRIVILEGES" || role_state=$?
+case $role_state in
+  0)
+    READ_ROLE_EXISTING=1
+    ;;
+  1)
+    ;;
+  3)
+    legacy_state=0
+    role_privileges_status "$READ_ROLE" "$LEGACY_READ_PRIVILEGES" || legacy_state=$?
+    [[ $legacy_state -eq 0 ]] || \
+      die "existing PVE role $READ_ROLE does not exactly match the required or known legacy privilege set; refusing ACL changes"
+    READ_ROLE_EXISTING=1
+    READ_ROLE_MIGRATION=1
+    ;;
+  *)
+    die "could not safely validate privileges for PVE role $READ_ROLE"
+    ;;
+esac
 
 READ_USER_EXISTING=0
 CONTROL_USER_EXISTING=0
@@ -770,6 +788,13 @@ fi
 # Rollback removes only exact mappings absent from this snapshot and added by
 # this invocation; pre-existing ACLs are never deleted.
 load_acl_snapshot
+
+if [[ $READ_ROLE_MIGRATION -eq 1 ]]; then
+  MUTATIONS_STARTED=1
+  MODIFIED_ROLES+=("$READ_ROLE|$LEGACY_READ_PRIVILEGES")
+  pveum role modify "$READ_ROLE" -privs "$READ_PRIVILEGES" >/dev/null
+  printf 'Migrated dedicated PVE read role for SDN discovery: %s\n' "$READ_ROLE"
+fi
 
 ensure_role "$READ_ROLE" "$READ_PRIVILEGES" "$READ_ROLE_EXISTING"
 ensure_role "$CONTROL_ROLE" "$CONTROL_PRIVILEGES" "$CONTROL_ROLE_EXISTING"

@@ -2,9 +2,11 @@
 # Revoke the fixed, dedicated PVE API identities created for PPFlight.
 #
 # This helper deliberately has no target/path arguments.  It only ever acts on
-# PPFlight's two fixed users, their fixed tokens, and every ACL owned by those
-# identities.  It never invokes VM, template, storage, backup, pool, or role
-# mutation operations.
+# PPFlight's two fixed users, their fixed tokens, every ACL owned by those
+# identities, and the two fixed role definitions when they still match a
+# published PPFlight privilege contract and are not assigned to another
+# subject.  It never invokes VM, template, storage, backup, or pool mutation
+# operations.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -14,16 +16,19 @@ readonly READ_USER='ppflight-agent@pve'
 readonly READ_TOKEN='collector'
 readonly CONTROL_USER='ppflight-control@pve'
 readonly CONTROL_TOKEN='executor'
+readonly READ_ROLE='PPFlightAgentAudit'
+readonly CONTROL_ROLE='PPFlightAgentControl'
 
 usage() {
   cat <<'EOF'
 Usage: sudo scripts/remove-pve-credentials.sh
 
 Revokes only PPFlight's fixed PVE API users and tokens and removes every ACL
-owned by those identities.  Role definitions are retained because checking
-whether another administrator is concurrently assigning one cannot be made
-atomic through separate pveum commands.  It never changes VMs, templates,
-storage, images, or backups.
+owned by those identities. The two fixed PPFlight roles are removed only when
+an atomic PVE user.cfg transaction proves that each role has a known historical
+PPFlight privilege set and no remaining ACL reference. Shared or customized
+roles are retained. It never changes VMs, templates, storage, images, or
+backups.
 EOF
 }
 
@@ -41,6 +46,10 @@ command -v python3 >/dev/null 2>&1 || die 'python3 is required to safely parse p
 # object names are accepted.
 PVEUM_BIN=${PVEUM_BIN:-pveum}
 command -v "$PVEUM_BIN" >/dev/null 2>&1 || die 'pveum is required (set PVEUM_BIN only for a test mock)'
+
+# PVE_ROLE_CLEANER_BIN is a test seam equivalent to PVEUM_BIN. Production
+# leaves it empty and executes the embedded PVE cluster transaction below.
+PVE_ROLE_CLEANER_BIN=${PVE_ROLE_CLEANER_BIN:-}
 
 TMPDIR_REMOVE=$(mktemp -d '/tmp/ppflight-pve-remove.XXXXXX')
 chmod 700 "$TMPDIR_REMOVE"
@@ -260,4 +269,110 @@ if [[ -s $POST_OWNED_ACLS_PLAN ]]; then
   die 'PPFlight-owned ACLs remain after credential removal'
 fi
 
-printf '%s\n' 'PPFlight fixed PVE credentials and owned ACLs have been revoked; role definitions were retained.'
+# `pveum role delete` does not remove/check ACL references atomically. Perform
+# the final known-role cleanup under PVE's own user.cfg cluster lock instead.
+# Only exact privilege sets shipped by PPFlight are eligible, including the
+# pre-SDN read role left by RC.5/RC.6-era installations. A customized or shared
+# role is preserved and reported rather than guessed to be ours.
+ROLE_CLEANUP_RESULT="$TMPDIR_REMOVE/role-cleanup.result"
+if [[ -n $PVE_ROLE_CLEANER_BIN ]]; then
+  command "$PVE_ROLE_CLEANER_BIN" >"$ROLE_CLEANUP_RESULT" || \
+    die 'could not atomically clean up unused PPFlight PVE roles'
+else
+  command -v perl >/dev/null 2>&1 || die 'perl is required to atomically clean up PVE roles'
+  perl - "$READ_ROLE" "$CONTROL_ROLE" >"$ROLE_CLEANUP_RESULT" <<'PL' || \
+    die 'could not atomically clean up unused PPFlight PVE roles'
+use strict;
+use warnings;
+use PVE::AccessControl ();
+use PVE::Cluster qw(cfs_read_file cfs_write_file);
+
+my ($read_role, $control_role) = @ARGV;
+my %known = (
+    $read_role => {
+        join(' ', sort split(/\s+/, 'Sys.Audit VM.Audit VM.Monitor Datastore.Audit')) => 1,
+        join(' ', sort split(/\s+/, 'Sys.Audit VM.Audit VM.Monitor Datastore.Audit SDN.Audit')) => 1,
+    },
+    $control_role => {
+        join(' ', sort split(/\s+/, 'VM.Allocate VM.Clone VM.Config.CPU VM.Config.Disk VM.Config.Memory VM.Config.Network VM.Config.Options VM.Monitor VM.PowerMgmt Datastore.AllocateSpace')) => 1,
+        join(' ', sort split(/\s+/, 'Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use')) => 1,
+    },
+);
+my @result;
+
+sub acl_references_role {
+    my ($node, $role) = @_;
+    return 0 if ref($node) ne 'HASH';
+    for my $kind (qw(users groups tokens)) {
+        my $members = $node->{$kind};
+        next if ref($members) ne 'HASH';
+        for my $member (values %$members) {
+            return 1 if ref($member) eq 'HASH' && exists($member->{$role});
+        }
+    }
+    my $children = $node->{children};
+    if (ref($children) eq 'HASH') {
+        for my $child (values %$children) {
+            return 1 if acl_references_role($child, $role);
+        }
+    }
+    return 0;
+}
+
+PVE::AccessControl::lock_user_config(
+    sub {
+        my $usercfg = cfs_read_file('user.cfg');
+        my $changed = 0;
+        for my $role ($read_role, $control_role) {
+            my $definition = $usercfg->{roles}->{$role};
+            if (ref($definition) ne 'HASH') {
+                push @result, "absent\t$role";
+                next;
+            }
+            my $signature = join(' ', sort keys %$definition);
+            if (!$known{$role}->{$signature}) {
+                push @result, "preserved-custom\t$role";
+                next;
+            }
+            if (acl_references_role($usercfg->{acl_root}, $role)) {
+                push @result, "preserved-shared\t$role";
+                next;
+            }
+            delete($usercfg->{roles}->{$role});
+            $changed = 1;
+            push @result, "removed\t$role";
+        }
+        cfs_write_file('user.cfg', $usercfg) if $changed;
+    },
+    'PPFlight role cleanup failed',
+);
+
+print "$_\n" for @result;
+PL
+fi
+
+READ_ROLE_RESULT_COUNT=0
+CONTROL_ROLE_RESULT_COUNT=0
+while IFS=$'\t' read -r role_status role_name extra; do
+  [[ -z $extra ]] || die 'invalid PPFlight role cleanup result'
+  case "$role_name" in
+    "$READ_ROLE") READ_ROLE_RESULT_COUNT=$((READ_ROLE_RESULT_COUNT + 1)) ;;
+    "$CONTROL_ROLE") CONTROL_ROLE_RESULT_COUNT=$((CONTROL_ROLE_RESULT_COUNT + 1)) ;;
+    *) die 'invalid PPFlight role cleanup target' ;;
+  esac
+  case "$role_status" in
+    removed|absent) ;;
+    preserved-shared)
+      printf 'warning: preserved PVE role %s because another ACL still references it\n' "$role_name" >&2
+      ;;
+    preserved-custom)
+      printf 'warning: preserved PVE role %s because its privileges are not an exact published PPFlight contract\n' "$role_name" >&2
+      ;;
+    *) die 'invalid PPFlight role cleanup status' ;;
+  esac
+done <"$ROLE_CLEANUP_RESULT"
+
+[[ $READ_ROLE_RESULT_COUNT -eq 1 && $CONTROL_ROLE_RESULT_COUNT -eq 1 ]] || \
+  die 'incomplete or duplicate PPFlight role cleanup result'
+
+printf '%s\n' 'PPFlight fixed PVE credentials, owned ACLs, and unshared known role definitions have been removed.'

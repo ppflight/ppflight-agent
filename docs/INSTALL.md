@@ -363,7 +363,7 @@ Executor 的动作全集和网络/IPFilter 编排见 [Agent API v1](AGENT-API-V1
 
 不要删除 `/var/lib/ppflight-agent` 中的 queue、control journal、assignment refresh state，或 `/var/lib/ppflight-agent/bindings` 中的 binding state、device ID/pending state。它们用于幂等、UPID 恢复和凭据防回滚。卸载前先确认官网已经接收所有关键队列，并明确是否保留绑定状态。
 
-完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户以及这些身份拥有的全部 ACL。角色定义不含凭据，且无法用分离的 `pveum` 检查/删除命令原子判断是否正被另一管理员并发复用，因此始终保留供重装复用。任何 ACL、Token 或用户删除失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。它不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
+完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户以及这些身份拥有的全部 ACL。随后在 PVE 自身的 `user.cfg` 集群锁内，对 `PPFlightAgentAudit`/`PPFlightAgentControl` 做“已发布历史权限集合 + 无剩余 ACL 引用”的原子检查；只有两项都满足才删除角色，因此 RC.5/RC.6 遗留的 pre-SDN read role 能被完整清理，管理员自定义或仍被其他主体引用的同名角色会保留并明确告警。任何 ACL、Token、用户或原子角色清理失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。即使机器曾用旧卸载器留下 pre-SDN role，新安装器也会识别其 exact 历史权限并在创建新凭据前迁移；未知权限集合仍 fail-closed。完整卸载不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
 
 ## 11. 故障检查
 
