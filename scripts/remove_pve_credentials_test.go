@@ -186,6 +186,8 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 	fixture.putUser(t, "operator@pve")
 	fixture.putRole(t, "OperatorRole")
 	fixture.putACL(t, "/vms/100", "user", "operator@pve", "OperatorRole")
+	fixture.putRole(t, "ManuallyAssignedRole")
+	fixture.putACL(t, "/vms/200", "token", removeReadUser+"!"+removeReadToken, "ManuallyAssignedRole")
 
 	output, err := fixture.run(t)
 	if err != nil {
@@ -212,6 +214,7 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 	}{
 		{"users", "operator@pve"},
 		{"roles", "OperatorRole"},
+		{"roles", "ManuallyAssignedRole"},
 	} {
 		if !fixture.hasState(t, state.kind, state.name) {
 			t.Fatalf("unrelated PVE state %s/%s was removed", state.kind, state.name)
@@ -317,16 +320,24 @@ func TestRemovePVECredentialsStopsBeforeUserWhenExistingTokenDeletionFails(t *te
 	}
 }
 
-func TestRemovePVECredentialsReturnsNonzeroForOwnedACLDeleteFailureAfterRevokingCredentials(t *testing.T) {
+func TestRemovePVECredentialsPreservesCredentialsWhenOwnedACLDeleteFails(t *testing.T) {
 	fixture := newRemoveCredentialsFixture(t)
 	fixture.seedCompletePPFlightState(t)
 	output, err := fixture.run(t, "MOCK_REMOVE_FAIL=acl-delete:/:token:"+removeReadUser+"!"+removeReadToken+":"+removeReadRole)
 	if err == nil {
 		t.Fatalf("ACL deletion failure unexpectedly succeeded: %s", output)
 	}
-	for _, name := range []string{removeReadUser, removeControlUser} {
-		if fixture.hasState(t, "users", name) {
-			t.Fatalf("user %s remained after an ACL deletion failure", name)
+	for _, state := range []struct {
+		kind string
+		name string
+	}{
+		{"users", removeReadUser},
+		{"users", removeControlUser},
+		{"tokens", removeReadUser + "!" + removeReadToken},
+		{"tokens", removeControlUser + "!" + removeControlToken},
+	} {
+		if !fixture.hasState(t, state.kind, state.name) {
+			t.Fatalf("credential %s/%s was removed after an ACL deletion failure", state.kind, state.name)
 		}
 	}
 	for _, role := range []string{removeReadRole, removeControlRole} {
@@ -335,14 +346,14 @@ func TestRemovePVECredentialsReturnsNonzeroForOwnedACLDeleteFailureAfterRevoking
 		}
 	}
 	log := fixture.logText(t)
-	if strings.Contains(log, "role\tdelete\t") {
-		t.Fatalf("script attempted role deletion after an ACL deletion failure:\n%s", log)
+	for _, forbidden := range []string{"user\ttoken\tremove\t", "user\tdelete\t", "role\tdelete\t"} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("script attempted %q after an ACL deletion failure:\n%s", forbidden, log)
+		}
 	}
-	assertRemovalOrder(t, log,
-		"acl\tdelete\t/\t--tokens\t"+removeReadUser+"!"+removeReadToken+"\t--roles\t"+removeReadRole,
-		"user\ttoken\tremove\t"+removeControlUser+"\t"+removeControlToken,
-		"user\tdelete\t"+removeControlUser,
-	)
+	if !strings.Contains(log, "acl\tdelete\t/\t--tokens\t"+removeReadUser+"!"+removeReadToken+"\t--roles\t"+removeReadRole) {
+		t.Fatalf("missing failed ACL deletion invocation:\n%s", log)
+	}
 }
 
 func TestRemovePVECredentialsReturnsNonzeroForExistingUserDeleteFailure(t *testing.T) {

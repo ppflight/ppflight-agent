@@ -61,6 +61,31 @@ func TestUninstallRefusesActivePathUnitWithoutMainPIDFallback(t *testing.T) {
 	}
 }
 
+func TestUninstallNotFoundUnitStillRequiresNoLiveProcess(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		unit        string
+		activeState string
+		mainPID     string
+		wantErr     bool
+	}{
+		{name: "absent inactive service", unit: "ppflight-agent.service", activeState: "inactive", mainPID: ""},
+		{name: "removed unit with live service", unit: "ppflight-agent.service", activeState: "active", mainPID: "741", wantErr: true},
+		{name: "removed active path", unit: "ppflight-agent-upgrade.path", activeState: "active", wantErr: true},
+		{name: "absent inactive path", unit: "ppflight-agent-upgrade.path", activeState: "inactive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, log, err := runStopRequiredUnit(t, test.unit, "not-found", test.activeState, test.mainPID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("err=%v wantErr=%t output=%s log=%s", err, test.wantErr, output, log)
+			}
+			if strings.Contains(log, "disable --now") {
+				t.Fatalf("not-found unit was passed to disable --now:\n%s", log)
+			}
+		})
+	}
+}
+
 func runStopRequiredUnit(t *testing.T, unit, loadState, activeState, mainPID string) (string, string, error) {
 	t.Helper()
 	root := t.TempDir()

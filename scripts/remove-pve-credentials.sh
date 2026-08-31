@@ -110,11 +110,12 @@ identifier_exists() {
   esac
 }
 
-# Write a deletion plan for target-role ACLs that belong exactly to one of the
-# two dedicated PPFlight identities.  ACLs for the same roles held by any
-# other user, token, or group are deliberately *not* included: a role shared
-# with another subject is retained later with a warning instead of being
-# force-deleted.  The strict path grammar also guarantees that the only value
+# Write a deletion plan for every ACL owned by either dedicated PPFlight
+# identity, irrespective of its assigned role.  Otherwise an unexpected ACL
+# could survive token removal and regain authority when the same fixed token
+# ID is created again.  ACLs held by any other subject are never deleted; they
+# are used only to decide whether a PPFlight-defined role is shared and must be
+# retained.  The strict path grammar also guarantees that the only value
 # sourced from PVE JSON and reused as an argv is a canonical PVE ACL path.
 classify_acls() {
   local source=$1 owned_plan=$2 foreign_roles=$3
@@ -162,13 +163,11 @@ try:
         if key in seen:
             raise ValueError('duplicate ACL entry')
         seen.add(key)
-        if role not in roles:
-            continue
         is_owned = ((kind == 'user' and identity in users) or
                     (kind == 'token' and identity in tokens))
         if is_owned:
             owned.append(key)
-        else:
+        elif role in roles:
             foreign.add(role)
 
     # Token ACLs are revoked before user ACLs.  This is not relied upon for
@@ -186,7 +185,7 @@ except (OSError, ValueError, json.JSONDecodeError, TypeError):
 PY
 }
 
-remove_owned_role_acls() {
+remove_owned_acls() {
   local plan=$1 path kind identity role subject_option failed=0
   while IFS=$'\t' read -r path kind identity role; do
     [[ -n $path && -n $kind && -n $identity && -n $role ]] || die 'invalid internal ACL deletion plan'
@@ -196,7 +195,7 @@ remove_owned_role_acls() {
       *) die 'invalid internal ACL deletion subject' ;;
     esac
     if ! pveum acl delete "$path" "$subject_option" "$identity" --roles "$role"; then
-      printf 'error: failed to remove PPFlight ACL at %s; credentials will still be revoked\n' "$path" >&2
+      printf 'error: failed to remove PPFlight ACL at %s; credentials are preserved for retry\n' "$path" >&2
       failed=1
     fi
   done <"$plan"
@@ -239,11 +238,12 @@ classify_acls "$ACLS_JSON" "$OWNED_ACLS_JSON_PLAN" "$FOREIGN_ROLES_PLAN" || \
   die 'could not safely parse PVE ACL JSON'
 
 # Remove the explicit role bindings while their user/token subjects still
-# exist.  Continue to revoke credentials if one ACL deletion fails, but retain
-# the roles and return non-zero afterwards so an actual deletion failure is
-# never reported as a successful complete uninstall.
+# exist.  If any ACL deletion fails, stop before deleting either subject.  PVE
+# releases that require the token/user to exist cannot safely retry deletion
+# of an orphaned ACL after its subject has already been removed.
 ACL_DELETE_FAILED=0
-remove_owned_role_acls "$OWNED_ACLS_JSON_PLAN" || ACL_DELETE_FAILED=1
+remove_owned_acls "$OWNED_ACLS_JSON_PLAN" || ACL_DELETE_FAILED=1
+[[ $ACL_DELETE_FAILED -eq 0 ]] || die 'one or more PPFlight ACL deletions failed; credentials were preserved for a safe retry'
 
 # Credential teardown is intentionally token -> user.  These are fixed argv
 # calls and every object was checked from a strict JSON list first.
@@ -259,8 +259,6 @@ fi
 if [[ $CONTROL_USER_EXISTS -eq 1 ]]; then
   pveum user delete "$CONTROL_USER" || die "failed to remove PVE user $CONTROL_USER"
 fi
-
-[[ $ACL_DELETE_FAILED -eq 0 ]] || die 'one or more PPFlight ACL deletions failed; credentials were revoked and PPFlight roles were retained'
 
 # PVE deletes a user's ACLs as part of user deletion.  Re-list and validate
 # the ACL table before role deletion, both to prove that our owned role ACLs

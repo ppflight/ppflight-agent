@@ -43,16 +43,15 @@ stop_required_unit() {
     printf 'error: cannot inspect required unit %s\n' "$unit" >&2
     return 1
   fi
-  if [[ "$load_state" == 'not-found' ]]; then
-    return 0
-  fi
   if [[ -z "$load_state" ]]; then
     printf 'error: required unit %s has an unknown load state\n' "$unit" >&2
     return 1
   fi
-  if ! systemctl disable --now "$unit"; then
-    printf 'error: failed to stop required unit %s; no files were removed\n' "$unit" >&2
-    return 1
+  if [[ "$load_state" != 'not-found' ]]; then
+    if ! systemctl disable --now "$unit"; then
+      printf 'error: failed to stop required unit %s; no files were removed\n' "$unit" >&2
+      return 1
+    fi
   fi
   if ! active_state="$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null)"; then
     printf 'error: cannot verify required unit %s stopped; no files were removed\n' "$unit" >&2
@@ -63,12 +62,16 @@ stop_required_unit() {
   # purged, so a live process can never survive complete uninstall.
   main_pid='not-applicable'
   if [[ "$unit" == *.service ]]; then
-    if ! main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)" || [[ -z "$main_pid" ]]; then
+    if ! main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)"; then
+      printf 'error: cannot verify required unit %s MainPID; no files were removed\n' "$unit" >&2
+      return 1
+    fi
+    if [[ "$load_state" != 'not-found' && -z "$main_pid" ]]; then
       printf 'error: cannot verify required unit %s MainPID; no files were removed\n' "$unit" >&2
       return 1
     fi
   fi
-  if [[ ( "$unit" == *.service && "$main_pid" != '0' ) || ( "$active_state" != 'inactive' && "$active_state" != 'failed' ) ]]; then
+  if [[ ( "$unit" == *.service && -n "$main_pid" && "$main_pid" != '0' ) || ( "$active_state" != 'inactive' && "$active_state" != 'failed' ) ]]; then
     printf 'error: required unit %s is still active (state=%s pid=%s); no files were removed\n' "$unit" "$active_state" "$main_pid" >&2
     return 1
   fi
@@ -102,7 +105,7 @@ fi
 # intact when systemd cannot confirm removal rather than deleting a live unit.
 stop_optional_exporter() {
   local unit=$1
-  if ! systemctl disable --now "$unit" 2>/dev/null; then
+  if ! stop_required_unit "$unit"; then
     printf 'warning: exporter unit %s was not stopped; preserving it\n' "$unit" >&2
     return 1
   fi
@@ -121,6 +124,19 @@ if [[ $REMOVE_EXPORTERS -eq 1 && $EXPORTERS_STOPPED -eq 1 ]]; then
 elif [[ $REMOVE_EXPORTERS -eq 1 ]]; then
   printf '%s\n' 'warning: kept exporter files because systemd did not confirm every exporter stopped.' >&2
 fi
+systemctl daemon-reload
+
+# Keep the binary and installed uninstaller available until every preceding
+# systemd and state operation has succeeded.  A daemon-reload or purge failure
+# can then be fixed and retried through AG instead of leaving a half-removed
+# installation with no recovery entrypoint.
+if [[ $PURGE -eq 1 ]]; then
+  rm -rf -- /etc/ppflight-agent /var/lib/ppflight-agent
+  printf '%s\n' 'Purged configuration and durable local queue.'
+else
+  printf '%s\n' 'Preserved /etc/ppflight-agent and /var/lib/ppflight-agent (including durable queue).'
+fi
+
 rm -f -- /usr/local/bin/ppflight-agent /usr/local/bin/ag-pve /usr/local/bin/ag /usr/local/bin/AG
 rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap
 rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh
@@ -128,11 +144,3 @@ rm -f -- /usr/local/lib/ppflight-agent/remove-pve-credentials.sh
 rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh
 rm -rf -- /usr/local/lib/ppflight-agent/template-bundles
 rm -rf -- /usr/local/lib/ppflight-agent
-systemctl daemon-reload
-
-if [[ $PURGE -eq 1 ]]; then
-  rm -rf -- /etc/ppflight-agent /var/lib/ppflight-agent
-  printf '%s\n' 'Purged configuration and durable local queue.'
-else
-  printf '%s\n' 'Preserved /etc/ppflight-agent and /var/lib/ppflight-agent (including durable queue).'
-fi
