@@ -285,7 +285,7 @@ sudo ag
 sudo ag-pve template init
 ```
 
-安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一五项主菜单：模板初始化、官网绑定设置、监控绑定设置、系统概况、完全卸载。官网与监控各自只允许一个绑定；未绑定时显示“添加绑定”，已有有效绑定时同一位置只显示“删除绑定”，必须先删除才能绑定另一家，不再从菜单提供覆盖或重新绑定入口。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。系统概况以脱敏中文视图汇总 Agent/systemd、真实 PVE readiness、两个绑定的远端状态、最近上传、鉴权阻塞、队列积压和升级监听。域级删除分别要求完整输入 `DELETE WEBSITE`/`DELETE MONITORING`，只删除该域本机凭据与派生配置并自动重启回验；另一信任域、稳定 device ID 和持久队列不删除。完全卸载另需输入 `UNINSTALL`。
+安装后的 `AG`、`ag`、`ag-pve` 不带参数都会显示同一六项主菜单：模板初始化、官网绑定设置、监控绑定设置、系统概况、一键更新、完全卸载。官网与监控各自只允许一个绑定；未绑定时显示“添加绑定”，已有有效绑定时同一位置只显示“删除绑定”，必须先删除才能绑定另一家，不再从菜单提供覆盖或重新绑定入口。两个绑定选项仍只在交互提示中读取一次性 code，不会把 code 转成 argv。系统概况以脱敏中文视图汇总 Agent/systemd、真实 PVE readiness、两个绑定的远端状态、最近上传、鉴权阻塞、队列积压和升级监听。一键更新也可直接运行 `ag-pve update`：它从安装时保存的 root-only 更新器取得 rolling-main 固定 manifest，校验归档与二进制 SHA，并复用安装器对真实采集、systemd active/enabled 的回验；配置、双绑定和持久队列不会删除，任一环节失败均不报告成功。域级删除分别要求完整输入 `DELETE WEBSITE`/`DELETE MONITORING`，只删除该域本机凭据与派生配置并自动重启回验；另一信任域、稳定 device ID 和持久队列不删除。完全卸载另需输入 `UNINSTALL`。
 
 向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）、外网桥和可选内网桥。外网桥用于 `net0`，启用内网时另建 `net1`；二者必须是不同的现有 PVE bridge。选择 `all` 也不会跳过任一 storage 或网络选择。它先输出无副作用 plan；只有核对 VMID/storage/摘要/备份策略/网络角色后输入完整单词 `YES` 才执行，输入 `no` 或直接回车不创建模板。
 

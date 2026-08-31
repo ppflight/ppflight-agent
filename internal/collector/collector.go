@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -415,11 +416,42 @@ func safeNetworks(raw map[string]json.RawMessage, guestType string) []observatio
 				network.Firewall = safeText(item, 8)
 			case "link_down":
 				network.LinkDown = safeText(item, 8)
+			case "ip":
+				if guestType == "lxc" {
+					if network.ConfiguredAddressing == nil {
+						network.ConfiguredAddressing = &observation.ConfiguredAddressing{}
+					}
+					network.ConfiguredAddressing.IPv4 = configuredAddress(item, false)
+				}
+			case "ip6":
+				if guestType == "lxc" {
+					if network.ConfiguredAddressing == nil {
+						network.ConfiguredAddressing = &observation.ConfiguredAddressing{}
+					}
+					network.ConfiguredAddressing.IPv6 = configuredAddress(item, true)
+				}
 			}
 		}
 		result = append(result, network)
 	}
 	return result
+}
+
+func configuredAddress(value string, ipv6 bool) *observation.ConfiguredAddress {
+	value = strings.ToLower(strings.TrimSpace(value))
+	allowedMode := value == "manual" || value == "dhcp" || ipv6 && value == "auto"
+	if allowedMode {
+		return &observation.ConfiguredAddress{Mode: value}
+	}
+	ip, network, err := net.ParseCIDR(value)
+	if err != nil || ip == nil || network == nil || ipv6 == (ip.To4() != nil) {
+		return &observation.ConfiguredAddress{Mode: "unavailable", Reason: "invalid_pve_config"}
+	}
+	ones, bits := network.Mask.Size()
+	if ones < 0 || (!ipv6 && bits != 32) || (ipv6 && bits != 128) {
+		return &observation.ConfiguredAddress{Mode: "unavailable", Reason: "invalid_pve_config"}
+	}
+	return &observation.ConfiguredAddress{Mode: "static", Address: ip.String(), Prefix: &ones}
 }
 
 func safeText(value string, max int) string {
@@ -485,7 +517,25 @@ func cloneInt(value *int) *int {
 	return &result
 }
 func cloneNetworks(value []observation.Network) []observation.Network {
-	return append([]observation.Network(nil), value...)
+	result := append([]observation.Network(nil), value...)
+	for index := range result {
+		if value[index].ConfiguredAddressing == nil {
+			continue
+		}
+		configured := *value[index].ConfiguredAddressing
+		if configured.IPv4 != nil {
+			copyValue := *configured.IPv4
+			copyValue.Prefix = cloneInt(configured.IPv4.Prefix)
+			configured.IPv4 = &copyValue
+		}
+		if configured.IPv6 != nil {
+			copyValue := *configured.IPv6
+			copyValue.Prefix = cloneInt(configured.IPv6.Prefix)
+			configured.IPv6 = &copyValue
+		}
+		result[index].ConfiguredAddressing = &configured
+	}
+	return result
 }
 func cloneHost(value *exporter.HostObservation) *exporter.HostObservation {
 	if value == nil {

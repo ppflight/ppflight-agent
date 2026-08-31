@@ -23,6 +23,7 @@ readonly TEMPLATE_LINK="$LIB_DIR/template-bootstrap"
 readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"
 readonly PVE_REMOVE_HELPER="$LIB_DIR/remove-pve-credentials.sh"
 readonly UNINSTALL_HELPER="$LIB_DIR/uninstall.sh"
+readonly UPDATE_HELPER="$LIB_DIR/quick-install.sh"
 readonly BIN_PATH='/usr/local/bin/ppflight-agent'
 readonly SYSTEMD_DIR='/etc/systemd/system'
 readonly TMPFILES_DIR='/usr/lib/tmpfiles.d'
@@ -279,6 +280,7 @@ install -m 0755 "$BINARY" "$BIN_PATH"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/remove-pve-credentials.sh" "$PVE_REMOVE_HELPER"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/uninstall.sh" "$UNINSTALL_HELPER"
+install -o root -g root -m 0700 "$REPO_DIR/scripts/quick-install.sh" "$UPDATE_HELPER"
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag-pve
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag
 ln -sfn -- "$BIN_PATH" /usr/local/bin/AG

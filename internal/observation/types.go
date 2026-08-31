@@ -125,4 +125,20 @@ type Network struct {
 	RateMbps  string `json:"rateMbps,omitempty"`
 	Firewall  string `json:"firewall,omitempty"`
 	LinkDown  string `json:"linkDown,omitempty"`
+	// ConfiguredAddressing is monitoring-only normalized LXC configuration.
+	// It is deliberately excluded from the legacy website payload so the new
+	// strict contract can be rolled out independently.
+	ConfiguredAddressing *ConfiguredAddressing `json:"-"`
+}
+
+type ConfiguredAddressing struct {
+	IPv4 *ConfiguredAddress `json:"ipv4,omitempty"`
+	IPv6 *ConfiguredAddress `json:"ipv6,omitempty"`
+}
+
+type ConfiguredAddress struct {
+	Mode    string `json:"mode"`
+	Address string `json:"address,omitempty"`
+	Prefix  *int   `json:"prefix,omitempty"`
+	Reason  string `json:"reason,omitempty"`
 }

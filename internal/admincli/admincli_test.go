@@ -198,17 +198,17 @@ func TestMonitoringPreflightRecordsPerAddressTLSErrorWithoutApprovalGate(t *test
 	}
 }
 
-func TestNoArgumentsShowsFiveItemMenu(t *testing.T) {
+func TestNoArgumentsShowsUpdateAndUninstallMenu(t *testing.T) {
 	var output, stderr bytes.Buffer
 	if code := RunWithInput(nil, "test", strings.NewReader("0\n"), &output, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, text := range []string{"1) 初始化/克隆", "2) 官网绑定设置", "3) 监控绑定设置", "4) 系统概况", "5) 完全卸载 PPFlight Agent"} {
+	for _, text := range []string{"1) 初始化/克隆", "2) 官网绑定设置", "3) 监控绑定设置", "4) 系统概况", "5) 一键更新 PPFlight Agent", "6) 完全卸载 PPFlight Agent"} {
 		if !strings.Contains(output.String(), text) {
 			t.Fatalf("menu does not contain %q: %s", text, output.String())
 		}
 	}
-	for _, removed := range []string{"查看 PPFlight 官网通信状态", "查看监控站通信状态", "6) 完全卸载"} {
+	for _, removed := range []string{"查看 PPFlight 官网通信状态", "查看监控站通信状态"} {
 		if strings.Contains(output.String(), removed) {
 			t.Fatalf("old top-level item %q remains: %s", removed, output.String())
 		}
@@ -333,7 +333,7 @@ func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("5\nYES\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("6\nYES\n"), out: &output, errOut: &stderr,
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
@@ -345,12 +345,42 @@ func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
 	}
 }
 
+func TestMenuOneClickUpdateUsesVerifiedInstalledFlow(t *testing.T) {
+	var output, stderr bytes.Buffer
+	called := false
+	instance := &cli{
+		in: strings.NewReader("5\n"), out: &output, errOut: &stderr,
+		effectiveUID: func() int { return 0 },
+		completeUpdate: func(context.Context) (string, error) {
+			called = true
+			return "0.1.0-rc.22", nil
+		},
+	}
+	if code := instance.menu("unused"); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if !called || !strings.Contains(output.String(), "一键更新完成并已回验：Agent 0.1.0-rc.22") {
+		t.Fatalf("called=%v output=%s", called, output.String())
+	}
+}
+
+func TestOneClickUpdateFailsClosedWithoutVerifiedVersion(t *testing.T) {
+	var output, stderr bytes.Buffer
+	instance := &cli{out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }, completeUpdate: func(context.Context) (string, error) { return "", nil }}
+	if code := instance.update(nil); code == 0 {
+		t.Fatal("update without verified version succeeded")
+	}
+	if strings.Contains(output.String(), "更新完成") || !strings.Contains(stderr.String(), "未报告成功") {
+		t.Fatalf("output=%s stderr=%s", output.String(), stderr.String())
+	}
+}
+
 func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("5\nUNINSTALL\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr,
 		effectiveUID:       func() int { return 0 },
 		completeUninstall:  func(context.Context) error { called = true; return nil },
 		managedWritePolicy: allowManagedWriteForTest,
@@ -365,7 +395,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 
 func TestMenuCompleteUninstallRequiresRoot(t *testing.T) {
 	var output, stderr bytes.Buffer
-	instance := &cli{in: strings.NewReader("5\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	instance := &cli{in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
 	if code := instance.menu("unused"); code == 0 {
 		t.Fatal("non-root complete uninstall succeeded")
 	}

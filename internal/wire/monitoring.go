@@ -2,7 +2,9 @@ package wire
 
 import (
 	"fmt"
+	"net"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -127,18 +129,57 @@ type MonitoringAssignment struct {
 }
 
 type MonitoringGuest struct {
-	Managed      bool                        `json:"managed"`
-	Identity     *MonitoringAssignment       `json:"identity,omitempty"`
-	VMID         int                         `json:"vmid"`
-	GuestType    string                      `json:"guestType"`
-	Name         string                      `json:"name"`
-	Node         string                      `json:"node"`
-	Template     bool                        `json:"template"`
-	PVE          MonitoringPVEGuest          `json:"pveObserved"`
-	QGA          MonitoringQGA               `json:"guestObserved"`
-	Networks     []WebsiteNetwork            `json:"networks"`
-	Capabilities MonitoringGuestCapabilities `json:"capabilities"`
-	ObservedAt   time.Time                   `json:"observedAt"`
+	Managed           bool                        `json:"managed"`
+	Identity          *MonitoringAssignment       `json:"identity,omitempty"`
+	VMID              int                         `json:"vmid"`
+	GuestType         string                      `json:"guestType"`
+	Name              string                      `json:"name"`
+	Node              string                      `json:"node"`
+	Template          bool                        `json:"template"`
+	PVE               MonitoringPVEGuest          `json:"pveObserved"`
+	QGA               MonitoringQGA               `json:"guestObserved"`
+	Networks          []WebsiteNetwork            `json:"networks"`
+	Capabilities      MonitoringGuestCapabilities `json:"capabilities"`
+	ObservedAt        time.Time                   `json:"observedAt"`
+	NetworkProjection MonitoringNetworkProjection `json:"networkProjection"`
+}
+
+type MonitoringNetworkProjection struct {
+	SchemaVersion           int                                `json:"schemaVersion"`
+	Interfaces              []MonitoringProjectedInterface     `json:"interfaces"`
+	UnmappedGuestInterfaces []MonitoringUnmappedGuestInterface `json:"unmappedGuestInterfaces"`
+}
+
+type MonitoringProjectedInterface struct {
+	InterfaceRef         string                            `json:"interfaceRef"`
+	MappingStatus        string                            `json:"mappingStatus"`
+	Source               string                            `json:"source"`
+	GuestInterfaceName   string                            `json:"guestInterfaceName,omitempty"`
+	CanonicalMAC         string                            `json:"canonicalMac,omitempty"`
+	MappingReason        string                            `json:"mappingReason,omitempty"`
+	Addresses            []MonitoringGuestAddress          `json:"addresses"`
+	ConfiguredAddressing *observation.ConfiguredAddressing `json:"configuredAddressing,omitempty"`
+	Counters             MonitoringNICCounterAvailability  `json:"counters"`
+}
+
+type MonitoringNICCounterAvailability struct {
+	Available bool              `json:"available"`
+	Source    string            `json:"source"`
+	Reason    string            `json:"reason,omitempty"`
+	RXBytes   *protocol.Counter `json:"rxBytes,omitempty"`
+	TXBytes   *protocol.Counter `json:"txBytes,omitempty"`
+	RXPackets *protocol.Counter `json:"rxPackets,omitempty"`
+	TXPackets *protocol.Counter `json:"txPackets,omitempty"`
+}
+
+type MonitoringUnmappedGuestInterface struct {
+	Name            string                   `json:"name"`
+	HardwareAddress string                   `json:"hardwareAddress"`
+	CanonicalMAC    string                   `json:"canonicalMac,omitempty"`
+	MappingStatus   string                   `json:"mappingStatus"`
+	Reason          string                   `json:"reason"`
+	Addresses       []MonitoringGuestAddress `json:"addresses"`
+	Statistics      *MonitoringGuestNICStats `json:"statistics,omitempty"`
 }
 
 type MonitoringPVEGuest struct {
@@ -365,7 +406,8 @@ func monitoringStorage(value observation.Storage) MonitoringStorage {
 }
 func monitoringGuest(cluster string, guest observation.Guest, assignments *inventory.Store, now time.Time) MonitoringGuest {
 	item := MonitoringGuest{VMID: guest.VMID, GuestType: guest.GuestType, Name: guest.Name, Node: guest.Node, Template: guest.Template,
-		PVE: monitoringPVEGuest(guest.PVE), QGA: monitoringQGA(guest.QGA), Networks: websiteNetworks(guest.Networks, nil), Capabilities: monitoringGuestCapabilities(guestCapabilities(guest, nil, now)), ObservedAt: guest.ObservedAt}
+		PVE: monitoringPVEGuest(guest.PVE), QGA: monitoringQGA(guest.QGA), Networks: websiteNetworks(guest.Networks, nil), Capabilities: monitoringGuestCapabilities(guestCapabilities(guest, nil, now)), ObservedAt: guest.ObservedAt,
+		NetworkProjection: monitoringNetworkProjection(guest)}
 	if assignments != nil {
 		if assignment, ok := assignments.Lookup(cluster, guest.GuestType, guest.VMID); ok {
 			item.Managed = true
@@ -405,6 +447,196 @@ func monitoringQGA(value observation.QGAView) MonitoringQGA {
 		result.Interfaces = append(result.Interfaces, item)
 	}
 	return result
+}
+
+func monitoringNetworkProjection(guest observation.Guest) MonitoringNetworkProjection {
+	result := MonitoringNetworkProjection{SchemaVersion: 1, Interfaces: []MonitoringProjectedInterface{}, UnmappedGuestInterfaces: []MonitoringUnmappedGuestInterface{}}
+	networks := append([]observation.Network(nil), guest.Networks...)
+	sort.SliceStable(networks, func(i, j int) bool { return networks[i].Index < networks[j].Index })
+	type qgaInterface struct {
+		value     pve.GuestInterface
+		canonical string
+		problem   string
+		mapped    bool
+	}
+	qga := make([]qgaInterface, len(guest.QGA.Interfaces))
+	qgaCounts, pveCounts := map[string]int{}, map[string]int{}
+	for index, item := range guest.QGA.Interfaces {
+		canonical, problem := monitoringCanonicalMAC(item.HardwareAddress, "qga")
+		qga[index] = qgaInterface{value: item, canonical: canonical, problem: problem}
+		if canonical != "" {
+			qgaCounts[canonical]++
+		}
+	}
+	for _, item := range networks {
+		if canonical, _ := monitoringCanonicalMAC(item.MAC, "pve"); canonical != "" {
+			pveCounts[canonical]++
+		}
+	}
+	for _, network := range networks {
+		if network.Index < 0 || network.Index > 31 {
+			continue
+		}
+		projected := MonitoringProjectedInterface{InterfaceRef: "net" + strconv.Itoa(network.Index), MappingStatus: "unmapped", Source: "unavailable", Addresses: []MonitoringGuestAddress{}, Counters: MonitoringNICCounterAvailability{Source: "unavailable", Reason: "qga_counters_missing"}}
+		canonical, pveProblem := monitoringCanonicalMAC(network.MAC, "pve")
+		projected.CanonicalMAC = canonical
+		if guest.GuestType == "lxc" {
+			projected.MappingStatus, projected.Source = "mapped", "pve-config"
+			projected.GuestInterfaceName = network.GuestName
+			projected.ConfiguredAddressing = cloneConfiguredAddressing(network.ConfiguredAddressing)
+			projected.Counters.Reason = "lxc_per_nic_counters_unavailable"
+			result.Interfaces = append(result.Interfaces, projected)
+			continue
+		}
+		qgaInterfacesAvailable := len(guest.QGA.Interfaces) > 0 || guest.QGA.Capabilities["interfaces"] == pve.Available
+		switch {
+		case !guest.QGA.Availability.Available || !qgaInterfacesAvailable:
+			projected.MappingReason = "qga_interfaces_unavailable"
+		case pveProblem != "":
+			projected.MappingReason = pveProblem
+		case pveCounts[canonical] > 1:
+			projected.MappingReason = "ambiguous_pve_mac"
+		case qgaCounts[canonical] > 1:
+			projected.MappingReason = "duplicate_qga_mac"
+		default:
+			match := -1
+			for index := range qga {
+				if qga[index].canonical == canonical {
+					match = index
+					break
+				}
+			}
+			if match < 0 {
+				projected.MappingReason = "qga_interface_not_found"
+			} else {
+				qga[match].mapped = true
+				projected.MappingStatus, projected.Source = "mapped", "qga"
+				projected.GuestInterfaceName = qga[match].value.Name
+				projected.Addresses = monitoringGuestAddresses(qga[match].value.IPAddresses)
+				projected.Counters = monitoringNICCounters(qga[match].value.Statistics)
+			}
+		}
+		result.Interfaces = append(result.Interfaces, projected)
+	}
+	for _, item := range qga {
+		if item.mapped {
+			continue
+		}
+		reason := item.problem
+		switch {
+		case reason != "":
+		case qgaCounts[item.canonical] > 1:
+			reason = "duplicate_qga_mac"
+		case pveCounts[item.canonical] > 1:
+			reason = "ambiguous_pve_mac"
+		default:
+			reason = "pve_interface_not_found"
+		}
+		unmapped := MonitoringUnmappedGuestInterface{Name: item.value.Name, HardwareAddress: item.value.HardwareAddress, CanonicalMAC: item.canonical, MappingStatus: "unmapped", Reason: reason, Addresses: monitoringGuestAddresses(item.value.IPAddresses)}
+		if item.value.Statistics != nil {
+			unmapped.Statistics = &MonitoringGuestNICStats{RXBytes: counterPointer(item.value.Statistics.RxBytes), TXBytes: counterPointer(item.value.Statistics.TxBytes), RXPackets: counterPointer(item.value.Statistics.RxPackets), TXPackets: counterPointer(item.value.Statistics.TxPackets)}
+		}
+		result.UnmappedGuestInterfaces = append(result.UnmappedGuestInterfaces, unmapped)
+	}
+	sort.SliceStable(result.UnmappedGuestInterfaces, func(i, j int) bool {
+		left, right := result.UnmappedGuestInterfaces[i], result.UnmappedGuestInterfaces[j]
+		if left.CanonicalMAC != right.CanonicalMAC {
+			return left.CanonicalMAC < right.CanonicalMAC
+		}
+		return left.Name < right.Name
+	})
+	return result
+}
+
+func monitoringCanonicalMAC(value, source string) (string, string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", source + "_mac_missing"
+	}
+	hardware, err := net.ParseMAC(value)
+	if err != nil || len(hardware) != 6 || hardware[0]&1 != 0 {
+		return "", source + "_mac_invalid"
+	}
+	allZero := true
+	for _, part := range hardware {
+		allZero = allZero && part == 0
+	}
+	if allZero {
+		return "", source + "_mac_invalid"
+	}
+	return strings.ToLower(hardware.String()), ""
+}
+
+func monitoringGuestAddresses(values []pve.GuestIPAddress) []MonitoringGuestAddress {
+	result := []MonitoringGuestAddress{}
+	for _, value := range values {
+		address := net.ParseIP(strings.TrimSpace(value.Address))
+		if address == nil {
+			continue
+		}
+		kind, maxPrefix := "ipv6", 128
+		if address.To4() != nil {
+			kind, maxPrefix, address = "ipv4", 32, address.To4()
+		}
+		if value.Prefix < 0 || value.Prefix > maxPrefix {
+			continue
+		}
+		result = append(result, MonitoringGuestAddress{Address: address.String(), Prefix: value.Prefix, Type: kind})
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Type != result[j].Type {
+			return result[i].Type < result[j].Type
+		}
+		if result[i].Address != result[j].Address {
+			return result[i].Address < result[j].Address
+		}
+		return result[i].Prefix < result[j].Prefix
+	})
+	return result
+}
+
+func monitoringNICCounters(value *pve.GuestInterfaceStats) MonitoringNICCounterAvailability {
+	result := MonitoringNICCounterAvailability{Source: "qga"}
+	if value == nil {
+		result.Source, result.Reason = "unavailable", "qga_counters_missing"
+		return result
+	}
+	result.RXBytes, result.TXBytes = counterPointer(value.RxBytes), counterPointer(value.TxBytes)
+	result.RXPackets, result.TXPackets = counterPointer(value.RxPackets), counterPointer(value.TxPackets)
+	if value.RxBytes == nil && value.TxBytes == nil && value.RxPackets == nil && value.TxPackets == nil {
+		result.Source, result.Reason = "unavailable", "qga_counters_missing"
+		return result
+	}
+	if value.RxBytes == nil || value.TxBytes == nil {
+		result.Source, result.Reason = "unavailable", "qga_counters_incomplete"
+		return result
+	}
+	result.Available = true
+	return result
+}
+
+func cloneConfiguredAddressing(value *observation.ConfiguredAddressing) *observation.ConfiguredAddressing {
+	if value == nil {
+		return nil
+	}
+	result := *value
+	if value.IPv4 != nil {
+		copyValue := *value.IPv4
+		if value.IPv4.Prefix != nil {
+			prefix := *value.IPv4.Prefix
+			copyValue.Prefix = &prefix
+		}
+		result.IPv4 = &copyValue
+	}
+	if value.IPv6 != nil {
+		copyValue := *value.IPv6
+		if value.IPv6.Prefix != nil {
+			prefix := *value.IPv6.Prefix
+			copyValue.Prefix = &prefix
+		}
+		result.IPv6 = &copyValue
+	}
+	return &result
 }
 
 // monitoringGuestAgentInfo keeps the monitoring wire contract independent

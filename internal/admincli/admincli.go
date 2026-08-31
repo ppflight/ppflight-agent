@@ -79,6 +79,7 @@ type cli struct {
 	// commands in binding_activation.go.
 	quiesceBinding    func(context.Context) error
 	completeUninstall func(context.Context) error
+	completeUpdate    func(context.Context) (string, error)
 	// managedWritePolicy is an explicit in-process test/embedding boundary for
 	// production-path ownership validation. Real CLI construction leaves it nil
 	// and therefore always uses the fixed installer paths on Linux root.
@@ -207,6 +208,8 @@ func (c *cli) run(args []string) int {
 		return c.pve(*filename, args[1:])
 	case "uninstall":
 		return c.menuCompleteUninstallAt(bufio.NewReader(io.LimitReader(c.in, 64<<10)), *filename)
+	case "update", "upgrade":
+		return c.update(args[1:])
 	case "menu":
 		return c.menu(*filename)
 	default:
@@ -219,7 +222,7 @@ func (c *cli) usage() {
 	fmt.Fprintln(c.out, `ag-pve - PPFlight Agent SSH 管理命令
 
   ag-pve [--config FILE] status
-  AG | ag | ag-pve                                   # 五项主菜单；含系统概况
+  AG | ag | ag-pve                                   # 六项主菜单；含系统概况和一键更新
   ag-pve [--config FILE] validate
   ag-pve [--config FILE] overview                    # 系统、PVE、绑定、通信和队列概况
   ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE] [--local-only]
@@ -241,6 +244,7 @@ func (c *cli) usage() {
   ag-pve template init                               # 交互选择存储、外网/内网桥并二次确认
   ag-pve template catalog|discover
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
+  ag-pve update                                      # 校验 rolling-main 制品并保留状态更新
   ag-pve uninstall                                   # 完全卸载，必须交互输入 UNINSTALL
 
 bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。website bind 与 monitoring bind 都从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载对应新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
@@ -256,9 +260,10 @@ func (c *cli) menu(filename string) int {
   2) 官网绑定设置
   3) 监控绑定设置
   4) 系统概况
-  5) 完全卸载 PPFlight Agent
+  5) 一键更新 PPFlight Agent
+  6) 完全卸载 PPFlight Agent
   0) 退出`)
-		choice, err := c.promptLine(reader, "请选择 [0-5]: ")
+		choice, err := c.promptLine(reader, "请选择 [0-6]: ")
 		if err != nil {
 			fmt.Fprintln(c.errOut, "无法读取菜单选择")
 			return 2
@@ -282,12 +287,87 @@ func (c *cli) menu(filename string) int {
 		case "4":
 			_ = c.systemOverview(filename)
 		case "5":
+			return c.update(nil)
+		case "6":
 			return c.menuCompleteUninstallAt(reader, filename)
 		default:
 			fmt.Fprintln(c.errOut, "菜单选择无效")
 			return 2
 		}
 	}
+}
+
+func (c *cli) update(args []string) int {
+	if len(args) != 0 {
+		fmt.Fprintln(c.errOut, "update 不接受参数")
+		return 2
+	}
+	if !c.isRoot() {
+		fmt.Fprintln(c.errOut, "一键更新必须由 PVE root 执行")
+		return 1
+	}
+	if c.completeUpdate != nil {
+		version, err := c.completeUpdate(context.Background())
+		if err != nil || strings.TrimSpace(version) == "" {
+			fmt.Fprintln(c.errOut, "一键更新失败；未报告成功，请按上方错误修复后重试")
+			return 1
+		}
+		fmt.Fprintf(c.out, "一键更新完成并已回验：Agent %s；服务、真实 PVE 采集和开机启动均由安装流程验证。\n", strings.TrimSpace(version))
+		return 0
+	}
+	helper := "/usr/local/lib/ppflight-agent/quick-install.sh"
+	info, err := os.Lstat(helper)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 1<<20 {
+		fmt.Fprintln(c.errOut, "一键更新脚本缺失或权限不安全；未修改 Agent")
+		return 1
+	}
+	tempDir, err := os.MkdirTemp("", "ppflight-agent-update.")
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法创建私有更新暂存目录；未修改 Agent")
+		return 1
+	}
+	defer os.RemoveAll(tempDir)
+	if err := os.Chmod(tempDir, 0o700); err != nil {
+		fmt.Fprintln(c.errOut, "无法保护更新暂存目录；未修改 Agent")
+		return 1
+	}
+	tempHelper := filepath.Join(tempDir, "quick-install.sh")
+	source, err := os.Open(helper)
+	if err != nil {
+		fmt.Fprintln(c.errOut, "无法读取一键更新脚本；未修改 Agent")
+		return 1
+	}
+	destination, err := os.OpenFile(tempHelper, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		source.Close()
+		fmt.Fprintln(c.errOut, "无法创建私有更新脚本副本；未修改 Agent")
+		return 1
+	}
+	copied, copyErr := io.Copy(destination, io.LimitReader(source, info.Size()+1))
+	syncErr := destination.Sync()
+	closeDestinationErr := destination.Close()
+	closeSourceErr := source.Close()
+	if copyErr != nil || syncErr != nil || closeDestinationErr != nil || closeSourceErr != nil || copied != info.Size() {
+		fmt.Fprintln(c.errOut, "无法完整暂存一键更新脚本；未修改 Agent")
+		return 1
+	}
+	fmt.Fprintln(c.out, "正在校验并安装 PPFlight Agent rolling-main 最新制品；现有配置、绑定和持久队列将保留。")
+	command := exec.Command(tempHelper)
+	command.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	command.Stdout, command.Stderr = c.out, c.errOut
+	if err := command.Run(); err != nil {
+		fmt.Fprintln(c.errOut, "一键更新失败；未报告成功，请按上方错误修复后重试")
+		return 1
+	}
+	versionCommand := exec.Command("/usr/local/bin/ag-pve", "version")
+	versionCommand.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	version, err := versionCommand.Output()
+	if err != nil || strings.TrimSpace(string(version)) == "" {
+		fmt.Fprintln(c.errOut, "更新安装已结束，但无法回验新 Agent 版本；请运行 ag-pve version")
+		return 1
+	}
+	fmt.Fprintf(c.out, "一键更新完成并已回验：Agent %s；服务、真实 PVE 采集和开机启动均由安装流程验证。\n", strings.TrimSpace(string(version)))
+	return 0
 }
 
 // menuCompleteUninstall retains the historical direct-test entry point. Real

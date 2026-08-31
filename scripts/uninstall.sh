@@ -142,5 +142,6 @@ rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap
 rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh
 rm -f -- /usr/local/lib/ppflight-agent/remove-pve-credentials.sh
 rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh
+rm -f -- /usr/local/lib/ppflight-agent/quick-install.sh
 rm -rf -- /usr/local/lib/ppflight-agent/template-bundles
 rm -rf -- /usr/local/lib/ppflight-agent
