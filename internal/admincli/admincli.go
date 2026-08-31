@@ -53,6 +53,7 @@ type cli struct {
 	pvesmSetContent   func(context.Context, string, string) error
 	pveVersion        func(context.Context) (string, error)
 	pveBootstrap      func(context.Context) error
+	pveControlACL     func(context.Context) error
 	pveNodeName       func() (string, error)
 	pveTLSPreflight   func(context.Context, string, string) error
 	bindingPVE        func(context.Context, string, config.Config) (config.Config, error)
@@ -1654,6 +1655,7 @@ func (c *cli) bind(filename string, args []string) int {
 		return 1
 	}
 	applyBinding(&cfg, response)
+	autoEnableProductionExecution(&cfg, "website", response.DeviceID)
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintln(c.errOut, "官网绑定生成的配置未通过严格校验；事务保持冻结，请使用同一绑定码重试")
 		return 1
@@ -1688,7 +1690,7 @@ func (c *cli) bind(filename string, args []string) int {
 		fmt.Fprintf(c.errOut, "WEBSITE_BIND_ACTIVATION_FAILED: 新官网绑定已安全保存但尚未确认首次真实上传；不会恢复服务端已经撤销的旧凭据，请检查 systemctl status ppflight-agent 后重试启动；配置备份=%s\n", configBackup)
 		return 1
 	}
-	fmt.Fprintf(c.out, "官网绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；官网采集、上传与任务轮询已启动；配置备份=%s。监控绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, configBackup)
+	fmt.Fprintf(c.out, "官网绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；官网采集、上传与任务轮询已启动；VPS写操作=%t；配置备份=%s。监控绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, cfg.Control.ProductionExecution, configBackup)
 	return 0
 }
 
@@ -1761,6 +1763,71 @@ func applyBinding(cfg *config.Config, response enrollment.Response) {
 	cfg.Control.CommandSigningKeyIDEnv = bindingoverlay.WebsiteSigningKeyIDEnv
 	cfg.Control.CommandPublicKeyEnv = bindingoverlay.WebsiteCommandPublicKeyEnv
 	cfg.Control.AllowedActions = append([]string(nil), response.AllowedActions...)
+}
+
+// autoEnableProductionExecution removes the old manual post-install switch.
+// It arms real writes only when local PVE preparation, the signed website
+// command channel, and the independent monitoring telemetry/audit trust domain
+// are all present. A domain currently being committed is accepted because its
+// durable commit marker prevents the service from starting before private
+// state and public configuration have both been verified.
+func autoEnableProductionExecution(cfg *config.Config, completingDomain, completingDeviceID string) bool {
+	cfg.Control.ProductionExecution = false
+	if cfg.Mode != "production" || cfg.PVE.Source != "api" || cfg.PVE.Endpoint != localPVEEndpoint ||
+		cfg.Control.PVETokenIDEnv != config.PVEControlTokenIDEnv || cfg.Control.PVETokenSecretEnv != config.PVEControlTokenSecretEnv ||
+		!cfg.Control.Enabled || cfg.Control.PollURL == "" || cfg.Control.ResultURL == "" || len(cfg.Control.AllowedActions) == 0 ||
+		!cfg.Destinations.Monitoring.Enabled || !cfg.Destinations.MonitoringAudit.Enabled {
+		return false
+	}
+	if completingDomain != "" && completingDomain != "website" && completingDomain != "monitoring" {
+		return false
+	}
+	if completingDomain != "" && completingDeviceID == "" {
+		return false
+	}
+	if requireNoUnbindTransaction(cfg.Runtime.StateDirectory) != nil {
+		return false
+	}
+	websiteReady := completingDomain == "website"
+	monitoringReady := completingDomain == "monitoring"
+	var website bindstate.State
+	var monitoring bindstate.MonitoringState
+	websiteDeviceID := completingDeviceID
+	monitoringDeviceID := completingDeviceID
+	if !websiteReady {
+		var err error
+		website, err = bindstate.Load(cfg.Runtime.StateDirectory)
+		if err != nil || bindingDomainHasPendingState(cfg.Runtime.StateDirectory, "website") {
+			return false
+		}
+		websiteDeviceID = website.DeviceID
+	}
+	if !monitoringReady {
+		var err error
+		monitoring, err = bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+		if err != nil || bindingDomainHasPendingState(cfg.Runtime.StateDirectory, "monitoring") {
+			return false
+		}
+		monitoringDeviceID = monitoring.DeviceID
+	}
+	if websiteDeviceID == "" || websiteDeviceID != monitoringDeviceID {
+		return false
+	}
+	cfg.Control.ProductionExecution = true
+	return true
+}
+
+func bindingDomainHasPendingState(stateDirectory, domain string) bool {
+	pending, err := bindstate.PendingRequestExists(stateDirectory, domain)
+	if err != nil || pending {
+		return true
+	}
+	if domain == "website" {
+		_, found, markerErr := bindstate.ReadWebsiteCommit(stateDirectory)
+		return markerErr != nil || found
+	}
+	_, found, markerErr := bindstate.ReadMonitoringCommit(stateDirectory)
+	return markerErr != nil || found
 }
 
 func (c *cli) monitoring(filename string, args []string) int {
@@ -2212,6 +2279,7 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 	cfg.Destinations.MonitoringAudit.Compression = response.Telemetry.Compression
 	cfg.Destinations.MonitoringAudit.MaxCompressedBytes = monitorenrollment.AuditMaxCompressedBytes
 	cfg.Destinations.MonitoringAudit.MaxUncompressedBytes = monitorenrollment.AuditMaxUncompressedBytes
+	autoEnableProductionExecution(&cfg, "monitoring", response.DeviceID)
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintln(c.errOut, "监控绑定生成的配置未通过严格校验；事务保持冻结，请使用同一绑定码重试")
 		return 1
@@ -2237,7 +2305,7 @@ func (c *cli) monitoringBind(filename string, cfg config.Config, args []string) 
 		fmt.Fprintf(c.errOut, "MONITORING_BIND_ACTIVATION_FAILED: 新监控绑定已安全保存但尚未确认首次真实上传；不会恢复服务端已经撤销的旧凭据，请检查 systemctl status ppflight-agent 后重试启动；配置备份=%s\n", configBackup)
 		return 1
 	}
-	fmt.Fprintf(c.out, "监控绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；配置备份=%s。官网绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, configBackup)
+	fmt.Fprintf(c.out, "监控绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；VPS写操作=%t；配置备份=%s。官网绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, cfg.Control.ProductionExecution, configBackup)
 	return 0
 }
 

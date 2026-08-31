@@ -63,6 +63,8 @@ type rawCredentialProbe struct {
 
 var requiredPVEReadPrivileges = []string{"Sys.Audit", "VM.Audit", "VM.Monitor", "Datastore.Audit"}
 
+var requiredPVEControlPrivileges = strings.Fields("Sys.Modify VM.Allocate VM.Audit VM.Backup VM.Clone VM.Config.CPU VM.Config.Cloudinit VM.Config.Disk VM.Config.HWType VM.Config.Memory VM.Config.Network VM.Config.Options VM.Console VM.Monitor VM.PowerMgmt VM.Snapshot VM.Snapshot.Rollback Datastore.Allocate Datastore.AllocateSpace Datastore.Audit SDN.Use")
+
 func (c *cli) pve(filename string, args []string) int {
 	if len(args) == 0 {
 		fmt.Fprintln(c.errOut, "pve 需要 prepare 或 status")
@@ -134,10 +136,10 @@ func (c *cli) preparePVE(filename string, cfg config.Config, args []string) int 
 	if *localOnly {
 		fmt.Fprintln(c.out, "本机真实 PVE 采集已回验；已有官网/监控绑定的数据将由持久队列自动续传。")
 	}
-	if result.ControlPermissionGrants == 0 {
-		fmt.Fprintln(c.out, "控制 token 尚未授予资源范围；真实监控已启用，但 productionExecution 保持 false，VPS 写操作不会越权执行。")
+	if result.Config.Control.ProductionExecution {
+		fmt.Fprintf(c.out, "控制 token 已验证 %d 项权限；官网命令与独立监控审计均已绑定，VPS 写操作已自动启用。\n", result.ControlPermissionGrants)
 	} else {
-		fmt.Fprintf(c.out, "控制 token 已验证 %d 项权限；productionExecution 仍保持原有显式安全开关。\n", result.ControlPermissionGrants)
+		fmt.Fprintf(c.out, "控制 token 已验证 %d 项权限；完成官网和监控双绑定后将自动启用 VPS 写操作，无需手工授权。\n", result.ControlPermissionGrants)
 	}
 	if result.ConfigBackup != "" {
 		fmt.Fprintf(c.out, "配置备份=%s\n", result.ConfigBackup)
@@ -205,8 +207,18 @@ func (c *cli) prepareRealPVEWithRequirement(ctx context.Context, filename string
 	prepared.PVE.TLSServerName = serverName
 	prepared.PVE.InsecureSkipTLS = false
 	prepared.PVE.LocalNode = localNode
+	// Released installers preserve agent.yaml across upgrades.  Early releases
+	// shipped the exporter entries explicitly disabled, so relying on config
+	// defaults leaves otherwise healthy node_exporter/smartctl_exporter services
+	// invisible to the Agent forever.  Real local PVE preparation owns these two
+	// loopback-only helpers and therefore also performs the durable migration.
+	prepared.Exporters.Node.Enabled = true
+	prepared.Exporters.Node.URL = "http://127.0.0.1:9100/metrics"
+	prepared.Exporters.SMART.Enabled = true
+	prepared.Exporters.SMART.URL = "http://127.0.0.1:9633/metrics"
 	prepared.Control.PVETokenIDEnv = config.PVEControlTokenIDEnv
 	prepared.Control.PVETokenSecretEnv = config.PVEControlTokenSecretEnv
+	autoEnableProductionExecution(&prepared, "", "")
 	if prepared.Control.PollURL == "" && prepared.Control.ResultURL == "" {
 		prepared.Control.Enabled = false
 		prepared.Control.ProductionExecution = false
@@ -241,10 +253,17 @@ func (c *cli) prepareRealPVEWithRequirement(ctx context.Context, filename string
 	if localVersion != read.version.Version {
 		return realPVEPreparation{}, errors.New("local and API PVE versions do not match")
 	}
-	controlGrants := 0
-	if control, controlErr := c.runPVEProbe(ctx, pveConfig(prepared, values[config.PVEControlTokenIDEnv], values[config.PVEControlTokenSecretEnv]), false, ""); controlErr == nil {
-		controlGrants = permissionCounts(control.permissions).grants
+	control, controlErr := c.runPVEProbe(ctx, pveConfig(prepared, values[config.PVEControlTokenIDEnv], values[config.PVEControlTokenSecretEnv]), false, "")
+	if controlErr != nil || !hasRequiredPVEControlPermissions(control.permissions) {
+		if err := c.ensureGlobalPVEControlACL(ctx); err != nil {
+			return realPVEPreparation{}, errors.New("grant dedicated PVE control ACL")
+		}
+		control, controlErr = c.runPVEProbe(ctx, pveConfig(prepared, values[config.PVEControlTokenIDEnv], values[config.PVEControlTokenSecretEnv]), false, "")
 	}
+	if controlErr != nil || !hasRequiredPVEControlPermissions(control.permissions) {
+		return realPVEPreparation{}, errors.New("PVE control probe did not verify the dedicated VPS-control role at root scope")
+	}
+	controlGrants := permissionCounts(control.permissions).grants
 	backup := ""
 	changed := !reflect.DeepEqual(cfg, prepared)
 	if changed {
@@ -309,7 +328,20 @@ func (c *cli) bootstrapPVECredentials(ctx context.Context) error {
 	// This helper mutates PVE RBAC and owns compensating rollback traps. Do not
 	// wrap it in CommandContext: an abrupt SIGKILL at a caller deadline can
 	// bypass those traps and strand an unrecoverable one-time token secret.
-	command := exec.Command(pveBootstrapHelper, "--write-env", config.DefaultPVEEnvironmentFile)
+	command := exec.Command(pveBootstrapHelper, "--write-env", config.DefaultPVEEnvironmentFile, "--control-global-acl")
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	command.Stdout = c.out
+	command.Stderr = c.errOut
+	return command.Run()
+}
+
+func (c *cli) ensureGlobalPVEControlACL(ctx context.Context) error {
+	if c.pveControlACL != nil {
+		return c.pveControlACL(ctx)
+	}
+	// The helper owns its rollback traps. As with initial bootstrap, do not use
+	// CommandContext: a forced kill could interrupt a two-subject ACL update.
+	command := exec.Command(pveBootstrapHelper, "--acl-only", "--control-global-acl")
 	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 	command.Stdout = c.out
 	command.Stderr = c.errOut
@@ -340,6 +372,16 @@ func containsLocalPVENode(nodes []string, localNode string) bool {
 func hasRequiredPVEReadPermissions(value pve.Permissions) bool {
 	root := value.Paths["/"]
 	for _, privilege := range requiredPVEReadPrivileges {
+		if root[privilege] <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func hasRequiredPVEControlPermissions(value pve.Permissions) bool {
+	root := value.Paths["/"]
+	for _, privilege := range requiredPVEControlPrivileges {
 		if root[privilege] <= 0 {
 			return false
 		}
@@ -427,9 +469,9 @@ func (c *cli) inspectLocalPVE(cfg config.Config) (localPVEStatus, int) {
 	// ProductionExecution, a scoped control token, assignment policy, signed
 	// commands, and the monitoring audit sink.
 	status.ProductionReady = cfg.Mode == "production" && cfg.PVE.Source == "api" && status.Read.CredentialReady && websiteBindingErr == nil && monitoringBindingErr == nil
-	// A deliberately unscoped control token is expected during read-only
-	// onboarding. It remains visible in the response but does not make a real,
-	// verified monitoring setup fail its command exit status.
+	// Production readiness remains a read/data-plane concept. Control readiness
+	// is reported independently and never substitutes for the verified read
+	// identity or both external trust domains.
 	if !status.Read.CredentialReady {
 		return status, 1
 	}
@@ -448,7 +490,7 @@ func (c *cli) probeView(ctx context.Context, cfg pve.Config, includeVersion bool
 	}
 	counts := permissionCounts(result.permissions)
 	view.Succeeded, view.PermissionPaths, view.PermissionGrants, view.Version = true, counts.paths, counts.grants, result.version
-	view.CredentialReady = counts.grants > 0
+	view.CredentialReady = hasRequiredPVEControlPermissions(result.permissions)
 	if includeVersion {
 		view.CredentialReady = result.version.Version != "" && hasRequiredPVEReadPermissions(result.permissions) && result.nodeStatusVerified && result.storageVerified
 	}
@@ -609,7 +651,7 @@ func (c *cli) controlCapabilityReady(cfg config.Config) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	result, err := c.runPVEProbe(ctx, pveConfig(cfg, values[cfg.Control.PVETokenIDEnv], values[cfg.Control.PVETokenSecretEnv]), false, "")
-	return err == nil && permissionCounts(result.permissions).grants > 0
+	return err == nil && hasRequiredPVEControlPermissions(result.permissions)
 }
 
 func (c *cli) menuPVEHeader(filename string) {

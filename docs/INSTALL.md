@@ -74,11 +74,11 @@ sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
 脚本会自动创建两套 privilege-separated PVE 身份：
 
 - `PVE_READ_TOKEN_*`：只读采集，使用固定审计角色；
-- `PVE_CONTROL_TOKEN_*`：受控写入，默认创建但**不授予 ACL**。
+- `PVE_CONTROL_TOKEN_*`：受控写入；一键准备为 dedicated VPS-control role 在 `/` 授予固定权限，但不含用户/RBAC、主机电源或主机控制台权限。
 
 Token secret 只进入 mode 0600、root-owned 的本地环境文件，不输出到终端，也不上传官网。脚本发现同名 Token 已存在时会 fail closed，因为 PVE 无法再次读取旧 secret；它不会删除或重建现有 Token。
 
-如果首次 bootstrap 就要在隔离测试池授予 control ACL，应**改用**下面的命令，而不是先执行上面的命令后再执行一次：
+若人工部署只希望控制指定资源池，可显式使用下面的缩小 scope 方式；标准一键安装则自动使用固定 global VPS-control role：
 
 ```bash
 sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
@@ -86,9 +86,9 @@ sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
   --control-pool lab
 ```
 
-`--control-global-acl` 仅允许隔离测试集群，不能作为生产安装示例。read/control Token 不得相同，官网也不得接收这四个环境变量的值。
+`--control-global-acl` 只把固定 VPS-control role 绑定到 `/`；该 role 包含实现防火墙等固定动作所需的 `Sys.Modify`，但不含用户/RBAC、主机电源或主机控制台权限。read/control Token 不得相同，官网也不得接收这四个环境变量的值。
 
-若 fresh-PVE bootstrap 时先按默认值创建了无 ACL 的 control Token，完成资源审查后使用显式 ACL-only 模式补授权；它只验证既有 dedicated role/user/token 并同时给 backing user 与 privsep token 增加所列 scope，不创建、读取或重写 secret：
+若早期版本已经创建无 ACL 的 control Token，自动 prepare 会使用 ACL-only global 模式补齐；该模式只验证既有 dedicated role/user/token 并同时给 backing user 与 privsep token 增加固定 role，不创建、读取或重写 secret。人工缩小 scope 的示例为：
 
 ```bash
 sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
@@ -102,7 +102,7 @@ sudo /usr/local/lib/ppflight-agent/create-pve-tokens.sh \
   --control-scope /vms/101
 ```
 
-ACL-only 禁止 `/` 和 `--control-global-acl`，也不能与 `--write-env` 混用。它不代替 assignment/action/approval gate；后续缩小或撤销 ACL 仍须作为独立、经审计的 PVE 管理操作完成。
+ACL-only 可以显式使用 `--control-global-acl`，但不能与 `--write-env` 混用。它不代替 Ed25519 command 签名、binding/device/epoch、assignment/action/approval、资源锁和 monitoring audit gate；后续缩小或撤销 ACL 仍须作为独立、经审计的 PVE 管理操作完成。
 
 ## 4. 本地配置
 
@@ -114,7 +114,7 @@ sudo ag-pve pve prepare \
   --ca-file /etc/ppflight-agent/pve-root-ca.pem
 ```
 
-`--tls-server-name` 必须是本机 PVE API 证书覆盖的严格 DNS 名称（不能是 IP、`localhost`、IPv6 或通配符）。它只用于 TLS SNI/证书校验；TCP 始终严格连接 `https://127.0.0.1:8006` 且 dial 为 `tcp4`。不传时会尝试本机 FQDN，无法通过真实 TLS/API 回验就拒绝写配置。`mode=production` 在这里表示数据来自真实 PVE，不会自动允许写操作；`control.productionExecution` 保持 false，control Token 默认也没有 ACL。
+`--tls-server-name` 必须是本机 PVE API 证书覆盖的严格 DNS 名称（不能是 IP、`localhost`、IPv6 或通配符）。它只用于 TLS SNI/证书校验；TCP 始终严格连接 `https://127.0.0.1:8006` 且 dial 为 `tcp4`。不传时会尝试本机 FQDN，无法通过真实 TLS/API 回验就拒绝写配置。prepare 会自动补齐并回读 dedicated control ACL，同时把旧配置中明确禁用的 node/smart exporter 迁移到启用的固定 loopback URL。`productionExecution` 只有在官网签名命令和独立 monitoring telemetry/audit 两个绑定均稳定且 device identity 一致时才自动打开；缺少任一域时保持 false。
 
 绑定事务与上述本机 prepare 不同：首次网络请求前，CLI 持久化仅含 `requestId` 和请求指纹的 pending 状态，并以它阻止服务在不确定状态启动。一旦官网或监控站已经签发新凭据，Agent **不会**把旧凭据、旧配置或旧 assignment 写回去，因为服务端可能已撤销旧凭据；本地写入、重启或加载回验失败时保持服务停止和 fail-closed marker。操作者必须用**同一枚绑定码**重试同一绑定请求，Agent 会复用 requestId 并由服务端返回原签发响应，完成本地恢复。绑定码原文始终不落盘。
 
@@ -181,7 +181,7 @@ sudo ag-pve website show
 
 服务启动后可运行第 7 节的 `website status`；它同时汇总脱敏本地 binding、Agent `/status` 和固定同源 `/internal/v1/agents/status`。远端 GET 只使用 Commands HMAC 的 `website:status.read`，还必须回钉本机 binding/device/agent/epoch 和数字 assignment revision。外部 website status 服务未部署时会安全返回不可用并以非零码退出，不表示本地绑定被删除。
 
-官网 bind/replace 不得修改独立监控绑定；绑定前共享的本机 readiness 流程可以创建隔离 PVE Token、切换真实只读 source/mode 并重启回验，但不会授予 control ACL 或打开 `productionExecution`。官网绑定本身只修改官网 identity、端点、凭据、initial assignment 与授权，写入后再次重启并确认新 website binding 已加载、采集/上传/任务轮询 worker 已启动。
+官网 bind/replace 不得修改独立监控绑定；绑定前共享的本机 readiness 流程会创建隔离 PVE Token、补齐并回读固定 control ACL、启用 exporter、切换真实 source/mode 并重启回验。官网绑定本身只修改官网 identity、端点、凭据、initial assignment 与授权，写入后再次重启并确认新 website binding 已加载、采集/上传/任务轮询 worker 已启动。若 monitoring 域已经稳定绑定且 device identity 匹配，本次事务同时自动启用 `productionExecution`；否则等待 monitoring 绑定完成时自动启用。
 
 官网绑定完成后，服务端以可信连接元数据观察并冻结 `agentObservedIPv4/32`，作用域绑定到 `bindingId/deviceId/agentRef`；来源 IP 命中不能替代 TLS、HMAC、Ed25519、epoch、assignment 或时间窗校验。出口地址变化不能静默自动学习，必须显式 rebind/轮换。
 

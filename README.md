@@ -18,7 +18,7 @@ PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网�
 curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scripts/quick-install.sh | bash
 ```
 
-`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离 PVE Token，安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集。随后切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。它不会授予 control ACL、打开 `productionExecution` 或绑定官网/监控站；发布版也不含 simulator 采集器。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
+`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离的 read/control PVE Token，为专用 control role 在 `/` 授予固定的 VPS 管理权限（不含用户/RBAC、主机电源或主机控制台权限），安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，并把遗留配置中的 exporter 禁用状态迁移为固定 `127.0.0.1:9100/9633` 采集。随后校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集，切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备、权限或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。安装不会代替官网/监控的一次性绑定；官网签名命令通道与独立监控 telemetry/audit 两个绑定都稳定后，`productionExecution` 自动启用，无需再运行 ACL 或配置命令。发布版不含 simulator 采集器；后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
 一键安装优先复用 PVE 已有的 `/usr/sbin/smartctl`。只有它确实缺失时，安装器才会使用与 PVE 8/9 对应的 Debian 官方 HTTPS 固定源，并通过独立 `sources.list`、IPv4 和 Debian archive 签名安装 `smartmontools`；不会读取、修改或更新操作者配置的 Proxmox Enterprise/Ceph 软件源。
 
@@ -46,7 +46,7 @@ sudo ag-pve bind \
   --endpoint https://www.example/internal/v1/agents/bind
 ```
 
-包内底层安装器落盘的未配置样例仍是 `mode=production`、`pve.source=disabled`，避免在校验前启动；一键脚本会紧接着自动完成真实 PVE 准备、启动和开机启用。运行时只有 `mode=production` 加 `pve.source=api` 可采集；遗留配置中的 `mode=test` 或 `pve.source=simulator` 在升级时自动转为 `production+disabled`，随后由同一自动准备流程恢复真实采集，绑定无需重做。若本机证书 DNS 无法自动确定，一键安装会明确失败而不会静默降级；可在修正主机 FQDN/证书后重试。CA 只接受安装器维护的 `/etc/ppflight-agent/pve-root-ca.pem`。该流程不会自动授予 control ACL，也不会把 `control.productionExecution` 从 false 打开；真实监控与生产写权限是两个独立安全门槛。
+包内底层安装器落盘的未配置样例仍是 `mode=production`、`pve.source=disabled`，避免在校验前启动；一键脚本会紧接着自动完成真实 PVE 准备、exporter 配置迁移、专用 control ACL、启动和开机启用。运行时只有 `mode=production` 加 `pve.source=api` 可采集；遗留配置中的 `mode=test` 或 `pve.source=simulator` 在升级时自动转为 `production+disabled`，随后由同一自动准备流程恢复真实采集，绑定无需重做。若本机证书 DNS 无法自动确定，一键安装会明确失败而不会静默降级；可在修正主机 FQDN/证书后重试。CA 只接受安装器维护的 `/etc/ppflight-agent/pve-root-ca.pem`。专用 control role 虽在 `/` 生效，但动作仍须同时通过官网 Ed25519 签名、binding/device/epoch、assignment revision、固定 action schema/allowlist、审批与资源锁；独立 monitoring audit 未绑定时 `productionExecution` 保持 false，完成双绑定后自动打开。
 
 也可用 `--code-file FILE` 读取仅 owner 可读、非符号链接的私密文件；CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项。Agent 在发送前持久化 UUID `requestId` 与 canonical 请求指纹以便安全重试，绑定码参与 hash 但原文不落盘。绑定成功后，官网必须返回 `bindingId`、匹配的 `deviceId`、身份、同源 HTTPS 端点、分用途 HMAC 凭据、Ed25519 命令验签公钥、初始 assignment、`networkPolicy` 和 `credentialEpoch`，并保存到 `<stateDirectory>/bindings/binding-state.json`；稳定 device ID 和 pending 幂等状态也在该私有子目录，PVE Token 永不上传官网。
 

@@ -28,9 +28,11 @@ usage() {
 Usage: sudo scripts/create-pve-tokens.sh [options]
 
 Creates separate privilege-separated PVE API tokens for read-only collection
-and control. The control token receives no ACL by default. Its backing user
-and token get PPFlightAgentControl only with a reviewed --control-scope or the
-explicitly dangerous --control-global-acl.
+and control. Its backing user and token get the dedicated PPFlightAgentControl
+role only at explicitly requested scopes. The one-command Agent installer uses
+--control-global-acl so website-assigned VPS operations work without a second
+manual PVE RBAC step; the role still excludes user/RBAC and host power/console
+administration.
 
 Options:
   --write-env [FILE]       Atomically save new IDs/secrets to FILE (default:
@@ -41,10 +43,9 @@ Options:
   --control-pool NAME      Shorthand for --control-scope /pool/NAME.
   --acl-only               Do not create credentials or write secrets. Require
                            the existing dedicated control role, user and token,
-                           then add only reviewed --control-scope/--control-pool
-                           ACLs. Global / ACL is forbidden in this mode.
-  --control-global-acl     DANGEROUS: grant the control role at /; only for an
-                           isolated test cluster. Incompatible with --acl-only.
+                           then add the requested control ACLs.
+  --control-global-acl     Grant the dedicated VPS-control role at /. This does
+                           not grant user/RBAC or host power/console privileges.
   --dry-run                Show intended work without invoking pveum.
   -h, --help               Show this help.
 
@@ -91,9 +92,8 @@ done
 [[ $CONTROL_GLOBAL_ACL -eq 0 || ${#CONTROL_SCOPES[@]} -eq 0 ]] || \
   die 'use either --control-global-acl or --control-scope options, not both'
 if [[ $ACL_ONLY -eq 1 ]]; then
-  [[ $CONTROL_GLOBAL_ACL -eq 0 ]] || die '--acl-only never grants /; use reviewed --control-scope or --control-pool paths'
   [[ -z $ENV_FILE ]] || die '--acl-only does not create or recover secrets and cannot use --write-env'
-  (( ${#CONTROL_SCOPES[@]} > 0 )) || die '--acl-only requires at least one --control-scope or --control-pool'
+  [[ $CONTROL_GLOBAL_ACL -eq 1 || ${#CONTROL_SCOPES[@]} -gt 0 ]] || die '--acl-only requires --control-global-acl, --control-scope or --control-pool'
 fi
 
 # Avoid repeating identical pveum ACL mutations while preserving CLI order.
@@ -111,11 +111,12 @@ fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $ACL_ONLY -eq 1 ]]; then
-    printf '%s\n' 'dry-run: would verify the existing dedicated control role/user/token and add only reviewed ACLs.'
+    printf '%s\n' 'dry-run: would verify the existing dedicated control role/user/token and add the requested ACLs.'
+    [[ $CONTROL_GLOBAL_ACL -eq 1 ]] && printf '%s\n' 'dry-run: would grant the dedicated VPS-control role at /.'
   else
     printf '%s\n' 'dry-run: would preflight the environment target, both token IDs, roles and users, then create both tokens with compensating rollback for resources created by this run.'
     [[ -n $ENV_FILE ]] && printf 'dry-run: would atomically write root-only environment file: %s\n' "$ENV_FILE"
-    [[ $CONTROL_GLOBAL_ACL -eq 1 ]] && printf '%s\n' 'dry-run: would grant the control role at / (DANGEROUS).'
+    [[ $CONTROL_GLOBAL_ACL -eq 1 ]] && printf '%s\n' 'dry-run: would grant the dedicated VPS-control role at /.'
   fi
   for scope in "${CONTROL_SCOPES[@]}"; do printf 'dry-run: would grant control role at %s\n' "$scope"; done
   exit 0
@@ -680,6 +681,9 @@ if [[ $ACL_ONLY -eq 1 ]]; then
   user_exists "$CONTROL_USER" || die "--acl-only requires existing dedicated PVE user $CONTROL_USER"
   token_exists "$CONTROL_USER" "$CONTROL_TOKEN" || die "--acl-only requires existing dedicated token $CONTROL_USER!$CONTROL_TOKEN"
   load_acl_snapshot
+  if [[ $CONTROL_GLOBAL_ACL -eq 1 ]]; then
+    CONTROL_SCOPES=(/)
+  fi
   for scope in "${CONTROL_SCOPES[@]}"; do
     apply_acl "$scope" user "$CONTROL_USER" "$CONTROL_ROLE"
     apply_acl "$scope" token "$CONTROL_USER!$CONTROL_TOKEN" "$CONTROL_ROLE"
@@ -736,7 +740,7 @@ apply_acl / user "$READ_USER" "$READ_ROLE"
 apply_acl / token "$READ_USER!$READ_TOKEN" "$READ_ROLE"
 
 if [[ $CONTROL_GLOBAL_ACL -eq 1 ]]; then
-  printf '%s\n' 'WARNING: granting control identity at / (isolated test clusters only).'
+  printf '%s\n' 'Granting the dedicated VPS-control role at /; user/RBAC and host power/console administration remains excluded.'
   CONTROL_SCOPES=(/)
 fi
 for scope in "${CONTROL_SCOPES[@]}"; do

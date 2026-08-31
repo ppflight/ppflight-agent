@@ -47,7 +47,11 @@ func prepareProbe(controlPermissions bool) func(context.Context, pve.Config, boo
 			if cfg.TokenID != "ppflight-control@pve!executor" || cfg.TokenSecret != "control-secret-0123456789" {
 				return rawCredentialProbe{}, io.ErrUnexpectedEOF
 			}
-			result.permissions.Paths["/pool/ppflight"] = map[string]int{"VM.PowerMgmt": 1}
+			root := make(map[string]int, len(requiredPVEControlPrivileges))
+			for _, privilege := range requiredPVEControlPrivileges {
+				root[privilege] = 1
+			}
+			result.permissions.Paths["/"] = root
 		}
 		return result, nil
 	}
@@ -67,7 +71,7 @@ func TestPVEPrepareProbesThenOnlyEnablesReadAPISource(t *testing.T) {
 		in: strings.NewReader(""), out: &output, errOut: &stderr, version: "test",
 		effectiveUID:       func() int { return 0 },
 		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:           prepareProbe(false),
+		pveProbe:           prepareProbe(true),
 		pveNodeName:        func() (string, error) { return "pve01", nil },
 		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight:    successfulPVETLSPreflight,
@@ -88,18 +92,63 @@ func TestPVEPrepareProbesThenOnlyEnablesReadAPISource(t *testing.T) {
 	if cfg.PVE.TokenIDEnv != config.PVEReadTokenIDEnv || cfg.Control.PVETokenIDEnv != config.PVEControlTokenIDEnv {
 		t.Fatalf("unexpected environment names: %#v %#v", cfg.PVE, cfg.Control)
 	}
+	if !cfg.Exporters.Node.Enabled || cfg.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" ||
+		!cfg.Exporters.SMART.Enabled || cfg.Exporters.SMART.URL != "http://127.0.0.1:9633/metrics" {
+		t.Fatalf("real PVE preparation did not enable fixed loopback exporters: %#v", cfg.Exporters)
+	}
 	combined := output.String() + stderr.String()
 	for _, secret := range []string{"read-secret-0123456789", "control-secret-0123456789"} {
 		if strings.Contains(combined, secret) {
 			t.Fatalf("secret leaked: %s", combined)
 		}
 	}
-	if !strings.Contains(output.String(), "真实监控已启用") || !strings.Contains(output.String(), "productionExecution 保持 false") && cfg.Control.ProductionExecution {
+	if !strings.Contains(output.String(), "完成官网和监控双绑定后将自动启用") {
 		t.Fatalf("safe control state not reported: %s", output.String())
 	}
 	backups, _ := filepath.Glob(filename + ".bak.*")
 	if len(backups) != 1 {
 		t.Fatalf("backup count=%d", len(backups))
+	}
+}
+
+func TestPVEPrepareMigratesExplicitlyDisabledLegacyExporters(t *testing.T) {
+	filename := writeTestConfig(t)
+	cfg, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Exporters.Node.Enabled = false
+	cfg.Exporters.Node.URL = "http://127.0.0.1:19100/metrics"
+	cfg.Exporters.SMART.Enabled = false
+	cfg.Exporters.SMART.URL = "http://127.0.0.1:19633/metrics"
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, append(raw, '\n'), 0o640); err != nil {
+		t.Fatal(err)
+	}
+
+	instance := &cli{
+		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
+		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe:           prepareProbe(true),
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
+	}
+	if code := instance.pve(filename, []string{"prepare", "--local-only", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code != 0 {
+		t.Fatalf("legacy exporter migration failed: code=%d", code)
+	}
+	prepared, err := config.LoadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prepared.Exporters.Node.Enabled || prepared.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" ||
+		!prepared.Exporters.SMART.Enabled || prepared.Exporters.SMART.URL != "http://127.0.0.1:9633/metrics" {
+		t.Fatalf("legacy exporter configuration was preserved instead of migrated: %#v", prepared.Exporters)
 	}
 }
 
@@ -147,7 +196,7 @@ func TestPVEPrepareBootstrapsMissingCredentialsBeforeRealProbe(t *testing.T) {
 			return localPVEEnvironmentForTest(), nil
 		},
 		pveBootstrap:       func(context.Context) error { bootstrapped = true; return nil },
-		pveProbe:           prepareProbe(false),
+		pveProbe:           prepareProbe(true),
 		pveNodeName:        func() (string, error) { return "pve01", nil },
 		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight:    successfulPVETLSPreflight,
@@ -156,6 +205,69 @@ func TestPVEPrepareBootstrapsMissingCredentialsBeforeRealProbe(t *testing.T) {
 	}
 	if code := instance.pve(filename, []string{"prepare", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code != 0 || !bootstrapped {
 		t.Fatalf("code=%d bootstrapped=%v stderr=%s", code, bootstrapped, stderr.String())
+	}
+}
+
+func TestPVEPrepareAutomaticallyGrantsAndVerifiesDedicatedControlACL(t *testing.T) {
+	filename := writeTestConfig(t)
+	aclReady := false
+	aclCalls := 0
+	probe := prepareProbe(true)
+	instance := &cli{
+		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
+		pveEnvironment: func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe: func(ctx context.Context, cfg pve.Config, includeVersion bool, localNode string) (rawCredentialProbe, error) {
+			if !includeVersion && !aclReady {
+				return rawCredentialProbe{permissions: pve.Permissions{Paths: map[string]map[string]int{}}}, nil
+			}
+			return probe(ctx, cfg, includeVersion, localNode)
+		},
+		pveControlACL: func(context.Context) error {
+			aclCalls++
+			aclReady = true
+			return nil
+		},
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
+	}
+	if code := instance.pve(filename, []string{"prepare", "--local-only", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code != 0 {
+		t.Fatalf("automatic control ACL preparation failed: code=%d", code)
+	}
+	if aclCalls != 1 {
+		t.Fatalf("control ACL helper calls=%d, want 1", aclCalls)
+	}
+}
+
+func TestPVEPrepareFailsClosedWhenDedicatedControlACLCannotBeGranted(t *testing.T) {
+	filename := writeTestConfig(t)
+	before, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readProbe := prepareProbe(false)
+	instance := &cli{
+		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
+		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
+		pveProbe:           readProbe,
+		pveControlACL:      func(context.Context) error { return errors.New("PVE ACL denied") },
+		pveNodeName:        func() (string, error) { return "pve01", nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
+		pveTLSPreflight:    successfulPVETLSPreflight,
+		activatePVE:        func(context.Context, config.Config) error { return nil },
+		managedWritePolicy: allowManagedWriteForTest,
+	}
+	if code := instance.pve(filename, []string{"prepare", "--local-only", "--tls-server-name", "pve01.example.test", "--ca-file", managedPVECAFile}); code == 0 {
+		t.Fatal("failed control ACL grant reported ready")
+	}
+	after, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("failed control ACL grant mutated configuration")
 	}
 }
 
@@ -219,7 +331,7 @@ func TestPVEPrepareActivationFailureRestoresDisabledConfig(t *testing.T) {
 	instance := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
 		pveEnvironment:  func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:        prepareProbe(false),
+		pveProbe:        prepareProbe(true),
 		pveNodeName:     func() (string, error) { return "pve01", nil },
 		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight: successfulPVETLSPreflight,
@@ -255,7 +367,7 @@ func TestPVEPrepareDoesNotRevertRealCollectionAfterLocalReadiness(t *testing.T) 
 	instance := &cli{
 		out: io.Discard, errOut: &stderr, effectiveUID: func() int { return 0 },
 		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:           prepareProbe(false),
+		pveProbe:           prepareProbe(true),
 		pveNodeName:        func() (string, error) { return "pve01", nil },
 		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight:    successfulPVETLSPreflight,

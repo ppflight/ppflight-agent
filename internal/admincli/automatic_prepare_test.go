@@ -22,7 +22,7 @@ func TestPVEPrepareLocalOnlyAcceptsFreshRealPVEWithoutSimulator(t *testing.T) {
 	instance := &cli{
 		out: &output, errOut: &stderr, effectiveUID: func() int { return 0 },
 		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:           prepareProbe(false),
+		pveProbe:           prepareProbe(true),
 		pveNodeName:        func() (string, error) { return "pve01", nil },
 		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight:    successfulPVETLSPreflight,
@@ -70,7 +70,7 @@ func TestPVEPrepareLocalOnlyDoesNotWaitForBoundRemoteDelivery(t *testing.T) {
 	}
 }
 
-func TestPVEPrepareLocalOnlyPreservesExistingBindingsOnUpgrade(t *testing.T) {
+func TestPVEPrepareLocalOnlyPreservesBindingsAndArmsReadyControlOnUpgrade(t *testing.T) {
 	filename := prepareBindConfig(t)
 	before, website, monitoring := seedDualBindings(t, filename)
 	before.Mode = "production"
@@ -93,10 +93,6 @@ func TestPVEPrepareLocalOnlyPreservesExistingBindingsOnUpgrade(t *testing.T) {
 	if err := os.WriteFile(filename, append(raw, '\n'), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	configBefore, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatal(err)
-	}
 	websiteBefore, err := os.ReadFile(bindstate.Path(before.Runtime.StateDirectory))
 	if err != nil {
 		t.Fatal(err)
@@ -109,7 +105,7 @@ func TestPVEPrepareLocalOnlyPreservesExistingBindingsOnUpgrade(t *testing.T) {
 	instance := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
 		pveEnvironment:     func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:           prepareProbe(false),
+		pveProbe:           prepareProbe(true),
 		pveNodeName:        func() (string, error) { return "pve01", nil },
 		pveVersion:         func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight:    successfulPVETLSPreflight,
@@ -120,12 +116,15 @@ func TestPVEPrepareLocalOnlyPreservesExistingBindingsOnUpgrade(t *testing.T) {
 		t.Fatalf("upgrade local-only prepare code=%d", code)
 	}
 
-	configAfter, err := os.ReadFile(filename)
+	configAfter, err := config.LoadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(configBefore, configAfter) {
-		t.Fatal("local-only upgrade rewrote an already-real PVE configuration")
+	if !configAfter.Control.ProductionExecution {
+		t.Fatal("dual-bound, locally verified upgrade did not automatically arm VPS control")
+	}
+	if !configAfter.Exporters.Node.Enabled || !configAfter.Exporters.SMART.Enabled {
+		t.Fatalf("upgrade did not migrate exporter collection: %#v", configAfter.Exporters)
 	}
 	websiteAfter, err := os.ReadFile(bindstate.Path(before.Runtime.StateDirectory))
 	if err != nil || !bytes.Equal(websiteBefore, websiteAfter) {
@@ -145,6 +144,32 @@ func TestPVEPrepareLocalOnlyPreservesExistingBindingsOnUpgrade(t *testing.T) {
 	}
 }
 
+func TestAutoEnableProductionExecutionRequiresMatchingDualBindings(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, website, _ := seedDualBindings(t, filename)
+	cfg.Mode = "production"
+	cfg.PVE.Source = "api"
+	cfg.PVE.Endpoint = config.LocalPVEEndpoint
+	cfg.Control.PVETokenIDEnv = config.PVEControlTokenIDEnv
+	cfg.Control.PVETokenSecretEnv = config.PVEControlTokenSecretEnv
+
+	if !autoEnableProductionExecution(&cfg, "", "") || !cfg.Control.ProductionExecution {
+		t.Fatal("stable matching website and monitoring bindings did not arm control")
+	}
+	if autoEnableProductionExecution(&cfg, "monitoring", "00000000-0000-4000-8000-000000000001") || cfg.Control.ProductionExecution {
+		t.Fatal("mismatched replacement device identity armed control")
+	}
+	if !autoEnableProductionExecution(&cfg, "monitoring", website.DeviceID) || !cfg.Control.ProductionExecution {
+		t.Fatal("matching monitoring completion did not arm control")
+	}
+	if err := os.Remove(bindstate.MonitoringPath(cfg.Runtime.StateDirectory)); err != nil {
+		t.Fatal(err)
+	}
+	if autoEnableProductionExecution(&cfg, "", "") || cfg.Control.ProductionExecution {
+		t.Fatal("single-domain state armed control")
+	}
+}
+
 func TestPVEPrepareLocalOnlyFailureRestoresDisabledConfigAndStopsService(t *testing.T) {
 	filename := writeTestConfig(t)
 	before, err := os.ReadFile(filename)
@@ -155,7 +180,7 @@ func TestPVEPrepareLocalOnlyFailureRestoresDisabledConfigAndStopsService(t *test
 	instance := &cli{
 		out: io.Discard, errOut: io.Discard, effectiveUID: func() int { return 0 },
 		pveEnvironment:  func(string) (map[string]string, error) { return localPVEEnvironmentForTest(), nil },
-		pveProbe:        prepareProbe(false),
+		pveProbe:        prepareProbe(true),
 		pveNodeName:     func() (string, error) { return "pve01", nil },
 		pveVersion:      func(context.Context) (string, error) { return "9.0.3", nil },
 		pveTLSPreflight: successfulPVETLSPreflight,

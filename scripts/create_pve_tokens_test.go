@@ -222,6 +222,36 @@ func TestPVEBootstrapFreshNotFoundCreatesBothTokensWithoutLeakingSecrets(t *test
 	}
 }
 
+func TestPVEBootstrapFreshGlobalControlCreatesExactDedicatedACLs(t *testing.T) {
+	fixture := newBootstrapFixture(t)
+	output, err := fixture.run(t, nil, "--write-env", fixture.environment, "--control-global-acl")
+	if err != nil {
+		t.Fatalf("fresh global bootstrap failed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
+	}
+	if strings.Contains(output, "SECRET-") {
+		t.Fatalf("bootstrap leaked one-time token secret: %q", output)
+	}
+	for _, required := range []string{
+		"acl\tmodify\t/\t--users\tppflight-agent@pve\t--roles\tPPFlightAgentAudit",
+		"acl\tmodify\t/\t--tokens\tppflight-agent@pve!collector\t--roles\tPPFlightAgentAudit",
+		"acl\tmodify\t/\t--users\tppflight-control@pve\t--roles\tPPFlightAgentControl",
+		"acl\tmodify\t/\t--tokens\tppflight-control@pve!executor\t--roles\tPPFlightAgentControl",
+	} {
+		if !strings.Contains(fixture.logText(t), required) {
+			t.Fatalf("global bootstrap log is missing %q:\n%s", required, fixture.logText(t))
+		}
+	}
+	raw, err := os.ReadFile(fixture.environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"PVE_READ_TOKEN_ID=", "PVE_READ_TOKEN_SECRET=", "PVE_CONTROL_TOKEN_ID=", "PVE_CONTROL_TOKEN_SECRET="} {
+		if !strings.Contains(string(raw), required) {
+			t.Fatalf("private environment is missing %q", required)
+		}
+	}
+}
+
 func TestPVEBootstrapAllowsRootOwnedParentWithNonRootGroup(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("changing a directory group requires root")
@@ -414,6 +444,34 @@ func TestPVEBootstrapACLOnlyUsesExistingDedicatedIdentityAndNeverRoot(t *testing
 	}
 	if _, err := os.Stat(fixture.environment); !os.IsNotExist(err) {
 		t.Fatalf("ACL-only mode must not write an environment file, stat error=%v", err)
+	}
+}
+
+func TestPVEBootstrapACLOnlyCanGrantDedicatedGlobalControlWithoutSecrets(t *testing.T) {
+	fixture := newBootstrapFixture(t)
+	fixture.putRole(t, "PPFlightAgentControl", controlPrivileges)
+	fixture.putUser(t, "ppflight-control@pve")
+	fixture.putToken(t, "ppflight-control@pve", "executor")
+	output, err := fixture.run(t, nil, "--acl-only", "--control-global-acl")
+	if err != nil {
+		t.Fatalf("global ACL-only update failed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
+	}
+	log := fixture.logText(t)
+	for _, forbidden := range []string{"role\tadd", "user\tadd", "token\tadd", "SECRET-"} {
+		if strings.Contains(log+output, forbidden) {
+			t.Fatalf("global ACL-only mode performed forbidden operation %q:\n%s", forbidden, log)
+		}
+	}
+	for _, required := range []string{
+		"acl\tmodify\t/\t--users\tppflight-control@pve",
+		"acl\tmodify\t/\t--tokens\tppflight-control@pve!executor",
+	} {
+		if !strings.Contains(log, required) {
+			t.Fatalf("global ACL-only log is missing %q:\n%s", required, log)
+		}
+	}
+	if _, err := os.Stat(fixture.environment); !os.IsNotExist(err) {
+		t.Fatalf("global ACL-only mode must not write an environment file, stat error=%v", err)
 	}
 }
 
