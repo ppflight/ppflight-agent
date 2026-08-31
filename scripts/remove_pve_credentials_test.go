@@ -678,7 +678,8 @@ role_is_referenced() {
 }
 
 cleanup_role() {
-  local role=$1 legacy=$2 current=$3 file="$MOCK_REMOVE_STATE/roles/$role" privileges
+  local role=$1 legacy=$2 current=$3 privileges
+  local file="$MOCK_REMOVE_STATE/roles/$role"
   if [[ ! -f $file ]]; then
     printf 'absent\t%s\n' "$role"
     return
