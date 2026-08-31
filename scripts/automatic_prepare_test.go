@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.0-rc.19"
+		repositoryVersion = "0.1.0-rc.20"
 		// quick-install is advanced only after the immutable GitHub assets for
 		// the repository version exist and their complete archive digests have
 		// been verified. During the release commit it therefore still pins the
