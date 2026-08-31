@@ -32,7 +32,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 			fmt.Fprint(w, `{"data":{"enable":1}}`)
 		case "/api2/json/cluster/firewall/rules", "/api2/json/nodes/pve1/firewall/rules", "/api2/json/nodes/pve1/qemu/101/firewall/rules":
 			fmt.Fprint(w, `{"data":[{"pos":0,"type":"in","action":"ACCEPT"}]}`)
-		case "/api2/json/cluster/firewall/ipset", "/api2/json/nodes/pve1/firewall/ipset", "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
+		case "/api2/json/cluster/firewall/ipset", "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
 			fmt.Fprint(w, `{"data":[{"name":"trusted"}]}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -67,8 +67,27 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(seen) != 14 {
-		t.Fatalf("saw %d fixed paths, want 14", len(seen))
+	if seen["/api2/json/nodes/pve1/firewall/ipset"] {
+		t.Fatal("requested the non-existent node firewall IPSet collection")
+	}
+	if len(seen) != 13 {
+		t.Fatalf("saw %d fixed paths, want 13", len(seen))
+	}
+}
+
+func TestNodeFirewallIPSetsAreNotAnAPICollection(t *testing.T) {
+	requested := false
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requested = true
+		http.Error(w, "node firewall has no ipset child", http.StatusNotFound)
+	}))
+	defer server.Close()
+	got, err := c.FirewallIPSets(context.Background(), FirewallRef{Node: "pve1"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("node firewall IP sets = %#v, %v", got, err)
+	}
+	if requested {
+		t.Fatal("node firewall IPSet lookup reached the PVE API")
 	}
 }
 

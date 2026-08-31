@@ -75,7 +75,7 @@ func TestDiscoverFirewallCoversClusterNodeAndGuest(t *testing.T) {
 			fmt.Fprint(w, `{"data":{"enable":1}}`)
 		case "/api2/json/cluster/firewall/rules", "/api2/json/nodes/pve1/firewall/rules", "/api2/json/nodes/pve1/qemu/101/firewall/rules":
 			fmt.Fprint(w, `{"data":[{"pos":0,"type":"in","action":"ACCEPT"}]}`)
-		case "/api2/json/cluster/firewall/ipset", "/api2/json/nodes/pve1/firewall/ipset", "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
+		case "/api2/json/cluster/firewall/ipset", "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
 			fmt.Fprint(w, `{"data":[{"name":"office"}]}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -88,7 +88,11 @@ func TestDiscoverFirewallCoversClusterNodeAndGuest(t *testing.T) {
 		t.Fatalf("firewall result %#v", result)
 	}
 	for _, scope := range result.Data.Firewall {
-		if scope.Options == nil || len(scope.Rules) != 1 || len(scope.IPSets) != 1 {
+		wantIPSets := 1
+		if scope.Scope == "node" {
+			wantIPSets = 0
+		}
+		if scope.Options == nil || len(scope.Rules) != 1 || len(scope.IPSets) != wantIPSets {
 			t.Fatalf("incomplete scope %#v", scope)
 		}
 	}

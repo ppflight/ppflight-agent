@@ -189,6 +189,13 @@ func (c *Client) FirewallRules(ctx context.Context, ref FirewallRef) ([]Firewall
 }
 
 func (c *Client) FirewallIPSets(ctx context.Context, ref FirewallRef) ([]FirewallIPSet, error) {
+	// PVE exposes IPSet collections for the cluster and for QEMU/LXC guests,
+	// but not below /nodes/{node}/firewall. Host firewall rules reference the
+	// cluster IPSet collection. Treat the node-local collection as empty rather
+	// than requesting the API directory's non-existent /ipset child.
+	if ref.Node != "" && ref.Kind == "" && ref.VMID == 0 {
+		return []FirewallIPSet{}, nil
+	}
 	base, err := firewallBase(ref)
 	if err != nil {
 		return nil, err
