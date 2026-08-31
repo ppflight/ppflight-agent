@@ -201,8 +201,6 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 		{"users", removeControlUser},
 		{"tokens", removeReadUser + "!" + removeReadToken},
 		{"tokens", removeControlUser + "!" + removeControlToken},
-		{"roles", removeReadRole},
-		{"roles", removeControlRole},
 	} {
 		if fixture.hasState(t, state.kind, state.name) {
 			t.Fatalf("PPFlight state %s/%s remains after removal", state.kind, state.name)
@@ -215,6 +213,8 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 		{"users", "operator@pve"},
 		{"roles", "OperatorRole"},
 		{"roles", "ManuallyAssignedRole"},
+		{"roles", removeReadRole},
+		{"roles", removeControlRole},
 	} {
 		if !fixture.hasState(t, state.kind, state.name) {
 			t.Fatalf("unrelated PVE state %s/%s was removed", state.kind, state.name)
@@ -223,7 +223,7 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 	if got, want := fixture.aclText(t), "/vms/100\tuser\toperator@pve\tOperatorRole\n"; got != want {
 		t.Fatalf("unexpected ACL cleanup:\n got %q\nwant %q", got, want)
 	}
-	if !strings.Contains(output, "credentials have been revoked") {
+	if !strings.Contains(output, "credentials and owned ACLs have been revoked") {
 		t.Fatalf("missing successful credential-revocation confirmation: %s", output)
 	}
 
@@ -233,9 +233,10 @@ func TestRemovePVECredentialsFullyRevokesOnlyFixedPPFlightIdentity(t *testing.T)
 		"user\ttoken\tremove\t"+removeControlUser+"\t"+removeControlToken,
 		"user\tdelete\t"+removeReadUser,
 		"user\tdelete\t"+removeControlUser,
-		"role\tdelete\t"+removeReadRole,
-		"role\tdelete\t"+removeControlRole,
 	)
+	if strings.Contains(log, "role\t") {
+		t.Fatalf("credential removal must never inspect or mutate role definitions:\n%s", log)
+	}
 	assertNoOutOfBoundaryPVEUMCommands(t, log)
 }
 
@@ -263,7 +264,7 @@ func TestRemovePVECredentialsIsIdempotentAfterCompleteRemoval(t *testing.T) {
 	}
 }
 
-func TestRemovePVECredentialsSharedRoleWarnsAndIsRetainedWithoutBlockingCredentialRevocation(t *testing.T) {
+func TestRemovePVECredentialsRetainsRoleDefinitionsAndForeignACLs(t *testing.T) {
 	fixture := newRemoveCredentialsFixture(t)
 	fixture.seedCompletePPFlightState(t)
 	fixture.putUser(t, "auditor@pve")
@@ -271,16 +272,13 @@ func TestRemovePVECredentialsSharedRoleWarnsAndIsRetainedWithoutBlockingCredenti
 
 	output, err := fixture.run(t)
 	if err != nil {
-		t.Fatalf("shared-role removal must preserve the role but succeed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
-	}
-	if !strings.Contains(output, "warning: preserving PVE role "+removeReadRole) {
-		t.Fatalf("missing shared-role warning: %s", output)
+		t.Fatalf("role-safe credential removal failed: %v\n%s\nlog:\n%s", err, output, fixture.logText(t))
 	}
 	if !fixture.hasState(t, "roles", removeReadRole) {
 		t.Fatal("shared PPFlight role was force-deleted")
 	}
-	if fixture.hasState(t, "roles", removeControlRole) {
-		t.Fatal("unshared PPFlight control role was not deleted")
+	if !fixture.hasState(t, "roles", removeControlRole) {
+		t.Fatal("PPFlight control role definition was deleted")
 	}
 	for _, name := range []string{
 		removeReadUser,
@@ -300,8 +298,8 @@ func TestRemovePVECredentialsSharedRoleWarnsAndIsRetainedWithoutBlockingCredenti
 		t.Fatalf("shared role ACL was changed:\n got %q\nwant %q", got, want)
 	}
 	log := fixture.logText(t)
-	if strings.Contains(log, "role\tdelete\t"+removeReadRole) {
-		t.Fatalf("script attempted to delete shared role:\n%s", log)
+	if strings.Contains(log, "role\t") {
+		t.Fatalf("script inspected or mutated role definitions:\n%s", log)
 	}
 }
 
@@ -373,32 +371,6 @@ func TestRemovePVECredentialsReturnsNonzeroForExistingUserDeleteFailure(t *testi
 	assertRemovalOrder(t, log,
 		"user\ttoken\tremove\t"+removeControlUser+"\t"+removeControlToken,
 		"user\tdelete\t"+removeControlUser,
-	)
-}
-
-func TestRemovePVECredentialsReturnsNonzeroForExistingRoleDeleteFailureAfterCredentials(t *testing.T) {
-	fixture := newRemoveCredentialsFixture(t)
-	fixture.seedCompletePPFlightState(t)
-	output, err := fixture.run(t, "MOCK_REMOVE_FAIL=role-delete:"+removeControlRole)
-	if err == nil {
-		t.Fatalf("role deletion failure unexpectedly succeeded: %s", output)
-	}
-	for _, name := range []string{removeReadUser, removeControlUser} {
-		if fixture.hasState(t, "users", name) {
-			t.Fatalf("user %s remained after later role deletion failure", name)
-		}
-	}
-	if !fixture.hasState(t, "roles", removeControlRole) {
-		t.Fatal("failed role delete did not leave the role in place")
-	}
-	log := fixture.logText(t)
-	if !strings.Contains(log, "role\tdelete\t"+removeControlRole) {
-		t.Fatalf("missing failed role delete invocation:\n%s", log)
-	}
-	assertRemovalOrder(t, log,
-		"user\ttoken\tremove\t"+removeControlUser+"\t"+removeControlToken,
-		"user\tdelete\t"+removeControlUser,
-		"role\tdelete\t"+removeControlRole,
 	)
 }
 

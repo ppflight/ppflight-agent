@@ -94,3 +94,24 @@ func TestCompleteUninstallReleasesTransactionAfterHelperFailure(t *testing.T) {
 		t.Fatalf("complete uninstall could not retry after helper failure: code=%d attempts=%d", code, attempts)
 	}
 }
+
+func TestCompleteUninstallHoldsTransactionWithoutProcessTimeout(t *testing.T) {
+	filename := prepareBindConfig(t)
+	called := false
+	instance := &cli{
+		out:                io.Discard,
+		errOut:             io.Discard,
+		effectiveUID:       func() int { return 0 },
+		managedWritePolicy: allowManagedWriteForTest,
+		completeUninstall: func(ctx context.Context) error {
+			called = true
+			if _, hasDeadline := ctx.Deadline(); hasDeadline {
+				t.Fatal("complete uninstall context has a deadline that can orphan pveum children")
+			}
+			return nil
+		},
+	}
+	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || !called {
+		t.Fatalf("complete uninstall code=%d called=%t", code, called)
+	}
+}

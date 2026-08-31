@@ -2,8 +2,9 @@
 # Revoke the fixed, dedicated PVE API identities created for PPFlight.
 #
 # This helper deliberately has no target/path arguments.  It only ever acts on
-# PPFlight's two fixed users, their fixed tokens, and the two fixed roles.  It
-# never invokes VM, template, storage, backup, or pool operations.
+# PPFlight's two fixed users, their fixed tokens, and every ACL owned by those
+# identities.  It never invokes VM, template, storage, backup, pool, or role
+# mutation operations.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -13,17 +14,16 @@ readonly READ_USER='ppflight-agent@pve'
 readonly READ_TOKEN='collector'
 readonly CONTROL_USER='ppflight-control@pve'
 readonly CONTROL_TOKEN='executor'
-readonly READ_ROLE='PPFlightAgentAudit'
-readonly CONTROL_ROLE='PPFlightAgentControl'
 
 usage() {
   cat <<'EOF'
 Usage: sudo scripts/remove-pve-credentials.sh
 
-Revokes only PPFlight's fixed PVE API users and tokens, removes ACL bindings
-owned by those identities, and removes the PPFlight roles when they are no
-longer assigned elsewhere.  It never changes VMs, templates, storage, images,
-or backups.
+Revokes only PPFlight's fixed PVE API users and tokens and removes every ACL
+owned by those identities.  Role definitions are retained because checking
+whether another administrator is concurrently assigning one cannot be made
+atomic through separate pveum commands.  It never changes VMs, templates,
+storage, images, or backups.
 EOF
 }
 
@@ -114,21 +114,18 @@ identifier_exists() {
 # identity, irrespective of its assigned role.  Otherwise an unexpected ACL
 # could survive token removal and regain authority when the same fixed token
 # ID is created again.  ACLs held by any other subject are never deleted; they
-# are used only to decide whether a PPFlight-defined role is shared and must be
-# retained.  The strict path grammar also guarantees that the only value
+# are ignored.  The strict path grammar also guarantees that the only value
 # sourced from PVE JSON and reused as an argv is a canonical PVE ACL path.
 classify_acls() {
-  local source=$1 owned_plan=$2 foreign_roles=$3
-  python3 - "$source" "$owned_plan" "$foreign_roles" \
-    "$READ_USER" "$READ_TOKEN" "$CONTROL_USER" "$CONTROL_TOKEN" \
-    "$READ_ROLE" "$CONTROL_ROLE" <<'PY'
+  local source=$1 owned_plan=$2
+  python3 - "$source" "$owned_plan" \
+    "$READ_USER" "$READ_TOKEN" "$CONTROL_USER" "$CONTROL_TOKEN" <<'PY'
 import json
 import re
 import sys
 
-(source, owned_path, foreign_path, read_user, read_token, control_user,
- control_token, read_role, control_role) = sys.argv[1:]
-roles = {read_role, control_role}
+(source, owned_path, read_user, read_token, control_user,
+ control_token) = sys.argv[1:]
 users = {read_user, control_user}
 tokens = {read_user + '!' + read_token, control_user + '!' + control_token}
 path_pattern = re.compile(r'^/(?:[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_.:-]+)*)?$')
@@ -144,7 +141,6 @@ try:
         raise ValueError('expected a JSON array')
 
     owned = []
-    foreign = set()
     seen = set()
     for item in items:
         if not isinstance(item, dict):
@@ -167,8 +163,6 @@ try:
                     (kind == 'token' and identity in tokens))
         if is_owned:
             owned.append(key)
-        elif role in roles:
-            foreign.add(role)
 
     # Token ACLs are revoked before user ACLs.  This is not relied upon for
     # authorization, but makes the teardown sequence auditable and stable.
@@ -177,9 +171,6 @@ try:
     with open(owned_path, 'w', encoding='utf-8', newline='\n') as destination:
         for path, kind, identity, role in owned:
             destination.write('\t'.join((path, kind, identity, role)) + '\n')
-    with open(foreign_path, 'w', encoding='utf-8', newline='\n') as destination:
-        for role in sorted(foreign):
-            destination.write(role + '\n')
 except (OSError, ValueError, json.JSONDecodeError, TypeError):
     raise SystemExit(1)
 PY
@@ -213,7 +204,6 @@ READ_TOKENS_JSON="$TMPDIR_REMOVE/read-tokens.json"
 CONTROL_TOKENS_JSON="$TMPDIR_REMOVE/control-tokens.json"
 ACLS_JSON="$TMPDIR_REMOVE/acls.json"
 OWNED_ACLS_JSON_PLAN="$TMPDIR_REMOVE/owned-acls.plan"
-FOREIGN_ROLES_PLAN="$TMPDIR_REMOVE/foreign-roles.plan"
 
 require_list "$USERS_JSON" 'PVE users' user list
 READ_USER_EXISTS=0
@@ -234,10 +224,10 @@ if [[ $CONTROL_USER_EXISTS -eq 1 ]]; then
 fi
 
 require_list "$ACLS_JSON" 'PVE ACLs' acl list
-classify_acls "$ACLS_JSON" "$OWNED_ACLS_JSON_PLAN" "$FOREIGN_ROLES_PLAN" || \
+classify_acls "$ACLS_JSON" "$OWNED_ACLS_JSON_PLAN" || \
   die 'could not safely parse PVE ACL JSON'
 
-# Remove the explicit role bindings while their user/token subjects still
+# Remove every ACL while its user/token subject still
 # exist.  If any ACL deletion fails, stop before deleting either subject.  PVE
 # releases that require the token/user to exist cannot safely retry deletion
 # of an orphaned ACL after its subject has already been removed.
@@ -260,39 +250,14 @@ if [[ $CONTROL_USER_EXISTS -eq 1 ]]; then
   pveum user delete "$CONTROL_USER" || die "failed to remove PVE user $CONTROL_USER"
 fi
 
-# PVE deletes a user's ACLs as part of user deletion.  Re-list and validate
-# the ACL table before role deletion, both to prove that our owned role ACLs
-# are gone and to avoid deleting a role which another subject now uses.
+# Re-list and validate that no ACL owned by either fixed identity remains.
 POST_ACLS_JSON="$TMPDIR_REMOVE/acls-post.json"
 POST_OWNED_ACLS_PLAN="$TMPDIR_REMOVE/owned-acls-post.plan"
-POST_FOREIGN_ROLES_PLAN="$TMPDIR_REMOVE/foreign-roles-post.plan"
 require_list "$POST_ACLS_JSON" 'PVE ACLs after credential removal' acl list
-classify_acls "$POST_ACLS_JSON" "$POST_OWNED_ACLS_PLAN" "$POST_FOREIGN_ROLES_PLAN" || \
+classify_acls "$POST_ACLS_JSON" "$POST_OWNED_ACLS_PLAN" || \
   die 'could not safely parse PVE ACL JSON after credential removal'
 if [[ -s $POST_OWNED_ACLS_PLAN ]]; then
-  die 'PPFlight-owned role ACLs remain after credential removal; refusing role deletion'
+  die 'PPFlight-owned ACLs remain after credential removal'
 fi
 
-ROLES_JSON="$TMPDIR_REMOVE/roles.json"
-require_list "$ROLES_JSON" 'PVE roles' role list
-
-remove_role_if_unshared() {
-  local role=$1 exists=0
-  if identifier_exists "$ROLES_JSON" roleid "$role"; then
-    exists=1
-  fi
-  [[ $exists -eq 1 ]] || return 0
-  if grep -Fqx -- "$role" "$POST_FOREIGN_ROLES_PLAN"; then
-    printf 'warning: preserving PVE role %s because it is still assigned to a non-PPFlight subject\n' "$role" >&2
-    return 0
-  fi
-  pveum role delete "$role" || die "failed to remove PVE role $role"
-}
-
-# Roles are last.  A shared role contains no credential material and is safe
-# to retain for an exact-match reuse on a later install; credentials have
-# already been revoked successfully in that case.
-remove_role_if_unshared "$READ_ROLE"
-remove_role_if_unshared "$CONTROL_ROLE"
-
-printf '%s\n' 'PPFlight fixed PVE credentials have been revoked.'
+printf '%s\n' 'PPFlight fixed PVE credentials and owned ACLs have been revoked; role definitions were retained.'

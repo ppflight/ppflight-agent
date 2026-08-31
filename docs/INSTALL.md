@@ -359,7 +359,7 @@ Executor 的动作全集和网络/IPFilter 编排见 [Agent API v1](AGENT-API-V1
 
 不要删除 `/var/lib/ppflight-agent` 中的 queue、control journal、assignment refresh state，或 `/var/lib/ppflight-agent/bindings` 中的 binding state、device ID/pending state。它们用于幂等、UPID 恢复和凭据防回滚。卸载前先确认官网已经接收所有关键队列，并明确是否保留绑定状态。
 
-完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户及其 PPFlight ACL；未被其他主体引用的两个 PPFlight 专用角色也会删除，被其他主体引用的角色只告警保留。任何存在对象删除失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。它不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
+完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户以及这些身份拥有的全部 ACL。角色定义不含凭据，且无法用分离的 `pveum` 检查/删除命令原子判断是否正被另一管理员并发复用，因此始终保留供重装复用。任何 ACL、Token 或用户删除失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。它不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
 
 ## 11. 故障检查
 

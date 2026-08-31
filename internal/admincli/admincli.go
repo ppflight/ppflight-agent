@@ -252,13 +252,16 @@ func (c *cli) menuCompleteUninstallAt(reader *bufio.Reader, filename string) int
 		return 1
 	}
 	defer transaction.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	// Keep the exclusive management lock until the root helper and every
+	// pveum/systemd child it waits for have exited. A CommandContext timeout
+	// would kill only the shell process, potentially releasing this lock while
+	// an orphaned child was still mutating PVE state.
+	ctx := context.Background()
 	var uninstallErr error
 	if c.completeUninstall != nil {
 		uninstallErr = c.completeUninstall(ctx)
 	} else {
-		command := exec.CommandContext(ctx, "/usr/local/lib/ppflight-agent/uninstall.sh", "--remove-exporters", "--purge")
+		command := exec.Command("/usr/local/lib/ppflight-agent/uninstall.sh", "--remove-exporters", "--purge")
 		command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 		command.Stdout = c.out
 		command.Stderr = c.errOut
