@@ -211,11 +211,30 @@ if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
   verify_sha256 "$SMART_ARCHIVE" "$SMART_SHA256"
 fi
 
-if [[ $INSTALL_SMARTMONTOOLS -eq 1 ]]; then
-  command -v apt-get >/dev/null || die '--install-smartmontools currently requires apt-get (Debian-based PVE)'
-  DEBIAN_FRONTEND=noninteractive apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends smartmontools
+if [[ $INSTALL_SMARTMONTOOLS -eq 1 && ! -x /usr/sbin/smartctl ]]; then
+  command -v apt-get >/dev/null || die '--install-smartmontools requires apt-get when /usr/sbin/smartctl is absent'
+  case "$pve_version" in
+    8) suite='bookworm' ;;
+    9) suite='trixie' ;;
+  esac
+  smart_sources="$TMP_DIR/debian-smartmontools.list"
+  printf '%s\n' \
+    "deb https://deb.debian.org/debian $suite main" \
+    "deb https://deb.debian.org/debian $suite-updates main" \
+    "deb https://security.debian.org/debian-security $suite-security main" \
+    >"$smart_sources"
+  chmod 0600 "$smart_sources"
+  smart_apt_options=(
+    -o "Dir::Etc::sourcelist=$smart_sources"
+    -o 'Dir::Etc::sourceparts=-'
+    -o 'APT::Get::List-Cleanup=0'
+    -o 'Acquire::ForceIPv4=true'
+    -o 'Acquire::Retries=3'
+  )
+  DEBIAN_FRONTEND=noninteractive apt-get "${smart_apt_options[@]}" update
+  DEBIAN_FRONTEND=noninteractive apt-get "${smart_apt_options[@]}" install -y --no-install-recommends smartmontools
 fi
+[[ $INSTALL_SMARTMONTOOLS -eq 0 || -x /usr/sbin/smartctl ]] || die 'smartmontools installation did not provide /usr/sbin/smartctl'
 
 getent group ppflight-agent >/dev/null || groupadd --system ppflight-agent
 getent passwd ppflight-agent >/dev/null || useradd --system --gid ppflight-agent --home-dir "$STATE_DIR" --shell /usr/sbin/nologin ppflight-agent

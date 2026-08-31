@@ -4,6 +4,8 @@
 
 当前 `main` 一键安装会自动完成受控 Token bootstrap、固定版本及 SHA-256 的 `node_exporter`/`smartctl_exporter` 安装、真实网卡、磁盘 IO 与至少一块 SMART 设备的指标回验、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及全部相关 systemd unit 的开机启用；安装成功即表示本机真实 PVE、宿主机、网卡、磁盘 IO 与 SMART 读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
 
+`smartctl` 已存在时绝不调用 APT。缺失时只使用安装器临时生成的 Debian 官方 HTTPS 源：PVE 8 固定 `bookworm`，PVE 9 固定 `trixie`，强制 IPv4 并保留 Debian archive 签名验证；本机 `/etc/apt/sources.list*` 中的 Enterprise、Ceph 或第三方源不会被读取、更新或改写。
+
 ## 1. 前置条件
 
 - Debian 系 PVE 8.x 或 9.x，root 管理权限；

@@ -71,10 +71,25 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 	if strings.Contains(installInvocation, "--start") {
 		t.Fatal("quick installer must not start a disabled/unprepared Agent through install.sh")
 	}
-	for _, required := range []string{"--install-exporters", "--node-exporter-archive", "--node-exporter-sha256", "--smartctl-exporter-archive", "--smartctl-exporter-sha256", "--install-smartmontools"} {
+	for _, required := range []string{"--install-exporters", "--node-exporter-archive", "--node-exporter-sha256", "--smartctl-exporter-archive", "--smartctl-exporter-sha256"} {
 		if !strings.Contains(installInvocation, required) {
 			t.Fatalf("quick installer omitted exporter bootstrap option %q", required)
 		}
+	}
+	for _, required := range []string{
+		"https://deb.debian.org/debian",
+		"https://security.debian.org/debian-security",
+		"Dir::Etc::sourcelist=",
+		"Dir::Etc::sourceparts=-",
+		"Acquire::ForceIPv4=true",
+		`apt-get "${apt_options[@]}" update`,
+	} {
+		if !strings.Contains(quickInstall, required) {
+			t.Fatalf("quick installer is missing isolated official smartmontools source contract %q", required)
+		}
+	}
+	if strings.Contains(quickInstall, "DEBIAN_FRONTEND=noninteractive apt-get update") {
+		t.Fatal("quick installer must never update the operator's configured Proxmox repositories")
 	}
 	for _, metric := range []string{"node_network_receive_bytes_total", "node_network_transmit_bytes_total", "node_disk_read_bytes_total", "node_disk_written_bytes_total"} {
 		if !strings.Contains(compact, metric) {
@@ -218,10 +233,14 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	}
 	ag := filepath.Join(root, "ag-pve")
 	writeQuickInstallMock(t, ag, "#!/usr/bin/env bash\nprintf 'prepare:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nexit \"${TEST_PREPARE_EXIT:?}\"\n")
+	smartctl := filepath.Join(root, "smartctl")
+	writeQuickInstallMock(t, smartctl, "#!/usr/bin/env bash\nexit 0\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\nsmartctl_device_info{device=\"/dev/sda\"} 1\\n' >\"$out\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf 'binary\\n' >ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "pveversion"), "#!/usr/bin/env bash\nprintf 'pve-manager/8.4.0/fixture\\n'\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "apt-get"), "#!/usr/bin/env bash\nprintf 'apt-get:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")
 
 	raw := readDeploymentFile(t, "quick-install.sh")
 	const rootCheck = "[[ ${EUID:-$(id -u)} -eq 0 ]] || die '请在 PVE root 终端执行'"
@@ -230,6 +249,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 		t.Fatal("could not isolate quick installer root check")
 	}
 	patched = strings.Replace(patched, "/usr/local/bin/ag-pve", ag, 1)
+	patched = strings.ReplaceAll(patched, "/usr/sbin/smartctl", smartctl)
 	if !strings.Contains(patched, ag+" pve prepare --local-only") {
 		t.Fatal("could not redirect installed AG command into quick-install fixture")
 	}

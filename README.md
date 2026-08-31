@@ -20,6 +20,8 @@ curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scrip
 
 `quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离 PVE Token，安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集。随后切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。它不会授予 control ACL、打开 `productionExecution` 或绑定官网/监控站；发布版也不含 simulator 采集器。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
+一键安装优先复用 PVE 已有的 `/usr/sbin/smartctl`。只有它确实缺失时，安装器才会使用与 PVE 8/9 对应的 Debian 官方 HTTPS 固定源，并通过独立 `sources.list`、IPv4 和 Debian archive 签名安装 `smartmontools`；不会读取、修改或更新操作者配置的 Proxmox Enterprise/Ceph 软件源。
+
 安装完成后只输入：
 
 ```bash

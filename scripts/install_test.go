@@ -132,6 +132,27 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 	}
 }
 
+func TestSmartmontoolsInstallUsesOnlyIsolatedOfficialDebianSources(t *testing.T) {
+	installer := readDeploymentFile(t, "install.sh")
+	for _, required := range []string{
+		`[[ $INSTALL_SMARTMONTOOLS -eq 1 && ! -x /usr/sbin/smartctl ]]`,
+		`https://deb.debian.org/debian`,
+		`https://security.debian.org/debian-security`,
+		`Dir::Etc::sourcelist=$smart_sources`,
+		`Dir::Etc::sourceparts=-`,
+		`Acquire::ForceIPv4=true`,
+		`apt-get "${smart_apt_options[@]}" update`,
+		`apt-get "${smart_apt_options[@]}" install -y --no-install-recommends smartmontools`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("installer is missing isolated smartmontools source contract %q", required)
+		}
+	}
+	if strings.Contains(installer, "DEBIAN_FRONTEND=noninteractive apt-get update") {
+		t.Fatal("installer must not update operator-configured Proxmox Enterprise repositories")
+	}
+}
+
 func TestTemplateBundleInstallStagesBeforeAtomicSymlinkSwitch(t *testing.T) {
 	installer := readDeploymentFile(t, "install.sh")
 	ordered := []string{

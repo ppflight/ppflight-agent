@@ -105,6 +105,40 @@ download_verified() {
     || die "$label SHA-256 校验失败"
 }
 
+install_smartmontools() {
+  if [[ -x /usr/sbin/smartctl ]]; then
+    printf '复用本机已有 smartctl。\n'
+    return
+  fi
+  command -v apt-get >/dev/null 2>&1 || die '缺少 /usr/sbin/smartctl，且本机没有 apt-get'
+  command -v pveversion >/dev/null 2>&1 || die '无法识别本机 PVE 版本'
+  local pve_major suite sources_file
+  pve_major="$(pveversion | sed -n 's/^pve-manager\/\([0-9]\+\).*/\1/p')"
+  case "$pve_major" in
+    8) suite='bookworm' ;;
+    9) suite='trixie' ;;
+    *) die "不支持的 PVE 主版本: ${pve_major:-unknown}" ;;
+  esac
+  sources_file="$INSTALL_TEMP_DIR/debian-smartmontools.list"
+  printf '%s\n' \
+    "deb https://deb.debian.org/debian $suite main" \
+    "deb https://deb.debian.org/debian $suite-updates main" \
+    "deb https://security.debian.org/debian-security $suite-security main" \
+    >"$sources_file"
+  chmod 0600 "$sources_file"
+  local -a apt_options=(
+    -o "Dir::Etc::sourcelist=$sources_file"
+    -o 'Dir::Etc::sourceparts=-'
+    -o 'APT::Get::List-Cleanup=0'
+    -o 'Acquire::ForceIPv4=true'
+    -o 'Acquire::Retries=3'
+  )
+  printf '本机缺少 smartctl；仅使用 Debian 官方 %s 固定源安装 smartmontools...\n' "$suite"
+  DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
+  DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends smartmontools
+  [[ -x /usr/sbin/smartctl ]] || die 'Debian 官方 smartmontools 安装完成后仍未找到 /usr/sbin/smartctl'
+}
+
 readonly NODE_EXPORTER_PATH="$INSTALL_TEMP_DIR/$NODE_EXPORTER_ARCHIVE"
 readonly SMARTCTL_EXPORTER_PATH="$INSTALL_TEMP_DIR/$SMARTCTL_EXPORTER_ARCHIVE"
 printf '正在下载固定版本 node_exporter %s 和 smartctl_exporter %s...\n' "$NODE_EXPORTER_VERSION" "$SMARTCTL_EXPORTER_VERSION"
@@ -112,6 +146,7 @@ download_verified "$NODE_EXPORTER_BASE/$NODE_EXPORTER_ARCHIVE" "$NODE_EXPORTER_P
 download_verified "$SMARTCTL_EXPORTER_BASE/$SMARTCTL_EXPORTER_ARCHIVE" "$SMARTCTL_EXPORTER_PATH" "$SMARTCTL_EXPORTER_SHA256" 'smartctl_exporter'
 
 binary_sha256="$(cut -d ' ' -f 1 ppflight-agent.sha256)"
+install_smartmontools
 scripts/install.sh \
   --binary ./ppflight-agent \
   --binary-sha256 "$binary_sha256" \
@@ -120,7 +155,6 @@ scripts/install.sh \
   --node-exporter-sha256 "$NODE_EXPORTER_SHA256" \
   --smartctl-exporter-archive "$SMARTCTL_EXPORTER_PATH" \
   --smartctl-exporter-sha256 "$SMARTCTL_EXPORTER_SHA256" \
-  --install-smartmontools \
   --enable
 
 systemctl start ppflight-node-exporter.service ppflight-smartctl-exporter.service \
