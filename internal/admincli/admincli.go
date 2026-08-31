@@ -1448,11 +1448,12 @@ func systemdUnitEnabledState(unit string) string {
 	return "未知或未安装"
 }
 
-// restoreAfterUnsentBinding is only called when the request never reached the
-// enrollment service (for example, service quiescing failed). The pending
-// marker is removed first so the old runtime overlay can load again before we
-// restart it. Every HTTP response, including all 4xx, is ambiguous and must
-// retain the marker and request ID for an idempotent replay.
+// restoreAfterUnsentBinding is called when the request never reached the
+// enrollment service or the service returned an exact rejection that is
+// contractually guaranteed not to consume the code or issue credentials. The
+// pending marker is removed first so the old runtime overlay can load again
+// before we restart it. All other HTTP failures remain ambiguous and retain
+// the marker and request ID for an idempotent replay.
 func (c *cli) restoreAfterUnsentBinding(cfg config.Config, domain string) error {
 	if err := bindstate.ClearPending(cfg.Runtime.StateDirectory, domain); err != nil {
 		return errors.New("clear rejected binding pending state")
@@ -1789,10 +1790,23 @@ func (c *cli) bind(filename string, args []string) int {
 	}
 	response, err := client.Bind(context.Background(), request)
 	if err != nil {
-		// Every HTTP response is deliberately treated as ambiguous: an upstream
-		// proxy can replace a successful enrollment response with any 4xx body.
-		// Retain pending for idempotent replay, but restore the last complete
-		// runtime so a bad/expired code cannot take either domain offline.
+		var rejection *enrollment.RejectionError
+		if errors.As(err, &rejection) && !resumingWebsiteCommit {
+			if recoveryErr := c.restoreAfterUnsentBinding(cfg, "website"); recoveryErr != nil {
+				fmt.Fprintln(c.errOut, "官网已明确拒绝本次绑定，但本机未决状态清理或原 Agent 恢复未确认；请检查本机 Agent")
+				return 1
+			}
+			if rejection.Code == "binding_already_active" {
+				fmt.Fprintln(c.errOut, "官网拒绝绑定：此 PVE 设备仍有未归档的有效绑定；本次绑定码未消费。请先在官网归档旧设备，再使用该绑定码重新绑定")
+				return 1
+			}
+			fmt.Fprintf(c.errOut, "官网拒绝绑定（%s）；本次绑定码未消费，已恢复原 Agent\n", rejection.Code)
+			return 1
+		}
+		// Unrecognized HTTP responses stay ambiguous: an upstream proxy can
+		// replace a successful enrollment response with another status/body.
+		// Retain pending for idempotent replay while restoring the last complete
+		// runtime so either trust domain remains available.
 		if resumingWebsiteCommit {
 			fmt.Fprintln(c.errOut, "官网绑定请求结果未确定；本地新凭据提交尚未完成，Agent 保持受保护状态，请使用同一绑定码重试")
 			return 1

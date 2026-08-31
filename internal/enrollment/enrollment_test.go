@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -122,6 +123,51 @@ func TestBindRejectsCrossOriginEndpointAndDoesNotLeakSecrets(t *testing.T) {
 	_, err = client.Bind(context.Background(), validRequest())
 	if err == nil || strings.Contains(err.Error(), secret) {
 		t.Fatalf("unsafe error: %v", err)
+	}
+}
+
+func TestBindRecognizesOnlyExactDefinitiveActiveBindingRejection(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		definitive  bool
+	}{
+		{name: "exact", status: http.StatusConflict, contentType: "application/json; charset=utf-8", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first."}}`, definitive: true},
+		{name: "wrong-status", status: http.StatusBadRequest, contentType: "application/json", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first."}}`},
+		{name: "unknown-code", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"other_conflict","message":"not allowlisted"}}`},
+		{name: "unknown-field", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"binding_already_active","message":"Archive the old device first.","detail":"unsafe"}}`},
+		{name: "duplicate-code", status: http.StatusConflict, contentType: "application/json", body: `{"error":{"code":"other_conflict","code":"binding_already_active","message":"Archive the old device first."}}`},
+		{name: "proxy-html", status: http.StatusConflict, contentType: "text/html", body: `<html>binding_already_active</html>`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				w.WriteHeader(test.status)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			client, err := NewClient(Config{Endpoint: server.URL, HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Bind(context.Background(), validRequest())
+			if err == nil {
+				t.Fatal("non-2xx response unexpectedly succeeded")
+			}
+			var rejection *RejectionError
+			if got := errors.As(err, &rejection); got != test.definitive {
+				t.Fatalf("definitive=%v want=%v err=%v", got, test.definitive, err)
+			}
+			if test.definitive && (rejection.Code != "binding_already_active" || rejection.StatusCode != http.StatusConflict) {
+				t.Fatalf("rejection=%#v", rejection)
+			}
+			if strings.Contains(err.Error(), "Archive the old device first") || strings.Contains(err.Error(), "unsafe") {
+				t.Fatalf("remote response detail leaked: %v", err)
+			}
+		})
 	}
 }
 

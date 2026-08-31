@@ -131,6 +131,31 @@ type Client struct {
 	http     *http.Client
 }
 
+// RejectionError is returned only for an exact, allowlisted enrollment
+// rejection from the HTTPS enrollment endpoint. The response message is
+// deliberately not retained: it is operator-controlled remote text and may
+// contain details that must not reach local logs.
+type RejectionError struct {
+	Code       string
+	StatusCode int
+}
+
+func (e *RejectionError) Error() string {
+	if e == nil {
+		return "binding request rejected"
+	}
+	return "binding request rejected: " + e.Code
+}
+
+type rejectionEnvelope struct {
+	Error rejectionBody `json:"error"`
+}
+
+type rejectionBody struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 func NewClient(cfg Config) (*Client, error) {
 	endpoint, err := parseSecureURL(cfg.Endpoint)
 	if err != nil || endpoint.RawQuery != "" {
@@ -179,10 +204,13 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 		return Response{}, errors.New("binding response exceeds maximum size")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		// A one-time-code service may have committed its response before a
-		// gateway/proxy changes or loses the response.  A non-2xx status alone
-		// is never proof that no credential was issued, so deliberately expose
-		// no status/body classification to the resumable local transaction.
+		// Most non-2xx responses remain ambiguous: a gateway can replace a
+		// successful enrollment response after the service commits it. Only an
+		// exact allowlisted service rejection is proof that this request did not
+		// issue credentials and may safely release its local pending marker.
+		if rejection := parseDefinitiveRejection(response.StatusCode, response.Header.Get("Content-Type"), body); rejection != nil {
+			return Response{}, rejection
+		}
 		return Response{}, errors.New("binding response outcome is unknown")
 	}
 	if !isJSON(response.Header.Get("Content-Type")) {
@@ -207,6 +235,29 @@ func (c *Client) Bind(ctx context.Context, request Request) (Response, error) {
 		return Response{}, errors.New("binding response device does not match request")
 	}
 	return result, nil
+}
+
+func parseDefinitiveRejection(statusCode int, contentType string, body []byte) *RejectionError {
+	// The website contract guarantees that this conflict is raised before the
+	// one-time code is consumed or any binding credential is issued. Keep this
+	// allowlist intentionally narrow; new codes require a matching server
+	// transaction guarantee and a regression test before they are added.
+	if statusCode != http.StatusConflict || !isJSON(contentType) || len(body) == 0 || len(body) > MaxResponseBytes {
+		return nil
+	}
+	if err := rejectDuplicateKeys(body); err != nil {
+		return nil
+	}
+	var envelope rejectionEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil || onlyOneJSONValue(decoder) != nil {
+		return nil
+	}
+	if envelope.Error.Code != "binding_already_active" || strings.TrimSpace(envelope.Error.Message) == "" || len(envelope.Error.Message) > 1024 {
+		return nil
+	}
+	return &RejectionError{Code: envelope.Error.Code, StatusCode: statusCode}
 }
 
 func (r Request) Validate() error {

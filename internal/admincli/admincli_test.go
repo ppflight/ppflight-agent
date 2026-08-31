@@ -2117,6 +2117,63 @@ func TestMonitoringBindActivationFailurePreservesServerIssuedState(t *testing.T)
 	}
 }
 
+func TestWebsiteActiveBindingRejectionClearsPendingAndRestoresPreviousService(t *testing.T) {
+	filename := prepareBindConfig(t)
+	cfg, websiteState, monitoringState := seedDualBindings(t, filename)
+	quiesced, recovered := false, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !quiesced {
+			t.Error("binding request reached the server before the Agent was quiesced")
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"binding_already_active","message":"server detail must not be printed"}}`))
+	}))
+	defer server.Close()
+	var stdout, stderr bytes.Buffer
+	instance := &cli{
+		in: strings.NewReader("ACTIVE-BINDING-REJECT-123456\n"), out: &stdout, errOut: &stderr, version: "test",
+		bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		quiesceBinding: func(context.Context) error {
+			quiesced = true
+			return nil
+		},
+		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
+			if expected.BindingID != "" {
+				return errors.New("a rejected request must not activate a new binding")
+			}
+			secrets, err := bindingoverlay.Resolve(loaded, func(string) (string, bool) { return "", false })
+			if err != nil {
+				return err
+			}
+			if secrets.MonitoringBindingID != monitoringState.BindingID || secrets.Monitoring.CredentialEpoch != monitoringState.CredentialEpoch {
+				return errors.New("website rejection changed monitoring binding")
+			}
+			recovered++
+			return nil
+		},
+	}
+	code := instance.run([]string{"--config", filename, "website", "bind", "--endpoint", server.URL, "--hostname", "pve-test", "--replace"})
+	if code != 1 || !quiesced || recovered != 1 {
+		t.Fatalf("code=%d quiesced=%v recovered=%d stderr=%s", code, quiesced, recovered, stderr.String())
+	}
+	if _, err := os.Stat(bindstate.PendingPath(cfg.Runtime.StateDirectory, "website")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("definitive rejection kept pending intent: %v", err)
+	}
+	websiteCurrent, err := bindstate.Load(cfg.Runtime.StateDirectory)
+	if err != nil || websiteCurrent.BindingID != websiteState.BindingID || websiteCurrent.CredentialEpoch != websiteState.CredentialEpoch {
+		t.Fatalf("old website state changed: %#v err=%v", websiteCurrent, err)
+	}
+	monitoringCurrent, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	if err != nil || monitoringCurrent.BindingID != monitoringState.BindingID || monitoringCurrent.CredentialEpoch != monitoringState.CredentialEpoch {
+		t.Fatalf("monitoring state changed: %#v err=%v", monitoringCurrent, err)
+	}
+	if !strings.Contains(stderr.String(), "仍有未归档的有效绑定") || !strings.Contains(stderr.String(), "绑定码未消费") || strings.Contains(stderr.String(), "server detail") {
+		t.Fatalf("unsafe or unclear rejection message: %s", stderr.String())
+	}
+}
+
 func TestBindingFourXXNeverClearsIntentAndRestoresPreviousService(t *testing.T) {
 	cases := []struct {
 		name   string
