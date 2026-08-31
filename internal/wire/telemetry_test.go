@@ -44,21 +44,28 @@ func TestWebsiteTelemetryStringEncodesCumulativeCounters(t *testing.T) {
 }
 
 func TestWebsiteTelemetryCarriesObservedAndSentTimes(t *testing.T) {
-	observed := time.Date(2026, 8, 30, 1, 2, 3, 0, time.UTC)
-	sent := observed.Add(45 * time.Second)
-	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: observed}
+	observed := time.Date(2026, 8, 30, 1, 2, 3, 987654321, time.FixedZone("test-offset", 8*60*60))
+	sent := observed.Add(45*time.Second + 123*time.Millisecond)
+	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: observed,
+		Components: map[string]observation.Availability{"pve": {Available: true, ObservedAt: observed, FreshUntil: observed.Add(time.Minute)}}}
 	batch, err := BuildWebsiteTelemetryAt(snapshot, nil, "source", 7, sent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !batch.ObservedAt.Equal(observed) || !batch.SentAt.Equal(sent) || uint64(batch.Sequence) != 7 {
+	wantObserved := observed.UTC().Truncate(time.Second)
+	wantSent := sent.UTC().Truncate(time.Second)
+	if !batch.ObservedAt.Equal(wantObserved) || !batch.SentAt.Equal(wantSent) || uint64(batch.Sequence) != 7 {
 		t.Fatalf("unexpected time/sequence contract: %#v", batch)
+	}
+	if !batch.Components["pve"].ObservedAt.Equal(wantObserved) || batch.Components["pve"].FreshUntil.Nanosecond() != 0 {
+		t.Fatalf("website component timestamps were not canonicalized: %#v", batch.Components["pve"])
 	}
 	raw, err := json.Marshal(batch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(raw, []byte(`"sequence":"7"`)) || !bytes.Contains(raw, []byte(`"sentAt":`)) {
+	if !bytes.Contains(raw, []byte(`"sequence":"7"`)) || !bytes.Contains(raw, []byte(`"observedAt":"2026-08-29T17:02:03Z"`)) ||
+		!bytes.Contains(raw, []byte(`"sentAt":"2026-08-29T17:02:49Z"`)) || bytes.Contains(raw, []byte(".987")) {
 		t.Fatalf("wire contract missing string sequence/sentAt: %s", raw)
 	}
 }

@@ -113,8 +113,8 @@ func BuildWebsiteTelemetryAt(snapshot observation.Snapshot, assignments *invento
 	result := WebsiteTelemetryBatch{
 		SchemaVersion: 1, BatchID: batchID, AgentRef: snapshot.AgentRef, CollectorRef: snapshot.CollectorRef,
 		SourceRef: sourceRef, ClusterRef: snapshot.ClusterRef, Mode: snapshot.Mode,
-		Sequence: protocol.Counter(sequence), ObservedAt: snapshot.ObservedAt, SentAt: sentAt.UTC(), PVEVersion: snapshot.PVEVersion,
-		Components: snapshot.Components, Nodes: snapshot.Nodes, Storages: snapshot.Storages,
+		Sequence: protocol.Counter(sequence), ObservedAt: websiteSecond(snapshot.ObservedAt), SentAt: websiteSecond(sentAt), PVEVersion: snapshot.PVEVersion,
+		Components: websiteAvailability(snapshot.Components), Nodes: snapshot.Nodes, Storages: snapshot.Storages,
 		Tasks: snapshot.Tasks, Host: snapshot.Host, SMART: snapshot.SMART,
 	}
 	for _, guest := range snapshot.Guests {
@@ -130,6 +130,27 @@ func BuildWebsiteTelemetryAt(snapshot observation.Snapshot, assignments *invento
 		result.Guests = append(result.Guests, item)
 	}
 	return result, nil
+}
+
+// Website telemetry v1 freezes timestamps at UTC second precision. Laravel's
+// strict receiver intentionally rejects RFC3339Nano so retries, canonical JSON
+// digests, database projections and cross-language golden payloads all share
+// one representation.
+func websiteSecond(value time.Time) time.Time {
+	if value.IsZero() {
+		return value
+	}
+	return value.UTC().Truncate(time.Second)
+}
+
+func websiteAvailability(values map[string]observation.Availability) map[string]observation.Availability {
+	result := make(map[string]observation.Availability, len(values))
+	for name, value := range values {
+		value.ObservedAt = websiteSecond(value.ObservedAt)
+		value.FreshUntil = websiteSecond(value.FreshUntil)
+		result[name] = value
+	}
+	return result
 }
 
 func guestCapabilities(guest observation.Guest, assignment *inventory.Assignment, now time.Time) GuestCapabilities {

@@ -198,12 +198,12 @@ func TestMonitoringPreflightRecordsPerAddressTLSErrorWithoutApprovalGate(t *test
 	}
 }
 
-func TestNoArgumentsShowsFourItemMenu(t *testing.T) {
+func TestNoArgumentsShowsFiveItemMenu(t *testing.T) {
 	var output, stderr bytes.Buffer
 	if code := RunWithInput(nil, "test", strings.NewReader("0\n"), &output, &stderr); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, text := range []string{"1) 初始化/克隆", "2) 官网绑定设置", "3) 监控绑定设置", "4) 完全卸载 PPFlight Agent"} {
+	for _, text := range []string{"1) 初始化/克隆", "2) 官网绑定设置", "3) 监控绑定设置", "4) 系统概况", "5) 完全卸载 PPFlight Agent"} {
 		if !strings.Contains(output.String(), text) {
 			t.Fatalf("menu does not contain %q: %s", text, output.String())
 		}
@@ -228,7 +228,7 @@ func TestBindingSettingsSubmenusMoveStatusAndShowContextualActions(t *testing.T)
 			t.Fatalf("unbound submenu missing %q: %s", expected, text)
 		}
 	}
-	if strings.Contains(text, "3) 删除绑定") {
+	if strings.Contains(text, "2) 删除绑定") {
 		t.Fatalf("unbound submenu exposed delete: %s", text)
 	}
 
@@ -252,10 +252,31 @@ func TestBindingSettingsSubmenusMoveStatusAndShowContextualActions(t *testing.T)
 		t.Fatalf("bound website submenu code=%d stderr=%s", code, stderr.String())
 	}
 	text = output.String()
-	for _, expected := range []string{"当前状态：已绑定", "2) 使用新的一次性绑定码重新绑定", "3) 删除绑定"} {
+	for _, expected := range []string{"当前状态：已绑定", "2) 删除绑定"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("bound submenu missing %q: %s", expected, text)
 		}
+	}
+	if strings.Contains(text, "重新绑定") || strings.Contains(text, "添加绑定") {
+		t.Fatalf("bound submenu exposed a second binding path: %s", text)
+	}
+}
+
+func TestSystemOverviewShowsCoreSectionsWithoutSecrets(t *testing.T) {
+	filename := prepareBindConfig(t)
+	var output, stderr bytes.Buffer
+	instance := &cli{in: strings.NewReader("4\n0\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
+	if code := instance.menu(filename); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	text := output.String()
+	for _, expected := range []string{"PPFlight 系统概况", "[Agent]", "[PVE 本地读取]", "网卡/宿主机采集", "SMART 采集", "[PPFlight 官网]", "[监控站]", "[高可用与升级]", "绑定：未绑定"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("overview missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "Secret") || strings.Contains(text, "Bearer") {
+		t.Fatalf("overview exposed credential material: %s", text)
 	}
 }
 
@@ -263,7 +284,7 @@ func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("4\nYES\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("5\nYES\n"), out: &output, errOut: &stderr,
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
@@ -280,7 +301,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("4\nUNINSTALL\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("5\nUNINSTALL\n"), out: &output, errOut: &stderr,
 		effectiveUID:       func() int { return 0 },
 		completeUninstall:  func(context.Context) error { called = true; return nil },
 		managedWritePolicy: allowManagedWriteForTest,
@@ -295,7 +316,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 
 func TestMenuCompleteUninstallRequiresRoot(t *testing.T) {
 	var output, stderr bytes.Buffer
-	instance := &cli{in: strings.NewReader("4\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	instance := &cli{in: strings.NewReader("5\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
 	if code := instance.menu("unused"); code == 0 {
 		t.Fatal("non-root complete uninstall succeeded")
 	}

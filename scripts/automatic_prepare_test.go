@@ -12,30 +12,46 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		expectedVersion = "0.1.0-rc.16"
-		expectedAMD64   = "ac60196c28e5713e113eea874ebb61d83dac933a8ed16fc1341b410e915d02d7"
-		expectedARM64   = "8fedd724818dc0d746ea5e1cf381238211ab39f9d9804e0025aa59c2190c8b53"
+		repositoryVersion = "0.1.0-rc.17"
+		// quick-install is advanced only after the immutable GitHub assets for
+		// the repository version exist and their complete archive digests have
+		// been verified. During the release commit it therefore still pins the
+		// most recent published version.
+		quickInstallVersion = "0.1.0-rc.16"
+		expectedAMD64       = "ac60196c28e5713e113eea874ebb61d83dac933a8ed16fc1341b410e915d02d7"
+		expectedARM64       = "8fedd724818dc0d746ea5e1cf381238211ab39f9d9804e0025aa59c2190c8b53"
+		nodeAMD64           = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
+		nodeARM64           = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
+		smartAMD64          = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
+		smartARM64          = "27353b3adca7f54dd486417412041a17260709c724ea63f5138df2612ecf4299"
 	)
-	if version := strings.TrimSpace(readDeploymentFile(t, "..", "VERSION")); version != expectedVersion {
-		t.Fatalf("repository VERSION=%q, want published %q", version, expectedVersion)
+	if version := strings.TrimSpace(readDeploymentFile(t, "..", "VERSION")); version != repositoryVersion {
+		t.Fatalf("repository VERSION=%q, want release candidate %q", version, repositoryVersion)
 	}
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	for _, required := range []string{
-		"readonly RELEASE_TAG='v" + expectedVersion + "'",
-		"readonly RELEASE_VERSION='" + expectedVersion + "'",
+		"readonly RELEASE_TAG='v" + quickInstallVersion + "'",
+		"readonly RELEASE_VERSION='" + quickInstallVersion + "'",
 		"readonly RELEASE_SHA256='" + expectedAMD64 + "'",
 		"readonly RELEASE_SHA256='" + expectedARM64 + "'",
+		"readonly NODE_EXPORTER_VERSION='1.12.1'",
+		"readonly SMARTCTL_EXPORTER_VERSION='0.14.0'",
+		"readonly NODE_EXPORTER_SHA256='" + nodeAMD64 + "'",
+		"readonly NODE_EXPORTER_SHA256='" + nodeARM64 + "'",
+		"readonly SMARTCTL_EXPORTER_SHA256='" + smartAMD64 + "'",
+		"readonly SMARTCTL_EXPORTER_SHA256='" + smartARM64 + "'",
 	} {
 		if !strings.Contains(quickInstall, required) {
-			t.Fatalf("quick installer is not pinned to published RC.16 value %q", required)
+			t.Fatalf("quick installer is not pinned to verified published value %q", required)
 		}
 	}
 }
 
 // TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices locks the
 // non-interactive bootstrap contract.  The released installer owns the
-// initial --enable operation; quick-install must then make the installed AG
-// perform a real local PVE readiness check before it claims success.
+// initial --enable operation; quick-install must then verify real network
+// counters and make the installed AG perform a real local PVE readiness check
+// before it claims success.
 func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	compact := compactShell(quickInstall)
@@ -54,6 +70,14 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 	}
 	if strings.Contains(installInvocation, "--start") {
 		t.Fatal("quick installer must not start a disabled/unprepared Agent through install.sh")
+	}
+	for _, required := range []string{"--install-exporters", "--node-exporter-archive", "--node-exporter-sha256", "--smartctl-exporter-archive", "--smartctl-exporter-sha256", "--install-smartmontools"} {
+		if !strings.Contains(installInvocation, required) {
+			t.Fatalf("quick installer omitted exporter bootstrap option %q", required)
+		}
+	}
+	if !strings.Contains(compact, "node_network_receive_bytes_total") || !strings.Contains(compact, "node_network_transmit_bytes_total") {
+		t.Fatal("quick installer must verify real node_exporter network counters before reporting success")
 	}
 	if strings.Contains(compact, "source=simulator") || strings.Contains(compact, "--source simulator") {
 		t.Fatal("quick installer must never select a simulator collection path")
@@ -137,8 +161,8 @@ func TestQuickInstallPreparationFailureDoesNotStartOrReportSuccess(t *testing.T)
 	if strings.Contains(output, "安装或更新完成") {
 		t.Fatalf("quick installer reported success after failed local preparation: %s", output)
 	}
-	if strings.Contains(log, "systemctl:") {
-		t.Fatalf("quick installer started or verified a unit after failed local preparation:\n%s", log)
+	if strings.Contains(log, "ppflight-agent-upgrade.path") || strings.Contains(log, "systemctl:is-active --quiet ppflight-agent.service") {
+		t.Fatalf("quick installer advanced Agent activation after failed local preparation:\n%s", log)
 	}
 }
 
@@ -163,8 +187,12 @@ func TestQuickInstallStartsAndVerifiesBothUnitsAfterLocalPreparation(t *testing.
 	for _, command := range []string{
 		"systemctl:is-enabled --quiet ppflight-agent.service",
 		"systemctl:is-enabled --quiet ppflight-agent-upgrade.path",
+		"systemctl:is-enabled --quiet ppflight-node-exporter.service",
+		"systemctl:is-enabled --quiet ppflight-smartctl-exporter.service",
 		"systemctl:is-active --quiet ppflight-agent.service",
 		"systemctl:is-active --quiet ppflight-agent-upgrade.path",
+		"systemctl:is-active --quiet ppflight-node-exporter.service",
+		"systemctl:is-active --quiet ppflight-smartctl-exporter.service",
 	} {
 		if !strings.Contains(log, command) {
 			t.Fatalf("quick installer did not verify %q:\n%s", command, log)
@@ -185,7 +213,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	}
 	ag := filepath.Join(root, "ag-pve")
 	writeQuickInstallMock(t, ag, "#!/usr/bin/env bash\nprintf 'prepare:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nexit \"${TEST_PREPARE_EXIT:?}\"\n")
-	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\n: >\"$out\"\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\n' >\"$out\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf 'binary\\n' >ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")

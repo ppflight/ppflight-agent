@@ -133,6 +133,8 @@ func (c *cli) run(args []string) int {
 		return c.status(*filename)
 	case "validate":
 		return c.validate(*filename)
+	case "overview":
+		return c.systemOverview(*filename)
 	case "monitor", "monitoring":
 		return c.monitoring(*filename, args[1:])
 	case "website":
@@ -155,8 +157,9 @@ func (c *cli) usage() {
 	fmt.Fprintln(c.out, `ag-pve - PPFlight Agent SSH 管理命令
 
   ag-pve [--config FILE] status
-  AG | ag | ag-pve                                   # 四项主菜单；官网/监控状态在各自绑定设置中
+  AG | ag | ag-pve                                   # 五项主菜单；含系统概况
   ag-pve [--config FILE] validate
+  ag-pve [--config FILE] overview                    # 系统、PVE、绑定、通信和队列概况
   ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE] [--local-only]
   ag-pve [--config FILE] pve status
   ag-pve [--config FILE] bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
@@ -190,9 +193,10 @@ func (c *cli) menu(filename string) int {
   1) 初始化/克隆 Cloud-Init 模板
   2) 官网绑定设置
   3) 监控绑定设置
-  4) 完全卸载 PPFlight Agent
+  4) 系统概况
+  5) 完全卸载 PPFlight Agent
   0) 退出`)
-		choice, err := c.promptLine(reader, "请选择 [0-4]: ")
+		choice, err := c.promptLine(reader, "请选择 [0-5]: ")
 		if err != nil {
 			fmt.Fprintln(c.errOut, "无法读取菜单选择")
 			return 2
@@ -214,6 +218,8 @@ func (c *cli) menu(filename string) int {
 				return code
 			}
 		case "4":
+			_ = c.systemOverview(filename)
+		case "5":
 			return c.menuCompleteUninstallAt(reader, filename)
 		default:
 			fmt.Fprintln(c.errOut, "菜单选择无效")
@@ -282,14 +288,13 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 	}
 	target := "PPFlight 官网"
 	bound := false
-	endpoint := ""
 	bindingID := ""
 	credentialEpoch := uint64(0)
 	if monitoring {
 		target = "监控站"
 		state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
 		if err == nil {
-			bound, endpoint, bindingID, credentialEpoch = true, state.BindingEndpoint, state.BindingID, state.CredentialEpoch
+			bound, bindingID, credentialEpoch = true, state.BindingID, state.CredentialEpoch
 		} else if !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintln(c.errOut, "监控绑定状态不安全或无效；已禁止添加、替换和删除，请先检查本机状态文件")
 			return 1, false
@@ -297,7 +302,7 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 	} else {
 		state, err := bindstate.Load(cfg.Runtime.StateDirectory)
 		if err == nil {
-			bound, endpoint, bindingID, credentialEpoch = true, state.BindingEndpoint, state.BindingID, state.CredentialEpoch
+			bound, bindingID, credentialEpoch = true, state.BindingID, state.CredentialEpoch
 		} else if !errors.Is(err, os.ErrNotExist) {
 			fmt.Fprintln(c.errOut, "官网绑定状态不安全或无效；已禁止添加、替换和删除，请先检查本机状态文件")
 			return 1, false
@@ -312,17 +317,12 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 	}
 	fmt.Fprintln(c.out, "  1) 查看绑定与通信状态")
 	if bound {
-		fmt.Fprintln(c.out, "  2) 使用新的一次性绑定码重新绑定")
-		fmt.Fprintln(c.out, "  3) 删除绑定")
+		fmt.Fprintln(c.out, "  2) 删除绑定")
 	} else {
 		fmt.Fprintln(c.out, "  2) 添加绑定")
 	}
 	fmt.Fprintln(c.out, "  0) 返回主菜单")
-	maxChoice := "2"
-	if bound {
-		maxChoice = "3"
-	}
-	choice, err := c.promptLine(reader, fmt.Sprintf("请选择 [0-%s]: ", maxChoice))
+	choice, err := c.promptLine(reader, "请选择 [0-2]: ")
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法读取绑定设置选择")
 		return 2, false
@@ -336,13 +336,10 @@ func (c *cli) menuBindingSettings(reader *bufio.Reader, filename string, monitor
 		}
 		return c.website(filename, []string{"status"}), false
 	case "2":
-		return c.menuBind(reader, filename, monitoring, bound, endpoint), false
-	case "3":
-		if !bound {
-			fmt.Fprintln(c.errOut, "当前没有可删除的绑定")
-			return 2, false
+		if bound {
+			return c.menuRemoveBinding(reader, filename, monitoring), false
 		}
-		return c.menuRemoveBinding(reader, filename, monitoring), false
+		return c.menuBind(reader, filename, monitoring, false, ""), false
 	default:
 		fmt.Fprintln(c.errOut, "绑定设置选择无效")
 		return 2, false
@@ -1063,6 +1060,226 @@ func fetchLocalStatus(cfg config.Config) (health.Status, error) {
 		return health.Status{}, errors.New("Agent 状态不是有效 JSON")
 	}
 	return value, nil
+}
+
+// systemOverview is a human-readable, non-secret operational summary for the
+// local PVE administrator. Domain status is derived from the independently
+// authenticated binding authorities; payload identity is never trusted as an
+// authorization source and no credential material is printed.
+func (c *cli) systemOverview(filename string) int {
+	cfg, ok := c.load(filename)
+	if !ok {
+		return 1
+	}
+	fmt.Fprintln(c.out, "\nPPFlight 系统概况")
+
+	local, localErr := fetchLocalStatus(cfg)
+	fmt.Fprintln(c.out, "\n[Agent]")
+	fmt.Fprintf(c.out, "  服务：%s\n", systemdUnitState(agentServiceUnit))
+	if localErr != nil {
+		fmt.Fprintf(c.out, "  本地状态接口：不可达\n  配置模式：%s\n", cfg.Mode)
+	} else {
+		fmt.Fprintf(c.out, "  版本：%s\n  模式：%s\n  readiness：%s\n", local.Version, local.Mode, yesNo(local.Ready))
+		fmt.Fprintf(c.out, "  启动时间：%s\n  最近采集成功：%s\n", displayTime(&local.StartedAt), displayTime(local.Collection.LastSuccess))
+		if local.Collection.LastError != "" {
+			fmt.Fprintf(c.out, "  采集异常：%s\n", local.Collection.LastError)
+		}
+	}
+
+	pveStatus, _ := c.inspectLocalPVE(cfg)
+	fmt.Fprintln(c.out, "\n[PVE 本地读取]")
+	fmt.Fprintf(c.out, "  数据源：%s\n  读取凭据：%s (%s)\n  productionReady：%s\n", pveStatus.PVESource, readyLabel(pveStatus.Read.CredentialReady), pveStatus.Read.Code, yesNo(pveStatus.ProductionReady))
+	fmt.Fprintf(c.out, "  写操作：%s；control credential：%s (%s)\n", enabledLabel(pveStatus.ProductionExecution), readyLabel(pveStatus.Control.CredentialReady), pveStatus.Control.Code)
+	fmt.Fprintf(c.out, "  网卡/宿主机采集：%s；开机启动：%s\n", systemdUnitState("ppflight-node-exporter.service"), systemdUnitEnabledState("ppflight-node-exporter.service"))
+	fmt.Fprintf(c.out, "  SMART 采集：%s；开机启动：%s\n", systemdUnitState("ppflight-smartctl-exporter.service"), systemdUnitEnabledState("ppflight-smartctl-exporter.service"))
+
+	c.printWebsiteOverview(cfg, local, localErr)
+	c.printMonitoringOverview(cfg, local, localErr)
+
+	fmt.Fprintln(c.out, "\n[高可用与升级]")
+	fmt.Fprintf(c.out, "  开机启动：%s\n  升级监听：%s\n", systemdUnitEnabledState(agentServiceUnit), systemdUnitState("ppflight-agent-upgrade.path"))
+	fmt.Fprintln(c.out)
+	return 0
+}
+
+func (c *cli) printWebsiteOverview(cfg config.Config, local health.Status, localErr error) {
+	fmt.Fprintln(c.out, "\n[PPFlight 官网]")
+	state, err := bindstate.Load(cfg.Runtime.StateDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(c.out, "  绑定：未绑定\n  远端状态：未检查")
+		printDomainDeliveryOverview(c.out, "website", local, localErr)
+		return
+	}
+	if err != nil {
+		fmt.Fprintln(c.out, "  绑定：状态文件不安全或损坏\n  远端状态：禁止检查")
+		printDomainDeliveryOverview(c.out, "website", local, localErr)
+		return
+	}
+	fmt.Fprintf(c.out, "  绑定：已绑定  bindingId=%s  credentialEpoch=%d\n", state.BindingID, state.CredentialEpoch)
+	assignmentState, assignmentErr := assignment.LoadState(filepath.Join(cfg.Runtime.StateDirectory, "assignments", "refresh-state.json"))
+	if assignmentErr != nil || assignmentState.Revision == 0 {
+		fmt.Fprintln(c.out, "  远端状态：本机 assignment revision 尚未就绪")
+	} else {
+		client, clientErr := enrollment.NewStatusClient(enrollment.StatusClientConfig{BindingEndpoint: state.BindingEndpoint, Credential: state.HMACCredentials.Commands, NetworkPolicy: state.NetworkPolicy, Timeout: 5 * time.Second})
+		if clientErr == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			remote, remoteErr := client.Get(ctx, enrollment.StatusExpected{BindingID: state.BindingID, DeviceID: state.DeviceID, AgentRef: state.Identity.AgentRef, CredentialEpoch: state.CredentialEpoch, AssignmentRevision: assignmentState.Revision})
+			cancel()
+			if remoteErr == nil {
+				fmt.Fprintf(c.out, "  远端状态：%s  commandStale=%s  lastVerified=%s\n", remoteStatusLabel(remote.Status), yesNo(remote.CommandChannelStale), displayTime(remote.LastVerifiedAt))
+			} else {
+				fmt.Fprintln(c.out, "  远端状态：不可达或验签失败")
+			}
+		} else {
+			fmt.Fprintln(c.out, "  远端状态：本机绑定网络策略或凭据状态无效")
+		}
+	}
+	printDomainDeliveryOverview(c.out, "website", local, localErr)
+}
+
+func (c *cli) printMonitoringOverview(cfg config.Config, local health.Status, localErr error) {
+	fmt.Fprintln(c.out, "\n[监控站]")
+	state, err := bindstate.LoadMonitoring(cfg.Runtime.StateDirectory)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(c.out, "  绑定：未绑定\n  远端状态：未检查")
+		printDomainDeliveryOverview(c.out, "monitoring", local, localErr)
+		return
+	}
+	if err != nil {
+		fmt.Fprintln(c.out, "  绑定：状态文件不安全或损坏\n  远端状态：禁止检查")
+		printDomainDeliveryOverview(c.out, "monitoring", local, localErr)
+		return
+	}
+	fmt.Fprintf(c.out, "  绑定：已绑定  bindingId=%s  credentialEpoch=%d\n", state.BindingID, state.CredentialEpoch)
+	client, clientErr := monitorenrollment.NewStatusClient(monitorenrollment.StatusClientConfig{BindingEndpoint: state.BindingEndpoint, Credential: state.HMACCredential, NetworkPolicy: state.NetworkPolicy, Timeout: 5 * time.Second})
+	if clientErr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		remote, remoteErr := client.Get(ctx, monitorenrollment.StatusExpected{BindingID: state.BindingID, DeviceID: state.DeviceID, MonitoringAgentRef: state.MonitoringAgentRef, CredentialEpoch: state.CredentialEpoch})
+		cancel()
+		if remoteErr == nil {
+			fmt.Fprintf(c.out, "  远端状态：%s  telemetryStale=%s  auditStale=%s  lastVerified=%s\n", remoteStatusLabel(remote.Status), yesNo(remote.TelemetryStale), yesNo(remote.AuditStale), displayTime(remote.LastVerifiedAt))
+		} else {
+			fmt.Fprintln(c.out, "  远端状态：不可达或验签失败")
+		}
+	} else {
+		fmt.Fprintln(c.out, "  远端状态：本机绑定网络策略或凭据状态无效")
+	}
+	printDomainDeliveryOverview(c.out, "monitoring", local, localErr)
+}
+
+func printDomainDeliveryOverview(out io.Writer, domain string, local health.Status, localErr error) {
+	if localErr != nil {
+		fmt.Fprintln(out, "  上传状态：Agent 本地状态接口不可达")
+		return
+	}
+	pendingItems := 0
+	pendingBytes := int64(0)
+	deadLetters := uint64(0)
+	authBlocked := false
+	var lastSuccess *time.Time
+	for name, state := range local.Deliveries {
+		if !deliveryBelongsToDomain(name, domain) {
+			continue
+		}
+		authBlocked = authBlocked || state.AuthBlocked
+		if state.LastSuccess != nil && (lastSuccess == nil || state.LastSuccess.After(*lastSuccess)) {
+			value := state.LastSuccess.UTC()
+			lastSuccess = &value
+		}
+	}
+	for name, stats := range local.Queues {
+		if !deliveryBelongsToDomain(name, domain) {
+			continue
+		}
+		pendingItems += stats.PendingItems
+		pendingBytes += stats.PendingBytes
+		deadLetters += stats.DeadLetterItems
+	}
+	fmt.Fprintf(out, "  最近上传成功：%s\n  鉴权阻塞：%s\n  队列：pendingItems=%d  pendingBytes=%d  deadLetters=%d\n", displayTime(lastSuccess), yesNo(authBlocked), pendingItems, pendingBytes, deadLetters)
+}
+
+func deliveryBelongsToDomain(name, domain string) bool {
+	if domain == "website" {
+		return strings.HasPrefix(name, "website-") || name == "control-results"
+	}
+	return strings.HasPrefix(name, "monitoring")
+}
+
+func displayTime(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return "暂无"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "是"
+	}
+	return "否"
+}
+
+func readyLabel(value bool) string {
+	if value {
+		return "就绪"
+	}
+	return "未就绪"
+}
+
+func enabledLabel(value bool) string {
+	if value {
+		return "已启用"
+	}
+	return "未启用"
+}
+
+func remoteStatusLabel(value string) string {
+	switch value {
+	case "active":
+		return "正常(active)"
+	case "stale":
+		return "过期(stale)"
+	case "degraded":
+		return "降级(degraded)"
+	case "revoked":
+		return "已撤销(revoked)"
+	default:
+		return value
+	}
+}
+
+func systemdUnitState(unit string) string {
+	if runtime.GOOS != "linux" {
+		return "当前平台不可检查"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "is-active", unit).Output()
+	value := strings.TrimSpace(string(output))
+	if err == nil && value == "active" {
+		return "运行中(active)"
+	}
+	if value == "inactive" || value == "failed" || value == "activating" || value == "deactivating" {
+		return value
+	}
+	return "未知或未安装"
+}
+
+func systemdUnitEnabledState(unit string) string {
+	if runtime.GOOS != "linux" {
+		return "当前平台不可检查"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "is-enabled", unit).Output()
+	value := strings.TrimSpace(string(output))
+	if err == nil && value == "enabled" {
+		return "已启用(enabled)"
+	}
+	if value != "" {
+		return value
+	}
+	return "未知或未安装"
 }
 
 // restoreAfterUnsentBinding is only called when the request never reached the
