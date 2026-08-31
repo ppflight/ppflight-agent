@@ -380,7 +380,8 @@ apply_acl() {
 # 2 for an unreadable/ambiguous JSON contract. The PVE JSON field is expected
 # to be roleid + privs; unknown shapes fail closed rather than guessing.
 role_privileges_status() {
-  local role=$1 expected=$2 out="$TMPDIR_BOOTSTRAP/role-contract-${role}.json"
+  local role=$1 expected=$2 out
+  out="$TMPDIR_BOOTSTRAP/role-contract-${role}.json"
   list_json "$out" role list || return 2
   python3 - "$out" "$role" "$expected" <<'PY'
 import json, re, sys
