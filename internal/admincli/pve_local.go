@@ -103,6 +103,7 @@ func (c *cli) preparePVE(filename string, cfg config.Config, args []string) int 
 	set.SetOutput(c.errOut)
 	tlsServerName := set.String("tls-server-name", cfg.PVE.TLSServerName, "DNS name in the PVE API certificate (TCP remains 127.0.0.1)")
 	caFile := set.String("ca-file", cfg.PVE.CAFile, "managed PVE root CA PEM file (must be /etc/ppflight-agent/pve-root-ca.pem)")
+	localOnly := set.Bool("local-only", false, "verify local real-PVE collection without waiting for remote telemetry delivery")
 	if err := set.Parse(args); err != nil || set.NArg() != 0 {
 		return 2
 	}
@@ -119,7 +120,7 @@ func (c *cli) preparePVE(filename string, cfg config.Config, args []string) int 
 	// the old five-minute bootstrap window.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	result, err := c.prepareRealPVE(ctx, filename, cfg, strings.TrimSpace(*tlsServerName), strings.TrimSpace(*caFile))
+	result, err := c.prepareRealPVEWithRequirement(ctx, filename, cfg, strings.TrimSpace(*tlsServerName), strings.TrimSpace(*caFile), !*localOnly)
 	if err != nil {
 		var activationErr *realPVEActivationError
 		if errors.As(err, &activationErr) && activationErr.localReady {
@@ -130,6 +131,9 @@ func (c *cli) preparePVE(filename string, cfg config.Config, args []string) int 
 		return 1
 	}
 	fmt.Fprintf(c.out, "PVE 真实采集已就绪并自动生效：mode=production source=api node=%s version=%s readPermissionGrants=%d，%s active。\n", result.Config.PVE.LocalNode, result.Version, result.ReadPermissionGrants, agentServiceUnit)
+	if *localOnly {
+		fmt.Fprintln(c.out, "本机真实 PVE 采集已回验；已有官网/监控绑定的数据将由持久队列自动续传。")
+	}
 	if result.ControlPermissionGrants == 0 {
 		fmt.Fprintln(c.out, "控制 token 尚未授予资源范围；真实监控已启用，但 productionExecution 保持 false，VPS 写操作不会越权执行。")
 	} else {

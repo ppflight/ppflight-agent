@@ -18,7 +18,7 @@ PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网�
 curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scripts/quick-install.sh | bash
 ```
 
-`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本，校验内置 SHA-256 后才解压并运行包内安装器。它只安装并启用开机启动，不会启动 Agent、创建 PVE Token、授予 control ACL 或绑定官网/监控站。发布版不含 simulator 采集器，也不会生成或上传 `test`/`simulator` PVE telemetry；只有完成本机真实 PVE API 准备后的 `mode=production`/`pve.source=api` 才能启动并上报。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
+`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本，校验内置 SHA-256 后才解压并运行包内安装器。它会自动创建或复用本机隔离 PVE Token，校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集，然后切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把两者加入开机启动。任何准备或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 状态报告成成功。它不会授予 control ACL、打开 `productionExecution` 或绑定官网/监控站；发布版也不含 simulator 采集器。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
 安装完成后只输入：
 
@@ -26,7 +26,7 @@ curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scrip
 AG
 ```
 
-先从 `AG` 菜单查看和调整。添加官网或监控绑定前，Agent 会在读取一次性码之前自动完成真实 PVE 只读接入：先验证固定、service 可读的 CA/SNI、本机版本和节点，再在缺少凭据时调用安装包内固定 helper 创建隔离 Token；固定通过 `127.0.0.1:8006/tcp4` 要求 read Token 具备完整 audit 权限并实际读取本机 node status/storage，随后切换到 `mode=production`/`pve.source=api`，受控启动或重启，等待真实采集和对应已绑定 telemetry 上传成功。任何一步失败都不会读取或消耗绑定码，也不会生成或上传虚构的 PVE 数据。该一行命令用于当前 `main` 联调分支；生产环境仍应采用安装文档中的离线校验流程。
+此时服务已经运行，直接从 `AG` 菜单初始化模板或添加官网/监控绑定。绑定向导仍会在读取一次性码之前重新核对真实 PVE readiness，防止配置在安装后被替换；任何失败都不会读取或消耗绑定码，也不会生成或上传虚构的 PVE 数据。该一行命令用于当前 `main` 联调分支；生产环境仍应采用安装文档中的离线校验流程。
 
 官网、监控站和 PVE 外连的目标合同是 IPv4-only：dial 固定 `tcp4`，禁止 IPv6 literal/fallback；PVE 固定 `127.0.0.1:8006`。官网和 monitoring bind response 分别返回 exact `networkPolicy={agentObservedIPv4}`；该值是对应服务端从可信连接元数据观察并冻结的 Agent 公网出口 canonical IPv4，只用于服务端 `/32` 来源白名单，不是 Agent 自报值或拨号目的地。Agent 不再固定 Cloudflare DNS A/Anycast 地址，始终保留 endpoint hostname 作 HTTP Host、TLS SNI 和系统 CA 证书校验，并禁环境代理、redirect 与跨 origin credential。来源 IP 命中不能替代绑定 identity、key scope/epoch、HMAC/Ed25519、assignment generation、nonce/time、action allowlist 和审计校验。
 
@@ -44,7 +44,7 @@ sudo ag-pve bind \
   --endpoint https://www.example/internal/v1/agents/bind
 ```
 
-安装器落盘的未配置样例是 `mode=production`、`pve.source=disabled`：服务不能启动、不能采集、也不能上传，直到 `AG` 的真实 PVE 准备完成。运行时只有 `mode=production` 加 `pve.source=api` 可启动采集；遗留配置中的 `mode=test` 或 `pve.source=simulator` 在升级时自动转为 `production+disabled`，绑定无需重做。若证书 DNS 无法从本机 FQDN 安全确定，可显式加 `--tls-server-name <PVE证书DNS名>`；它不能是 `127.0.0.1`、`localhost`、IPv6 或通配符。CA 只接受安装器维护的 `/etc/ppflight-agent/pve-root-ca.pem`，防止 root 探测成功但 service 无权读取。该流程不会自动授予 control ACL，也不会把 `control.productionExecution` 从 false 打开；真实监控与生产写权限是两个独立安全门槛。
+包内底层安装器落盘的未配置样例仍是 `mode=production`、`pve.source=disabled`，避免在校验前启动；一键脚本会紧接着自动完成真实 PVE 准备、启动和开机启用。运行时只有 `mode=production` 加 `pve.source=api` 可采集；遗留配置中的 `mode=test` 或 `pve.source=simulator` 在升级时自动转为 `production+disabled`，随后由同一自动准备流程恢复真实采集，绑定无需重做。若本机证书 DNS 无法自动确定，一键安装会明确失败而不会静默降级；可在修正主机 FQDN/证书后重试。CA 只接受安装器维护的 `/etc/ppflight-agent/pve-root-ca.pem`。该流程不会自动授予 control ACL，也不会把 `control.productionExecution` 从 false 打开；真实监控与生产写权限是两个独立安全门槛。
 
 也可用 `--code-file FILE` 读取仅 owner 可读、非符号链接的私密文件；CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项。Agent 在发送前持久化 UUID `requestId` 与 canonical 请求指纹以便安全重试，绑定码参与 hash 但原文不落盘。绑定成功后，官网必须返回 `bindingId`、匹配的 `deviceId`、身份、同源 HTTPS 端点、分用途 HMAC 凭据、Ed25519 命令验签公钥、初始 assignment、`networkPolicy` 和 `credentialEpoch`，并保存到 `<stateDirectory>/bindings/binding-state.json`；稳定 device ID 和 pending 幂等状态也在该私有子目录，PVE Token 永不上传官网。
 
@@ -64,7 +64,7 @@ sudo ag-pve bind \
 
 绑定后的 assignment 客户端支持最长 25 秒的长轮询。命令通道也以持久 cursor/operation 设计；PVE 返回 UPID 只表示任务已提交。Agent journal 保存 UPID，重启后通过 `task.status` 对应的 PVE task status 读取继续对账，不重新提交原 mutation。当前接线状态与服务端仍需实现的部分见契约中的[实现状态](docs/AGENT-API-V1.md#11-实现状态与上线门槛)。
 
-模板初始化是另一条仅限 PVE 本机 root 管理员的流程，不是官网远程 command。cloud-init helper bundle 作为同一 Agent 发布/安装包内的 `bundles/ppflight-cloudinit` 交付，不在安装时从任意 URL 拉代码；缺失或摘要不符时安装失败。安装后的 `AG`/`ag`/`ag-pve` 不带参数显示四项主菜单：模板初始化、官网绑定设置、监控绑定设置、完全卸载。官网与监控子菜单分别包含绑定/通信状态、添加或重新绑定，以及仅在已有安全绑定状态时显示的删除绑定；两个 trust domain 的状态、配置、pending 和凭据相互隔离。删除绑定要求 PVE root 输入完整 `DELETE WEBSITE` 或 `DELETE MONITORING`，会禁用该域配置、删除该域本机凭据并重启回验，失败自动恢复；另一绑定与所有持久队列保留。第 4 项完全卸载仍要求输入完整 `UNINSTALL`，会删除 Agent 配置、双绑定凭据、持久队列和审计状态，但不会删除 PVE 虚拟机、模板、镜像缓存或备份。
+模板初始化是另一条仅限 PVE 本机 root 管理员的流程，不是官网远程 command。cloud-init helper bundle 作为同一 Agent 发布/安装包内的 `bundles/ppflight-cloudinit` 交付，不在安装时从任意 URL 拉代码；缺失或摘要不符时安装失败。安装后的 `AG`/`ag`/`ag-pve` 不带参数显示四项主菜单：模板初始化、官网绑定设置、监控绑定设置、完全卸载。官网与监控子菜单分别包含绑定/通信状态、添加或重新绑定，以及仅在已有安全绑定状态时显示的删除绑定；两个 trust domain 的状态、配置、pending 和凭据相互隔离。删除绑定要求 PVE root 输入完整 `DELETE WEBSITE` 或 `DELETE MONITORING`，会禁用该域配置、删除该域本机凭据并重启回验，失败自动恢复；另一绑定与所有持久队列保留。第 4 项完全卸载仍要求输入完整 `UNINSTALL`；确认后即使存在未完成的绑定/解绑 journal，也会在取得独占管理锁并确认所有 Agent/升级进程已停止后，撤销 PPFlight 专用 PVE Token/用户/ACL（未被其它主体引用的专用角色也删除），再强制删除程序、systemd units、配置、双绑定凭据、持久队列和审计状态。它不会删除 PVE 虚拟机、模板、镜像缓存或备份。
 
 模板向导会依次选择模板、镜像缓存 storage、模板磁盘 storage、备份策略与备份 storage、外网桥，以及可选的独立内网桥。外网桥固定用于模板 `net0`，启用内网时内网桥固定用于 `net1`；两者必须存在且不能相同，单网卡环境可明确不创建 `net1`。若 active/enabled 存储仅缺受支持的 content 类型，向导会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定 `pvesm set` 命令；只有操作者输入 `Y` 才执行，并在继续前重新 discovery 验证。随后先输出无副作用 plan，只有操作者输入完整单词 `YES` 才按该 plan 的 `requestId/operationId/catalogRevision/catalogSha256` 执行；输入 `no` 或直接回车会取消。安装器已校验 bundle、运行依赖、逐文件摘要和 `networkRedirectPolicy.addressFamily=ipv4-only`，以版本目录加原子 managed symlink 提供 `/usr/local/lib/ppflight-agent/template-bootstrap`；helper 的镜像连接固定 `curl --disable --ipv4`、HTTPS-only redirect 和 catalog/official-checksum 完整性链。Agent 每次调用前再次校验，再以 `/usr/bin/python3 -I` 和受限环境执行唯一入口。真实 PVE 上会创建模板/备份的 plan/execute 尚未完成破坏性发布验收；它不新增 control action，更不表示 `vm.reinstall` 或远程 Agent 自升级已经实现。
 

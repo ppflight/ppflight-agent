@@ -15,9 +15,9 @@ Stops and disables PPFlight units, then removes installed binaries and unit
 files. --remove-exporters also removes PPFlight's private exporter binaries.
 The Agent-owned, immutable cloud-template helper bundle is removed with the
 Agent binary; PVE templates and image/backup data created by it are untouched.
---purge additionally removes /etc/ppflight-agent and /var/lib/ppflight-agent;
-that destroys the local durable queue and should only be used after it has
-drained or has been backed up.
+--purge additionally revokes PPFlight's fixed PVE credentials and removes
+/etc/ppflight-agent and /var/lib/ppflight-agent; that destroys the local
+durable queue and should only be used after it has drained or been backed up.
 EOF
 }
 
@@ -54,12 +54,21 @@ stop_required_unit() {
     printf 'error: failed to stop required unit %s; no files were removed\n' "$unit" >&2
     return 1
   fi
-  if ! active_state="$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null)" ||
-     ! main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)"; then
+  if ! active_state="$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null)"; then
     printf 'error: cannot verify required unit %s stopped; no files were removed\n' "$unit" >&2
     return 1
   fi
-  if [[ "$main_pid" != '0' || ( "$active_state" != 'inactive' && "$active_state" != 'failed' ) ]]; then
+  # .path units do not expose MainPID; an empty MainPID is therefore normal
+  # for them. Services must still prove a zero PID before credentials are
+  # purged, so a live process can never survive complete uninstall.
+  main_pid='not-applicable'
+  if [[ "$unit" == *.service ]]; then
+    if ! main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)" || [[ -z "$main_pid" ]]; then
+      printf 'error: cannot verify required unit %s MainPID; no files were removed\n' "$unit" >&2
+      return 1
+    fi
+  fi
+  if [[ ( "$unit" == *.service && "$main_pid" != '0' ) || ( "$active_state" != 'inactive' && "$active_state" != 'failed' ) ]]; then
     printf 'error: required unit %s is still active (state=%s pid=%s); no files were removed\n' "$unit" "$active_state" "$main_pid" >&2
     return 1
   fi
@@ -70,6 +79,23 @@ stop_required_unit() {
 for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service; do
   stop_required_unit "$required_unit" || exit 1
 done
+
+# A complete purge must also revoke the cluster-side credentials created by
+# automatic local PVE preparation. Otherwise agent.env would be deleted while
+# the unreadable one-time token secret remained in PVE, making a clean
+# reinstall impossible. The fixed helper cannot touch guests, templates,
+# storage, images, backups, or caller-selected PVE objects.
+PVE_CREDENTIAL_REMOVER='/usr/local/lib/ppflight-agent/remove-pve-credentials.sh'
+if [[ $PURGE -eq 1 ]]; then
+  [[ -x "$PVE_CREDENTIAL_REMOVER" && ! -L "$PVE_CREDENTIAL_REMOVER" ]] || {
+    printf 'error: PPFlight PVE credential remover is missing or unsafe; no Agent data or credentials were removed\n' >&2
+    exit 1
+  }
+  "$PVE_CREDENTIAL_REMOVER" || {
+    printf 'error: could not fully revoke PPFlight PVE credentials; local Agent files were preserved for a safe retry\n' >&2
+    exit 1
+  }
+fi
 
 # Exporters carry no Agent credential authority.  Only after the primary
 # Agent is proved dead may their shutdown be best-effort; keep their unit/file
@@ -98,6 +124,7 @@ fi
 rm -f -- /usr/local/bin/ppflight-agent /usr/local/bin/ag-pve /usr/local/bin/ag /usr/local/bin/AG
 rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap
 rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh
+rm -f -- /usr/local/lib/ppflight-agent/remove-pve-credentials.sh
 rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh
 rm -rf -- /usr/local/lib/ppflight-agent/template-bundles
 rm -rf -- /usr/local/lib/ppflight-agent

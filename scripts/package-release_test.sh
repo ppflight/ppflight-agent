@@ -61,7 +61,7 @@ expected=(
   docs/AGENT-API-V1.md docs/API.md docs/CONTRACT-REVIEW.md docs/INSTALL.md docs/SELF-UPGRADE-V1.md
   packaging/systemd/ppflight-agent.service packaging/systemd/ppflight-agent-upgrade.path packaging/systemd/ppflight-agent-upgrade.service packaging/systemd/ppflight-node-exporter.service packaging/systemd/ppflight-smartctl-exporter.service
   packaging/tmpfiles.d/ppflight-agent.conf
-  scripts/install.sh scripts/uninstall.sh scripts/create-pve-tokens.sh scripts/verify-template-bundle.py
+  scripts/install.sh scripts/uninstall.sh scripts/create-pve-tokens.sh scripts/remove-pve-credentials.sh scripts/verify-template-bundle.py
   bundles/ppflight-cloudinit/agent-vendor-manifest.v1.json
 )
 while IFS= read -r bundle_file; do

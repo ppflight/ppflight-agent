@@ -325,7 +325,7 @@ var releaseFileAllowlist = map[string]bool{
 	"docs/AGENT-API-V1.md": true, "docs/API.md": true, "docs/CONTRACT-REVIEW.md": true, "docs/INSTALL.md": true, "docs/SELF-UPGRADE-V1.md": true,
 	"packaging/systemd/ppflight-agent.service": true, "packaging/systemd/ppflight-agent-upgrade.path": true, "packaging/systemd/ppflight-agent-upgrade.service": true,
 	"packaging/systemd/ppflight-node-exporter.service": true, "packaging/systemd/ppflight-smartctl-exporter.service": true, "packaging/tmpfiles.d/ppflight-agent.conf": true,
-	"scripts/install.sh": true, "scripts/uninstall.sh": true, "scripts/create-pve-tokens.sh": true, "scripts/verify-template-bundle.py": true,
+	"scripts/install.sh": true, "scripts/uninstall.sh": true, "scripts/create-pve-tokens.sh": true, "scripts/remove-pve-credentials.sh": true, "scripts/verify-template-bundle.py": true,
 	"bundles/ppflight-cloudinit/agent-vendor-manifest.v1.json": true, "bundles/ppflight-cloudinit/build-cloud-templates.sh": true,
 	"bundles/ppflight-cloudinit/tools/ppflight-template-bootstrap.py": true,
 	"bundles/ppflight-cloudinit/catalog/template-catalog.v1.json":     true, "bundles/ppflight-cloudinit/catalog/template-catalog.schema.json": true,

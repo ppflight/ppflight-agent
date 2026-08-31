@@ -11,9 +11,12 @@ func TestUninstallerProvesPrimaryAgentStoppedBeforeRemoval(t *testing.T) {
 		"stop_required_unit()",
 		"systemctl disable --now \"$unit\"",
 		"--property=MainPID --value \"$unit\"",
-		"[[ \"$main_pid\" != '0'",
+		"[[ \"$unit\" == *.service ]]",
+		"\"$unit\" == *.service && \"$main_pid\" != '0'",
 		"ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service",
 		"stop_required_unit \"$required_unit\" || exit 1",
+		"PVE_CREDENTIAL_REMOVER='/usr/local/lib/ppflight-agent/remove-pve-credentials.sh'",
+		"\"$PVE_CREDENTIAL_REMOVER\" || {",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("uninstaller is missing required fail-closed stop contract %q", required)
@@ -23,9 +26,15 @@ func TestUninstallerProvesPrimaryAgentStoppedBeforeRemoval(t *testing.T) {
 		t.Fatal("uninstaller still masks primary Agent stop failures")
 	}
 	stop := strings.Index(source, "stop_required_unit \"$required_unit\" || exit 1")
+	revoke := strings.Index(source, "\"$PVE_CREDENTIAL_REMOVER\" || {")
 	remove := strings.Index(source, "rm -f -- /etc/systemd/system/ppflight-agent.service")
 	purge := strings.Index(source, "rm -rf -- /etc/ppflight-agent /var/lib/ppflight-agent")
-	if stop < 0 || remove < stop || purge < stop {
-		t.Fatal("uninstaller can remove Agent files or credential state before proving the primary unit is stopped")
+	if stop < 0 || revoke < stop || remove < revoke || purge < revoke {
+		t.Fatal("uninstaller can remove Agent/PVE credentials or files before proving the primary unit is stopped")
+	}
+	serviceGuard := strings.Index(source, "if [[ \"$unit\" == *.service ]]")
+	pidQuery := strings.Index(source, "main_pid=\"$(systemctl show --property=MainPID --value \"$unit\"")
+	if serviceGuard < 0 || pidQuery < serviceGuard {
+		t.Fatal("uninstaller queries MainPID before restricting that check to service units")
 	}
 }

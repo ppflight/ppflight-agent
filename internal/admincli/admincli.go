@@ -157,7 +157,7 @@ func (c *cli) usage() {
   ag-pve [--config FILE] status
   AG | ag | ag-pve                                   # 四项主菜单；官网/监控状态在各自绑定设置中
   ag-pve [--config FILE] validate
-  ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE]
+  ag-pve [--config FILE] pve prepare [--tls-server-name DNS_NAME] [--ca-file FILE] [--local-only]
   ag-pve [--config FILE] pve status
   ag-pve [--config FILE] bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
   ag-pve [--config FILE] website bind --endpoint HTTPS_URL [--code-file FILE] [--replace]
@@ -235,7 +235,7 @@ func (c *cli) menuCompleteUninstallAt(reader *bufio.Reader, filename string) int
 		fmt.Fprintln(c.errOut, "完全卸载必须由 PVE root 显式执行")
 		return 1
 	}
-	fmt.Fprintln(c.out, `完全卸载会停止并删除 PPFlight Agent、systemd 服务、官网/监控绑定凭据、配置、持久队列和本地审计状态。
+	fmt.Fprintln(c.out, `完全卸载会停止并删除 PPFlight Agent、systemd 服务、PPFlight 专用 PVE Token/用户/ACL、官网/监控绑定凭据、配置、持久队列和本地审计状态。
 不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存或备份文件。`)
 	confirmation, err := c.promptLine(reader, "输入 UNINSTALL 确认完全卸载（其他输入取消）: ")
 	if err != nil {
@@ -246,9 +246,9 @@ func (c *cli) menuCompleteUninstallAt(reader *bufio.Reader, filename string) int
 		fmt.Fprintln(c.out, "已取消，未卸载任何内容。")
 		return 0
 	}
-	_, transaction, err := c.acquireStableMutationTransaction(filename, "")
+	_, transaction, err := c.acquireCompleteUninstallTransaction(filename)
 	if err != nil {
-		fmt.Fprintln(c.errOut, "完全卸载已拒绝：本机存在并发或未完成的 Agent 管理事务；未删除任何内容")
+		fmt.Fprintln(c.errOut, "完全卸载已拒绝：另一个 Agent 管理命令仍在执行，或本机配置/权限状态不安全；未删除任何内容")
 		return 1
 	}
 	defer transaction.Close()
@@ -866,6 +866,42 @@ func (c *cli) acquireStableUnbindTransaction(filename, expectedStateDirectory, d
 		return config.Config{}, nil, errors.New("invalid binding removal domain")
 	}
 	return c.acquireStableMutationTransactionExceptUnbind(filename, expectedStateDirectory, domain)
+}
+
+// acquireCompleteUninstallTransaction serializes complete removal with every
+// other root management operation, but deliberately permits incomplete bind
+// or unbind journals. A confirmed --purge uninstall is the recovery boundary
+// for deleting those journals together with all Agent credentials and state.
+func (c *cli) acquireCompleteUninstallTransaction(filename string) (config.Config, *fsutil.Lock, error) {
+	initial, err := config.LoadFile(filename)
+	if err != nil {
+		return config.Config{}, nil, errors.New("load Agent configuration")
+	}
+	if err := c.requireManagedWriteTarget(filename, initial); err != nil {
+		return config.Config{}, nil, err
+	}
+	transaction, err := bindstate.AcquireTransaction(initial.Runtime.StateDirectory)
+	if err != nil {
+		return config.Config{}, nil, errors.New("acquire Agent management transaction")
+	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = transaction.Close()
+		}
+	}()
+	latest, err := config.LoadFile(filename)
+	if err != nil {
+		return config.Config{}, nil, errors.New("reload Agent configuration under transaction lock")
+	}
+	if latest.Runtime.StateDirectory != initial.Runtime.StateDirectory {
+		return config.Config{}, nil, errors.New("Agent configuration changed during transaction acquisition")
+	}
+	if err := c.requireManagedWriteTarget(filename, latest); err != nil {
+		return config.Config{}, nil, err
+	}
+	closeOnError = false
+	return latest, transaction, nil
 }
 
 func (c *cli) acquireStableMutationTransactionExceptUnbind(filename, expectedStateDirectory, allowedUnbindDomain string) (config.Config, *fsutil.Lock, error) {

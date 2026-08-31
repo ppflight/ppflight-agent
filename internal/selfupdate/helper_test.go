@@ -34,6 +34,15 @@ func TestVerifiedBinaryRejectsLinks(t *testing.T) {
 	}
 }
 
+func TestReleaseAllowlistIncludesCredentialRemovalHelper(t *testing.T) {
+	if !allowedReleaseEntry("ppflight-agent/scripts/remove-pve-credentials.sh", false) {
+		t.Fatal("release allowlist rejected the installed PVE credential removal helper")
+	}
+	if allowedReleaseEntry("ppflight-agent/scripts/remove-arbitrary-pve-data.sh", false) {
+		t.Fatal("release allowlist accepted an unapproved removal helper")
+	}
+}
+
 func buildArchive(t *testing.T, binary []byte, link bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "release.tar.gz")

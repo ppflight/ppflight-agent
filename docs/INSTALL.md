@@ -2,7 +2,7 @@
 
 本页用于 Proxmox VE 8.x/9.x 节点。目标架构只允许 Agent 在本机连接 `https://127.0.0.1:8006`；官网不保存 PVE 地址或 Token，也不需要访问 PVE 8006。
 
-当前 Agent 已把安装后的真实 PVE readiness 与官网/监控绑定向导串联：绑定码读取前自动完成受控 Token bootstrap、TLS/API/权限探测、production/api 切换、服务重启和真实采集回验。安装后默认处于 disabled，服务不会启动或外发；旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会迁移为 `production+disabled`，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把安装成功等同于生产写控制已开放。
+当前 `main` 一键安装会自动完成受控 Token bootstrap、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及 systemd 开机启用；安装成功即表示本机真实读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
 
 ## 1. 前置条件
 
@@ -52,7 +52,7 @@ sudo scripts/install.sh \
   --enable
 ```
 
-安装器会创建专用系统用户和目录、安装 `/usr/local/bin/ppflight-agent`，并创建 `/usr/local/bin/ag-pve`、`/usr/local/bin/ag`、`/usr/local/bin/AG` 软链接。它保留已有 `/etc/ppflight-agent/agent.yaml`、`agent.env` 和 assignment 数据，且没有 `--start` 时不会启动服务。生产 assignment 的目标路径是 `/var/lib/ppflight-agent/assignments/assignments.json`；从旧 `/etc/ppflight-agent/assignments.json` 迁移时必须保留现有内容、再按目标 `ppflight-agent:ppflight-agent/0640` 元数据落盘，不能用空文件覆盖。
+底层安装器会创建专用系统用户和目录、安装 `/usr/local/bin/ppflight-agent`，并创建 `/usr/local/bin/ag-pve`、`/usr/local/bin/ag`、`/usr/local/bin/AG` 软链接。它保留已有 `/etc/ppflight-agent/agent.yaml`、`agent.env` 和 assignment 数据，且没有 `--start` 时不会自行启动 disabled 服务。仓库根的一键脚本会在它之后自动执行 `ag-pve pve prepare --local-only`，等待真实本地采集成功，再启动升级监听并严格核对 agent/path 均为 enabled+active；远端暂时不可用不会阻止本地队列继续积压重试。生产 assignment 的目标路径是 `/var/lib/ppflight-agent/assignments/assignments.json`；从旧 `/etc/ppflight-agent/assignments.json` 迁移时必须保留现有内容、再按目标 `ppflight-agent:ppflight-agent/0640` 元数据落盘，不能用空文件覆盖。
 
 cloud-init helper 不是安装时另行下载的插件：同一 Agent 发布/安装包必须携带仓内 `bundles/ppflight-cloudinit`、manifest 和 verifier。安装器在安装二进制前先验证 bundle 精确文件集、摘要、依赖和 IPv4/HTTPS redirect policy；缺失、混装或校验失败会中止整次安装。当前自动化已覆盖打包/安装合同，但发布物仍须在 PVE 8/9 非生产节点完成会创建模板/备份的真实 plan/execute 破坏性验收。
 
@@ -359,7 +359,7 @@ Executor 的动作全集和网络/IPFilter 编排见 [Agent API v1](AGENT-API-V1
 
 不要删除 `/var/lib/ppflight-agent` 中的 queue、control journal、assignment refresh state，或 `/var/lib/ppflight-agent/bindings` 中的 binding state、device ID/pending state。它们用于幂等、UPID 恢复和凭据防回滚。卸载前先确认官网已经接收所有关键队列，并明确是否保留绑定状态。
 
-卸载器会删除 Agent 自带的 `/usr/local/lib/ppflight-agent/create-pve-tokens.sh`、`template-bootstrap` managed link 和 `template-bundles` helper 版本目录；它不会删除已经创建的 PVE user/token/role/ACL，也不会删除 PVE 中已经创建的模板、镜像缓存或备份。是否撤销身份/ACL或清理这些 PVE 资产必须另做清单、审批和显式操作。
+完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户及其 PPFlight ACL；未被其他主体引用的两个 PPFlight 专用角色也会删除，被其他主体引用的角色只告警保留。任何存在对象删除失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。它不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
 
 ## 11. 故障检查
 

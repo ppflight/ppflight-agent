@@ -21,6 +21,7 @@ readonly LIB_DIR='/usr/local/lib/ppflight-agent'
 readonly TEMPLATE_BUNDLES_DIR="$LIB_DIR/template-bundles"
 readonly TEMPLATE_LINK="$LIB_DIR/template-bootstrap"
 readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"
+readonly PVE_REMOVE_HELPER="$LIB_DIR/remove-pve-credentials.sh"
 readonly UNINSTALL_HELPER="$LIB_DIR/uninstall.sh"
 readonly BIN_PATH='/usr/local/bin/ppflight-agent'
 readonly SYSTEMD_DIR='/etc/systemd/system'
@@ -257,6 +258,7 @@ install -d -o root -g root -m 0755 "$TEMPLATE_BUNDLES_DIR"
 install -d -o root -g root -m 0755 "$TMPFILES_DIR"
 install -m 0755 "$BINARY" "$BIN_PATH"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"
+install -o root -g root -m 0700 "$REPO_DIR/scripts/remove-pve-credentials.sh" "$PVE_REMOVE_HELPER"
 install -o root -g root -m 0700 "$REPO_DIR/scripts/uninstall.sh" "$UNINSTALL_HELPER"
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag-pve
 ln -sfn -- "$BIN_PATH" /usr/local/bin/ag
@@ -473,10 +475,10 @@ elif [[ $START -eq 1 ]]; then
 fi
 
 if [[ $PVE_PREPARATION_REQUIRED -eq 1 ]]; then
-  note "Installed $APP for PVE $pve_version. PVE collection is disabled and the service remains stopped; enter AG to complete local PVE preparation."
+  note "Installed $APP for PVE $pve_version. PVE collection is disabled and the service remains stopped until the caller completes verified local PVE preparation."
 elif [[ $SERVICE_WAS_ACTIVE -eq 1 ]]; then
   note "Installed $APP for PVE $pve_version and restored the previously active service."
 else
   note "Installed $APP for PVE $pve_version. No service was started unless --start was supplied."
 fi
-note "AG local PVE preparation verifies the local API and enables pve.source=api before the service can collect or upload."
+note "Verified local PVE preparation enables pve.source=api before the service can collect or upload."

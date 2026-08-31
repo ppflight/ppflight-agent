@@ -107,6 +107,7 @@ readonly -a RELEASE_FILES=(
   'scripts/install.sh'
   'scripts/uninstall.sh'
   'scripts/create-pve-tokens.sh'
+  'scripts/remove-pve-credentials.sh'
   'scripts/verify-template-bundle.py'
 )
 

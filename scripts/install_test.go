@@ -47,8 +47,10 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 		`[[ "$service_user" == 'ppflight-agent' ]]`,
 		`readonly TEMPLATE_BUNDLES_DIR="$LIB_DIR/template-bundles"`,
 		`readonly PVE_BOOTSTRAP_HELPER="$LIB_DIR/create-pve-tokens.sh"`,
+		`readonly PVE_REMOVE_HELPER="$LIB_DIR/remove-pve-credentials.sh"`,
 		`readonly UNINSTALL_HELPER="$LIB_DIR/uninstall.sh"`,
 		`install -o root -g root -m 0700 "$REPO_DIR/scripts/create-pve-tokens.sh" "$PVE_BOOTSTRAP_HELPER"`,
+		`install -o root -g root -m 0700 "$REPO_DIR/scripts/remove-pve-credentials.sh" "$PVE_REMOVE_HELPER"`,
 		`install -o root -g root -m 0700 "$REPO_DIR/scripts/uninstall.sh" "$UNINSTALL_HELPER"`,
 		`python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_SOURCE"`,
 		`TEMPLATE_STAGE="$(mktemp -d "$TEMPLATE_BUNDLES_DIR/.template-bootstrap-stage.XXXXXX")"`,
@@ -71,6 +73,7 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 	for _, required := range []string{
 		`rm -f -- /usr/local/lib/ppflight-agent/template-bootstrap`,
 		`rm -f -- /usr/local/lib/ppflight-agent/create-pve-tokens.sh`,
+		`rm -f -- /usr/local/lib/ppflight-agent/remove-pve-credentials.sh`,
 		`rm -f -- /usr/local/lib/ppflight-agent/uninstall.sh`,
 		`rm -rf -- /usr/local/lib/ppflight-agent`,
 		`rm -rf -- /usr/local/lib/ppflight-agent/template-bundles`,

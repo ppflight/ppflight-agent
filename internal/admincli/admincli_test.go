@@ -805,7 +805,7 @@ func TestPublicConfigurationMutationsRefusePendingCommitAndTransactionLock(t *te
 	}
 }
 
-func TestPVEPrepareUnbindAndUninstallRefuseIncompleteBindingTransaction(t *testing.T) {
+func TestPVEPrepareAndUnbindRefuseButCompleteUninstallPurgesIncompleteBindingTransaction(t *testing.T) {
 	filename := prepareBindConfig(t)
 	cfg, websiteState, _ := seedDualBindings(t, filename)
 	if err := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, "123e4567-e89b-42d3-a456-426614174001", 1); err != nil {
@@ -839,8 +839,8 @@ func TestPVEPrepareUnbindAndUninstallRefuseIncompleteBindingTransaction(t *testi
 		completeUninstall:  func(context.Context) error { called = true; return nil },
 		managedWritePolicy: allowManagedWriteForTest,
 	}
-	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code == 0 || called {
-		t.Fatalf("incomplete binding allowed complete uninstall: code=%d called=%t output=%s stderr=%s", code, called, output.String(), stderr.String())
+	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || !called {
+		t.Fatalf("confirmed complete uninstall did not purge incomplete binding state: code=%d called=%t output=%s stderr=%s", code, called, output.String(), stderr.String())
 	}
 }
 
