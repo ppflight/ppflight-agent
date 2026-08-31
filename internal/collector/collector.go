@@ -495,6 +495,7 @@ func cloneHost(value *exporter.HostObservation) *exporter.HostObservation {
 	copyValue.CPUSeconds = append([]exporter.CPUSecondsObservation(nil), value.CPUSeconds...)
 	copyValue.Filesystems = append([]exporter.FilesystemObservation(nil), value.Filesystems...)
 	copyValue.Interfaces = append([]exporter.InterfaceObservation(nil), value.Interfaces...)
+	copyValue.Disks = append([]exporter.DiskObservation(nil), value.Disks...)
 	copyValue.Pressure = append([]exporter.PressureObservation(nil), value.Pressure...)
 	copyValue.HardwareTemperatures = append([]exporter.HardwareTemperatureObservation(nil), value.HardwareTemperatures...)
 	copyValue.ZFSPools = append([]exporter.ZFSPoolObservation(nil), value.ZFSPools...)

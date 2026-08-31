@@ -136,14 +136,16 @@ for ((attempt = 0; attempt < 15; attempt++)); do
   if curl --disable --ipv4 --fail --silent --show-error --max-time 5 \
       http://127.0.0.1:9100/metrics --output "$node_metrics" \
       && grep -q '^node_network_receive_bytes_total{' "$node_metrics" \
-      && grep -q '^node_network_transmit_bytes_total{' "$node_metrics"; then
+      && grep -q '^node_network_transmit_bytes_total{' "$node_metrics" \
+      && grep -q '^node_disk_read_bytes_total{' "$node_metrics" \
+      && grep -q '^node_disk_written_bytes_total{' "$node_metrics"; then
     node_network_ready=1
     break
   fi
   sleep 1
 done
 [[ $node_network_ready -eq 1 ]] \
-  || die 'node_exporter 未提供网卡累计字节指标，Agent 不能报告真实带宽接口'
+  || die 'node_exporter 未提供网卡与硬盘累计字节指标，Agent 不能报告真实带宽或硬盘 IO'
 
 printf '\n正在自动准备本机真实 PVE 读取、启动服务并校验首次采集...\n'
 /usr/local/bin/ag-pve pve prepare --local-only \

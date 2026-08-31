@@ -28,7 +28,9 @@ func TestMonitoringTelemetryPreservesAllLargeValuesAsStrings(t *testing.T) {
 				Filesystems: []pve.GuestFilesystem{{Name: "root", Mountpoint: "/", Type: "ext4", TotalBytes: &large, UsedBytes: &large}},
 				Interfaces:  []pve.GuestInterface{{Name: "eth0", HardwareAddress: "02:00:00:00:00:01", Statistics: &pve.GuestInterfaceStats{RxBytes: &large, TxBytes: &large, RxPackets: &large, TxPackets: &large}}}},
 		}},
-		Host:  &exporter.HostObservation{ObservedAt: now, MemoryTotalBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}, Interfaces: []exporter.InterfaceObservation{{Device: "eth0", ReceiveBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}}}},
+		Host: &exporter.HostObservation{ObservedAt: now, MemoryTotalBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"},
+			Interfaces: []exporter.InterfaceObservation{{Device: "eth0", ReceiveBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}}},
+			Disks:      []exporter.DiskObservation{{Device: "sda", ReadBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}, WrittenBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}}}},
 		SMART: &exporter.SmartObservation{ObservedAt: now, Devices: []exporter.SmartDeviceObservation{{Device: "/dev/sda", CapacityBytes: exporter.Value{Value: &metricFloat, Raw: "9007199254740993"}}}},
 	}
 	assignments := inventory.NewStore(inventory.Document{SchemaVersion: 1, Revision: "revision-01", IssuedAt: now, Assignments: []inventory.Assignment{{ServiceRef: "service-01", ClusterRef: "cluster-01", NodeRef: "node-01", VMID: 101, Generation: large, InstanceUUID: "instance-01", GuestType: "qemu", BillingState: "shadow"}}})
@@ -56,6 +58,9 @@ func TestMonitoringTelemetryPreservesAllLargeValuesAsStrings(t *testing.T) {
 		if !bytes.Contains(raw, needle) {
 			t.Fatalf("field %s did not preserve exact decimal value: %s", field, raw)
 		}
+	}
+	if !bytes.Contains(raw, []byte(`"disks":[{"device":"sda","readBytes":{"decimal":"9007199254740993"},"writtenBytes":{"decimal":"9007199254740993"}}]`)) {
+		t.Fatalf("host disk cumulative counters are missing from monitoring payload: %s", raw)
 	}
 }
 

@@ -7,7 +7,7 @@ import (
 )
 
 func TestParseAndNormalizeHost(t *testing.T) {
-	metrics := "# HELP node_load1 Load\nnode_load1 0.42\nnode_memory_MemTotal_bytes 100\nnode_memory_MemAvailable_bytes 55\nnode_filesystem_size_bytes{device=\"/dev/sda1\",mountpoint=\"/\",fstype=\"ext4\"} 99\nnode_filesystem_avail_bytes{device=\"/dev/sda1\",mountpoint=\"/\",fstype=\"ext4\"} 49\nnode_network_receive_bytes_total{device=\"eth0\"} 11\nnode_network_transmit_bytes_total{device=\"eth0\"} 12\n"
+	metrics := "# HELP node_load1 Load\nnode_load1 0.42\nnode_memory_MemTotal_bytes 100\nnode_memory_MemAvailable_bytes 55\nnode_filesystem_size_bytes{device=\"/dev/sda1\",mountpoint=\"/\",fstype=\"ext4\"} 99\nnode_filesystem_avail_bytes{device=\"/dev/sda1\",mountpoint=\"/\",fstype=\"ext4\"} 49\nnode_network_receive_bytes_total{device=\"eth0\"} 11\nnode_network_transmit_bytes_total{device=\"eth0\"} 12\nnode_disk_read_bytes_total{device=\"sda\"} 9007199254740993\nnode_disk_written_bytes_total{device=\"sda\"} 9007199254741993\nnode_disk_reads_completed_total{device=\"sda\"} 13\nnode_disk_writes_completed_total{device=\"sda\"} 14\nnode_disk_io_time_seconds_total{device=\"sda\"} 15.5\n"
 	samples, err := Parse(strings.NewReader(metrics), 4096)
 	if err != nil {
 		t.Fatal(err)
@@ -21,6 +21,9 @@ func TestParseAndNormalizeHost(t *testing.T) {
 	}
 	if len(result.Interfaces) != 1 || *result.Interfaces[0].TransmitBytes.Value != 12 {
 		t.Fatalf("interfaces %#v", result.Interfaces)
+	}
+	if len(result.Disks) != 1 || result.Disks[0].ReadBytes.Raw != "9007199254740993" || result.Disks[0].WrittenBytes.Raw != "9007199254741993" || result.Disks[0].IOTimeSeconds.Value == nil {
+		t.Fatalf("disks %#v", result.Disks)
 	}
 }
 func TestMissingMetricIsUnavailable(t *testing.T) {

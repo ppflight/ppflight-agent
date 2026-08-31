@@ -18,7 +18,7 @@ PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网�
 curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scripts/quick-install.sh | bash
 ```
 
-`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离 PVE Token，安装并启用仅监听回环地址的宿主机/网卡/SMART 采集服务，校验真实网卡累计收发字节指标，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集。随后切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡数据的状态报告成成功。它不会授予 control ACL、打开 `productionExecution` 或绑定官网/监控站；发布版也不含 simulator 采集器。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
+`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离 PVE Token，安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，校验真实网卡累计收发字节与磁盘累计读写字节指标，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集。随后切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。它不会授予 control ACL、打开 `productionExecution` 或绑定官网/监控站；发布版也不含 simulator 采集器。后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
 安装完成后只输入：
 

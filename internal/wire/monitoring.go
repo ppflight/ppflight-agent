@@ -225,6 +225,7 @@ type MonitoringHost struct {
 	CPUSeconds           []MonitoringCPUSeconds     `json:"cpuSeconds,omitempty"`
 	Filesystems          []MonitoringHostFilesystem `json:"filesystems,omitempty"`
 	Interfaces           []MonitoringHostInterface  `json:"interfaces,omitempty"`
+	Disks                []MonitoringHostDisk       `json:"disks,omitempty"`
 	Pressure             []MonitoringPressure       `json:"pressure,omitempty"`
 	HardwareTemperatures []MonitoringTemperature    `json:"hardwareTemperatures,omitempty"`
 	ZFSPools             []MonitoringZFSPool        `json:"zfsPools,omitempty"`
@@ -252,6 +253,14 @@ type MonitoringHostInterface struct {
 	ReceiveDrops   *MonitoringMetric `json:"receiveDrops,omitempty"`
 	TransmitDrops  *MonitoringMetric `json:"transmitDrops,omitempty"`
 	LinkUp         *MonitoringMetric `json:"linkUp,omitempty"`
+}
+type MonitoringHostDisk struct {
+	Device          string            `json:"device"`
+	ReadBytes       *MonitoringMetric `json:"readBytes,omitempty"`
+	WrittenBytes    *MonitoringMetric `json:"writtenBytes,omitempty"`
+	ReadsCompleted  *MonitoringMetric `json:"readsCompleted,omitempty"`
+	WritesCompleted *MonitoringMetric `json:"writesCompleted,omitempty"`
+	IOTimeSeconds   *MonitoringMetric `json:"ioTimeSeconds,omitempty"`
 }
 type MonitoringPressure struct {
 	Resource     string            `json:"resource"`
@@ -475,6 +484,9 @@ func monitoringHost(value exporter.HostObservation) MonitoringHost {
 	}
 	for _, item := range value.Interfaces {
 		result.Interfaces = append(result.Interfaces, MonitoringHostInterface{Device: item.Device, ReceiveBytes: monitoringMetric(item.ReceiveBytes), TransmitBytes: monitoringMetric(item.TransmitBytes), ReceiveErrors: monitoringMetric(item.ReceiveErrors), TransmitErrors: monitoringMetric(item.TransmitErrors), ReceiveDrops: monitoringMetric(item.ReceiveDrops), TransmitDrops: monitoringMetric(item.TransmitDrops), LinkUp: monitoringMetric(item.LinkUp)})
+	}
+	for _, item := range value.Disks {
+		result.Disks = append(result.Disks, MonitoringHostDisk{Device: item.Device, ReadBytes: monitoringMetric(item.ReadBytes), WrittenBytes: monitoringMetric(item.WrittenBytes), ReadsCompleted: monitoringMetric(item.ReadsCompleted), WritesCompleted: monitoringMetric(item.WritesCompleted), IOTimeSeconds: monitoringMetric(item.IOTimeSeconds)})
 	}
 	for _, item := range value.Pressure {
 		result.Pressure = append(result.Pressure, MonitoringPressure{Resource: item.Resource, State: item.State, SecondsTotal: monitoringMetric(item.SecondsTotal)})

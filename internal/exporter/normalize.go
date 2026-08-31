@@ -42,6 +42,14 @@ type InterfaceObservation struct {
 	TransmitDrops  Value  `json:"transmitDrops"`
 	LinkUp         Value  `json:"linkUp"`
 }
+type DiskObservation struct {
+	Device          string `json:"device"`
+	ReadBytes       Value  `json:"readBytes"`
+	WrittenBytes    Value  `json:"writtenBytes"`
+	ReadsCompleted  Value  `json:"readsCompleted"`
+	WritesCompleted Value  `json:"writesCompleted"`
+	IOTimeSeconds   Value  `json:"ioTimeSeconds"`
+}
 type CPUSecondsObservation struct {
 	CPU     string `json:"cpu"`
 	Mode    string `json:"mode"`
@@ -74,6 +82,7 @@ type HostObservation struct {
 	CPUSeconds           []CPUSecondsObservation          `json:"cpuSeconds,omitempty"`
 	Filesystems          []FilesystemObservation          `json:"filesystems,omitempty"`
 	Interfaces           []InterfaceObservation           `json:"interfaces,omitempty"`
+	Disks                []DiskObservation                `json:"disks,omitempty"`
 	Pressure             []PressureObservation            `json:"pressure,omitempty"`
 	HardwareTemperatures []HardwareTemperatureObservation `json:"hardwareTemperatures,omitempty"`
 	ZFSPools             []ZFSPoolObservation             `json:"zfsPools,omitempty"`
@@ -104,6 +113,7 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 	o := HostObservation{ObservedAt: observedAt}
 	fs := map[string]*FilesystemObservation{}
 	nic := map[string]*InterfaceObservation{}
+	disks := map[string]*DiskObservation{}
 	pressure := map[string]*PressureObservation{}
 	hwmon := map[string]*HardwareTemperatureObservation{}
 	zfs := map[string]*ZFSPoolObservation{}
@@ -178,6 +188,28 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 			case "node_network_up":
 				v.LinkUp = number(s.Value, s.RawValue)
 			}
+		case "node_disk_read_bytes_total", "node_disk_written_bytes_total", "node_disk_reads_completed_total", "node_disk_writes_completed_total", "node_disk_io_time_seconds_total":
+			device := s.Labels["device"]
+			if device == "" {
+				continue
+			}
+			v := disks[device]
+			if v == nil {
+				v = &DiskObservation{Device: device}
+				disks[device] = v
+			}
+			switch s.Name {
+			case "node_disk_read_bytes_total":
+				v.ReadBytes = number(s.Value, s.RawValue)
+			case "node_disk_written_bytes_total":
+				v.WrittenBytes = number(s.Value, s.RawValue)
+			case "node_disk_reads_completed_total":
+				v.ReadsCompleted = number(s.Value, s.RawValue)
+			case "node_disk_writes_completed_total":
+				v.WritesCompleted = number(s.Value, s.RawValue)
+			case "node_disk_io_time_seconds_total":
+				v.IOTimeSeconds = number(s.Value, s.RawValue)
+			}
 		case "node_pressure_cpu_waiting_seconds_total", "node_pressure_io_waiting_seconds_total", "node_pressure_io_stalled_seconds_total", "node_pressure_memory_waiting_seconds_total", "node_pressure_memory_stalled_seconds_total":
 			parts := strings.Split(strings.TrimPrefix(strings.TrimSuffix(s.Name, "_seconds_total"), "node_pressure_"), "_")
 			if len(parts) == 2 {
@@ -225,6 +257,9 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 	for _, v := range nic {
 		o.Interfaces = append(o.Interfaces, *v)
 	}
+	for _, v := range disks {
+		o.Disks = append(o.Disks, *v)
+	}
 	for _, v := range pressure {
 		o.Pressure = append(o.Pressure, *v)
 	}
@@ -234,7 +269,7 @@ func NormalizeHost(samples []Sample, observedAt time.Time) HostObservation {
 	for _, v := range zfs {
 		o.ZFSPools = append(o.ZFSPools, *v)
 	}
-	sortHost(o.Filesystems, o.Interfaces, o.CPUSeconds, o.Pressure, o.HardwareTemperatures, o.ZFSPools)
+	sortHost(o.Filesystems, o.Interfaces, o.Disks, o.CPUSeconds, o.Pressure, o.HardwareTemperatures, o.ZFSPools)
 	return o
 }
 
@@ -304,7 +339,7 @@ func firstLabel(labels map[string]string, names ...string) string {
 	return ""
 }
 
-func sortHost(filesystems []FilesystemObservation, interfaces []InterfaceObservation, cpus []CPUSecondsObservation, pressure []PressureObservation, temperatures []HardwareTemperatureObservation, pools []ZFSPoolObservation) {
+func sortHost(filesystems []FilesystemObservation, interfaces []InterfaceObservation, disks []DiskObservation, cpus []CPUSecondsObservation, pressure []PressureObservation, temperatures []HardwareTemperatureObservation, pools []ZFSPoolObservation) {
 	sort.Slice(filesystems, func(i, j int) bool {
 		if filesystems[i].Device == filesystems[j].Device {
 			return filesystems[i].Mountpoint < filesystems[j].Mountpoint
@@ -312,6 +347,7 @@ func sortHost(filesystems []FilesystemObservation, interfaces []InterfaceObserva
 		return filesystems[i].Device < filesystems[j].Device
 	})
 	sort.Slice(interfaces, func(i, j int) bool { return interfaces[i].Device < interfaces[j].Device })
+	sort.Slice(disks, func(i, j int) bool { return disks[i].Device < disks[j].Device })
 	sort.Slice(cpus, func(i, j int) bool {
 		if cpus[i].CPU == cpus[j].CPU {
 			return cpus[i].Mode < cpus[j].Mode

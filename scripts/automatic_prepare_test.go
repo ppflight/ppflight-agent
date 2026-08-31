@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.0-rc.17"
+		repositoryVersion = "0.1.0-rc.18"
 		// quick-install is advanced only after the immutable GitHub assets for
 		// the repository version exist and their complete archive digests have
 		// been verified. During the release commit it therefore still pins the
@@ -76,8 +76,10 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 			t.Fatalf("quick installer omitted exporter bootstrap option %q", required)
 		}
 	}
-	if !strings.Contains(compact, "node_network_receive_bytes_total") || !strings.Contains(compact, "node_network_transmit_bytes_total") {
-		t.Fatal("quick installer must verify real node_exporter network counters before reporting success")
+	for _, metric := range []string{"node_network_receive_bytes_total", "node_network_transmit_bytes_total", "node_disk_read_bytes_total", "node_disk_written_bytes_total"} {
+		if !strings.Contains(compact, metric) {
+			t.Fatalf("quick installer must verify real node_exporter metric %q before reporting success", metric)
+		}
 	}
 	if strings.Contains(compact, "source=simulator") || strings.Contains(compact, "--source simulator") {
 		t.Fatal("quick installer must never select a simulator collection path")
@@ -213,7 +215,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	}
 	ag := filepath.Join(root, "ag-pve")
 	writeQuickInstallMock(t, ag, "#!/usr/bin/env bash\nprintf 'prepare:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nexit \"${TEST_PREPARE_EXIT:?}\"\n")
-	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\n' >\"$out\"\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nprintf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\n' >\"$out\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf 'binary\\n' >ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")

@@ -2,7 +2,7 @@
 
 本页用于 Proxmox VE 8.x/9.x 节点。目标架构只允许 Agent 在本机连接 `https://127.0.0.1:8006`；官网不保存 PVE 地址或 Token，也不需要访问 PVE 8006。
 
-当前 `main` 一键安装会自动完成受控 Token bootstrap、固定版本及 SHA-256 的 `node_exporter`/`smartctl_exporter` 安装、真实网卡指标回验、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及全部相关 systemd unit 的开机启用；安装成功即表示本机真实 PVE、宿主机和网卡读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
+当前 `main` 一键安装会自动完成受控 Token bootstrap、固定版本及 SHA-256 的 `node_exporter`/`smartctl_exporter` 安装、真实网卡与磁盘 IO 指标回验、TLS/API/权限探测、production/api 切换、服务启动、首轮真实采集回验以及全部相关 systemd unit 的开机启用；安装成功即表示本机真实 PVE、宿主机、网卡、磁盘 IO 与 SMART 读取已运行。包内底层 installer 仍先落盘 disabled 状态，供离线操作者分阶段审计。绑定码读取前还会重新核对真实 PVE readiness。旧版遗留的 `mode=test` 或 `pve.source=simulator` 升级时会先迁移为 `production+disabled`，再由一键流程恢复真实采集，无需重新绑定。发布版没有模拟采集路径，不能生成或上传测试 PVE telemetry。官网 Agent upgrade route feature flag 仍必须默认关闭，直到自升级合同完成生产验收；不要把读取安装成功等同于生产写控制已开放。
 
 ## 1. 前置条件
 
@@ -52,7 +52,9 @@ sudo scripts/install.sh \
   --enable
 ```
 
-底层安装器会创建专用系统用户和目录、安装 `/usr/local/bin/ppflight-agent`，并创建 `/usr/local/bin/ag-pve`、`/usr/local/bin/ag`、`/usr/local/bin/AG` 软链接。它保留已有 `/etc/ppflight-agent/agent.yaml`、`agent.env` 和 assignment 数据，且没有 `--start` 时不会自行启动 disabled 服务。仓库根的一键脚本会在它之后自动安装、启用并启动只监听本机的 `ppflight-node-exporter` 与 `ppflight-smartctl-exporter`，要求 9100 指标同时含真实网卡收发累计字节，再执行 `ag-pve pve prepare --local-only`；等待真实本地采集成功后启动升级监听，并严格核对 Agent、升级监听和两个 exporter 均为 enabled+active。远端暂时不可用不会阻止本地队列继续积压重试。生产 assignment 的目标路径是 `/var/lib/ppflight-agent/assignments/assignments.json`；从旧 `/etc/ppflight-agent/assignments.json` 迁移时必须保留现有内容、再按目标 `ppflight-agent:ppflight-agent/0640` 元数据落盘，不能用空文件覆盖。
+底层安装器会创建专用系统用户和目录、安装 `/usr/local/bin/ppflight-agent`，并创建 `/usr/local/bin/ag-pve`、`/usr/local/bin/ag`、`/usr/local/bin/AG` 软链接。它保留已有 `/etc/ppflight-agent/agent.yaml`、`agent.env` 和 assignment 数据，且没有 `--start` 时不会自行启动 disabled 服务。仓库根的一键脚本会在它之后自动安装、启用并启动只监听本机的 `ppflight-node-exporter` 与 `ppflight-smartctl-exporter`，要求 9100 指标同时含真实网卡收发累计字节和磁盘读写累计字节，再执行 `ag-pve pve prepare --local-only`；等待真实本地采集成功后启动升级监听，并严格核对 Agent、升级监听和两个 exporter 均为 enabled+active。远端暂时不可用不会阻止本地队列继续积压重试。生产 assignment 的目标路径是 `/var/lib/ppflight-agent/assignments/assignments.json`；从旧 `/etc/ppflight-agent/assignments.json` 迁移时必须保留现有内容、再按目标 `ppflight-agent:ppflight-agent/0640` 元数据落盘，不能用空文件覆盖。
+
+监控 `telemetry-v1` 的可选 `telemetry.host.disks[]` 使用严格结构 `{device,readBytes?,writtenBytes?,readsCompleted?,writesCompleted?,ioTimeSeconds?}`。每个累计值均为 `{decimal:"..."}`，保留 exporter 原始十进制文本，不能经过 JavaScript `number` 舍入；服务端以相邻样本和观察时间计算速率，首样本、计数器重置或乱序样本不能伪造磁盘吞吐。
 
 cloud-init helper 不是安装时另行下载的插件：同一 Agent 发布/安装包必须携带仓内 `bundles/ppflight-cloudinit`、manifest 和 verifier。安装器在安装二进制前先验证 bundle 精确文件集、摘要、依赖和 IPv4/HTTPS redirect policy；缺失、混装或校验失败会中止整次安装。当前自动化已覆盖打包/安装合同，但发布物仍须在 PVE 8/9 非生产节点完成会创建模板/备份的真实 plan/execute 破坏性验收。
 
