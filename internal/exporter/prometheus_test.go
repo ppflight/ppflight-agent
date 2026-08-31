@@ -33,10 +33,42 @@ func TestMissingMetricIsUnavailable(t *testing.T) {
 	}
 }
 func TestParserRejectsBadInput(t *testing.T) {
-	for _, input := range []string{"bad", "metric{a=\"bad\\q\"} 1", "metric NaN", "metric{a=\"1\",a=\"2\"} 1"} {
+	for _, input := range []string{"bad", "metric{a=\"bad\\q\"} 1", "metric{a=\"1\",a=\"2\"} 1"} {
 		if _, err := Parse(strings.NewReader(input+"\n"), 1024); err == nil {
 			t.Fatalf("expected malformed input error for %q", input)
 		}
+	}
+}
+
+func TestParserSkipsPrometheusNonFiniteSamplesWithoutDroppingRealMetrics(t *testing.T) {
+	metrics := strings.Join([]string{
+		`node_network_receive_bytes_total{device="eth0"} 123`,
+		`node_hwmon_temp_celsius{chip="missing",sensor="missing"} NaN`,
+		`node_disk_io_time_seconds_total{device="sda"} +Inf`,
+		`smartctl_device_power_on_hours{device="sda"} -Inf`,
+		`smartctl_device_smart_status{device="sda"} 1`,
+	}, "\n") + "\n"
+	samples, err := Parse(strings.NewReader(metrics), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 2 || samples[0].Name != "node_network_receive_bytes_total" || samples[1].Name != "smartctl_device_smart_status" {
+		t.Fatalf("finite samples were not preserved exactly: %#v", samples)
+	}
+}
+
+func TestParserAcceptsSpacesInsideRealExporterLabels(t *testing.T) {
+	metrics := strings.Join([]string{
+		`node_uname_info{domainname="(none)",release="6.8.12-1-pve",version="#1 SMP PREEMPT DYNAMIC PVE build"} 1`,
+		`node_network_receive_bytes_total{device="vmbr public"} 123`,
+		`smartctl_device_info{device="sda",model_name="Samsung SSD 870 EVO",serial_number="safe"} 1`,
+	}, "\n") + "\n"
+	samples, err := Parse(strings.NewReader(metrics), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 3 || samples[0].Labels["version"] != "#1 SMP PREEMPT DYNAMIC PVE build" || samples[1].Labels["device"] != "vmbr public" || samples[2].Labels["model_name"] != "Samsung SSD 870 EVO" {
+		t.Fatalf("labels containing spaces were not preserved: %#v", samples)
 	}
 }
 func TestParserEnforcesBodyLimit(t *testing.T) {
@@ -71,12 +103,12 @@ func TestNormalizeHostExtendedMetrics(t *testing.T) {
 
 func TestNormalizeSMARTExtendedMetrics(t *testing.T) {
 	r := NormalizeSMART([]Sample{
-		{Name: "smartctl_device_info", Labels: map[string]string{"device": "/dev/nvme0", "model_name": "Disk", "serial_number": "abc", "protocol_type": "NVMe"}, Value: 1},
+		{Name: "smartctl_device", Labels: map[string]string{"device": "/dev/nvme0", "model_name": "Disk Model With Spaces", "serial_number": "abc", "protocol": "NVMe"}, Value: 1},
 		{Name: "smartctl_device_media_errors", Labels: map[string]string{"device": "/dev/nvme0"}, Value: 2},
 		{Name: "smartctl_device_percentage_used", Labels: map[string]string{"device": "/dev/nvme0"}, Value: 4},
 		{Name: "smartctl_device_capacity", Labels: map[string]string{"device": "/dev/nvme0"}, Value: 500},
 	}, time.Time{})
-	if len(r.Devices) != 1 || r.Devices[0].Model != "Disk" || r.Devices[0].MediaErrors.Value == nil || r.Devices[0].CapacityBytes.Value == nil {
+	if len(r.Devices) != 1 || r.Devices[0].Model != "Disk Model With Spaces" || r.Devices[0].Protocol != "NVMe" || r.Devices[0].MediaErrors.Value == nil || r.Devices[0].CapacityBytes.Value == nil {
 		t.Fatalf("SMART metadata missing: %#v", r)
 	}
 }

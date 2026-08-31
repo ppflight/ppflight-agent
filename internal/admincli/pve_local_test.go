@@ -7,15 +7,50 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/pve"
 )
+
+func TestVerifyLocalExporterDataUsesProductionParserAndRequiredMetrics(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Join([]string{
+			`node_uname_info{version="#1 SMP PREEMPT DYNAMIC PVE build"} 1`,
+			`node_network_receive_bytes_total{device="vmbr0"} 10`,
+			`node_network_transmit_bytes_total{device="vmbr0"} 11`,
+			`node_disk_read_bytes_total{device="sda"} 12`,
+			`node_disk_written_bytes_total{device="sda"} 13`,
+		}, "\n")+"\n")
+	}))
+	defer node.Close()
+	smart := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "smartctl_device_info{device=\"sda\",model_name=\"Samsung SSD 870 EVO\"} 1\nsmartctl_device_smart_status{device=\"sda\"} 1\n")
+	}))
+	defer smart.Close()
+	cfg := config.ExportersConfig{
+		Node:  config.ExporterConfig{Enabled: true, URL: node.URL, Timeout: config.Duration{Duration: time.Second}, MaxResponseBytes: 16 << 20},
+		SMART: config.ExporterConfig{Enabled: true, URL: smart.URL, Timeout: config.Duration{Duration: time.Second}, MaxResponseBytes: 32 << 20},
+	}
+	if err := verifyLocalExporterData(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	missingNetwork := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "node_disk_read_bytes_total{device=\"sda\"} 12\nnode_disk_written_bytes_total{device=\"sda\"} 13\n")
+	}))
+	defer missingNetwork.Close()
+	cfg.Node.URL = missingNetwork.URL
+	if err := verifyLocalExporterData(context.Background(), cfg); err == nil {
+		t.Fatal("readiness accepted exporter data without network counters")
+	}
+}
 
 func localPVEEnvironmentForTest() map[string]string {
 	return map[string]string{

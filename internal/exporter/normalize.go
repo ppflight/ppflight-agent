@@ -279,7 +279,7 @@ func NormalizeSMART(samples []Sample, observedAt time.Time) SmartObservation {
 	o := SmartObservation{ObservedAt: observedAt}
 	devices := map[string]*SmartDeviceObservation{}
 	for _, s := range samples {
-		if s.Name != "smartctl_device_smart_status" && s.Name != "smartctl_device_temperature" && s.Name != "smartctl_device_power_on_hours" && s.Name != "smartctl_device_data_units_read" && s.Name != "smartctl_device_data_units_written" && s.Name != "smartctl_device_media_errors" && s.Name != "smartctl_device_percentage_used" && s.Name != "smartctl_device_capacity" && s.Name != "smartctl_device_info" {
+		if s.Name != "smartctl_device_smart_status" && s.Name != "smartctl_device_temperature" && s.Name != "smartctl_device_power_on_hours" && s.Name != "smartctl_device_data_units_read" && s.Name != "smartctl_device_data_units_written" && s.Name != "smartctl_device_media_errors" && s.Name != "smartctl_device_percentage_used" && s.Name != "smartctl_device_capacity" && s.Name != "smartctl_device_info" && s.Name != "smartctl_device" {
 			continue
 		}
 		device := s.Labels["device"]
@@ -311,7 +311,7 @@ func NormalizeSMART(samples []Sample, observedAt time.Time) SmartObservation {
 			d.PercentageUsed = number(s.Value, s.RawValue)
 		case "smartctl_device_capacity":
 			d.CapacityBytes = number(s.Value, s.RawValue)
-		case "smartctl_device_info":
+		case "smartctl_device_info", "smartctl_device":
 			if d.Model == "" {
 				d.Model = firstLabel(s.Labels, "model_name", "model")
 			}

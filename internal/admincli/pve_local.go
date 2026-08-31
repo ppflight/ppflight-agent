@@ -263,6 +263,9 @@ func (c *cli) prepareRealPVEWithRequirement(ctx context.Context, filename string
 	if controlErr != nil || !hasRequiredPVEControlPermissions(control.permissions) {
 		return realPVEPreparation{}, errors.New("PVE control probe did not verify the dedicated VPS-control role at root scope")
 	}
+	if err := c.verifyLocalExporters(ctx, prepared.Exporters); err != nil {
+		return realPVEPreparation{}, fmt.Errorf("local exporter readiness failed: %w", err)
+	}
 	controlGrants := permissionCounts(control.permissions).grants
 	backup := ""
 	changed := !reflect.DeepEqual(cfg, prepared)

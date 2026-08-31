@@ -19,6 +19,8 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
 
+var errNonFiniteMetricValue = errors.New("metric value is not finite")
+
 const (
 	defaultMaxBody = int64(8 << 20)
 	maxBody        = int64(32 << 20)
@@ -112,6 +114,14 @@ func Parse(r io.Reader, bodyLimit int64) ([]Sample, error) {
 			continue
 		}
 		sample, err := parseLine(line)
+		// NaN and +/-Inf are valid Prometheus exposition values and are emitted
+		// by real node_exporter/smartctl_exporter installations when one sensor
+		// or kernel counter is unavailable.  They cannot be represented in our
+		// JSON wire contract, but one unavailable sample must not discard every
+		// other valid interface, disk and SMART sample from the same response.
+		if errors.Is(err, errNonFiniteMetricValue) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +151,7 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 func parseLine(line string) (Sample, error) {
-	first := strings.IndexAny(line, " \t")
+	first := sampleValueSeparator(line)
 	if first < 1 {
 		return Sample{}, errors.New("metric sample has no value")
 	}
@@ -152,13 +162,53 @@ func parseLine(line string) (Sample, error) {
 	}
 	value, err := strconv.ParseFloat(fields[0], 64)
 	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return Sample{}, errors.New("metric value is not finite")
+		return Sample{}, errNonFiniteMetricValue
 	}
 	name, labels, err := parseSeries(series)
 	if err != nil {
 		return Sample{}, err
 	}
 	return Sample{Name: name, Labels: labels, Value: value, RawValue: fields[0]}, nil
+}
+
+// sampleValueSeparator finds the first whitespace outside a Prometheus label
+// set. Real exporters routinely include spaces inside quoted labels (kernel
+// versions, disk model names, mountpoints). strings.IndexAny would split those
+// valid series names in the middle and make the entire exporter unavailable.
+func sampleValueSeparator(line string) int {
+	inLabels, inQuote, escaped := false, false, false
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if inQuote {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if character == '\\' {
+				escaped = true
+				continue
+			}
+			if character == '"' {
+				inQuote = false
+			}
+			continue
+		}
+		switch character {
+		case '{':
+			inLabels = true
+		case '}':
+			inLabels = false
+		case '"':
+			if inLabels {
+				inQuote = true
+			}
+		case ' ', '\t':
+			if !inLabels {
+				return index
+			}
+		}
+	}
+	return -1
 }
 func parseSeries(series string) (string, map[string]string, error) {
 	open := strings.IndexByte(series, '{')

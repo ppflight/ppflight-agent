@@ -31,6 +31,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/enrollment"
+	"github.com/ppflight/ppflight-agent/internal/exporter"
 	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/health"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
@@ -56,6 +57,7 @@ type cli struct {
 	pveControlACL     func(context.Context) error
 	pveNodeName       func() (string, error)
 	pveTLSPreflight   func(context.Context, string, string) error
+	exporterProbe     func(context.Context, config.ExportersConfig) error
 	bindingPVE        func(context.Context, string, config.Config) (config.Config, error)
 	bindingCodePrompt func() (string, error)
 	activatePVE       func(context.Context, config.Config) error
@@ -80,6 +82,58 @@ type cli struct {
 	// production-path ownership validation. Real CLI construction leaves it nil
 	// and therefore always uses the fixed installer paths on Linux root.
 	managedWritePolicy func(string, config.Config) error
+}
+
+func (c *cli) verifyLocalExporters(ctx context.Context, exporters config.ExportersConfig) error {
+	if c.exporterProbe != nil {
+		return c.exporterProbe(ctx, exporters)
+	}
+	// Tests and embedded callers that replace the complete activation boundary
+	// do not own real loopback exporter services. Production never injects that
+	// boundary and must pass the same parser/normalizer used by the Agent before
+	// a configuration can be reported ready.
+	if c.activatePVE != nil {
+		return nil
+	}
+	return verifyLocalExporterData(ctx, exporters)
+}
+
+func verifyLocalExporterData(ctx context.Context, exporters config.ExportersConfig) error {
+	nodeSamples, err := exporter.Fetch(ctx, exporter.FetchConfig{
+		URL: exporters.Node.URL, Timeout: exporters.Node.Timeout.Duration, MaxBodyBytes: exporters.Node.MaxResponseBytes,
+	})
+	if err != nil {
+		return errors.New("node exporter response failed Agent parsing")
+	}
+	host := exporter.NormalizeHost(nodeSamples, time.Now().UTC())
+	hasInterface := false
+	for _, item := range host.Interfaces {
+		if item.ReceiveBytes.Value != nil && item.TransmitBytes.Value != nil {
+			hasInterface = true
+			break
+		}
+	}
+	hasDisk := false
+	for _, item := range host.Disks {
+		if item.ReadBytes.Value != nil && item.WrittenBytes.Value != nil {
+			hasDisk = true
+			break
+		}
+	}
+	if !hasInterface || !hasDisk {
+		return errors.New("node exporter lacks parsed network or disk counters")
+	}
+	smartSamples, err := exporter.Fetch(ctx, exporter.FetchConfig{
+		URL: exporters.SMART.URL, Timeout: exporters.SMART.Timeout.Duration, MaxBodyBytes: exporters.SMART.MaxResponseBytes,
+	})
+	if err != nil {
+		return errors.New("smartctl exporter response failed Agent parsing")
+	}
+	smart := exporter.NormalizeSMART(smartSamples, time.Now().UTC())
+	if len(smart.Devices) == 0 {
+		return errors.New("smartctl exporter has no parsed physical devices")
+	}
+	return nil
 }
 
 func Run(args []string, version string, out, errOut io.Writer) int {
