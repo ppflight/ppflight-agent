@@ -18,7 +18,7 @@ PVE 8006、node_exporter 9100 和 smartctl_exporter 9633 都不需要向公网�
 curl -4fsSL https://raw.githubusercontent.com/ppflight/ppflight-agent/main/scripts/quick-install.sh | bash
 ```
 
-`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 下载脚本内锁定的联调版本以及官方 `node_exporter`/`smartctl_exporter`，逐项校验内置 SHA-256 后才安装。它会自动创建或复用本机隔离的 read/control PVE Token，为专用 control role 在 `/` 授予固定的 VPS 管理权限（不含用户/RBAC、主机电源或主机控制台权限），安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，并把遗留配置中的 exporter 禁用状态迁移为固定 `127.0.0.1:9100/9633` 采集。随后校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集，切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备、权限或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。安装不会代替官网/监控的一次性绑定；官网签名命令通道与独立监控 telemetry/audit 两个绑定都稳定后，`productionExecution` 自动启用，无需再运行 ACL 或配置命令。发布版不含 simulator 采集器；后续升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
+`quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 从唯一的 `rolling-main` 联调分支下载最近一次通过全量 CI 的两个架构制品和 `SHA256SUMS`；联调期间不会为每次修改创建 GitHub tag/Release。若清单与制品正逢原子分支切换而不匹配，脚本会重新读取，三次仍不一致就拒绝安装。它还会下载固定版本的官方 `node_exporter`/`smartctl_exporter` 并逐项校验 SHA-256，自动创建或复用本机隔离的 read/control PVE Token，为专用 control role 在 `/` 授予固定的 VPS 管理权限（不含用户/RBAC、主机电源或主机控制台权限），安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，并把遗留配置中的 exporter 禁用状态迁移为固定 `127.0.0.1:9100/9633` 采集。随后校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集，切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备、权限或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。安装不会代替官网/监控的一次性绑定；官网签名命令通道与独立监控 telemetry/audit 两个绑定都稳定后，`productionExecution` 自动启用，无需再运行 ACL 或配置命令。发布版不含 simulator 采集器；后续远程升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
 一键安装优先复用 PVE 已有的 `/usr/sbin/smartctl`。只有它确实缺失时，安装器才会使用与 PVE 8/9 对应的 Debian 官方 HTTPS 固定源，并通过独立 `sources.list`、IPv4 和 Debian archive 签名安装 `smartmontools`；不会读取、修改或更新操作者配置的 Proxmox Enterprise/Ceph 软件源。
 
@@ -34,7 +34,7 @@ AG
 
 > 上线状态：Agent 侧绑定、发现、assignment、受控执行、UPID 恢复与 `agent.upgrade` 安全执行链已在本仓接线，但外部服务和真实 PVE 端到端验收尚未完成；这不等于官网新 Agent 升级业务路由已经上线。官网的 Agent upgrade route feature flag 必须默认关闭。未支持 `agent.upgrade` root helper 的旧版不能被远程升级，首次迁移仍须人工执行固定 SHA 安装；只有支持版才允许按合同远程升级。迁移期间旧客户的升级路由继续使用既有路径，直到按资产完成 shadow/read-back、互斥和显式切换；目标切换完成后官网才停止该资产的旧 PVE 直连。
 
-发布物由与仓库根 `VERSION` **完全一致**的 tag `vX.Y.Z` workflow 分别构建 Linux `amd64`/`arm64`、离线可复现打包并发布 tarball 与 `SHA256SUMS`；不一致的 tag 会在发布前失败。手动触发只生成 artifact，不发布。上面的 `curl | bash` 仅是 `main` 联调测试入口，脚本仍会校验固定发布包摘要；正式生产节点必须按安装文档先独立校验 checksum、再解压并运行包内 installer。发布脚本不会下载代码或把运行时凭据/队列打入包；具体校验和本地重建方式见[安装文档](docs/INSTALL.md#2-安装已校验发布物)。
+每次 `main` 通过 race、静态检查、Linux 安装 fixture、双架构构建和离线包测试后，workflow 会强制覆盖只有一个提交的 `rolling-main` 分支；其 `manifest.json` 记录源 commit、架构、大小和 SHA-256，但不会创建 Release。上面的同一条 `curl | bash` 因而可重复执行以升级到最新已通过 CI 的联调制品，并保留配置、双绑定与队列。全量调测完成后才使用与仓库根 `VERSION` **完全一致**的正式 tag `vX.Y.Z` 生成不可变 Release；正式生产节点仍须按安装文档独立校验 checksum、再解压运行包内 installer。发布脚本不会下载代码或把运行时凭据/队列打入包；具体校验和本地重建方式见[安装文档](docs/INSTALL.md#2-安装已校验发布物)。
 
 ## 安全绑定与本地凭据
 
