@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +252,9 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	var result DeliveryVerificationResult
 	if json.Unmarshal(receipt.Result, &result) != nil || !result.Ready || !result.ConfigMatched || !result.DiskIOMatched || !result.NetworkMatched || !result.FirewallMatched || !result.QGAFresh || !result.GuestAddressMatched || !result.TimezoneMatched || result.PowerState != "running" {
 		t.Fatalf("result=%s", receipt.Result)
+	}
+	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
+		t.Fatalf("delivery result timestamp is not the whole-second golden: %s", receipt.Result)
 	}
 }
 

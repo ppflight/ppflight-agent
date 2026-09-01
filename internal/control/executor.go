@@ -1478,7 +1478,9 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 	if err != nil || timezone.Zone != p.Expected.Timezone {
 		return nil, errors.New("guest timezone does not match delivery contract")
 	}
-	observedAt := time.Now().UTC()
+	// The frozen cross-language receipt contract uses whole-second UTC. Keep
+	// the observation boundary deterministic instead of emitting RFC3339Nano.
+	observedAt := time.Now().UTC().Truncate(time.Second)
 	if observedAt.Before(p.NotBefore) {
 		return nil, errors.New("delivery verification observation predates the command boundary")
 	}
