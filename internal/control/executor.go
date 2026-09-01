@@ -1391,6 +1391,8 @@ func validDelivery(p deliveryP) bool {
 	}
 	seen := map[string]bool{}
 	seenMAC := map[string]bool{}
+	var firewallState bool
+	firewallStateSet := false
 	for _, network := range e.Networks {
 		ipv4Filter, ipv4OK := deliveryAddressFilter(network.IPv4, 4)
 		ipv6Filter, ipv6OK := deliveryAddressFilter(network.IPv6, 6)
@@ -1398,6 +1400,11 @@ func validDelivery(p deliveryP) bool {
 		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !ipv4OK || !ipv6OK || *network.Firewall && dynamicAddress || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
 			return false
 		}
+		if firewallStateSet && firewallState != *network.Firewall {
+			return false
+		}
+		firewallState = *network.Firewall
+		firewallStateSet = true
 		// The delivery contract has two exact, non-overlapping firewall
 		// states.  An enabled NIC must carry at least one canonical host
 		// filter.  A customer-controlled, disabled NIC must carry no filter
