@@ -153,17 +153,29 @@ func runUpgradeHelper(args []string) int {
 		fmt.Fprintln(os.Stderr, "upgrade helper binding validation failed")
 		return 1
 	}
-	document, err := inventory.LoadFile(cfg.Assignments.File, cfg.Identity.ClusterRef)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "upgrade helper assignment validation failed")
-		return 1
-	}
-	assignments := inventory.NewStore(document)
-	assignmentState, err := assignment.LoadState(filepath.Join(cfg.Runtime.StateDirectory, "assignments", "refresh-state.json"))
-	if err != nil || assignmentState.Revision == 0 {
+	authority, err := assignment.LoadAuthority(filepath.Join(cfg.Runtime.StateDirectory, "assignments", "refresh-state.json"), cfg.Identity.ClusterRef,
+		assignment.AuthorityScope{BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch})
+	if err != nil || authority.State.Revision == 0 {
 		fmt.Fprintln(os.Stderr, "upgrade helper assignment authority unavailable")
 		return 1
 	}
+	document := authority.Document
+	allowedActions := cfg.Control.AllowedActions
+	if !authority.Present {
+		document, err = inventory.LoadFile(cfg.Assignments.File, cfg.Identity.ClusterRef)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "upgrade helper assignment validation failed")
+			return 1
+		}
+	} else {
+		allowedActions = authority.Document.AllowedActions
+	}
+	if err := control.ValidateAllowedActions(allowedActions); err != nil {
+		fmt.Fprintln(os.Stderr, "upgrade helper assignment action authority unavailable")
+		return 1
+	}
+	assignmentState := authority.State
+	assignments := inventory.NewStore(document)
 	journal, err := control.OpenJournal(filepath.Join(agent.RuntimeStateDirectory(cfg.Runtime.StateDirectory), "control", "journal"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade helper journal unavailable")
@@ -179,7 +191,7 @@ func runUpgradeHelper(args []string) int {
 			AgentRef: cfg.Identity.AgentRef, ClusterRef: cfg.Identity.ClusterRef, Mode: cfg.Mode,
 			BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch,
 			AssignmentRevision: func() uint64 { return assignmentState.Revision }, SigningKeyID: secrets.ControlSigningKeyID,
-			PublicKey: ed25519.PublicKey(secrets.ControlPublicKey), Allowed: control.AllowedSet(cfg.Control.AllowedActions), Assignments: assignments,
+			PublicKey: ed25519.PublicKey(secrets.ControlPublicKey), Allowed: control.AllowedSet(allowedActions), Assignments: assignments,
 		},
 	})
 	if err != nil {

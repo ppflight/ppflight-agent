@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -39,6 +40,48 @@ func TestParseAndLookup(t *testing.T) {
 	capability := item.AggregateMeteringCapability()
 	if capability.Supported || capability.Reason != "multi_nic_pve_aggregate_only" {
 		t.Fatalf("private NIC was silently included in aggregate metering: %#v", capability)
+	}
+}
+
+func TestAllowedActionsAreStrictAndCopied(t *testing.T) {
+	document, err := Parse([]byte(assignmentJSON), "cluster-test-01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document.AllowedActions = []string{"pve.discover", "vm.set-disk-io", "firewall.guest.verify-ipfilter"}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := Parse(raw, "cluster-test-01")
+	if err != nil || len(parsed.AllowedActions) != 3 {
+		t.Fatalf("allowed actions rejected: %#v %v", parsed.AllowedActions, err)
+	}
+	store := NewStore(parsed)
+	snapshot := store.Snapshot()
+	snapshot.AllowedActions[0] = "vm.delete"
+	if store.Snapshot().AllowedActions[0] != "pve.discover" {
+		t.Fatal("allowed actions snapshot aliases mutable store state")
+	}
+
+	empty := strings.Replace(assignmentJSON, `"assignments":[`, `"allowedActions":[],"assignments":[`, 1)
+	if _, parseErr := Parse([]byte(empty), "cluster-test-01"); parseErr == nil {
+		t.Fatal("explicit empty allowedActions was accepted")
+	}
+	for _, actions := range [][]string{
+		{"vm.start", "vm.start"},
+		{"VM.START"},
+		{"arbitrary"},
+	} {
+		candidate := parsed
+		candidate.AllowedActions = actions
+		raw, marshalErr := json.Marshal(candidate)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, parseErr := Parse(raw, "cluster-test-01"); parseErr == nil {
+			t.Fatalf("invalid allowedActions accepted: %#v", actions)
+		}
 	}
 }
 

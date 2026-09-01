@@ -52,6 +52,30 @@ func writeTestConfig(t *testing.T) string {
 	return filename
 }
 
+func TestResetAssignmentRefreshAuthorityRemovesOnlyExactStateFile(t *testing.T) {
+	stateDirectory := t.TempDir()
+	stateFile := filepath.Join(stateDirectory, "assignments", "refresh-state.json")
+	if err := assignment.SaveState(stateFile, assignment.State{Revision: 7, Cursor: "cursor-7"}); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(stateDirectory, "assignments", "assignments.json")
+	if err := os.WriteFile(sentinel, []byte("sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetAssignmentRefreshAuthority(stateDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stateFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refresh authority still exists or stat failed: %v", err)
+	}
+	if contents, err := os.ReadFile(sentinel); err != nil || string(contents) != "sentinel" {
+		t.Fatalf("unrelated assignment file changed: %q %v", contents, err)
+	}
+	if err := resetAssignmentRefreshAuthority(stateDirectory); err != nil {
+		t.Fatalf("missing refresh authority was not idempotent: %v", err)
+	}
+}
+
 // allowManagedWriteForTest is the explicit test-only boundary for mutations
 // against temporary configs. Production CLI instances keep this nil so Linux
 // continues to require the installed configuration and state root.
@@ -1515,6 +1539,10 @@ func TestWebsiteBindActivationFailurePreservesServerIssuedState(t *testing.T) {
 	if err := bindstate.WriteAssignment(originalConfig.Assignments.File, originalWebsite.AssignmentDocument); err != nil {
 		t.Fatal(err)
 	}
+	refreshStatePath := filepath.Join(originalConfig.Runtime.StateDirectory, "assignments", "refresh-state.json")
+	if err := assignment.SaveState(refreshStatePath, assignment.State{Revision: 19, Cursor: "old-binding-cursor"}); err != nil {
+		t.Fatal(err)
+	}
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request enrollment.Request
@@ -1574,6 +1602,9 @@ func TestWebsiteBindActivationFailurePreservesServerIssuedState(t *testing.T) {
 	gotAssignment, _ := compactJSON(assignment)
 	if !bytes.Equal(gotAssignment, wantAssignment) {
 		t.Fatalf("new assignment was not preserved: %s", assignment)
+	}
+	if _, err := os.Stat(refreshStatePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old binding refresh authority survived replacement: %v", err)
 	}
 	if _, err := os.Stat(bindstate.PendingPath(originalConfig.Runtime.StateDirectory, "website")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("completed server-issued binding kept stale pending state: %v", err)

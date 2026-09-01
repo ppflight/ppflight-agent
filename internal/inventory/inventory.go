@@ -28,13 +28,15 @@ var (
 	networkRef    = regexp.MustCompile(`^net(?:[0-9]|[12][0-9]|3[01])$`)
 	attachmentRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$`)
 	canonicalMAC  = regexp.MustCompile(`(?i)^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$`)
+	actionRef     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}(?:\.[a-z][a-z0-9-]{0,31}){1,3}$`)
 )
 
 type Document struct {
-	SchemaVersion int          `json:"schemaVersion"`
-	Revision      string       `json:"revision"`
-	IssuedAt      time.Time    `json:"issuedAt"`
-	Assignments   []Assignment `json:"assignments"`
+	SchemaVersion  int          `json:"schemaVersion"`
+	Revision       string       `json:"revision"`
+	IssuedAt       time.Time    `json:"issuedAt"`
+	AllowedActions []string     `json:"allowedActions,omitempty"`
+	Assignments    []Assignment `json:"assignments"`
 }
 
 type Assignment struct {
@@ -134,6 +136,21 @@ func (d Document) Validate(expectedClusterRef string) error {
 	}
 	if len(d.Assignments) > maxAssignments {
 		return fmt.Errorf("assignment count exceeds %d", maxAssignments)
+	}
+	if d.AllowedActions != nil {
+		if len(d.AllowedActions) == 0 || len(d.AllowedActions) > 64 {
+			return errors.New("assignment allowedActions must contain 1-64 actions")
+		}
+		seenActions := make(map[string]struct{}, len(d.AllowedActions))
+		for index, action := range d.AllowedActions {
+			if !actionRef.MatchString(action) {
+				return fmt.Errorf("allowedActions[%d] is invalid", index)
+			}
+			if _, exists := seenActions[action]; exists {
+				return fmt.Errorf("allowedActions[%d] is duplicated", index)
+			}
+			seenActions[action] = struct{}{}
+		}
 	}
 	seenPVE, seenService := map[string]bool{}, map[string]bool{}
 	for index, assignment := range d.Assignments {
@@ -311,6 +328,7 @@ func (s *Store) Snapshot() Document {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	copyDocument := s.document
+	copyDocument.AllowedActions = append([]string(nil), s.document.AllowedActions...)
 	copyDocument.Assignments = append([]Assignment(nil), s.document.Assignments...)
 	sort.Slice(copyDocument.Assignments, func(i, j int) bool {
 		return strings.Compare(copyDocument.Assignments[i].PVEKey(), copyDocument.Assignments[j].PVEKey()) < 0

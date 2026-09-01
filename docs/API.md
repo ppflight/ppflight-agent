@@ -90,7 +90,31 @@ GET <binding response.endpoints.assignments>
     &cursor=...&version=...&afterRevision=...&wait=25
 ```
 
-Agent 客户端接受 `wait<=25s`，验证 Ed25519 signature、exact assignment JSON SHA-256、签发/过期时间、cursor 与单调 revision，并拒绝防回滚失败；runtime 主循环已接入 refresh，使用原子替换保存 assignment 和 cursor，安装器已接 service-owned `<stateDirectory>/assignments/assignments.json` 及 legacy 首次迁移。官网服务仍需联调，不能据此宣称服务已上线。
+Agent 客户端接受 `wait<=25s`，验证 Ed25519 signature、exact assignment JSON SHA-256、签发/过期时间、cursor 与单调 revision，并拒绝防回滚失败。新 authority 文档在 assignment document 顶层携带 `allowedActions`：
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": "assignment-4",
+  "issuedAt": "2026-09-01T04:00:00Z",
+  "allowedActions": [
+    "pve.discover",
+    "vm.clone",
+    "vm.set-cloud-init",
+    "vm.set-timezone",
+    "vm.verify-delivery"
+  ],
+  "assignments": []
+}
+```
+
+`allowedActions` 存在时必须是 1..64 个不重复、符合 action grammar 且属于 Agent 本地 known-action registry 的名称；unknown/duplicate/空数组均 fail closed。该数组位于 `assignmentDocument` 内，因此由 bundle 的 exact `contentSha256` 和 Ed25519 signature 覆盖。Agent 将当前 `bindingId/deviceId/credentialEpoch`、bundle 的 uint64 revision/cursor、exact document、document SHA-256 原子写入 `<stateDirectory>/assignments/refresh-state.json` version 2，然后在一个控制锁内同时切换 inventory、revision 与 action set；重启时 scope 必须逐项匹配当前 binding，崩溃或并发 command poll 不能观察到混合 authority。首次收到 version-2 authority 后，后续文档省略 `allowedActions` 会被拒绝。旧文档仍可沿用绑定时的静态 allowlist，直到第一次安全升级为动态 authority。
+
+`<stateDirectory>/assignments/assignments.json` 继续作为工具和旧 reader 的兼容投影；version-2 runtime 重启只信任上述原子 authority 文件，不会把兼容文件与另一 revision 拼接。安装器已接 service-owned assignment 路径及 legacy 首次迁移。官网服务仍需按该 shape 联调，不能据此宣称服务已上线。
+
+官网重新绑定/替换 credential epoch 时，旧 `refresh-state.json` 不得跨 binding 继续生效。Agent 管理事务在服务停止且新绑定响应已签发后精确移除旧 refresh authority，保留新响应的初始 assignment，并以 revision 0 启动刷新；此时所有 command authority 校验均拒绝，直到新绑定 credential 验证的首个单调 bundle 原子落盘。该清理只针对 refresh authority 文件，不触碰 telemetry/control queue、journal 或 dead-letter。
+
+仅删除官网绑定时，为了让独立监控域继续展示最后一份 inventory，旧 authority 文件可以留作只读 inventory 投影，但 website control/refresh 已从配置和私有状态中禁用，不能执行命令。以后重新绑定时必须先按上一段精确移除它，再接受新 binding scope。
 
 ## 3. 官网 metering
 

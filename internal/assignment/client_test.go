@@ -48,7 +48,7 @@ func TestRefreshSuccessSignsRequestAndReturnsVerifiedBundle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !gotQuery || result.State.Revision != 8 || result.State.Cursor != "cursor-2" || result.Document.Revision != "rev-8" || len(result.DocumentRaw) == 0 {
+	if !gotQuery || result.State.Revision != 8 || result.State.Cursor != "cursor-2" || result.Document.Revision != "rev-8" || len(result.Document.AllowedActions) != 3 || len(result.DocumentRaw) == 0 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
@@ -190,7 +190,7 @@ func testClientConfig(endpoint string, public ed25519.PublicKey, httpClient *htt
 
 func signedBundle(t *testing.T, private ed25519.PrivateKey, _ ed25519.PublicKey, mutate func(*Bundle)) Bundle {
 	t.Helper()
-	document := json.RawMessage(`{"schemaVersion":1,"revision":"rev-8","issuedAt":"2026-08-30T12:00:00Z","assignments":[{"serviceRef":"service-1","clusterRef":"cluster-1","vmid":101,"generation":1,"instanceUuid":"instance-1","guestType":"qemu","billingState":"disabled"}]}`)
+	document := json.RawMessage(`{"schemaVersion":1,"revision":"rev-8","issuedAt":"2026-08-30T12:00:00Z","allowedActions":["pve.discover","vm.set-disk-io","firewall.guest.verify-ipfilter"],"assignments":[{"serviceRef":"service-1","clusterRef":"cluster-1","vmid":101,"generation":1,"instanceUuid":"instance-1","guestType":"qemu","billingState":"disabled"}]}`)
 	hash := sha256.Sum256(document)
 	bundle := Bundle{SchemaVersion: 1, AgentRef: "agent-1", DeviceID: "device-1", ClusterRef: "cluster-1", Cursor: "cursor-2", Revision: 8,
 		IssuedAt: testNow, ExpiresAt: testNow.Add(time.Hour), Nonce: "0123456789abcdef", ContentSHA256: hex.EncodeToString(hash[:]), SigningKeyID: "assignment-signing-1", AssignmentDocument: document}

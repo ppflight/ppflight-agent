@@ -51,55 +51,61 @@ type TaskResolution struct {
 }
 
 type ServiceConfig struct {
-	AgentRef            string
-	ClusterRef          string
-	BindingID           string
-	DeviceID            string
-	CredentialEpoch     uint64
-	AssignmentRevision  func() uint64
-	AgentVersion        string
-	Mode                string
-	CommandSecret       []byte
-	CommandSigningKeyID string
-	CommandPublicKey    ed25519.PublicKey
-	AllowedActions      []string
-	Assignments         *inventory.Store
-	Poller              Poller
-	Journal             *Journal
-	Executor            Executor
-	TaskResolver        TaskResolver
-	UpgradeResolver     UpgradeResolver
-	ReceiptQueue        ReceiptQueue
-	AuditSink           auditlog.Sink
-	CursorFile          string
-	Now                 func() time.Time
+	AgentRef           string
+	ClusterRef         string
+	BindingID          string
+	DeviceID           string
+	CredentialEpoch    uint64
+	AssignmentRevision func() uint64
+	// AssignmentAuthorityDynamic means revision, inventory and allowedActions
+	// were restored from one atomic signed authority snapshot. Legacy callers
+	// keep using AssignmentRevision until the first dynamic authority is applied.
+	AssignmentAuthorityDynamic bool
+	AgentVersion               string
+	Mode                       string
+	CommandSecret              []byte
+	CommandSigningKeyID        string
+	CommandPublicKey           ed25519.PublicKey
+	AllowedActions             []string
+	Assignments                *inventory.Store
+	Poller                     Poller
+	Journal                    *Journal
+	Executor                   Executor
+	TaskResolver               TaskResolver
+	UpgradeResolver            UpgradeResolver
+	ReceiptQueue               ReceiptQueue
+	AuditSink                  auditlog.Sink
+	CursorFile                 string
+	Now                        func() time.Time
 }
 
 type Service struct {
-	mu                  sync.Mutex
-	agentRef            string
-	clusterRef          string
-	bindingID           string
-	deviceID            string
-	credentialEpoch     uint64
-	assignmentRevision  func() uint64
-	agentVersion        string
-	mode                string
-	commandSecret       []byte
-	commandSigningKeyID string
-	commandPublicKey    ed25519.PublicKey
-	allowed             map[string]bool
-	assignments         *inventory.Store
-	poller              Poller
-	journal             *Journal
-	executor            Executor
-	taskResolver        TaskResolver
-	upgradeResolver     UpgradeResolver
-	receiptQueue        ReceiptQueue
-	auditSink           auditlog.Sink
-	cursorFile          string
-	cursor              string
-	now                 func() time.Time
+	mu                   sync.Mutex
+	agentRef             string
+	clusterRef           string
+	bindingID            string
+	deviceID             string
+	credentialEpoch      uint64
+	assignmentRevision   uint64
+	assignmentRevisionFn func() uint64
+	dynamicAuthority     bool
+	agentVersion         string
+	mode                 string
+	commandSecret        []byte
+	commandSigningKeyID  string
+	commandPublicKey     ed25519.PublicKey
+	allowed              map[string]bool
+	assignments          *inventory.Store
+	poller               Poller
+	journal              *Journal
+	executor             Executor
+	taskResolver         TaskResolver
+	upgradeResolver      UpgradeResolver
+	receiptQueue         ReceiptQueue
+	auditSink            auditlog.Sink
+	cursorFile           string
+	cursor               string
+	now                  func() time.Time
 }
 
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -109,10 +115,8 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Mode != "test" && cfg.Mode != "production" {
 		return nil, errors.New("control service mode is invalid")
 	}
-	for _, action := range cfg.AllowedActions {
-		if _, ok := protocolActions[action]; !ok {
-			return nil, fmt.Errorf("control action %q is not part of the protocol", action)
-		}
+	if err := validateAllowedActions(cfg.AllowedActions, false); err != nil {
+		return nil, err
 	}
 	if cfg.Mode == "production" && (cfg.CommandSigningKeyID == "" || len(cfg.CommandPublicKey) != ed25519.PublicKeySize) {
 		return nil, errors.New("production control requires an Ed25519 signing key")
@@ -140,8 +144,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	cfg.Executor.Mode = cfg.Mode
 	service := &Service{
 		agentRef: cfg.AgentRef, clusterRef: cfg.ClusterRef, bindingID: cfg.BindingID, deviceID: cfg.DeviceID,
-		credentialEpoch: cfg.CredentialEpoch, assignmentRevision: cfg.AssignmentRevision,
-		agentVersion: cfg.AgentVersion, mode: cfg.Mode,
+		credentialEpoch: cfg.CredentialEpoch, assignmentRevision: assignmentRevision(cfg.AssignmentRevision), assignmentRevisionFn: cfg.AssignmentRevision,
+		dynamicAuthority: cfg.AssignmentAuthorityDynamic,
+		agentVersion:     cfg.AgentVersion, mode: cfg.Mode,
 		commandSecret: append([]byte(nil), cfg.CommandSecret...), commandSigningKeyID: cfg.CommandSigningKeyID,
 		commandPublicKey: append(ed25519.PublicKey(nil), cfg.CommandPublicKey...), allowed: AllowedSet(cfg.AllowedActions),
 		assignments: cfg.Assignments, poller: cfg.Poller, journal: cfg.Journal,
@@ -152,6 +157,75 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, err
 	}
 	return service, nil
+}
+
+func assignmentRevision(current func() uint64) uint64 {
+	if current == nil {
+		return 0
+	}
+	return current()
+}
+
+// ValidateAllowedActions rejects empty, duplicate and locally unknown remote
+// authorization. A signed assignment may narrow or expand its previous set,
+// but it can never expand the Agent's compiled protocol registry.
+func ValidateAllowedActions(actions []string) error {
+	return validateAllowedActions(actions, true)
+}
+
+func validateAllowedActions(actions []string, requireNonEmpty bool) error {
+	if (requireNonEmpty && len(actions) == 0) || len(actions) > 64 {
+		return errors.New("control allowed actions must contain 1-64 actions")
+	}
+	seen := make(map[string]struct{}, len(actions))
+	for _, action := range actions {
+		if _, ok := protocolActions[action]; !ok {
+			return fmt.Errorf("control action %q is not part of the protocol", action)
+		}
+		if _, duplicate := seen[action]; duplicate {
+			return fmt.Errorf("control action %q is duplicated", action)
+		}
+		seen[action] = struct{}{}
+	}
+	return nil
+}
+
+// ApplyAssignmentAuthority switches the signed inventory, monotonic revision
+// and allowed action set under the same mutex used by PollOnce. Command
+// verification therefore observes either the complete old authority or the
+// complete new authority, never a mixed revision/action/inventory view.
+func (s *Service) ApplyAssignmentAuthority(document inventory.Document, revision uint64, actions []string) error {
+	if s == nil || revision == 0 {
+		return errors.New("assignment authority revision is invalid")
+	}
+	if err := document.Validate(s.clusterRef); err != nil {
+		return fmt.Errorf("assignment authority document is invalid: %w", err)
+	}
+	if err := ValidateAllowedActions(actions); err != nil {
+		return err
+	}
+	if len(document.AllowedActions) != len(actions) {
+		return errors.New("assignment authority actions do not match signed document")
+	}
+	for index := range actions {
+		if document.AllowedActions[index] != actions[index] {
+			return errors.New("assignment authority actions do not match signed document")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	currentRevision := s.assignmentRevision
+	if !s.dynamicAuthority && s.assignmentRevisionFn != nil {
+		currentRevision = s.assignmentRevisionFn()
+	}
+	if revision <= currentRevision {
+		return errors.New("assignment authority revision did not advance")
+	}
+	s.assignments.Replace(document)
+	s.allowed = AllowedSet(actions)
+	s.assignmentRevision = revision
+	s.dynamicAuthority = true
+	return nil
 }
 
 // PollOnce advances the server cursor only after every command has a durable
@@ -167,10 +241,14 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 	processed := 0
 	for _, command := range response.Commands {
 		now := s.now().UTC()
+		assignmentRevision := s.assignmentRevisionFn
+		if s.dynamicAuthority {
+			assignmentRevision = func() uint64 { return s.assignmentRevision }
+		}
 		verifyErr := Verify(command, VerifyConfig{
 			AgentRef: s.agentRef, ClusterRef: s.clusterRef, Mode: s.mode, Secret: s.commandSecret,
 			BindingID: s.bindingID, DeviceID: s.deviceID, CredentialEpoch: s.credentialEpoch,
-			AssignmentRevision: s.assignmentRevision,
+			AssignmentRevision: assignmentRevision,
 			SigningKeyID:       s.commandSigningKeyID, PublicKey: s.commandPublicKey,
 			Allowed: s.allowed, Assignments: s.assignments, Now: now,
 		})

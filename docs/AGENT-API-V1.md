@@ -297,6 +297,14 @@ GET  /internal/v1/agents/{agentRef}/assignments?afterRevision=...&wait=25
 
 `wait` 最大 25 秒。assignment 客户端当前已实现该上限；command 客户端当前只发送 `agentRef + after + limit`，尚未发送 `wait`，因此命令长轮询仍是目标契约，不能写成已接线。
 
+新 assignment authority 的 `assignmentDocument` 顶层 exact shape 为 `schemaVersion/revision/issuedAt/allowedActions/assignments`。`allowedActions` 是 1..64 个不重复 action name，并与 inventory 一起被 bundle 的 exact content SHA-256 和 Ed25519 signature 覆盖。Agent 只接受本地 compiled known-action registry 中的名称；远端不能借此发明任意 action。
+
+验签成功后，Agent 把当前 `bindingId/deviceId/credentialEpoch`、bundle uint64 `revision`、opaque `cursor`、exact `assignmentDocument` 和 document SHA-256 作为 version-2 authority 原子持久化；重启加载时三项 binding scope 必须逐项匹配。随后在 command poll 共用的控制锁内同时替换 inventory、revision 和 allowed action set。命令只能看到完整旧 authority 或完整新 authority。首次接受含 `allowedActions` 的动态 authority 后，后续刷新省略该字段会 fail closed；legacy 文档在升级前仍使用绑定时 allowlist 和动态 revision callback，避免破坏旧服务端。`assignmentDocument.revision` 仍只是文档标签，命令签入的是 bundle 的单调 uint64 revision。
+
+重新绑定或 credential epoch 替换时，旧 refresh authority 不得跨 binding 复用。root 管理事务在新响应签发且服务已停止后只移除旧 `assignments/refresh-state.json`，保留新响应的初始 assignment；Agent 可以在 revision 0 启动 assignment refresh，但 command verification 一律 fail closed，直至新 credential 验证的首个 bundle 成功落盘。队列、control journal 和 dead-letter 不属于该重置范围。
+
+删除 website binding 但保留 monitoring binding 时，旧 authority 仅可作为监控 inventory 的最后已知只读投影；website control/refresh 已禁用，不存在可执行命令的 authority。下一次 website rebind 必须在新响应签发后精确移除该文件并从新 scope 的 revision 0 开始。
+
 官网为一次向导、VPS 操作、IP 切换或升级创建持久 `operationId`。其中每个不可分步骤有自己的 `commandId`；同一 command 的重试保留 command ID 和 canonical body。Agent 只有在所有回执已进入持久队列后才推进 cursor。同一 ID 配不同 body 返回 `COMMAND_ID_CONFLICT`。
 
 实际回执状态是 `dry_run`、`submitted`、`waiting`、`succeeded`、`failed`、`indeterminate`、`rejected`。PVE 返回 UPID 时只生成 `submitted/PVE_TASK_SUBMITTED`，不代表成功。Agent 必须把 UPID 写入 journal；后续通过 node scope 的 `task.status` 或内部等价 resolver 读取：
@@ -325,7 +333,7 @@ scope 与 identity 必须匹配：
 - `node`：`clusterRef + nodeRef`，用于 node discovery、`task.status` 和 `firewall.node.set-options`；
 - `vm`：`serviceRef + clusterRef + nodeRef + guestType + vmid + generation + instanceUuid`。
 
-VM 命令必须与当前 signed assignment 完全一致。部署 allowlist 只能缩小协议 allowlist，不能新增任意动作。除 `pve.discover` 与 `task.status` 外，所有当前协议动作都要求非空 `approvalRef`。mutation 以 scope/资源键互斥；只读 discovery/status 不应占用 mutation 锁。
+VM 命令必须与当前 signed assignment 完全一致。绑定时 allowlist 是初始授权；后续只有由同一 assignment trust domain 签名的 `assignmentDocument.allowedActions` 才能按 revision 原子缩小或扩展该集合，并且永远受 Agent compiled known-action registry 上限约束。未签名配置、数据库手工改值或 command 自报 action 都不能扩权。除 `pve.discover` 与 `task.status` 外，所有当前协议动作都要求非空 `approvalRef`。mutation 以 scope/资源键互斥；只读 discovery/status 不应占用 mutation 锁。
 
 修改任务执行前必须同时满足：服务端记录的 website 出口 IPv4 whitelist；本机 website state 中同一 `bindingId + deviceId + agentRef`；commands HMAC key 的 endpoint scope 与未回滚 `credentialEpoch`；命令 Ed25519 key ID/signature；remote assignment revision 及 VM assignment identity/generation；issued/expiry time；协议 known-action、绑定授权和部署 allowlist；approval/资源锁；以及第 6.1 节 monitoring audit availability。任一项失败都拒绝执行。IP 命中不能为错误 key、过期 epoch、旧 assignment/generation 或缺失审计开绿灯；monitoring HMAC 也不能授权 website command。
 

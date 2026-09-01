@@ -58,6 +58,8 @@ type App struct {
 	assignmentMu             sync.RWMutex
 	assignmentState          assignment.State
 	assignmentStatePath      string
+	assignmentDynamic        bool
+	assignmentAuthorityScope assignment.AuthorityScope
 	meter                    *meter.Manager
 	runstate                 *runstate.State
 	queues                   map[string]*store.Queue
@@ -131,9 +133,35 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			return nil, fmt.Errorf("load monitoring destination network policy: %w", policyErr)
 		}
 	}
-	assignments, err := loadAssignments(cfg)
+	assignmentStatePath := filepath.Join(cfg.Runtime.StateDirectory, "assignments", "refresh-state.json")
+	authorityScope := assignment.AuthorityScope{BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch}
+	var authority assignment.Authority
+	if secrets.WebsiteBindingID != "" && secrets.DeviceID != "" && secrets.WebsiteCredentialEpoch != 0 {
+		authority, err = assignment.LoadAuthority(assignmentStatePath, cfg.Identity.ClusterRef, authorityScope)
+	} else {
+		// Website unbind deliberately preserves inventory and every queue so the
+		// independent monitoring domain can keep projecting the last assignment.
+		// There is no command channel in this state, so the old scope is retained
+		// only as inventory and will be removed before any future website rebind.
+		authority, err = assignment.LoadAuthority(assignmentStatePath, cfg.Identity.ClusterRef)
+	}
 	if err != nil {
 		return nil, err
+	}
+	assignmentState := authority.State
+	effectiveAllowedActions := append([]string(nil), cfg.Control.AllowedActions...)
+	var assignments *inventory.Store
+	if authority.Present {
+		if err := control.ValidateAllowedActions(authority.Document.AllowedActions); err != nil {
+			return nil, fmt.Errorf("load assignment allowed actions: %w", err)
+		}
+		assignments = inventory.NewStore(authority.Document)
+		effectiveAllowedActions = append([]string(nil), authority.Document.AllowedActions...)
+	} else {
+		assignments, err = loadAssignments(cfg)
+		if err != nil {
+			return nil, err
+		}
 	}
 	source, err := collector.New(cfg, secrets)
 	if err != nil {
@@ -196,13 +224,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		return nil, err
 	}
 	var assignmentClient *assignment.Client
-	assignmentStatePath := filepath.Join(cfg.Runtime.StateDirectory, "assignments", "refresh-state.json")
-	assignmentState := assignment.State{}
 	if cfg.Assignments.RefreshURL != "" {
-		assignmentState, err = assignment.LoadState(assignmentStatePath)
-		if err != nil {
-			return nil, err
-		}
 		assignmentClient, err = assignment.NewClient(assignment.Config{
 			Endpoint: cfg.Assignments.RefreshURL, AgentRef: cfg.Identity.AgentRef, DeviceID: secrets.DeviceID, ClusterRef: cfg.Identity.ClusterRef,
 			Credential:   enrollment.HMACCredential{KeyID: secrets.Assignments.KeyID, Secret: enrollment.Secret(base64.StdEncoding.EncodeToString(secrets.Assignments.Secret))},
@@ -233,7 +255,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 	}
 	document := assignments.Snapshot()
 	registry.Assignment(document.Revision, len(document.Assignments))
-	app = &App{cfg: cfg, version: version, logger: logger, source: source, assignments: assignments, assignmentClient: assignmentClient, assignmentState: assignmentState, assignmentStatePath: assignmentStatePath, meter: meterManager, runstate: state, queues: queues, health: registry, stateLock: stateLock, collectionProgressSignal: make(chan struct{}, 1),
+	app = &App{cfg: cfg, version: version, logger: logger, source: source, assignments: assignments, assignmentClient: assignmentClient, assignmentState: assignmentState, assignmentStatePath: assignmentStatePath, assignmentDynamic: authority.Present, assignmentAuthorityScope: authorityScope, meter: meterManager, runstate: state, queues: queues, health: registry, stateLock: stateLock, collectionProgressSignal: make(chan struct{}, 1),
 		deviceID: secrets.DeviceID, monitoringBindingID: secrets.MonitoringBindingID, monitoringAgentRef: secrets.MonitoringAgentRef, monitoringEpoch: secrets.Monitoring.CredentialEpoch}
 	app.markCollectionProgress()
 	if progressSource, ok := source.(collector.ProgressSource); ok {
@@ -333,9 +355,10 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		service, serviceErr := control.NewService(control.ServiceConfig{
 			AgentRef: cfg.Identity.AgentRef, ClusterRef: cfg.Identity.ClusterRef,
 			BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch,
-			AssignmentRevision: app.currentAssignmentRevision, AgentVersion: version, AuditSink: auditSink, Mode: cfg.Mode,
+			AssignmentRevision: app.currentAssignmentRevision, AssignmentAuthorityDynamic: authority.Present,
+			AgentVersion: version, AuditSink: auditSink, Mode: cfg.Mode,
 			CommandSecret: secrets.ControlCommandSecret, CommandSigningKeyID: secrets.ControlSigningKeyID,
-			CommandPublicKey: ed25519.PublicKey(secrets.ControlPublicKey), AllowedActions: cfg.Control.AllowedActions,
+			CommandPublicKey: ed25519.PublicKey(secrets.ControlPublicKey), AllowedActions: effectiveAllowedActions,
 			Assignments: assignments, Poller: poller, Journal: journal,
 			UpgradeResolver: upgradeSubmitter,
 			Executor: control.Executor{
@@ -962,6 +985,7 @@ func (a *App) refreshAssignments(ctx context.Context) (bool, error) {
 	}
 	a.assignmentMu.RLock()
 	previous := a.assignmentState
+	dynamic := a.assignmentDynamic
 	a.assignmentMu.RUnlock()
 	result, err := a.assignmentClient.Refresh(ctx, previous)
 	if errors.Is(err, assignment.ErrNoChange) {
@@ -970,15 +994,42 @@ func (a *App) refreshAssignments(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := bindstate.WriteAssignment(a.cfg.Assignments.File, result.DocumentRaw); err != nil {
-		return false, fmt.Errorf("persist refreshed assignments: %w", err)
+	if result.Document.AllowedActions != nil {
+		if err := control.ValidateAllowedActions(result.Document.AllowedActions); err != nil {
+			return false, fmt.Errorf("validate refreshed assignment allowed actions: %w", err)
+		}
+		if err := assignment.SaveAuthority(a.assignmentStatePath, result.State, result.DocumentRaw, a.cfg.Identity.ClusterRef, a.assignmentAuthorityScope); err != nil {
+			return false, fmt.Errorf("persist refreshed assignment authority: %w", err)
+		}
+		// This file remains for tooling and legacy readers. Version-2 runtimes
+		// restart from the already-durable authority snapshot, so a failure here
+		// cannot create a mixed revision/action/inventory authority.
+		if err := bindstate.WriteAssignment(a.cfg.Assignments.File, result.DocumentRaw); err != nil {
+			a.logger.Warn("assignment compatibility file refresh failed; atomic authority remains active", "error", safeLogError(err))
+		}
+		if a.control != nil {
+			if err := a.control.ApplyAssignmentAuthority(result.Document, result.State.Revision, result.Document.AllowedActions); err != nil {
+				return false, fmt.Errorf("apply refreshed assignment authority: %w", err)
+			}
+		} else {
+			a.assignments.Replace(result.Document)
+		}
+		dynamic = true
+	} else {
+		if dynamic {
+			return false, errors.New("refreshed assignment authority omitted allowedActions")
+		}
+		if err := bindstate.WriteAssignment(a.cfg.Assignments.File, result.DocumentRaw); err != nil {
+			return false, fmt.Errorf("persist refreshed assignments: %w", err)
+		}
+		if err := assignment.SaveState(a.assignmentStatePath, result.State); err != nil {
+			return false, fmt.Errorf("persist assignment refresh cursor: %w", err)
+		}
+		a.assignments.Replace(result.Document)
 	}
-	if err := assignment.SaveState(a.assignmentStatePath, result.State); err != nil {
-		return false, fmt.Errorf("persist assignment refresh cursor: %w", err)
-	}
-	a.assignments.Replace(result.Document)
 	a.assignmentMu.Lock()
 	a.assignmentState = result.State
+	a.assignmentDynamic = dynamic
 	a.assignmentMu.Unlock()
 	a.health.Assignment(result.Document.Revision, len(result.Document.Assignments))
 	return true, nil

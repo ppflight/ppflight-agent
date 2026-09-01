@@ -68,6 +68,43 @@ func queuedReceipt(t *testing.T, queue *memoryReceiptQueue, index int) Receipt {
 	return receipt
 }
 
+func TestApplyAssignmentAuthoritySwitchesRevisionActionsAndInventoryTogether(t *testing.T) {
+	now := time.Unix(1800000000, 0).UTC()
+	journal, err := OpenJournal(t.TempDir() + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, assignments := submittedCommand(t, journal, now)
+	service := reconciliationService(t, journal, assignments, &memoryReceiptQueue{}, now, resolverFunc(func(context.Context, string, string) (TaskResolution, error) {
+		return TaskResolution{}, nil
+	}))
+	document := assignments.Snapshot()
+	document.Revision = "revision-8"
+	document.AllowedActions = []string{"vm.start", "vm.set-disk-io", "firewall.guest.verify-ipfilter"}
+	if err := service.ApplyAssignmentAuthority(document, 8, document.AllowedActions); err != nil {
+		t.Fatal(err)
+	}
+	if service.assignmentRevision != 8 || !service.allowed["vm.set-disk-io"] || service.assignments.Snapshot().Revision != "revision-8" {
+		t.Fatalf("authority did not switch atomically: revision=%d allowed=%#v document=%s", service.assignmentRevision, service.allowed, service.assignments.Snapshot().Revision)
+	}
+	if err := service.ApplyAssignmentAuthority(document, 8, []string{"vm.delete"}); err == nil {
+		t.Fatal("non-monotonic authority was accepted")
+	}
+	if err := service.ApplyAssignmentAuthority(document, 9, []string{"arbitrary.command"}); err == nil {
+		t.Fatal("unknown remote action was accepted")
+	}
+	if service.assignmentRevision != 8 || service.allowed["vm.delete"] {
+		t.Fatal("rejected authority changed active state")
+	}
+	legacy := reconciliationService(t, journal, assignments, &memoryReceiptQueue{}, now, resolverFunc(func(context.Context, string, string) (TaskResolution, error) {
+		return TaskResolution{}, nil
+	}))
+	legacy.assignmentRevisionFn = func() uint64 { return 20 }
+	if err := legacy.ApplyAssignmentAuthority(document, 9, document.AllowedActions); err == nil {
+		t.Fatal("dynamic authority rolled back a newer legacy revision")
+	}
+}
+
 func TestReconcileRunningThenSucceeded(t *testing.T) {
 	now := time.Unix(1800000000, 0).UTC()
 	journal, err := OpenJournal(t.TempDir() + "/journal")

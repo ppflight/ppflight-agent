@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -86,6 +87,63 @@ func TestServiceDryRunJournalsAndQueuesReceipt(t *testing.T) {
 	var receipt Receipt
 	if err := json.Unmarshal(queue.payloads[0], &receipt); err != nil || receipt.Code != "DRY_RUN" || !receipt.DryRun {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+}
+
+func TestServiceLegacyAuthorityReadsRefreshedRevisionUntilDynamicSwitch(t *testing.T) {
+	now := time.Now().UTC()
+	command, assignments := signedCommand(t, now)
+	command.AssignmentRevision = 8
+	command.Signature = SignCommand(command, []byte("secret"))
+	revision := uint64(7)
+	queue := &memoryReceiptQueue{}
+	directory := t.TempDir()
+	journal, err := OpenJournal(directory + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(ServiceConfig{
+		AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "test", CommandSecret: []byte("secret"),
+		BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: uint64(command.CredentialEpoch),
+		AssignmentRevision: func() uint64 { return revision },
+		AllowedActions:     []string{"vm.start"}, Assignments: assignments,
+		Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
+		Journal: journal, Executor: Executor{Mode: "test"}, ReceiptQueue: queue, AuditSink: &memoryAuditSink{}, AgentVersion: "test-version",
+		CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision = 8
+	processed, err := service.PollOnce(context.Background())
+	if err != nil || processed != 1 || len(queue.payloads) != 1 {
+		t.Fatalf("processed=%d payloads=%d err=%v", processed, len(queue.payloads), err)
+	}
+	var receipt Receipt
+	if err := json.Unmarshal(queue.payloads[0], &receipt); err != nil || receipt.Code != "DRY_RUN" {
+		t.Fatalf("legacy refreshed revision was not used: receipt=%#v err=%v", receipt, err)
+	}
+}
+
+func TestProductionServiceStartsAtRevisionZeroForFirstSignedRefresh(t *testing.T) {
+	_, assignments := signedCommand(t, time.Now().UTC())
+	directory := t.TempDir()
+	journal, err := OpenJournal(directory + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)).Public().(ed25519.PublicKey)
+	service, err := NewService(ServiceConfig{
+		AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "production",
+		BindingID: "11111111-1111-4111-8111-111111111111", DeviceID: "device-1", CredentialEpoch: 3,
+		AssignmentRevision:  func() uint64 { return 0 },
+		CommandSigningKeyID: "key-1", CommandPublicKey: publicKey,
+		AllowedActions: []string{"vm.start"}, Assignments: assignments,
+		Poller: fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1"}}, Journal: journal,
+		Executor: Executor{Mode: "production"}, ReceiptQueue: &memoryReceiptQueue{}, CursorFile: directory + "/cursor.json",
+	})
+	if err != nil || service == nil {
+		t.Fatalf("revision-zero startup must allow the first signed refresh: service=%#v err=%v", service, err)
 	}
 }
 

@@ -1932,6 +1932,15 @@ func (c *cli) bind(filename string, args []string) int {
 		fmt.Fprintln(c.errOut, "官网初始分配保存失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
 		return 1
 	}
+	// A refresh authority belongs to the previous website binding/credential
+	// epoch. The new enrollment response supplies a new initial assignment, but
+	// its first monotonic bundle revision is learned only after the Agent starts.
+	// Remove exactly the old cursor/authority file while the service is quiesced;
+	// revision zero rejects commands but must not prevent assignment refresh.
+	if err := resetAssignmentRefreshAuthority(cfg.Runtime.StateDirectory); err != nil {
+		fmt.Fprintln(c.errOut, "官网旧分配授权状态清理失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
+		return 1
+	}
 	configBackup, err = atomicUpdate(filename, cfg)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "官网绑定配置保存失败；新凭据可能已签发，事务保持冻结，请使用同一绑定码重试")
@@ -1959,6 +1968,25 @@ func (c *cli) bind(filename string, args []string) int {
 	}
 	fmt.Fprintf(c.out, "官网绑定完成并已自动生效：%s active，bindingId=%s，credentialEpoch=%d；官网采集、上传与任务轮询已启动；VPS写操作=%t；配置备份=%s。监控绑定未被修改。\n", agentServiceUnit, state.BindingID, state.CredentialEpoch, cfg.Control.ProductionExecution, configBackup)
 	return 0
+}
+
+func resetAssignmentRefreshAuthority(stateDirectory string) error {
+	directory := filepath.Join(stateDirectory, "assignments")
+	const name = "refresh-state.json"
+	file, err := fsutil.OpenRegularInDirectoryNoFollow(directory, name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(directory, name)); err != nil {
+		return err
+	}
+	return fsutil.SyncDir(directory)
 }
 
 func (c *cli) readBindingCode(filename string) (string, error) {

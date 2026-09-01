@@ -2,6 +2,11 @@
   "schemaVersion": 1,
   "revision": "example-001",
   "issuedAt": "2026-08-29T00:00:00Z",
+  "allowedActions": [
+    "vm.start",
+    "vm.shutdown",
+    "vm.reboot"
+  ],
   "assignments": [
     {
       "serviceRef": "subscription-example-01",

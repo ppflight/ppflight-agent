@@ -12,7 +12,7 @@
 
 安装器默认原样复制这份 disabled 样例。旧版遗留的 `mode=test` 或 `pve.source=simulator` 会在安装升级时自动迁移为 `production+disabled`；发布版 Agent 不包含模拟采集实现，运行态也只接受 `mode=production`/`pve.source=api`。官网与监控 bind 在读取一次性码之前都会执行同一 root-only 真实 PVE 准备：先预检固定 service-readable CA/SNI/本机信息，再安全创建或读取隔离 Token，固定 `127.0.0.1:8006/tcp4`，要求完整 read audit 权限并实际读取本机 node status/storage，原子切到 `mode=production`/`pve.source=api`，受控启动或重启并等待真实采集及已绑定 telemetry 成功。readiness 阶段失败不会读取绑定码、创建 pending 或发送请求。
 
-样例的 `allowedActions` 只列 `vm.start/vm.shutdown/vm.reboot`，表示本机部署层刻意缩小授权面，不是协议只实现这三项。配置只能从代码 known-action registry 中选择，且还必须是绑定响应 `allowedActions` 的子集；增加本机列表不能绕过绑定授权、scope、approval、`productionExecution`、assignment 或 audit gate。完整动作名以 [Agent API v1 第 7 节](../docs/AGENT-API-V1.md#7-executor-动作和参数事实) 为准。
+样例的 `allowedActions` 只列 `vm.start/vm.shutdown/vm.reboot`，表示绑定/legacy 启动时刻意缩小授权面，不是协议只实现这三项。配置只能从代码 known-action registry 中选择；手工增加本机列表不能绕过绑定授权、scope、approval、`productionExecution`、assignment 或 audit gate。支持动态 authority 的官网只能通过已验签 `assignmentDocument.allowedActions` 随单调 revision 原子更新授权集合；首次接受后省略该字段会 fail closed，远端仍不能越过本地 known-action registry。完整动作名和持久化语义以 [Agent API v1 第 5、7 节](../docs/AGENT-API-V1.md#5-长轮询操作线程和-upid-恢复) 为准。
 
 推荐配置顺序：
 
