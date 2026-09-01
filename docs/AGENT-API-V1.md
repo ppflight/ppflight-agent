@@ -491,6 +491,8 @@ QEMU 的 IP/gateway 写入与 `netN` 对应的 `ipconfigN`；LXC 写入 `netN` �
 
 PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用；`ipfilter-netN` 是 PVE 标准约定，不需要额外 option。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验，相关 cluster/node firewall 仍按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
 
+Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处于默认值的 option 可能省略字段，而各 scope 的缺省值并不相同：cluster master=`0`、node host firewall=`1`、guest=`0`。Agent 必须按 scope 补齐该有效值；显式值若不是 `0|1` 则以读取错误拒绝，官网不得把缺失值统一解释为关闭。启用 cluster master 前必须单独证明 node host firewall 不会阻断 SSH/API/Agent 管理通道。
+
 ### 8.3 QGA availability 与依赖动作
 
 Agent telemetry 已区分 `qga.availability.available`、`observedAt`、`freshUntil` 和 `unavailableReason`，并列出各 QGA read capability。APP 必须展示 availability 和 freshness，不能只显示最后一次成功结果，也不能把“已安装但已停止”和新鲜可用混为一谈。

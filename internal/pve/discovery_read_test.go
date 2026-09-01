@@ -91,6 +91,48 @@ func TestNodeFirewallIPSetsAreNotAnAPICollection(t *testing.T) {
 	}
 }
 
+func TestFirewallOptionsProjectsScopeSpecificEnableDefaults(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/firewall/options",
+			"/api2/json/nodes/pve1/firewall/options",
+			"/api2/json/nodes/pve1/qemu/101/firewall/options":
+			fmt.Fprint(w, `{"data":{"digest":"ignored"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name string
+		ref  FirewallRef
+		want int
+	}{
+		{name: "cluster defaults disabled", ref: FirewallRef{}, want: 0},
+		{name: "node defaults enabled", ref: FirewallRef{Node: "pve1"}, want: 1},
+		{name: "guest defaults disabled", ref: FirewallRef{Node: "pve1", Kind: "qemu", VMID: 101}, want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := c.FirewallOptions(context.Background(), tt.ref)
+			if err != nil || got.Enable == nil || *got.Enable != tt.want {
+				t.Fatalf("options = %#v, %v; want enable=%d", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestFirewallOptionsRejectsInvalidExplicitEnable(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"data":{"enable":2}}`)
+	}))
+	defer server.Close()
+	if _, err := c.FirewallOptions(context.Background(), FirewallRef{}); err == nil {
+		t.Fatal("accepted invalid explicit firewall enable value")
+	}
+}
+
 func TestClusterSDNReadsVNetCollectionNotAPIDirectory(t *testing.T) {
 	calledRoot := false
 	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

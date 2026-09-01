@@ -3,6 +3,7 @@ package discovery
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"net/http"
@@ -138,6 +139,54 @@ func TestDiscoverFirewallCoversClusterNodeAndGuest(t *testing.T) {
 		}
 		if scope.Options == nil || len(scope.Rules) != 1 || len(scope.IPSets) != wantIPSets {
 			t.Fatalf("incomplete scope %#v", scope)
+		}
+	}
+}
+
+func TestDiscoverFirewallEmitsEffectiveScopeDefaults(t *testing.T) {
+	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/resources":
+			fmt.Fprint(w, `{"data":[]}`)
+		case "/api2/json/cluster/firewall/options", "/api2/json/nodes/pve1/firewall/options":
+			fmt.Fprint(w, `{"data":{"digest":"omitted-default"}}`)
+		case "/api2/json/cluster/firewall/rules", "/api2/json/nodes/pve1/firewall/rules":
+			fmt.Fprint(w, `{"data":[]}`)
+		case "/api2/json/cluster/firewall/ipset":
+			fmt.Fprint(w, `{"data":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result := service.Discover(context.Background(), Request{OperationID: "firewall-defaults", Phase: PhaseFirewall, NodeRef: "pve1", Limit: 50})
+	if result.ErrorCode != "" || !result.Complete || len(result.Data.Firewall) != 2 {
+		t.Fatalf("firewall result %#v", result)
+	}
+	if got := result.Data.Firewall[0].Options.Enable; got == nil || *got != 0 {
+		t.Fatalf("cluster effective enable = %v, want 0", got)
+	}
+	if got := result.Data.Firewall[1].Options.Enable; got == nil || *got != 1 {
+		t.Fatalf("node effective enable = %v, want 1", got)
+	}
+	payload, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Data struct {
+			Firewall []struct {
+				Options map[string]any `json:"options"`
+			} `json:"firewall"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []float64{0, 1} {
+		if got, ok := decoded.Data.Firewall[i].Options["enable"]; !ok || got != want {
+			t.Fatalf("wire firewall[%d].options.enable = %#v, present=%v; want %v", i, got, ok, want)
 		}
 	}
 }

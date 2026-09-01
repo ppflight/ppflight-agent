@@ -382,8 +382,28 @@ func (c *Client) FirewallOptions(ctx context.Context, ref FirewallRef) (Firewall
 		return FirewallOptions{}, err
 	}
 	var result FirewallOptions
-	err = c.get(ctx, base+"/options", nil, &result)
-	return result, err
+	if err := c.get(ctx, base+"/options", nil, &result); err != nil {
+		return FirewallOptions{}, err
+	}
+	if result.Enable != nil {
+		if *result.Enable != 0 && *result.Enable != 1 {
+			return FirewallOptions{}, fmt.Errorf("invalid firewall enable value")
+		}
+		return result, nil
+	}
+
+	// PVE omits options that still have their schema default. Those defaults
+	// are deliberately different for the three firewall scopes: the cluster
+	// master switch and guest firewall default to disabled, while host firewall
+	// rules default to enabled. Project the effective value explicitly so a
+	// strict remote consumer cannot mistake an omitted host value for disabled
+	// and enable the cluster master switch under an unsafe SSH assumption.
+	effective := 0
+	if ref.Node != "" && ref.Kind == "" && ref.VMID == 0 {
+		effective = 1
+	}
+	result.Enable = &effective
+	return result, nil
 }
 
 func (c *Client) FirewallRules(ctx context.Context, ref FirewallRef) ([]FirewallRule, error) {
