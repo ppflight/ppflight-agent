@@ -1,6 +1,7 @@
 package assignment
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -10,6 +11,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,86 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/enrollment"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 )
+
+type allowedActionsV2Golden struct {
+	SchemaVersion                int    `json:"schemaVersion"`
+	Name                         string `json:"name"`
+	TestOnlyPrivateKeySeedBase64 string `json:"testOnlyPrivateKeySeedBase64"`
+	PublicKeyBase64              string `json:"publicKeyBase64"`
+	AgentRef                     string `json:"agentRef"`
+	DeviceID                     string `json:"deviceId"`
+	ClusterRef                   string `json:"clusterRef"`
+	Cursor                       string `json:"cursor"`
+	Revision                     string `json:"revision"`
+	IssuedAt                     string `json:"issuedAt"`
+	ExpiresAt                    string `json:"expiresAt"`
+	Nonce                        string `json:"nonce"`
+	SigningKeyID                 string `json:"signingKeyId"`
+	AssignmentDocument           string `json:"assignmentDocument"`
+	ContentSHA256                string `json:"contentSha256"`
+	CanonicalPayload             string `json:"canonicalPayload"`
+	SignatureBase64              string `json:"signatureBase64"`
+}
+
+func TestAllowedActionsV2CrossLanguageGolden(t *testing.T) {
+	raw, err := os.ReadFile("testdata/allowed-actions-v2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden allowedActionsV2Golden
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&golden); err != nil {
+		t.Fatal(err)
+	}
+	if golden.SchemaVersion != 1 || golden.Name != "signed-assignment-allowed-actions-v2" {
+		t.Fatalf("unexpected golden identity: %#v", golden)
+	}
+	seed, err := base64.StdEncoding.DecodeString(golden.TestOnlyPrivateKeySeedBase64)
+	if err != nil || len(seed) != ed25519.SeedSize {
+		t.Fatalf("invalid test-only seed: %v", err)
+	}
+	privateKey := ed25519.NewKeyFromSeed(seed)
+	publicKey, err := base64.StdEncoding.DecodeString(golden.PublicKeyBase64)
+	if err != nil || !bytes.Equal(publicKey, privateKey.Public().(ed25519.PublicKey)) {
+		t.Fatalf("public key does not match test-only seed: %v", err)
+	}
+	revision, err := strconv.ParseUint(golden.Revision, 10, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuedAt, err := time.Parse(time.RFC3339Nano, golden.IssuedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, golden.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := Bundle{
+		SchemaVersion: golden.SchemaVersion, AgentRef: golden.AgentRef, DeviceID: golden.DeviceID, ClusterRef: golden.ClusterRef,
+		Cursor: golden.Cursor, Revision: revision, IssuedAt: issuedAt, ExpiresAt: expiresAt, Nonce: golden.Nonce,
+		ContentSHA256: golden.ContentSHA256, SigningKeyID: golden.SigningKeyID,
+		AssignmentDocument: json.RawMessage(golden.AssignmentDocument), Signature: golden.SignatureBase64,
+	}
+	digest := sha256.Sum256(bundle.AssignmentDocument)
+	if hex.EncodeToString(digest[:]) != golden.ContentSHA256 {
+		t.Fatal("assignment document hash does not match golden")
+	}
+	payload, err := bundle.CanonicalPayload()
+	if err != nil || string(payload) != golden.CanonicalPayload {
+		t.Fatalf("canonical payload mismatch: %q %v", payload, err)
+	}
+	signature, err := base64.StdEncoding.DecodeString(bundle.Signature)
+	if err != nil || !ed25519.Verify(publicKey, payload, signature) {
+		t.Fatalf("golden signature did not verify: got=%s want=%s payload=%q err=%v", bundle.Signature, base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, payload)), payload, err)
+	}
+	client := &Client{agentRef: golden.AgentRef, deviceID: golden.DeviceID, clusterRef: golden.ClusterRef, signingKeyID: golden.SigningKeyID, publicKey: publicKey, maxSkew: 5 * time.Minute, now: func() time.Time { return issuedAt.Add(time.Minute) }}
+	result, err := client.verify(bundle, State{Revision: revision - 1, Cursor: "assignment-cursor-3"})
+	if err != nil || len(result.Document.AllowedActions) != 18 {
+		t.Fatalf("golden bundle verification failed: result=%#v err=%v", result, err)
+	}
+}
 
 var testNow = time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
 

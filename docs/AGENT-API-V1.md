@@ -299,6 +299,8 @@ GET  /internal/v1/agents/{agentRef}/assignments?afterRevision=...&wait=25
 
 新 assignment authority 的 `assignmentDocument` 顶层 exact shape 为 `schemaVersion/revision/issuedAt/allowedActions/assignments`。`allowedActions` 是 1..64 个不重复 action name，并与 inventory 一起被 bundle 的 exact content SHA-256 和 Ed25519 signature 覆盖。Agent 只接受本地 compiled known-action registry 中的名称；远端不能借此发明任意 action。
 
+跨语言 golden 为 `internal/assignment/testdata/allowed-actions-v2.json`。它冻结 exact document UTF-8、content SHA-256、canonical payload、测试专用 Ed25519 key material 和 signature；生产端只能把测试 seed 用于 fixture 测试，不能把它安装为真实签名 key。
+
 验签成功后，Agent 把当前 `bindingId/deviceId/credentialEpoch`、bundle uint64 `revision`、opaque `cursor`、exact `assignmentDocument` 和 document SHA-256 作为 version-2 authority 原子持久化；重启加载时三项 binding scope 必须逐项匹配。随后在 command poll 共用的控制锁内同时替换 inventory、revision 和 allowed action set。命令只能看到完整旧 authority 或完整新 authority。首次接受含 `allowedActions` 的动态 authority 后，后续刷新省略该字段会 fail closed；legacy 文档在升级前仍使用绑定时 allowlist 和动态 revision callback，避免破坏旧服务端。`assignmentDocument.revision` 仍只是文档标签，命令签入的是 bundle 的单调 uint64 revision。
 
 重新绑定或 credential epoch 替换时，旧 refresh authority 不得跨 binding 复用。root 管理事务在新响应签发且服务已停止后只移除旧 `assignments/refresh-state.json`，保留新响应的初始 assignment；Agent 可以在 revision 0 启动 assignment refresh，但 command verification 一律 fail closed，直至新 credential 验证的首个 bundle 成功落盘。队列、control journal 和 dead-letter 不属于该重置范围。

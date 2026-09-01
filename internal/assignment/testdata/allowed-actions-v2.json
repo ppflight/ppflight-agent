@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "name": "signed-assignment-allowed-actions-v2",
+  "testOnlyPrivateKeySeedBase64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "publicKeyBase64": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg=",
+  "agentRef": "agent-pve-golden-01",
+  "deviceId": "device-golden-01",
+  "clusterRef": "cluster-11",
+  "cursor": "assignment-cursor-4",
+  "revision": "4",
+  "issuedAt": "2026-09-01T04:30:00Z",
+  "expiresAt": "2026-09-01T05:00:00Z",
+  "nonce": "0123456789abcdef0123456789abcdef",
+  "signingKeyId": "assignment-signing-golden-01",
+  "assignmentDocument": "{\"schemaVersion\":1,\"revision\":\"assignment-4\",\"issuedAt\":\"2026-09-01T04:30:00Z\",\"allowedActions\":[\"pve.discover\",\"task.status\",\"vm.clone\",\"vm.set-resources\",\"vm.resize\",\"vm.set-disk-io\",\"vm.set-network\",\"firewall.guest.set-options\",\"firewall.ipset.create\",\"firewall.ipset.entry.create\",\"firewall.guest.verify-ipfilter\",\"vm.set-cloud-init\",\"vm.start\",\"vm.set-timezone\",\"vm.reboot\",\"vm.verify-delivery\",\"vm.stop\",\"vm.delete\"],\"assignments\":[]}",
+  "contentSha256": "6ba70c821dbccde919ef7047651b4c1f72fe4e2cc6aaaedf762eb79dd188d383",
+  "canonicalPayload": "ppflight-assignment-bundle-v1\n1\nagent-pve-golden-01\ndevice-golden-01\ncluster-11\nassignment-cursor-4\n4\n2026-09-01T04:30:00Z\n2026-09-01T05:00:00Z\n0123456789abcdef0123456789abcdef\n6ba70c821dbccde919ef7047651b4c1f72fe4e2cc6aaaedf762eb79dd188d383\nassignment-signing-golden-01",
+  "signatureBase64": "uHM0Rc3UjI9ZoDKRLWgK1oK6FEgc2V6b7hUWWzSK4wZN40mhanOBOgOS1FsMqtlpOsVpOyGblScmCeqaqqDiAA=="
+}
