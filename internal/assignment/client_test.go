@@ -96,7 +96,7 @@ func TestAllowedActionsV2CrossLanguageGolden(t *testing.T) {
 	}
 	client := &Client{agentRef: golden.AgentRef, deviceID: golden.DeviceID, clusterRef: golden.ClusterRef, signingKeyID: golden.SigningKeyID, publicKey: publicKey, maxSkew: 5 * time.Minute, now: func() time.Time { return issuedAt.Add(time.Minute) }}
 	result, err := client.verify(bundle, State{Revision: revision - 1, Cursor: "assignment-cursor-3"})
-	if err != nil || len(result.Document.AllowedActions) != 18 {
+	if err != nil || len(result.Document.AllowedActions) != 19 {
 		t.Fatalf("golden bundle verification failed: result=%#v err=%v", result, err)
 	}
 }
