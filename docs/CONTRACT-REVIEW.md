@@ -10,7 +10,7 @@
 
 出现冲突时，以当前 Go 类型、协议测试和上述规范为准。尤其是：discovery `limit` 默认 20、最大 50；动作使用 `snapshot.*`、`backup.*`、`firewall.*`、`task.status` 等代码中的完整名称。
 
-control 当前 34 个 known actions 已用一致性测试锁住 registry/validator/executor；`firewall.ipset.entry.update/delete` 与 `agent.upgrade` 已实现。`agent.upgrade` 只接受官网固定 manifest 的同源制品，并经独立 root helper 二次验签、原子替换、重启回验和回滚；官网在真实 PVE 验收前保持 delivery flag 关闭。`vm.reinstall` 仍未实现，也不能以本地 template helper、任意 URL、storage volume 或 `vm.create` 替代：PVE 恢复/介质切换是非事务性流程，缺少安全回滚保证，且尚无签名命令可验证的安装介质 allowlist、摘要/来源约束和审批模型。
+control 当前 39 个 known actions 已用一致性测试锁住 registry/validator/executor；`firewall.guest.verify-ipfilter`、`firewall.ipset.entry.update/delete` 与 `agent.upgrade` 已实现。`agent.upgrade` 只接受官网固定 manifest 的同源制品，并经独立 root helper 二次验签、原子替换、重启回验和回滚；官网在真实 PVE 验收前保持 delivery flag 关闭。`vm.reinstall` 仍未实现，也不能以本地 template helper、任意 URL、storage volume 或 `vm.create` 替代：PVE 恢复/介质切换是非事务性流程，缺少安全回滚保证，且尚无签名命令可验证的安装介质 allowlist、摘要/来源约束和审批模型。
 
 ## 仍然有效的审阅结论
 
