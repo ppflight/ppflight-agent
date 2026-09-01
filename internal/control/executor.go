@@ -161,6 +161,24 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "firewall.guest.verify-ipfilter" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, verifyErr := verifyGuestIPFilter(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if verifyErr != nil {
+			r.State, r.Code = "failed", "IPFILTER_NOT_READY"
+			return finish(verifyErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if e.Mode != "production" || !e.ProductionExecution {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "dry_run", "DRY_RUN", true, time.Now().UTC()
 		return finish(nil)
@@ -495,6 +513,13 @@ type ipFilterP struct {
 	Interface string `json:"interface"`
 	Enable    *bool  `json:"enable"`
 }
+type ipFilterVerifyP struct {
+	Networks []ipFilterVerifyNetwork `json:"networks"`
+}
+type ipFilterVerifyNetwork struct {
+	Interface     string   `json:"interface"`
+	IPFilterCIDRs []string `json:"ipFilterCidrs"`
+}
 
 func validateParameters(c Command) error {
 	if !commandIDRE.MatchString(c.Identity.ClusterRef) || !validActionScope(c.Action, c.Scope) {
@@ -588,6 +613,12 @@ func validateParameters(c Command) error {
 		var p deliveryP
 		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !exactDeliveryKeys(c.Parameters) || !validDelivery(p) {
 			return errors.New("invalid delivery verification parameters")
+		}
+		return nil
+	case "firewall.guest.verify-ipfilter":
+		var p ipFilterVerifyP
+		if strictParameters(c.Parameters, &p) != nil || !validIPFilterVerification(p) {
+			return errors.New("invalid guest IP filter verification parameters")
 		}
 		return nil
 	case "vm.delete":
@@ -1352,6 +1383,31 @@ func validDelivery(p deliveryP) bool {
 	}
 	return true
 }
+func validIPFilterVerification(p ipFilterVerifyP) bool {
+	if len(p.Networks) < 1 || len(p.Networks) > 8 {
+		return false
+	}
+	interfaces := map[string]bool{}
+	for _, network := range p.Networks {
+		if !netRE.MatchString(network.Interface) || interfaces[network.Interface] || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 {
+			return false
+		}
+		interfaces[network.Interface] = true
+		cidrs := map[string]bool{}
+		for _, value := range network.IPFilterCIDRs {
+			ip, parsed, err := net.ParseCIDR(value)
+			if err != nil || !ip.Equal(parsed.IP) || parsed.String() != value || cidrs[value] {
+				return false
+			}
+			ones, bits := parsed.Mask.Size()
+			if ones != bits || bits != 32 && bits != 128 {
+				return false
+			}
+			cidrs[value] = true
+		}
+	}
+	return true
+}
 func diskSizeBytes(drive string) (uint64, error) {
 	for _, segment := range strings.Split(drive, ",") {
 		key, value, ok := strings.Cut(strings.TrimSpace(segment), "=")
@@ -1577,12 +1633,15 @@ func qgaAddressesMatch(interfaces []pve.GuestInterface, expected deliveryNetwork
 	return false
 }
 func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, expected deliveryNetwork) error {
+	return verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs)
+}
+func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Command, interfaceRef string, expectedCIDRs []string) error {
 	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	options, err := client.FirewallOptions(ctx, ref)
 	if err != nil || options.Enable == nil || *options.Enable != 1 {
 		return errors.New("guest firewall is not enabled")
 	}
-	name := "ipfilter-" + expected.Interface
+	name := "ipfilter-" + interfaceRef
 	sets, err := client.FirewallIPSets(ctx, ref)
 	if err != nil {
 		return err
@@ -1605,15 +1664,49 @@ func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, ex
 		}
 		actual[entry.CIDR] = true
 	}
-	if len(actual) != len(expected.IPFilterCIDRs) {
+	if len(actual) != len(expectedCIDRs) {
 		return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
 	}
-	for _, cidr := range expected.IPFilterCIDRs {
+	for _, cidr := range expectedCIDRs {
 		if !actual[cidr] {
 			return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
 		}
 	}
 	return nil
+}
+
+type IPFilterVerificationResult struct {
+	Verified        bool                                `json:"verified"`
+	ObservedAt      time.Time                           `json:"observedAt"`
+	FirewallEnabled bool                                `json:"firewallEnabled"`
+	Networks        []IPFilterVerificationNetworkResult `json:"networks"`
+}
+type IPFilterVerificationNetworkResult struct {
+	Interface     string   `json:"interface"`
+	IPSet         string   `json:"ipSet"`
+	IPFilterCIDRs []string `json:"ipFilterCidrs"`
+}
+
+func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
+	var parameters ipFilterVerifyP
+	if err := strictParameters(command.Parameters, &parameters); err != nil {
+		return nil, err
+	}
+	result := IPFilterVerificationResult{
+		Verified: true, ObservedAt: time.Now().UTC().Truncate(time.Second), FirewallEnabled: true,
+		Networks: make([]IPFilterVerificationNetworkResult, 0, len(parameters.Networks)),
+	}
+	for _, expected := range parameters.Networks {
+		if err := verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
+			return nil, err
+		}
+		result.Networks = append(result.Networks, IPFilterVerificationNetworkResult{
+			Interface:     expected.Interface,
+			IPSet:         "ipfilter-" + expected.Interface,
+			IPFilterCIDRs: append([]string(nil), expected.IPFilterCIDRs...),
+		})
+	}
+	return json.Marshal(result)
 }
 func validNetwork(p networkP, kind string) bool {
 	if !netRE.MatchString(p.Interface) || (p.Bridge == nil && p.Model == nil && p.MAC == nil && p.VLAN == nil && p.MTU == nil && p.Firewall == nil && p.RateMbps == nil && p.IPv4 == nil && p.IPv6 == nil && p.Gateway4 == nil && p.Gateway6 == nil) || (kind == "lxc" && p.Model != nil) {

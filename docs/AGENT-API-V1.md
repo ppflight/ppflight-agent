@@ -423,6 +423,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `backup.create` | `storage`, `mode=snapshot|suspend|stop`, 可选 `compress`。 |
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
 | cluster/node/vm | `firewall.cluster.set-options`, `firewall.node.set-options`, `firewall.guest.set-options` | 当前 typed 参数仅 `enable`。 |
+| vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 guest firewall 已启用，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。可在 guest 停机时执行。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |
@@ -478,7 +479,7 @@ QEMU 的 IP/gateway 写入与 `netN` 对应的 `ipconfigN`；LXC 写入 `netN` �
 
 一次 IP 切换必须共用一个 `operationId`：IPAM 预留新 IP → 更新固定 MAC/VLAN/MTU/NIC/`ipconfigN` → 更新 `ipfilter-netN` → 启用 guest/NIC firewall 与 IPFilter → 等待必要的 reboot/guest 网络就绪 → 回读/探测 → 提交 IPAM 并释放旧 IP。失败时保留旧租约并进入补偿/人工处理，不能静默释放。
 
-PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。guest option 使用 `firewall.guest.set-ipfilter`，NIC 自身 `firewall=true`，相关 guest/cluster/node firewall 按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 当前没有一个名为“防盗用”的复合动作。
+PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用；`ipfilter-netN` 是 PVE 标准约定，不需要额外 option。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验，相关 cluster/node firewall 仍按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
 
 ### 8.3 QGA availability 与依赖动作
 

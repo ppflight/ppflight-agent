@@ -104,8 +104,8 @@ IP 切换应先保留新地址，再按操作线程更新 NIC/`ipconfigN`、`ipf
 
 1. `vm.set-network` 设置受管固定 MAC 并启用 NIC firewall；
 2. 创建 PVE 约定名称 `ipfilter-netN` 的 guest IPSet；用 `firewall.ipset.entry.create` 先加入新 CIDR，`entry.update` 只改该 CIDR 的 comment/`noSubnet`，验证切换后才用 `entry.delete` 移除旧 CIDR；
-3. 用 `firewall.guest.set-options` 和 `firewall.guest.set-ipfilter` 启用 guest firewall/IPFilter；
-4. 必要时单独审批 cluster/node firewall options，并回读验证。
+3. 用 `firewall.guest.set-options` 启用 guest firewall；`ipfilter-netN` 是 PVE 约定的标准 IPFilter 集合，不依赖一个额外的 guest option；
+4. 在 guest 启动前用只读 `firewall.guest.verify-ipfilter` 精确回验 firewall 与每个集合的正向 host CIDR，必要时再单独审批 cluster/node firewall options。
 
 这些是可编排原语，不是“一次调用即可无缝切换”的承诺。官网必须负责 IPAM 预留、顺序、补偿、digest/read-back、审批和防自锁。
 

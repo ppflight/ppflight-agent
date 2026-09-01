@@ -258,6 +258,77 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	}
 }
 
+func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("verification attempted a write: %s %s", r.Method, r.URL.Path)
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
+			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0}]}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net1"):
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:db8::10/128","nomatch":0}]}`))
+		default:
+			t.Fatalf("unexpected verification read: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net1","ipFilterCidrs":["2001:db8::10/128"]}]}`)
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || receipt.DryRun {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+	var result IPFilterVerificationResult
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.FirewallEnabled || len(result.Networks) != 2 || result.Networks[0].IPSet != "ipfilter-net0" {
+		t.Fatalf("result=%s", receipt.Result)
+	}
+	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
+		t.Fatalf("IPFilter result timestamp is not the whole-second golden: %s", receipt.Result)
+	}
+}
+
+func TestGuestIPFilterVerificationRejectsAmbiguousOrNonHostContracts(t *testing.T) {
+	for _, parameters := range []string{
+		`{"networks":[]}`,
+		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.0/24"]}]}`,
+		`{"networks":[{"interface":"net0","ipFilterCidrs":["2001:DB8::10/128"]}]}`,
+		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net0","ipFilterCidrs":["192.0.2.11/32"]}]}`,
+		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"],"unknown":true}]}`,
+	} {
+		if err := validateParameters(controlCommand("firewall.guest.verify-ipfilter", "qemu", parameters)); err == nil {
+			t.Fatalf("unsafe IPFilter verification contract accepted: %s", parameters)
+		}
+	}
+}
+
+func TestGuestIPFilterVerificationRejectsNegativeOrExtraEntries(t *testing.T) {
+	for _, entries := range []string{
+		`[{"cidr":"192.0.2.10/32","nomatch":1}]`,
+		`[{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"192.0.2.11/32","nomatch":0}]`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
+				_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
+			default:
+				_, _ = w.Write([]byte(`{"data":` + entries + `}`))
+			}
+		}))
+		command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+		receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+		server.Close()
+		if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" {
+			t.Fatalf("entries=%s receipt=%#v err=%v", entries, receipt, err)
+		}
+	}
+}
+
 func TestExecutorControlledEndpointForms(t *testing.T) {
 	tests := []struct {
 		name, action, guest, parameters, method, path string
