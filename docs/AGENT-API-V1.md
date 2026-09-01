@@ -407,15 +407,15 @@ POST /internal/v1/monitoring/audit-events/batches
 | node | `agent.upgrade` | strict 固定 manifest 制品参数；需要 approval、独立 root helper、重启回验与回滚，详见 `SELF-UPGRADE-V1.md`。 |
 | vm | `vm.start`, `vm.shutdown`, `vm.stop`, `vm.reboot` | `parameters` 必须是空对象。 |
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
-| vm | `vm.clone` | `sourceVmid`, `name` 和必填 bool `full`；`target/storage` 可选。 |
+| vm | `vm.clone` | `sourceVmid`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
 | vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
-| vm | `vm.set-disk-limits` | QEMU only；`disk` 与可选 IOPS/MBPS base/max/burst length typed 整数。省略 limit 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
+| vm | `vm.set-disk-io` | QEMU only；`disk` 与 `limits`。limits 的 10 个 IOPS/MBPS base/max/burst length 键必须全部出现，值为 typed 整数或 null；null 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
 | vm | `vm.set-network` | `interface` 及 bridge/model/MAC/VLAN/MTU/firewall/rate/IP/gateway typed 字段。 |
 | vm | `vm.set-rate` | `interface`, `rateMbps`；`0` 移除 rate。 |
-| vm | `vm.set-cloud-init` | `username/password/sshKeys/hostname/enableQGA`；QEMU 必须启用 QGA，LXC 另要求 IANA `timezone`。secret 不进入 result/receipt/audit。 |
-| vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone` 并等待 exit code 0。 |
-| vm | `vm.verify-delivery` | read-only；`interface/expectedMac/expectedAddresses/requireQGA`。要求 running、config MAC 一致；QEMU 同 MAC 的 QGA interface 必须包含全部地址。 |
+| vm | `vm.set-cloud-init` | QEMU only；`hostname/username/password/passwordFormat/sshAuthorizedKeys/qgaEnabled`，且 `qgaEnabled=true`。secret 不进入 result/receipt/audit。 |
+| vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone`、等待 exit code 0，并用固定只读 `guest-get-timezone` 回验。 |
+| vm | `vm.verify-delivery` | QEMU read-only；`notBefore` 与完整 `expected` 资源/磁盘 IO/多网卡/IPFilter/时区合同。重新读取 PVE config、QGA interfaces/timezone 和 guest firewall；全部匹配才返回 ready。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
 | vm | `vm.reset-password` | `username`, `password`, `crypted`；当前只接受 QEMU，并在提交前检查 QGA `guest-set-user-password` capability。LXC 返回 unsupported。 |
 | vm | `snapshot.create` | `name`、必填 bool `includeRam`，可选 `description`；LXC 的 `includeRam` 只能为 false。 |

@@ -82,7 +82,7 @@ Agent 或官网离线时都不得回退为官网直连 PVE。目标官网服务�
 
 Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代码中的动作名是：
 
-- 生命周期/资源与交付：`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot`、`vm.create`、`vm.clone`、`vm.set-resources`、`vm.resize`、`vm.set-disk-limits`、`vm.set-network`、`vm.set-rate`、`vm.set-cloud-init`、`vm.set-timezone`、`vm.verify-delivery`、`vm.delete`、`vm.reset-password`。
+- 生命周期/资源与交付：`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot`、`vm.create`、`vm.clone`、`vm.set-resources`、`vm.resize`、`vm.set-disk-io`、`vm.set-network`、`vm.set-rate`、`vm.set-cloud-init`、`vm.set-timezone`、`vm.verify-delivery`、`vm.delete`、`vm.reset-password`。
 - 快照/备份：`snapshot.create`、`snapshot.delete`、`snapshot.rollback`、`backup.create`、`backup.delete`、`backup.restore`。
 - PVE 任务：`task.status`。
 - 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`、`firewall.guest.set-ipfilter`。

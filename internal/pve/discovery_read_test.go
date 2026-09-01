@@ -22,7 +22,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 		case "/api2/json/cluster/sdn/vnets":
 			fmt.Fprint(w, `{"data":[{"vnet":"blue","zone":"public"}]}`)
 		case "/api2/json/nodes/pve1/qemu/101/config":
-			fmt.Fprint(w, `{"data":{"ide2":"local:cloudinit","net0":"virtio=aa"}}`)
+			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=8G","ide2":"local:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","agent":"enabled=1"}}`)
 		case "/api2/json/cluster/resources":
 			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Has("start") || r.URL.Query().Has("limit") {
 				t.Errorf("unexpected page query %s", r.URL.RawQuery)
@@ -50,7 +50,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 	if got, err := c.ClusterSDN(ctx); err != nil || len(got) != 1 || got[0].Type != "vnet" || got[0].VNet != "blue" || got[0].Zone != "public" {
 		t.Fatalf("sdn %#v: %v", got, err)
 	}
-	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 {
+	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 || got.Baseline == nil || got.Baseline.BootDisk.SizeGiB != 8 || got.ConfigSHA256 == "" {
 		t.Fatalf("template %#v: %v", got, err)
 	}
 	if got, err := c.ClusterResourcesPage(ctx, 1, 1); err != nil || len(got) != 1 || got[0].VMID != 101 {

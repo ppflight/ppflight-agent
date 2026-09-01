@@ -2,9 +2,14 @@ package pve
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -97,12 +102,35 @@ func (c *Client) ClusterSDN(ctx context.Context) ([]SDNConfig, error) {
 // fixed guest config endpoint without exposing secrets such as sshkeys or
 // cipassword. Kind is always qemu or lxc.
 type TemplateInfo struct {
-	Kind         string `json:"kind"`
-	Node         string `json:"node"`
-	VMID         int    `json:"vmid"`
-	Name         string `json:"name,omitempty"`
-	CloudInit    bool   `json:"cloudInit"`
-	NetworkCount int    `json:"networkCount"`
+	Kind         string            `json:"kind"`
+	Node         string            `json:"node"`
+	VMID         int               `json:"vmid"`
+	Name         string            `json:"name,omitempty"`
+	CloudInit    bool              `json:"cloudInit"`
+	NetworkCount int               `json:"networkCount"`
+	Baseline     *TemplateBaseline `json:"baseline,omitempty"`
+	ConfigSHA256 string            `json:"configSha256,omitempty"`
+}
+
+type TemplateBaseline struct {
+	Cores              int               `json:"cores"`
+	Sockets            int               `json:"sockets"`
+	MemoryMiB          int               `json:"memoryMiB"`
+	BootDisk           TemplateBootDisk  `json:"bootDisk"`
+	Networks           []TemplateNetwork `json:"networks"`
+	CloudInitDrive     bool              `json:"cloudInitDrive"`
+	QGADeviceEnabled   bool              `json:"qgaDeviceEnabled"`
+	GuestFirewallEmpty bool              `json:"guestFirewallEmpty"`
+}
+type TemplateBootDisk struct {
+	Interface string `json:"interface"`
+	SizeGiB   int    `json:"sizeGiB"`
+}
+type TemplateNetwork struct {
+	Interface string `json:"interface"`
+	Bridge    string `json:"bridge"`
+	Model     string `json:"model"`
+	Firewall  bool   `json:"firewall"`
 }
 
 func (c *Client) TemplateInfo(ctx context.Context, kind, node string, vmid int, name string) (TemplateInfo, error) {
@@ -110,20 +138,183 @@ func (c *Client) TemplateInfo(ctx context.Context, kind, node string, vmid int, 
 	if err != nil {
 		return TemplateInfo{}, err
 	}
-	info := TemplateInfo{Kind: kind, Node: node, VMID: vmid, Name: name}
-	for key, value := range config.Raw {
-		var text string
-		if json.Unmarshal(value, &text) != nil {
-			continue
+	if kind != "qemu" {
+		cloudInit, networkCount := false, 0
+		for key := range config.Raw {
+			value, _ := templateConfigString(config.Raw, key)
+			cloudInit = cloudInit || strings.Contains(strings.ToLower(value), "cloudinit")
+			if templateNetRE.MatchString(key) {
+				networkCount++
+			}
 		}
-		if strings.HasPrefix(key, "net") {
-			info.NetworkCount++
+		return TemplateInfo{Kind: kind, Node: node, VMID: vmid, Name: name, CloudInit: cloudInit, NetworkCount: networkCount}, nil
+	}
+	baseline, err := templateBaseline(config.Raw)
+	if err != nil {
+		return TemplateInfo{}, err
+	}
+	rules, err := c.FirewallRules(ctx, FirewallRef{Node: node, Kind: kind, VMID: vmid})
+	if err != nil {
+		return TemplateInfo{}, err
+	}
+	ipsets, err := c.FirewallIPSets(ctx, FirewallRef{Node: node, Kind: kind, VMID: vmid})
+	if err != nil {
+		return TemplateInfo{}, err
+	}
+	baseline.GuestFirewallEmpty = len(rules) == 0 && len(ipsets) == 0
+	canonical, err := json.Marshal(baseline)
+	if err != nil {
+		return TemplateInfo{}, err
+	}
+	digest := sha256.Sum256(canonical)
+	info := TemplateInfo{Kind: kind, Node: node, VMID: vmid, Name: name, CloudInit: baseline.CloudInitDrive, NetworkCount: len(baseline.Networks), Baseline: &baseline, ConfigSHA256: fmt.Sprintf("%x", digest)}
+	return info, nil
+}
+
+var templateDiskRE = regexp.MustCompile(`^(scsi|virtio|sata|ide)[0-9]{1,2}$`)
+var templateNetRE = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
+
+func templateBaseline(raw map[string]json.RawMessage) (TemplateBaseline, error) {
+	cores, ok := templateConfigInt(raw, "cores")
+	if !ok || cores < 1 || cores > 128 {
+		return TemplateBaseline{}, errors.New("template cores baseline is unavailable")
+	}
+	sockets, ok := templateConfigInt(raw, "sockets")
+	if !ok || sockets < 1 || sockets > 16 {
+		return TemplateBaseline{}, errors.New("template sockets baseline is unavailable")
+	}
+	memory, ok := templateConfigInt(raw, "memory")
+	if !ok || memory < 128 || memory > 4194304 {
+		return TemplateBaseline{}, errors.New("template memory baseline is unavailable")
+	}
+	baseline := TemplateBaseline{Cores: cores, Sockets: sockets, MemoryMiB: memory, Networks: []TemplateNetwork{}}
+	diskKeys, networkKeys := []string{}, []string{}
+	for key := range raw {
+		if templateDiskRE.MatchString(key) {
+			diskKeys = append(diskKeys, key)
 		}
-		if strings.Contains(strings.ToLower(text), "cloudinit") {
-			info.CloudInit = true
+		if templateNetRE.MatchString(key) {
+			networkKeys = append(networkKeys, key)
 		}
 	}
-	return info, nil
+	sort.Strings(diskKeys)
+	sort.Strings(networkKeys)
+	for _, key := range diskKeys {
+		value, ok := templateConfigString(raw, key)
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(value), "cloudinit") {
+			baseline.CloudInitDrive = true
+			continue
+		}
+		if baseline.BootDisk.Interface == "" {
+			size, err := templateDiskGiB(value)
+			if err != nil {
+				return TemplateBaseline{}, err
+			}
+			baseline.BootDisk = TemplateBootDisk{Interface: key, SizeGiB: size}
+		}
+	}
+	if baseline.BootDisk.Interface == "" {
+		return TemplateBaseline{}, errors.New("template boot disk baseline is unavailable")
+	}
+	if !baseline.CloudInitDrive {
+		return TemplateBaseline{}, errors.New("template Cloud-Init drive is unavailable")
+	}
+	for _, key := range networkKeys {
+		value, ok := templateConfigString(raw, key)
+		if !ok {
+			return TemplateBaseline{}, errors.New("template network baseline is invalid")
+		}
+		network, err := templateNetwork(key, value)
+		if err != nil {
+			return TemplateBaseline{}, err
+		}
+		baseline.Networks = append(baseline.Networks, network)
+	}
+	if len(baseline.Networks) < 1 || len(baseline.Networks) > 8 {
+		return TemplateBaseline{}, errors.New("template network baseline is unavailable")
+	}
+	agent, ok := templateConfigString(raw, "agent")
+	baseline.QGADeviceEnabled = ok && (agent == "1" || strings.Contains(agent, "enabled=1"))
+	if !baseline.QGADeviceEnabled {
+		return TemplateBaseline{}, errors.New("template QGA device is not enabled")
+	}
+	return baseline, nil
+}
+
+func templateConfigString(raw map[string]json.RawMessage, key string) (string, bool) {
+	value, ok := raw[key]
+	if !ok {
+		return "", false
+	}
+	var text string
+	if json.Unmarshal(value, &text) == nil {
+		return text, true
+	}
+	return "", false
+}
+func templateConfigInt(raw map[string]json.RawMessage, key string) (int, bool) {
+	value, ok := raw[key]
+	if !ok {
+		return 0, false
+	}
+	var integer int
+	if json.Unmarshal(value, &integer) == nil {
+		return integer, true
+	}
+	var text string
+	if json.Unmarshal(value, &text) != nil {
+		return 0, false
+	}
+	integer, err := strconv.Atoi(text)
+	return integer, err == nil
+}
+func templateDiskGiB(value string) (int, error) {
+	for _, segment := range strings.Split(value, ",") {
+		key, size, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok || key != "size" {
+			continue
+		}
+		match := regexp.MustCompile(`^([0-9]+)([KMGT])$`).FindStringSubmatch(size)
+		if len(match) != 3 {
+			return 0, errors.New("template boot disk size is invalid")
+		}
+		amount, err := strconv.ParseUint(match[1], 10, 64)
+		if err != nil || amount == 0 {
+			return 0, errors.New("template boot disk size is invalid")
+		}
+		shift := map[string]uint{"K": 10, "M": 20, "G": 30, "T": 40}[match[2]]
+		bytes := amount << shift
+		gib := (bytes + (1 << 30) - 1) >> 30
+		if gib < 1 || gib > 1048576 {
+			return 0, errors.New("template boot disk size is outside the supported range")
+		}
+		return int(gib), nil
+	}
+	return 0, errors.New("template boot disk size is unavailable")
+}
+func templateNetwork(key, value string) (TemplateNetwork, error) {
+	result := TemplateNetwork{Interface: key}
+	for _, segment := range strings.Split(value, ",") {
+		name, candidate, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok {
+			return TemplateNetwork{}, errors.New("template network is invalid")
+		}
+		switch name {
+		case "virtio", "e1000", "e1000e", "vmxnet3", "rtl8139":
+			result.Model = name
+		case "bridge":
+			result.Bridge = candidate
+		case "firewall":
+			result.Firewall = candidate == "1"
+		}
+	}
+	if result.Model == "" || result.Bridge == "" || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(result.Bridge) {
+		return TemplateNetwork{}, errors.New("template network baseline is incomplete")
+	}
+	return result, nil
 }
 
 // FirewallRef permits only the cluster, a node, or a particular QEMU/LXC
@@ -168,6 +359,11 @@ type FirewallIPSet struct {
 	Comment string `json:"comment,omitempty"`
 }
 
+type FirewallIPSetEntry struct {
+	CIDR    string `json:"cidr"`
+	NoMatch *int   `json:"nomatch,omitempty"`
+}
+
 func (c *Client) FirewallOptions(ctx context.Context, ref FirewallRef) (FirewallOptions, error) {
 	base, err := firewallBase(ref)
 	if err != nil {
@@ -202,6 +398,20 @@ func (c *Client) FirewallIPSets(ctx context.Context, ref FirewallRef) ([]Firewal
 	}
 	var result []FirewallIPSet
 	err = c.get(ctx, base+"/ipset", nil, &result)
+	return result, err
+}
+
+func (c *Client) FirewallIPSetEntries(ctx context.Context, ref FirewallRef, name string) ([]FirewallIPSetEntry, error) {
+	base, err := firewallBase(ref)
+	if err != nil {
+		return nil, err
+	}
+	part, err := segment(name)
+	if err != nil {
+		return nil, err
+	}
+	var result []FirewallIPSetEntry
+	err = c.get(ctx, base+"/ipset/"+part, nil, &result)
 	return result, err
 }
 

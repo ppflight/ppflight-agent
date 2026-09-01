@@ -2,7 +2,9 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,48 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/discovery"
 	"github.com/ppflight/ppflight-agent/internal/pve"
 )
+
+func TestCloneRequiresFreshTemplateBaselineHash(t *testing.T) {
+	baseline := pve.TemplateBaseline{
+		Cores: 2, Sockets: 1, MemoryMiB: 1024,
+		BootDisk:       pve.TemplateBootDisk{Interface: "scsi0", SizeGiB: 8},
+		Networks:       []pve.TemplateNetwork{{Interface: "net0", Bridge: "vmbr0", Model: "virtio", Firewall: false}},
+		CloudInitDrive: true, QGADeviceEnabled: true, GuestFirewallEmpty: true,
+	}
+	canonical, _ := json.Marshal(baseline)
+	digest := fmt.Sprintf("%x", sha256.Sum256(canonical))
+	mutated := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/resources":
+			_, _ = w.Write([]byte(`{"data":[{"type":"qemu","node":"pve1","vmid":100,"template":1}]}`))
+		case "/api2/json/nodes/pve1/qemu/100/config":
+			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-100-disk-0,size=8G","ide2":"local:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0","agent":"enabled=1"}}`))
+		case "/api2/json/nodes/pve1/qemu/100/firewall/rules", "/api2/json/nodes/pve1/qemu/100/firewall/ipset":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		case "/api2/json/nodes/pve1/qemu/100/clone":
+			mutated = true
+			_ = r.ParseForm()
+			if r.Method != http.MethodPost || r.Form.Get("newid") != "101" || r.Form.Get("full") != "1" || r.Form.Get("target") != "pve1" || r.Form.Get("storage") != "local-lvm" {
+				t.Fatalf("clone form: %v", r.Form)
+			}
+			_, _ = w.Write([]byte(`{"data":"UPID:pve1:clone"}`))
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := controlTestClient(t, server)
+	valid := fmt.Sprintf(`{"sourceVmid":100,"name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"%s"}`, digest)
+	if _, _, err := executePVE(context.Background(), client, controlCommand("vm.clone", "qemu", valid)); err != nil || !mutated {
+		t.Fatalf("valid clone failed: mutated=%t err=%v", mutated, err)
+	}
+	mutated = false
+	invalid := `{"sourceVmid":100,"name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	if _, _, err := executePVE(context.Background(), client, controlCommand("vm.clone", "qemu", invalid)); err == nil || mutated {
+		t.Fatalf("stale template hash reached mutation: mutated=%t err=%v", mutated, err)
+	}
+}
 
 func controlTestClient(t *testing.T, server *httptest.Server) *pve.Client {
 	t.Helper()
@@ -112,7 +156,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		if _, _, err := executePVE(context.Background(), client, controlCommand("vm.resize", "qemu", `{"disk":"scsi0","targetGiB":20}`)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := executePVE(context.Background(), client, controlCommand("vm.set-disk-limits", "qemu", `{"disk":"scsi0","iopsRead":1000,"iopsWrite":900,"iopsReadMax":1200,"iopsReadMaxLength":30}`)); err != nil {
+		if _, _, err := executePVE(context.Background(), client, controlCommand("vm.set-disk-io", "qemu", `{"disk":"scsi0","limits":{"iopsRead":1000,"iopsWrite":900,"iopsReadMax":1200,"iopsWriteMax":null,"iopsReadMaxLength":30,"iopsWriteMaxLength":null,"mbpsRead":null,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}}`)); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -135,9 +179,9 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":{"cipassword":"secret-value"}}`))
 		}))
 		defer server.Close()
-		command := controlCommand("vm.set-cloud-init", "qemu", `{"username":"root","password":"secret-value","sshKeys":["ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="],"hostname":"vm101","enableQGA":true}`)
+		command := controlCommand("vm.set-cloud-init", "qemu", `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":["ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="],"qgaEnabled":true}`)
 		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
-		if err != nil || receipt.State != "succeeded" || len(receipt.Result) != 0 {
+		if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"configured":true`) {
 			t.Fatalf("receipt=%#v err=%v", receipt, err)
 		}
 		if raw, _ := json.Marshal(receipt); strings.Contains(string(raw), "secret-value") {
@@ -161,6 +205,8 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 					t.Fatalf("pid query: %v", r.URL.Query())
 				}
 				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+				_, _ = w.Write([]byte(`{"data":{"zone":"Asia/Shanghai","offset":28800}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -173,29 +219,37 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	})
 }
 
-func TestDeliveryVerificationRequiresRunningGuestQGAIdentityAndAddress(t *testing.T) {
+func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status/current"):
 			_, _ = w.Write([]byte(`{"data":{"status":"running","uptime":30}}`))
 		case strings.HasSuffix(r.URL.Path, "/config"):
-			_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"}}`))
+			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=20G,iops_rd=1000,mbps_rd=100","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=1,rate=100","ipconfig0":"ip=192.0.2.10/24,ip6=2001:db8::10/64"}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/info"):
 			_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-network-get-interfaces","enabled":true}]}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
-			_, _ = w.Write([]byte(`{"data":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"}]}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"},{"ip-address":"2001:db8::10","prefix":64,"ip-address-type":"ipv6"}]}]}`))
+		case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+			_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
+			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"2001:db8::10/128","nomatch":0}]}`))
 		default:
 			t.Fatalf("unexpected request: %s", r.URL.Path)
 		}
 	}))
 	defer server.Close()
-	command := controlCommand("vm.verify-delivery", "qemu", `{"interface":"net0","expectedMac":"AA:BB:CC:DD:EE:FF","expectedAddresses":["192.0.2.10"],"requireQGA":true}`)
+	command := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`)
 	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || receipt.DryRun {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
 	}
 	var result DeliveryVerificationResult
-	if json.Unmarshal(receipt.Result, &result) != nil || !result.NetworkVerified || !result.QGAAvailable || len(result.MatchedAddresses) != 1 {
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Ready || !result.ConfigMatched || !result.DiskIOMatched || !result.NetworkMatched || !result.FirewallMatched || !result.QGAFresh || !result.GuestAddressMatched || !result.TimezoneMatched || result.PowerState != "running" {
 		t.Fatalf("result=%s", receipt.Result)
 	}
 }
@@ -256,9 +310,9 @@ func TestExecutorRejectsUnknownAndUnsafeParameters(t *testing.T) {
 		controlCommand("vm.set-network", "qemu", `{"interface":"net0","vlan":4095}`),
 		controlCommand("vm.set-network", "qemu", `{"interface":"net0","bridge":"vmbr0\nrate=100"}`),
 		controlCommand("vm.resize", "qemu", `{"disk":"scsi0","size":"+1G","targetGiB":20}`),
-		controlCommand("vm.set-disk-limits", "qemu", `{"disk":"scsi0","iopsRead":1000,"iopsReadMax":500}`),
-		controlCommand("vm.set-cloud-init", "qemu", `{"username":"root","password":"secret-value","sshKeys":["not-a-key"],"hostname":"vm101","enableQGA":true}`),
-		controlCommand("vm.set-cloud-init", "qemu", `{"username":"root","password":"secret-value","sshKeys":[],"hostname":"vm101","enableQGA":false}`),
+		controlCommand("vm.set-disk-io", "qemu", `{"disk":"scsi0","limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":500,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":null,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}}`),
+		controlCommand("vm.set-cloud-init", "qemu", `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":["not-a-key"],"qgaEnabled":true}`),
+		controlCommand("vm.set-cloud-init", "qemu", `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":[],"qgaEnabled":false}`),
 		controlCommand("vm.set-timezone", "qemu", `{"timezone":"../../etc/passwd"}`),
 		controlCommand("vm.verify-delivery", "qemu", `{"interface":"net0","expectedMac":"AA:BB:CC:DD:EE:FF","expectedAddresses":["192.0.2.10"],"requireQGA":false}`),
 		controlCommand("vm.reset-password", "qemu", `{"username":"root","password":"secret-value"}`),

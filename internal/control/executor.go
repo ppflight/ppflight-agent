@@ -217,7 +217,7 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	} else {
 		r.State, r.Code = "succeeded", "SUCCEEDED"
 	}
-	if command.Action != "vm.reset-password" && command.Action != "vm.set-cloud-init" {
+	if command.Action != "vm.reset-password" {
 		r.Result = result
 	}
 	return finish(nil)
@@ -319,11 +319,12 @@ func validTaskState(status string) bool {
 }
 
 type cloneP struct {
-	SourceVMID int    `json:"sourceVmid"`
-	Name       string `json:"name"`
-	Target     string `json:"target,omitempty"`
-	Storage    string `json:"storage,omitempty"`
-	Full       *bool  `json:"full"`
+	SourceVMID         int    `json:"sourceVmid"`
+	Name               string `json:"name"`
+	Target             string `json:"target"`
+	Storage            string `json:"storage"`
+	Full               *bool  `json:"full"`
+	SourceConfigSHA256 string `json:"sourceConfigSha256"`
 }
 type createP struct {
 	Name      string `json:"name"`
@@ -344,8 +345,11 @@ type resizeP struct {
 	Size      string `json:"size,omitempty"`
 	TargetGiB *int   `json:"targetGiB,omitempty"`
 }
-type diskLimitsP struct {
-	Disk               string `json:"disk"`
+type diskIOP struct {
+	Disk   string       `json:"disk"`
+	Limits diskIOLimits `json:"limits"`
+}
+type diskIOLimits struct {
 	IOPSRead           *int64 `json:"iopsRead,omitempty"`
 	IOPSWrite          *int64 `json:"iopsWrite,omitempty"`
 	IOPSReadMax        *int64 `json:"iopsReadMax,omitempty"`
@@ -385,21 +389,44 @@ type passwordP struct {
 	Crypted  *bool  `json:"crypted"`
 }
 type cloudInitP struct {
-	Username  string   `json:"username"`
-	Password  string   `json:"password"`
-	SSHKeys   []string `json:"sshKeys"`
-	Hostname  string   `json:"hostname"`
-	EnableQGA *bool    `json:"enableQGA"`
-	Timezone  *string  `json:"timezone,omitempty"`
+	Hostname          string   `json:"hostname"`
+	Username          string   `json:"username"`
+	Password          string   `json:"password"`
+	PasswordFormat    string   `json:"passwordFormat"`
+	SSHAuthorizedKeys []string `json:"sshAuthorizedKeys"`
+	QGAEnabled        *bool    `json:"qgaEnabled"`
 }
 type timezoneP struct {
 	Timezone string `json:"timezone"`
 }
 type deliveryP struct {
-	Interface         string   `json:"interface"`
-	ExpectedMAC       string   `json:"expectedMac"`
-	ExpectedAddresses []string `json:"expectedAddresses"`
-	RequireQGA        *bool    `json:"requireQGA"`
+	NotBefore time.Time        `json:"notBefore"`
+	Expected  deliveryExpected `json:"expected"`
+}
+type deliveryExpected struct {
+	Cores     int               `json:"cores"`
+	Sockets   int               `json:"sockets"`
+	MemoryMiB int               `json:"memoryMiB"`
+	Disk      deliveryDisk      `json:"disk"`
+	Networks  []deliveryNetwork `json:"networks"`
+	Timezone  string            `json:"timezone"`
+}
+type deliveryDisk struct {
+	Interface  string       `json:"interface"`
+	MinimumGiB int          `json:"minimumGiB"`
+	Limits     diskIOLimits `json:"limits"`
+}
+type deliveryNetwork struct {
+	Interface     string   `json:"interface"`
+	Bridge        string   `json:"bridge"`
+	MAC           string   `json:"mac"`
+	VLAN          *int     `json:"vlan,omitempty"`
+	MTU           int      `json:"mtu"`
+	Firewall      *bool    `json:"firewall"`
+	RateMbps      string   `json:"rateMbps"`
+	IPv4          string   `json:"ipv4"`
+	IPv6          string   `json:"ipv6"`
+	IPFilterCIDRs []string `json:"ipFilterCidrs"`
 }
 type snapP struct {
 	Name        string `json:"name"`
@@ -505,7 +532,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.clone":
 		var p cloneP
-		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || p.SourceVMID < 1 || !nameRE.MatchString(p.Name) || (p.Target != "" && !nodeRE.MatchString(p.Target)) || (p.Storage != "" && !storageRE.MatchString(p.Storage)) {
+		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
 			return errors.New("invalid clone parameters")
 		}
 		return nil
@@ -526,9 +553,9 @@ func validateParameters(c Command) error {
 			return errors.New("invalid grow-only resize parameters")
 		}
 		return nil
-	case "vm.set-disk-limits":
-		var p diskLimitsP
-		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !validDiskLimits(p) {
+	case "vm.set-disk-io":
+		var p diskIOP
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !exactDiskIOKeys(c.Parameters) || !validDiskLimits(p) {
 			return errors.New("invalid disk IO limit parameters")
 		}
 		return nil
@@ -546,7 +573,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.set-cloud-init":
 		var p cloudInitP
-		if strictParameters(c.Parameters, &p) != nil || p.EnableQGA == nil || !validCloudInit(p, c.Identity.GuestType) {
+		if strictParameters(c.Parameters, &p) != nil || p.QGAEnabled == nil || c.Identity.GuestType != "qemu" || !validCloudInit(p) {
 			return errors.New("invalid Cloud-Init parameters")
 		}
 		return nil
@@ -558,7 +585,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.verify-delivery":
 		var p deliveryP
-		if strictParameters(c.Parameters, &p) != nil || p.RequireQGA == nil || !validDelivery(p, c.Identity.GuestType) {
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !exactDeliveryKeys(c.Parameters) || !validDelivery(p) {
 			return errors.New("invalid delivery verification parameters")
 		}
 		return nil
@@ -750,19 +777,18 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	case "vm.clone":
 		var p cloneP
 		_ = strictParameters(c.Parameters, &p)
+		if err := verifyCloneSource(ctx, client, c, p); err != nil {
+			return "", nil, err
+		}
 		form = url.Values{"newid": {strconv.Itoa(c.Identity.VMID)}, "name": {p.Name}, "full": {boolText(*p.Full)}}
-		if p.Target != "" {
-			form.Set("target", p.Target)
-		}
-		if p.Storage != "" {
-			form.Set("storage", p.Storage)
-		}
+		form.Set("target", p.Target)
+		form.Set("storage", p.Storage)
 		method, path = http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/clone", c.Identity.NodeRef, c.Identity.GuestType, p.SourceVMID)
 	case "vm.set-resources":
 		return setResources(ctx, client, c, base)
 	case "vm.resize":
 		return resizeDisk(ctx, client, c, base)
-	case "vm.set-disk-limits":
+	case "vm.set-disk-io":
 		return setDiskLimits(ctx, client, c, base)
 	case "vm.set-network":
 		return setNetwork(ctx, client, c, base)
@@ -905,6 +931,30 @@ func doPVE(ctx context.Context, c *pve.Client, method, path string, form url.Val
 func guestConfig(ctx context.Context, c *pve.Client, cmd Command) (pve.GuestConfig, error) {
 	return c.GuestConfig(ctx, cmd.Identity.GuestType, cmd.Identity.NodeRef, cmd.Identity.VMID)
 }
+func verifyCloneSource(ctx context.Context, c *pve.Client, cmd Command, parameters cloneP) error {
+	resources, err := c.ClusterResources(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, resource := range resources {
+		if resource.VMID == parameters.SourceVMID && resource.Node == cmd.Identity.NodeRef && resource.Type == cmd.Identity.GuestType && resource.Template == 1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return errors.New("clone source is not the assigned PVE template")
+	}
+	info, err := c.TemplateInfo(ctx, cmd.Identity.GuestType, cmd.Identity.NodeRef, parameters.SourceVMID, "")
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(info.ConfigSHA256, parameters.SourceConfigSHA256) {
+		return errors.New("clone source configuration changed after discovery")
+	}
+	return nil
+}
 func setResources(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p resourcesP
 	_ = strictParameters(cmd.Parameters, &p)
@@ -970,7 +1020,7 @@ func resizeDisk(ctx context.Context, c *pve.Client, cmd Command, base string) (s
 	return doPVE(ctx, c, http.MethodPut, base+"/resize", url.Values{"disk": {p.Disk}, "size": {size}})
 }
 func setDiskLimits(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
-	var p diskLimitsP
+	var p diskIOP
 	_ = strictParameters(cmd.Parameters, &p)
 	current, err := guestConfig(ctx, c, cmd)
 	if err != nil {
@@ -1051,21 +1101,16 @@ func setCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) 
 	if err != nil {
 		return "", nil, err
 	}
-	form := url.Values{"ciuser": {p.Username}, "cipassword": {p.Password}, "sshkeys": {url.QueryEscape(strings.Join(p.SSHKeys, "\n"))}}
-	if cmd.Identity.GuestType == "qemu" {
-		form.Set("name", p.Hostname)
-		form.Set("agent", "enabled="+boolText(*p.EnableQGA))
-	} else {
-		form.Set("hostname", p.Hostname)
-		if p.Timezone != nil {
-			form.Set("timezone", *p.Timezone)
-		}
-	}
+	form := url.Values{"ciuser": {p.Username}, "cipassword": {p.Password}, "sshkeys": {url.QueryEscape(strings.Join(p.SSHAuthorizedKeys, "\n"))}, "name": {p.Hostname}, "agent": {"enabled=1"}}
 	if current.Digest != "" {
 		form.Set("digest", current.Digest)
 	}
 	upid, _, err := doPVE(ctx, c, http.MethodPut, base+"/config", form)
-	return upid, nil, err
+	if err != nil || upid != "" {
+		return upid, nil, err
+	}
+	result, _ := json.Marshal(map[string]any{"configured": true, "qgaDeviceEnabled": true})
+	return "", result, nil
 }
 func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p timezoneP
@@ -1105,7 +1150,11 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 			if status.ExitCode != 0 {
 				return "", nil, errors.New("guest timezone command failed")
 			}
-			result, _ := json.Marshal(map[string]any{"timezone": p.Timezone, "verified": true})
+			observed, readErr := c.ReadGuestTimezone(ctx, cmd.Identity.NodeRef, cmd.Identity.VMID)
+			if readErr != nil || observed.Zone != p.Timezone {
+				return "", nil, errors.New("guest timezone readback does not match")
+			}
+			result, _ := json.Marshal(map[string]any{"configured": true, "verified": true})
 			return "", result, nil
 		}
 		select {
@@ -1149,18 +1198,87 @@ func validResources(p resourcesP) bool {
 	}
 	return any && (p.Cores == nil || *p.Cores <= 128) && (p.Sockets == nil || *p.Sockets <= 16)
 }
-func validDiskLimits(p diskLimitsP) bool {
+func validDiskLimits(p diskIOP) bool {
 	if !diskRE.MatchString(p.Disk) {
 		return false
 	}
-	values := []*int64{p.IOPSRead, p.IOPSWrite, p.IOPSReadMax, p.IOPSWriteMax, p.IOPSReadMaxLength, p.IOPSWriteMaxLength, p.MBPSRead, p.MBPSWrite, p.MBPSReadMax, p.MBPSWriteMax}
-	for _, value := range values {
+	limits := p.Limits
+	for _, value := range []*int64{limits.IOPSRead, limits.IOPSWrite, limits.IOPSReadMax, limits.IOPSWriteMax} {
 		if value != nil && (*value < 1 || *value > 1000000000) {
 			return false
 		}
 	}
-	if !validBurst(p.IOPSRead, p.IOPSReadMax, p.IOPSReadMaxLength) || !validBurst(p.IOPSWrite, p.IOPSWriteMax, p.IOPSWriteMaxLength) || !validBurst(p.MBPSRead, p.MBPSReadMax, nil) || !validBurst(p.MBPSWrite, p.MBPSWriteMax, nil) {
+	for _, value := range []*int64{limits.MBPSRead, limits.MBPSWrite, limits.MBPSReadMax, limits.MBPSWriteMax} {
+		if value != nil && (*value < 1 || *value > 1000000) {
+			return false
+		}
+	}
+	for _, value := range []*int64{limits.IOPSReadMaxLength, limits.IOPSWriteMaxLength} {
+		if value != nil && (*value < 1 || *value > 86400) {
+			return false
+		}
+	}
+	if !validBurst(limits.IOPSRead, limits.IOPSReadMax, limits.IOPSReadMaxLength) || !validBurst(limits.IOPSWrite, limits.IOPSWriteMax, limits.IOPSWriteMaxLength) || !validBurst(limits.MBPSRead, limits.MBPSReadMax, nil) || !validBurst(limits.MBPSWrite, limits.MBPSWriteMax, nil) {
 		return false
+	}
+	return true
+}
+func exactDiskIOKeys(raw json.RawMessage) bool {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal(raw, &outer) != nil || len(outer) != 2 || outer["disk"] == nil || outer["limits"] == nil {
+		return false
+	}
+	var limits map[string]json.RawMessage
+	if json.Unmarshal(outer["limits"], &limits) != nil || len(limits) != 10 {
+		return false
+	}
+	for _, key := range []string{"iopsRead", "iopsWrite", "iopsReadMax", "iopsWriteMax", "iopsReadMaxLength", "iopsWriteMaxLength", "mbpsRead", "mbpsWrite", "mbpsReadMax", "mbpsWriteMax"} {
+		if _, ok := limits[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+func exactDeliveryKeys(raw json.RawMessage) bool {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal(raw, &outer) != nil || !hasExactKeys(outer, "notBefore", "expected") {
+		return false
+	}
+	var expected map[string]json.RawMessage
+	if json.Unmarshal(outer["expected"], &expected) != nil || !hasExactKeys(expected, "cores", "sockets", "memoryMiB", "disk", "networks", "timezone") {
+		return false
+	}
+	var disk map[string]json.RawMessage
+	if json.Unmarshal(expected["disk"], &disk) != nil || !hasExactKeys(disk, "interface", "minimumGiB", "limits") {
+		return false
+	}
+	var limits map[string]json.RawMessage
+	if json.Unmarshal(disk["limits"], &limits) != nil || !hasExactKeys(limits, "iopsRead", "iopsWrite", "iopsReadMax", "iopsWriteMax", "iopsReadMaxLength", "iopsWriteMaxLength", "mbpsRead", "mbpsWrite", "mbpsReadMax", "mbpsWriteMax") {
+		return false
+	}
+	var networks []map[string]json.RawMessage
+	if json.Unmarshal(expected["networks"], &networks) != nil {
+		return false
+	}
+	for _, network := range networks {
+		required := []string{"interface", "bridge", "mac", "mtu", "firewall", "rateMbps", "ipv4", "ipv6", "ipFilterCidrs"}
+		if _, hasVLAN := network["vlan"]; hasVLAN {
+			required = append(required, "vlan")
+		}
+		if !hasExactKeys(network, required...) {
+			return false
+		}
+	}
+	return true
+}
+func hasExactKeys(values map[string]json.RawMessage, keys ...string) bool {
+	if len(values) != len(keys) {
+		return false
+	}
+	for _, key := range keys {
+		if _, ok := values[key]; !ok {
+			return false
+		}
 	}
 	return true
 }
@@ -1170,21 +1288,18 @@ func validBurst(base, maximum, length *int64) bool {
 	}
 	return length == nil || maximum != nil
 }
-func validCloudInit(p cloudInitP, kind string) bool {
-	if !nameRE.MatchString(p.Username) || !nameRE.MatchString(p.Hostname) || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || len(p.SSHKeys) > 5 {
+func validCloudInit(p cloudInitP) bool {
+	if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`).MatchString(p.Username) || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$`).MatchString(p.Hostname) || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || (p.PasswordFormat != "plain" && p.PasswordFormat != "crypt") || len(p.SSHAuthorizedKeys) > 16 || !*p.QGAEnabled {
 		return false
 	}
 	seen := map[string]bool{}
-	for _, key := range p.SSHKeys {
+	for _, key := range p.SSHAuthorizedKeys {
 		if !validSSHKey(key) || seen[key] {
 			return false
 		}
 		seen[key] = true
 	}
-	if kind == "qemu" {
-		return *p.EnableQGA && p.Timezone == nil
-	}
-	return !*p.EnableQGA && p.Timezone != nil && validTimezone(*p.Timezone)
+	return true
 }
 func validSSHKey(value string) bool {
 	if len(value) > 4096 || strings.TrimSpace(value) != value {
@@ -1207,19 +1322,30 @@ func validTimezone(value string) bool {
 	_, err := time.LoadLocation(value)
 	return err == nil
 }
-func validDelivery(p deliveryP, kind string) bool {
-	if !netRE.MatchString(p.Interface) || !macRE.MatchString(p.ExpectedMAC) || len(p.ExpectedAddresses) < 1 || len(p.ExpectedAddresses) > 16 {
+func validDelivery(p deliveryP) bool {
+	e := p.Expected
+	if p.NotBefore.IsZero() || p.NotBefore.Location() != time.UTC || e.Cores < 1 || e.Cores > 128 || e.Sockets < 1 || e.Sockets > 16 || e.MemoryMiB < 128 || e.MemoryMiB > 4194304 || !diskRE.MatchString(e.Disk.Interface) || e.Disk.MinimumGiB < 1 || e.Disk.MinimumGiB > 1048576 || !validTimezone(e.Timezone) || len(e.Networks) < 1 || len(e.Networks) > 8 {
+		return false
+	}
+	if !validDiskLimits(diskIOP{Disk: e.Disk.Interface, Limits: e.Disk.Limits}) {
 		return false
 	}
 	seen := map[string]bool{}
-	for _, address := range p.ExpectedAddresses {
-		ip := net.ParseIP(address)
-		if ip == nil || seen[address] {
+	for _, network := range e.Networks {
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !macRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
 			return false
 		}
-		seen[address] = true
+		seen[network.Interface] = true
+		cidrs := map[string]bool{}
+		for _, cidr := range network.IPFilterCIDRs {
+			ip, parsed, err := net.ParseCIDR(cidr)
+			if err != nil || !ip.Equal(parsed.IP) || cidrs[cidr] {
+				return false
+			}
+			cidrs[cidr] = true
+		}
 	}
-	return kind != "qemu" || *p.RequireQGA
+	return true
 }
 func diskSizeBytes(drive string) (uint64, error) {
 	for _, segment := range strings.Split(drive, ",") {
@@ -1244,7 +1370,7 @@ func diskSizeBytes(drive string) (uint64, error) {
 	}
 	return 0, errors.New("current disk size is unavailable")
 }
-func mergeDiskLimits(drive string, p diskLimitsP) (string, error) {
+func mergeDiskLimits(drive string, p diskIOP) (string, error) {
 	if len(drive) > 4096 || strings.ContainsAny(drive, "\x00\r\n") {
 		return "", errors.New("unsafe existing disk configuration")
 	}
@@ -1270,7 +1396,7 @@ func mergeDiskLimits(drive string, p diskLimitsP) (string, error) {
 	for _, item := range []struct {
 		key string
 		val *int64
-	}{{"iops_rd", p.IOPSRead}, {"iops_wr", p.IOPSWrite}, {"iops_rd_max", p.IOPSReadMax}, {"iops_wr_max", p.IOPSWriteMax}, {"iops_rd_max_length", p.IOPSReadMaxLength}, {"iops_wr_max_length", p.IOPSWriteMaxLength}, {"mbps_rd", p.MBPSRead}, {"mbps_wr", p.MBPSWrite}, {"mbps_rd_max", p.MBPSReadMax}, {"mbps_wr_max", p.MBPSWriteMax}} {
+	}{{"iops_rd", p.Limits.IOPSRead}, {"iops_wr", p.Limits.IOPSWrite}, {"iops_rd_max", p.Limits.IOPSReadMax}, {"iops_wr_max", p.Limits.IOPSWriteMax}, {"iops_rd_max_length", p.Limits.IOPSReadMaxLength}, {"iops_wr_max_length", p.Limits.IOPSWriteMaxLength}, {"mbps_rd", p.Limits.MBPSRead}, {"mbps_wr", p.Limits.MBPSWrite}, {"mbps_rd_max", p.Limits.MBPSReadMax}, {"mbps_wr_max", p.Limits.MBPSWriteMax}} {
 		if item.val != nil {
 			out = append(out, item.key+"="+strconv.FormatInt(*item.val, 10))
 		}
@@ -1279,12 +1405,16 @@ func mergeDiskLimits(drive string, p diskLimitsP) (string, error) {
 }
 
 type DeliveryVerificationResult struct {
-	State            string   `json:"state"`
-	Interface        string   `json:"interface"`
-	MAC              string   `json:"mac"`
-	MatchedAddresses []string `json:"matchedAddresses"`
-	QGAAvailable     bool     `json:"qgaAvailable"`
-	NetworkVerified  bool     `json:"networkVerified"`
+	Ready               bool      `json:"ready"`
+	ObservedAt          time.Time `json:"observedAt"`
+	PowerState          string    `json:"powerState"`
+	ConfigMatched       bool      `json:"configMatched"`
+	DiskIOMatched       bool      `json:"diskIoMatched"`
+	NetworkMatched      bool      `json:"networkMatched"`
+	FirewallMatched     bool      `json:"firewallMatched"`
+	QGAFresh            bool      `json:"qgaFresh"`
+	GuestAddressMatched bool      `json:"guestAddressMatched"`
+	TimezoneMatched     bool      `json:"timezoneMatched"`
 }
 
 func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
@@ -1303,82 +1433,180 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 	if err != nil {
 		return nil, err
 	}
-	network, ok := configString(config.Raw, p.Interface)
+	for key, expected := range map[string]int{"cores": p.Expected.Cores, "sockets": p.Expected.Sockets, "memory": p.Expected.MemoryMiB} {
+		actual, ok := configInt(config.Raw, key)
+		if !ok || actual != expected {
+			return nil, fmt.Errorf("guest %s does not match delivery contract", key)
+		}
+	}
+	drive, ok := configString(config.Raw, p.Expected.Disk.Interface)
 	if !ok {
-		return nil, errors.New("target network interface does not exist")
+		return nil, errors.New("delivery disk does not exist")
 	}
-	configuredMAC, err := networkMAC(command.Identity.GuestType, network)
-	if err != nil || !strings.EqualFold(configuredMAC, p.ExpectedMAC) {
-		return nil, errors.New("configured network MAC does not match delivery identity")
+	diskBytes, err := diskSizeBytes(drive)
+	if err != nil || diskBytes < uint64(p.Expected.Disk.MinimumGiB)<<30 {
+		return nil, errors.New("delivery disk size is below the required minimum")
 	}
-	matched := make([]string, 0, len(p.ExpectedAddresses))
-	qgaAvailable := false
-	if command.Identity.GuestType == "qemu" {
-		observation, probeErr := client.ProbeGuestAgent(ctx, command.Identity.NodeRef, command.Identity.VMID)
-		if probeErr != nil {
-			return nil, probeErr
+	if !diskLimitsMatch(drive, p.Expected.Disk.Limits) {
+		return nil, errors.New("delivery disk IO limits do not match")
+	}
+	observation, err := client.ProbeGuestAgent(ctx, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return nil, err
+	}
+	if observation.Availability["info"] != pve.Available || observation.Availability["interfaces"] != pve.Available {
+		return nil, errors.New("QGA delivery information is unavailable")
+	}
+	for _, expected := range p.Expected.Networks {
+		value, exists := configString(config.Raw, expected.Interface)
+		if !exists || !networkMatches(config.Raw, value, expected) {
+			return nil, fmt.Errorf("delivery network %s does not match", expected.Interface)
 		}
-		qgaAvailable = observation.Availability["info"] == pve.Available && observation.Availability["interfaces"] == pve.Available
-		if *p.RequireQGA && !qgaAvailable {
-			return nil, errors.New("QGA network information is unavailable")
+		if !qgaAddressesMatch(observation.Interfaces, expected) {
+			return nil, fmt.Errorf("delivery network %s guest addresses are not ready", expected.Interface)
 		}
-		for _, iface := range observation.Interfaces {
-			if !strings.EqualFold(strings.TrimSpace(iface.HardwareAddress), p.ExpectedMAC) {
-				continue
-			}
-			present := map[string]bool{}
-			for _, address := range iface.IPAddresses {
-				present[strings.TrimSpace(address.Address)] = true
-			}
-			for _, expected := range p.ExpectedAddresses {
-				if present[expected] {
-					matched = append(matched, expected)
-				}
-			}
-			break
-		}
-	} else {
-		present := lxcConfiguredAddresses(network)
-		for _, expected := range p.ExpectedAddresses {
-			if present[expected] {
-				matched = append(matched, expected)
-			}
+		if err := verifyIPFilter(ctx, client, command, expected); err != nil {
+			return nil, err
 		}
 	}
-	if len(matched) != len(p.ExpectedAddresses) {
-		return nil, errors.New("guest network addresses are not ready")
+	timezone, err := client.ReadGuestTimezone(ctx, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil || timezone.Zone != p.Expected.Timezone {
+		return nil, errors.New("guest timezone does not match delivery contract")
 	}
-	result, err := json.Marshal(DeliveryVerificationResult{State: "running", Interface: p.Interface, MAC: strings.ToUpper(p.ExpectedMAC), MatchedAddresses: matched, QGAAvailable: qgaAvailable, NetworkVerified: true})
+	observedAt := time.Now().UTC()
+	if observedAt.Before(p.NotBefore) {
+		return nil, errors.New("delivery verification observation predates the command boundary")
+	}
+	result, err := json.Marshal(DeliveryVerificationResult{Ready: true, ObservedAt: observedAt, PowerState: "running", ConfigMatched: true, DiskIOMatched: true, NetworkMatched: true, FirewallMatched: true, QGAFresh: true, GuestAddressMatched: true, TimezoneMatched: true})
 	return result, err
 }
-func networkMAC(kind, value string) (string, error) {
+func diskLimitsMatch(drive string, expected diskIOLimits) bool {
+	actual := map[string]string{}
+	for _, segment := range strings.Split(drive, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if ok {
+			actual[key] = value
+		}
+	}
+	for _, item := range []struct {
+		key   string
+		value *int64
+	}{{"iops_rd", expected.IOPSRead}, {"iops_wr", expected.IOPSWrite}, {"iops_rd_max", expected.IOPSReadMax}, {"iops_wr_max", expected.IOPSWriteMax}, {"iops_rd_max_length", expected.IOPSReadMaxLength}, {"iops_wr_max_length", expected.IOPSWriteMaxLength}, {"mbps_rd", expected.MBPSRead}, {"mbps_wr", expected.MBPSWrite}, {"mbps_rd_max", expected.MBPSReadMax}, {"mbps_wr_max", expected.MBPSWriteMax}} {
+		value, exists := actual[item.key]
+		if item.value == nil && exists || item.value != nil && (!exists || value != strconv.FormatInt(*item.value, 10)) {
+			return false
+		}
+	}
+	return true
+}
+func networkMatches(raw map[string]json.RawMessage, value string, expected deliveryNetwork) bool {
+	parts := map[string]string{}
 	for _, segment := range strings.Split(value, ",") {
 		key, candidate, ok := strings.Cut(strings.TrimSpace(segment), "=")
 		if !ok {
-			continue
+			return false
 		}
-		if kind == "qemu" && validModel(key) || kind == "lxc" && key == "hwaddr" {
-			if macRE.MatchString(candidate) {
-				return candidate, nil
-			}
-			return "", errors.New("configured network MAC is invalid")
+		parts[key] = candidate
+	}
+	configuredMAC := ""
+	for _, model := range []string{"virtio", "e1000", "e1000e", "vmxnet3", "rtl8139"} {
+		if parts[model] != "" {
+			configuredMAC = parts[model]
 		}
 	}
-	return "", errors.New("configured network MAC is unavailable")
+	if !strings.EqualFold(configuredMAC, expected.MAC) || parts["bridge"] != expected.Bridge || parts["mtu"] != strconv.Itoa(expected.MTU) || parts["firewall"] != boolText(*expected.Firewall) || normalizedRate(parts["rate"]) != normalizedRate(expected.RateMbps) {
+		return false
+	}
+	if expected.VLAN == nil && parts["tag"] != "" || expected.VLAN != nil && parts["tag"] != strconv.Itoa(*expected.VLAN) {
+		return false
+	}
+	ipconfig, ok := configString(raw, "ipconfig"+strings.TrimPrefix(expected.Interface, "net"))
+	if !ok {
+		return false
+	}
+	addresses := map[string]string{}
+	for _, segment := range strings.Split(ipconfig, ",") {
+		key, value, valid := strings.Cut(strings.TrimSpace(segment), "=")
+		if valid {
+			addresses[key] = value
+		}
+	}
+	return addresses["ip"] == expected.IPv4 && addresses["ip6"] == expected.IPv6
 }
-func lxcConfiguredAddresses(value string) map[string]bool {
-	result := map[string]bool{}
-	for _, segment := range strings.Split(value, ",") {
-		key, candidate, ok := strings.Cut(strings.TrimSpace(segment), "=")
-		if !ok || (key != "ip" && key != "ip6") {
-			continue
-		}
-		address := strings.SplitN(candidate, "/", 2)[0]
+func normalizedRate(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" || value == "0.0" {
+		return "0"
+	}
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return value
+	}
+	return strconv.FormatFloat(number, 'f', -1, 64)
+}
+func qgaAddressesMatch(interfaces []pve.GuestInterface, expected deliveryNetwork) bool {
+	wanted := map[string]bool{}
+	for _, configured := range []string{expected.IPv4, expected.IPv6} {
+		address := strings.SplitN(configured, "/", 2)[0]
 		if net.ParseIP(address) != nil {
-			result[address] = true
+			wanted[address] = true
 		}
 	}
-	return result
+	for _, iface := range interfaces {
+		if !strings.EqualFold(strings.TrimSpace(iface.HardwareAddress), expected.MAC) {
+			continue
+		}
+		present := map[string]bool{}
+		for _, address := range iface.IPAddresses {
+			present[strings.TrimSpace(address.Address)] = true
+		}
+		for address := range wanted {
+			if !present[address] {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, expected deliveryNetwork) error {
+	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
+	options, err := client.FirewallOptions(ctx, ref)
+	if err != nil || options.Enable == nil || *options.Enable != 1 {
+		return errors.New("guest firewall is not enabled")
+	}
+	name := "ipfilter-" + expected.Interface
+	sets, err := client.FirewallIPSets(ctx, ref)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, set := range sets {
+		found = found || set.Name == name
+	}
+	if !found {
+		return fmt.Errorf("guest IP filter %s does not exist", name)
+	}
+	entries, err := client.FirewallIPSetEntries(ctx, ref, name)
+	if err != nil {
+		return err
+	}
+	actual := map[string]bool{}
+	for _, entry := range entries {
+		if entry.NoMatch != nil && *entry.NoMatch != 0 {
+			return fmt.Errorf("guest IP filter %s contains a negative entry", name)
+		}
+		actual[entry.CIDR] = true
+	}
+	if len(actual) != len(expected.IPFilterCIDRs) {
+		return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
+	}
+	for _, cidr := range expected.IPFilterCIDRs {
+		if !actual[cidr] {
+			return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
+		}
+	}
+	return nil
 }
 func validNetwork(p networkP, kind string) bool {
 	if !netRE.MatchString(p.Interface) || (p.Bridge == nil && p.Model == nil && p.MAC == nil && p.VLAN == nil && p.MTU == nil && p.Firewall == nil && p.RateMbps == nil && p.IPv4 == nil && p.IPv6 == nil && p.Gateway4 == nil && p.Gateway6 == nil) || (kind == "lxc" && p.Model != nil) {

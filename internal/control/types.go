@@ -69,7 +69,7 @@ var protocolActions = map[string]actionSpec{
 	"vm.clone":                     {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-resources":             {scopes: map[string]bool{ScopeVM: true}},
 	"vm.resize":                    {scopes: map[string]bool{ScopeVM: true}},
-	"vm.set-disk-limits":           {scopes: map[string]bool{ScopeVM: true}},
+	"vm.set-disk-io":               {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-network":               {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-rate":                  {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-cloud-init":            {scopes: map[string]bool{ScopeVM: true}},

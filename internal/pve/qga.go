@@ -2,6 +2,7 @@ package pve
 
 import (
 	"context"
+	"errors"
 	"strings"
 )
 
@@ -55,6 +56,10 @@ type GuestInterfaceStats struct {
 	RxPackets *uint64 `json:"rx-packets,omitempty"`
 	TxPackets *uint64 `json:"tx-packets,omitempty"`
 }
+type GuestTimezone struct {
+	Zone   string `json:"zone"`
+	Offset int64  `json:"offset"`
+}
 
 // GuestAgentObservation contains only non-mutating QEMU Guest Agent data.
 // Availability always has an entry for every attempted logical collection.
@@ -105,6 +110,30 @@ func (c *Client) ProbeGuestAgent(ctx context.Context, node string, vmid int) (Gu
 		if c.get(ctx, base+"/agent/network-get-interfaces", nil, &v) == nil {
 			result.Interfaces, result.Availability["interfaces"] = v, Available
 		}
+	}
+	return result, nil
+}
+
+// ReadGuestTimezone uses QGA's fixed read-only guest-get-timezone command.
+// It never invokes guest-exec and returns only the typed zone/offset fields.
+func (c *Client) ReadGuestTimezone(ctx context.Context, node string, vmid int) (GuestTimezone, error) {
+	base, err := guestPath("qemu", node, vmid)
+	if err != nil {
+		return GuestTimezone{}, err
+	}
+	var response struct {
+		GuestTimezone
+		Result *GuestTimezone `json:"result,omitempty"`
+	}
+	if err := c.get(ctx, base+"/agent/get-timezone", nil, &response); err != nil {
+		return GuestTimezone{}, err
+	}
+	result := response.GuestTimezone
+	if response.Result != nil {
+		result = *response.Result
+	}
+	if strings.TrimSpace(result.Zone) == "" {
+		return GuestTimezone{}, errors.New("QGA timezone response is missing zone")
 	}
 	return result, nil
 }
