@@ -1636,6 +1636,10 @@ func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, ex
 	return verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs)
 }
 func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Command, interfaceRef string, expectedCIDRs []string) error {
+	clusterOptions, err := client.FirewallOptions(ctx, pve.FirewallRef{})
+	if err != nil || clusterOptions.Enable == nil || *clusterOptions.Enable != 1 {
+		return errors.New("cluster firewall is not enabled")
+	}
 	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	options, err := client.FirewallOptions(ctx, ref)
 	if err != nil || options.Enable == nil || *options.Enable != 1 {
