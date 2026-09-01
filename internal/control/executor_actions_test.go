@@ -618,6 +618,20 @@ func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
 		"firewall enabled with noncanonical IPv6 filter claim": func(payload map[string]any) {
 			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{"2001:DB8::10/128"}
 		},
+		"firewall enabled with wrong host filter claim": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{"192.0.2.11/32", "2001:db8::10/128"}
+		},
+		"firewall enabled with missing IPv6 host filter claim": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{"192.0.2.10/32"}
+		},
+		"firewall enabled with dynamic address": func(payload map[string]any) {
+			network := payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)
+			network["ipv4"] = "dhcp"
+			network["ipFilterCidrs"] = []any{"2001:db8::10/128"}
+		},
+		"noncanonical expected IPv6": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipv6"] = "2001:DB8::10/64"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var payload map[string]any

@@ -1392,7 +1392,10 @@ func validDelivery(p deliveryP) bool {
 	seen := map[string]bool{}
 	seenMAC := map[string]bool{}
 	for _, network := range e.Networks {
-		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+		ipv4Filter, ipv4OK := deliveryAddressFilter(network.IPv4, 4)
+		ipv6Filter, ipv6OK := deliveryAddressFilter(network.IPv6, 6)
+		dynamicAddress := network.IPv4 == "dhcp" || network.IPv4 == "manual" || network.IPv6 == "auto" || network.IPv6 == "dhcp" || network.IPv6 == "manual"
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !ipv4OK || !ipv6OK || *network.Firewall && dynamicAddress || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
 			return false
 		}
 		// The delivery contract has two exact, non-overlapping firewall
@@ -1405,6 +1408,16 @@ func validDelivery(p deliveryP) bool {
 		}
 		seen[network.Interface] = true
 		seenMAC[network.MAC] = true
+		expectedCIDRs := map[string]bool{}
+		if ipv4Filter != "" {
+			expectedCIDRs[ipv4Filter] = true
+		}
+		if ipv6Filter != "" {
+			expectedCIDRs[ipv6Filter] = true
+		}
+		if *network.Firewall && len(expectedCIDRs) != len(network.IPFilterCIDRs) {
+			return false
+		}
 		cidrs := map[string]bool{}
 		for _, cidr := range network.IPFilterCIDRs {
 			ip, parsed, err := net.ParseCIDR(cidr)
@@ -1415,10 +1428,35 @@ func validDelivery(p deliveryP) bool {
 			if ones != bits || bits != 32 && bits != 128 {
 				return false
 			}
+			if !expectedCIDRs[cidr] {
+				return false
+			}
 			cidrs[cidr] = true
 		}
 	}
 	return true
+}
+
+func deliveryAddressFilter(value string, family int) (string, bool) {
+	if value == "" {
+		return "", true
+	}
+	if family == 4 && (value == "dhcp" || value == "manual") || family == 6 && (value == "auto" || value == "dhcp" || value == "manual") {
+		return "", true
+	}
+	ip, network, err := net.ParseCIDR(value)
+	if err != nil || family == 4 && (ip.To4() == nil || network.IP.To4() == nil) || family == 6 && (ip.To4() != nil || network.IP.To4() != nil) {
+		return "", false
+	}
+	ones, bits := network.Mask.Size()
+	if ones < 0 || bits != 32 && bits != 128 {
+		return "", false
+	}
+	canonical := ip.String() + "/" + strconv.Itoa(ones)
+	if canonical != value {
+		return "", false
+	}
+	return ip.String() + "/" + strconv.Itoa(bits), true
 }
 func validIPFilterVerification(p ipFilterVerifyP) bool {
 	if len(p.Networks) < 1 || len(p.Networks) > 8 {
