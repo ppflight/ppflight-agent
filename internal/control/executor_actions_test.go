@@ -612,6 +612,12 @@ func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
 		"firewall enabled without filter claims": func(payload map[string]any) {
 			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{}
 		},
+		"firewall enabled with subnet filter claim": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{"192.0.2.0/24"}
+		},
+		"firewall enabled with noncanonical IPv6 filter claim": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{"2001:DB8::10/128"}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var payload map[string]any

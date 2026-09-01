@@ -1406,7 +1406,11 @@ func validDelivery(p deliveryP) bool {
 		cidrs := map[string]bool{}
 		for _, cidr := range network.IPFilterCIDRs {
 			ip, parsed, err := net.ParseCIDR(cidr)
-			if err != nil || !ip.Equal(parsed.IP) || cidrs[cidr] {
+			if err != nil || !ip.Equal(parsed.IP) || parsed.String() != cidr || cidrs[cidr] {
+				return false
+			}
+			ones, bits := parsed.Mask.Size()
+			if ones != bits || bits != 32 && bits != 128 {
 				return false
 			}
 			cidrs[cidr] = true
