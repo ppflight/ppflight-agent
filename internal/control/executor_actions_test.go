@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -384,6 +385,98 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 	}
 }
 
+func TestGuestIPFilterSetPreconfigurationVerificationIsReadOnlyAndMultiNIC(t *testing.T) {
+	parametersGolden, err := os.ReadFile("testdata/agent-v1-firewall-verify-ipfilter-sets.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedGolden, err := os.ReadFile("testdata/agent-v1-firewall-verify-ipfilter-sets-result.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("preconfiguration verification attempted a write: %s %s", r.Method, r.URL.Path)
+		}
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+			if r.URL.Path == "/api2/json/cluster/firewall/options" {
+				t.Fatalf("preconfiguration verification must not depend on cluster enforcement")
+			}
+			_, _ = w.Write([]byte(`{"data":{"enable":0}}`))
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0","net1":"virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1"}}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
+			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0}]}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net1"):
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:db8::10/128","nomatch":0}]}`))
+		default:
+			t.Fatalf("unexpected preconfiguration read: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	command := controlCommand("firewall.guest.verify-ipfilter-sets", "qemu", string(parametersGolden))
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || receipt.DryRun {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+	var result IPFilterSetVerificationResult
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || result.GuestFirewallEnabled || result.EnforcementState != "preconfigured-not-enforcing" || len(result.Networks) != 2 || result.Networks[0].FirewallEnabled || result.Networks[1].FirewallEnabled || result.Networks[0].IPSet != "ipfilter-net0" || result.Networks[1].IPSet != "ipfilter-net1" {
+		t.Fatalf("result=%s", receipt.Result)
+	}
+	var expected IPFilterSetVerificationResult
+	if err := json.Unmarshal(expectedGolden, &expected); err != nil {
+		t.Fatal(err)
+	}
+	result.ObservedAt = expected.ObservedAt
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("result=%#v does not match golden=%#v", result, expected)
+	}
+	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
+		t.Fatalf("IPFilter set result timestamp is not the whole-second golden: %s", receipt.Result)
+	}
+}
+
+func TestGuestIPFilterSetPreconfigurationVerificationFailsClosed(t *testing.T) {
+	tests := []struct {
+		name, guestOptions, network, entries string
+	}{
+		{"guest enforcement enabled", `{"enable":1}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":0}]`},
+		{"NIC enforcement enabled", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=1", `[{"cidr":"192.0.2.10/32","nomatch":0}]`},
+		{"negative IPSet entry", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":1}]`},
+		{"extra IPSet entry", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"192.0.2.11/32","nomatch":0}]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Fatalf("verification attempted a write: %s %s", r.Method, r.URL.Path)
+				}
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+					_, _ = w.Write([]byte(`{"data":` + tt.guestOptions + `}`))
+				case strings.HasSuffix(r.URL.Path, "/config"):
+					_, _ = w.Write([]byte(`{"data":{"net0":` + strconv.Quote(tt.network) + `}}`))
+				case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
+					_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
+				case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
+					_, _ = w.Write([]byte(`{"data":` + tt.entries + `}`))
+				default:
+					t.Fatalf("unexpected verification read: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			command := controlCommand("firewall.guest.verify-ipfilter-sets", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+			if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_SETS_NOT_READY" {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+		})
+	}
+}
+
 func TestGuestIPFilterVerificationRejectsBlockingPolicyOrDisabledMACFilter(t *testing.T) {
 	for name, guestOptions := range map[string]string{
 		"implicit input drop": `{"enable":1}`,
@@ -442,8 +535,10 @@ func TestGuestIPFilterVerificationRejectsAmbiguousOrNonHostContracts(t *testing.
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net0","ipFilterCidrs":["192.0.2.11/32"]}]}`,
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"],"unknown":true}]}`,
 	} {
-		if err := validateParameters(controlCommand("firewall.guest.verify-ipfilter", "qemu", parameters)); err == nil {
-			t.Fatalf("unsafe IPFilter verification contract accepted: %s", parameters)
+		for _, action := range []string{"firewall.guest.verify-ipfilter", "firewall.guest.verify-ipfilter-sets"} {
+			if err := validateParameters(controlCommand(action, "qemu", parameters)); err == nil {
+				t.Fatalf("unsafe %s contract accepted: %s", action, parameters)
+			}
 		}
 	}
 }
@@ -506,7 +601,6 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 		{"backup", "backup.create", "qemu", `{"storage":"backup1","mode":"snapshot","compress":"zstd"}`, http.MethodPost, "/api2/json/nodes/pve1/vzdump", url.Values{"storage": {"backup1"}, "mode": {"snapshot"}, "compress": {"zstd"}}},
 		{"firewall guest option legacy", "firewall.guest.set-options", "qemu", `{"enable":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/options", url.Values{"enable": {"1"}}},
 		{"firewall guest anti-spoof policy", "firewall.guest.set-options", "qemu", `{"enable":true,"policyIn":"ACCEPT","policyOut":"ACCEPT","macFilter":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/options", url.Values{"enable": {"1"}, "policy_in": {"ACCEPT"}, "policy_out": {"ACCEPT"}, "macfilter": {"1"}}},
-		{"firewall guest ipfilter", "firewall.guest.set-ipfilter", "qemu", `{"interface":"net0","enable":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/options", url.Values{"ipfilter-net0": {"1"}}},
 		{"firewall node option", "firewall.node.set-options", "lxc", `{"enable":false}`, http.MethodPut, "/api2/json/nodes/pve1/firewall/options", url.Values{"enable": {"0"}}},
 		{"firewall cluster option", "firewall.cluster.set-options", "qemu", `{"enable":true}`, http.MethodPut, "/api2/json/cluster/firewall/options", url.Values{"enable": {"1"}}},
 		{"firewall rule", "firewall.rule.create", "qemu", `{"direction":"in","action":"ACCEPT","protocol":"tcp","source":"+trusted","destinationPort":"443","enable":true}`, http.MethodPost, "/api2/json/nodes/pve1/qemu/101/firewall/rules", url.Values{"type": {"in"}, "action": {"ACCEPT"}, "proto": {"tcp"}, "source": {"+trusted"}, "dport": {"443"}, "enable": {"1"}}},

@@ -179,6 +179,24 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "firewall.guest.verify-ipfilter-sets" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, verifyErr := verifyGuestIPFilterSets(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if verifyErr != nil {
+			r.State, r.Code = "failed", "IPFILTER_SETS_NOT_READY"
+			return finish(verifyErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if e.Mode != "production" || !e.ProductionExecution {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "dry_run", "DRY_RUN", true, time.Now().UTC()
 		return finish(nil)
@@ -515,10 +533,6 @@ type ipsetEntryDeleteP struct {
 	Name string `json:"name"`
 	CIDR string `json:"cidr"`
 }
-type ipFilterP struct {
-	Interface string `json:"interface"`
-	Enable    *bool  `json:"enable"`
-}
 type ipFilterVerifyP struct {
 	Networks []ipFilterVerifyNetwork `json:"networks"`
 }
@@ -625,6 +639,12 @@ func validateParameters(c Command) error {
 		var p ipFilterVerifyP
 		if strictParameters(c.Parameters, &p) != nil || !validIPFilterVerification(p) {
 			return errors.New("invalid guest IP filter verification parameters")
+		}
+		return nil
+	case "firewall.guest.verify-ipfilter-sets":
+		var p ipFilterVerifyP
+		if strictParameters(c.Parameters, &p) != nil || !validIPFilterVerification(p) {
+			return errors.New("invalid guest IP filter set verification parameters")
 		}
 		return nil
 	case "vm.delete":
@@ -737,12 +757,6 @@ func validateParameters(c Command) error {
 		var p ipsetEntryDeleteP
 		if strictParameters(c.Parameters, &p) != nil || !validIPSetEntry(p.Name, p.CIDR) {
 			return errors.New("invalid ipset entry delete")
-		}
-		return nil
-	case "firewall.guest.set-ipfilter":
-		var p ipFilterP
-		if err := strictParameters(c.Parameters, &p); err != nil || p.Enable == nil || !netRE.MatchString(p.Interface) {
-			return errors.New("invalid ipfilter parameters")
 		}
 		return nil
 	default:
@@ -955,10 +969,6 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		var p ipsetEntryDeleteP
 		_ = strictParameters(c.Parameters, &p)
 		method, path = http.MethodDelete, base+"/firewall/ipset/"+p.Name+"/"+p.CIDR
-	case "firewall.guest.set-ipfilter":
-		var p ipFilterP
-		_ = strictParameters(c.Parameters, &p)
-		method, path, form = http.MethodPut, base+"/firewall/options", url.Values{"ipfilter-" + p.Interface: {boolText(*p.Enable)}}
 	default:
 		return "", nil, ErrUnsupported
 	}
@@ -1867,6 +1877,57 @@ func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Comman
 	return json.Marshal(result)
 }
 
+type IPFilterSetVerificationResult struct {
+	Verified             bool                                   `json:"verified"`
+	ObservedAt           time.Time                              `json:"observedAt"`
+	EnforcementState     string                                 `json:"enforcementState"`
+	GuestFirewallEnabled bool                                   `json:"guestFirewallEnabled"`
+	Networks             []IPFilterSetVerificationNetworkResult `json:"networks"`
+}
+
+type IPFilterSetVerificationNetworkResult struct {
+	Interface       string   `json:"interface"`
+	FirewallEnabled bool     `json:"firewallEnabled"`
+	IPSet           string   `json:"ipSet"`
+	IPFilterCIDRs   []string `json:"ipFilterCidrs"`
+}
+
+// verifyGuestIPFilterSets proves that per-NIC anti-spoof sets are ready while
+// enforcement is deliberately off. PVE activates a set named ipfilter-netN
+// when guest and NIC firewalls are later enabled; ipfilter-netN is not a guest
+// firewall option and must never be sent to /firewall/options.
+func verifyGuestIPFilterSets(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
+	var parameters ipFilterVerifyP
+	if err := strictParameters(command.Parameters, &parameters); err != nil {
+		return nil, err
+	}
+	if err := verifyGuestFirewallDisabled(ctx, client, command); err != nil {
+		return nil, err
+	}
+	config, err := client.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return nil, err
+	}
+	result := IPFilterSetVerificationResult{
+		Verified: true, ObservedAt: time.Now().UTC().Truncate(time.Second),
+		EnforcementState: "preconfigured-not-enforcing", GuestFirewallEnabled: false,
+		Networks: make([]IPFilterSetVerificationNetworkResult, 0, len(parameters.Networks)),
+	}
+	for _, expected := range parameters.Networks {
+		if !guestNetworkFirewallDisabled(config, expected.Interface) {
+			return nil, fmt.Errorf("guest network %s firewall is not disabled", expected.Interface)
+		}
+		if err := verifyExpectedIPFilterSet(ctx, client, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
+			return nil, err
+		}
+		result.Networks = append(result.Networks, IPFilterSetVerificationNetworkResult{
+			Interface: expected.Interface, FirewallEnabled: false, IPSet: "ipfilter-" + expected.Interface,
+			IPFilterCIDRs: append([]string(nil), expected.IPFilterCIDRs...),
+		})
+	}
+	return json.Marshal(result)
+}
+
 func guestNetworkFirewallEnabled(config pve.GuestConfig, interfaceRef string) bool {
 	value, ok := configString(config.Raw, interfaceRef)
 	if !ok {
@@ -1879,6 +1940,28 @@ func guestNetworkFirewallEnabled(config pve.GuestConfig, interfaceRef string) bo
 		}
 	}
 	return false
+}
+
+func guestNetworkFirewallDisabled(config pve.GuestConfig, interfaceRef string) bool {
+	value, ok := configString(config.Raw, interfaceRef)
+	if !ok {
+		return false
+	}
+	rawFirewall := ""
+	seenFirewall := false
+	for _, segment := range strings.Split(value, ",") {
+		key, candidate, present := strings.Cut(strings.TrimSpace(segment), "=")
+		if !present || strings.TrimSpace(key) == "" {
+			return false
+		}
+		if key == "firewall" {
+			if seenFirewall {
+				return false
+			}
+			seenFirewall, rawFirewall = true, candidate
+		}
+	}
+	return deliveryFirewallMatches(rawFirewall, false)
 }
 func validNetwork(p networkP, kind string) bool {
 	if !netRE.MatchString(p.Interface) || (p.Bridge == nil && p.Model == nil && p.MAC == nil && p.VLAN == nil && p.MTU == nil && p.Firewall == nil && p.RateMbps == nil && p.IPv4 == nil && p.IPv6 == nil && p.Gateway4 == nil && p.Gateway6 == nil) || (kind == "lxc" && p.Model != nil) {

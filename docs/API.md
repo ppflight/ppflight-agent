@@ -242,7 +242,7 @@ Agent 离线时，官网必须把尚未过期的命令持久排队，恢复后�
 
 修改任务执行门槛是合取而不是任选：website 服务端 IPv4 whitelist、本机 `bindingId+deviceId+agentRef` 关系、commands key scope/epoch/HMAC、Ed25519 key/signature、assignment generation、issued/expiry time、协议/绑定/部署 action allowlist、approval/resource lock，以及 monitoring audit availability 全部通过才可执行。IPv4 whitelist 不能让其他校验 fail-open，monitoring key 也不能授权 commands。
 
-动作名必须采用代码值，例如 `snapshot.create`、`backup.create`、`firewall.rule.create`、`firewall.guest.set-ipfilter`、`task.status`。完整 allowlist、scope、参数和 UPID 重启恢复见 [Agent API v1 第 5–7 节](AGENT-API-V1.md#5-长轮询操作线程和-upid-恢复)。
+动作名必须采用代码值，例如 `snapshot.create`、`backup.create`、`firewall.rule.create`、`firewall.guest.verify-ipfilter-sets`、`task.status`。完整 allowlist、scope、参数和 UPID 重启恢复见 [Agent API v1 第 5–7 节](AGENT-API-V1.md#5-长轮询操作线程和-upid-恢复)。
 
 ## 7. HTTP/幂等处理
 

@@ -435,12 +435,17 @@ POST /internal/v1/monitoring/audit-events/batches
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
 | vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
+| vm | `firewall.guest.verify-ipfilter-sets` | 只读；默认关闭阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，同时每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |
 | vm | `firewall.ipset.entry.update` | `name`, `cidr`，以及可选 `comment/noSubnet`；后两者至少提供一项，固定 PUT 到该 guest IPSet entry。 |
 | vm | `firewall.ipset.entry.delete` | `name`, `cidr`，固定 DELETE 该 guest IPSet entry。 |
-| vm | `firewall.guest.set-ipfilter` | `interface=netN`, `enable`，映射到 PVE option `ipfilter-netN`。 |
+
+`firewall.guest.verify-ipfilter-sets` 的请求与成功结果由
+`internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets.json` 和
+`internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets-result.json`
+锁定。每张 NIC 都必须出现且 `interface` 唯一；CIDR 必须是 canonical `/32` 或 `/128` host，未知字段、缺失/额外/negative IPSet entry、guest firewall 已开或任一 NIC firewall 已开都会失败。该动作不读取 cluster firewall，也不执行写操作。
 
 当前共有 39 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
 
@@ -490,7 +495,7 @@ QEMU 的 IP/gateway 写入与 `netN` 对应的 `ipconfigN`；LXC 写入 `netN` �
 
 一次 IP 切换必须共用一个 `operationId`：IPAM 预留新 IP → 更新固定 MAC/VLAN/MTU/NIC/`ipconfigN` → 更新 `ipfilter-netN` → 启用 guest/NIC firewall 与 IPFilter → 等待必要的 reboot/guest 网络就绪 → 回读/探测 → 提交 IPAM 并释放旧 IP。失败时保留旧租约并进入补偿/人工处理，不能静默释放。
 
-PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用并固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`；这样启用 IP/MAC 防伪造但不默认限制客户业务端口。`ipfilter-netN` 是 PVE 标准约定，不需要额外 option。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验以上策略和集合，相关 cluster/node firewall 仍按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
+PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。`ipfilter-netN` 是 PVE 标准命名约定，不是 `/firewall/options` 的可写字段。默认关闭阶段必须用只读 `firewall.guest.verify-ipfilter-sets` 证明集合精确但 enforcement 未启用。客户明确启用后，NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用并固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`；这样启用 IP/MAC 防伪造但不默认限制客户业务端口。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验以上策略和集合，相关 cluster/node firewall 仍按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
 
 Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处于默认值的 option 可能省略字段，而各 scope 的缺省值并不相同：cluster master=`0`、node host firewall=`1`、guest=`0`。Agent 必须按 scope 补齐该有效值；显式值若不是 `0|1` 则以读取错误拒绝，官网不得把缺失值统一解释为关闭。启用 cluster master 前必须单独证明 node host firewall 不会阻断 SSH/API/Agent 管理通道。
 

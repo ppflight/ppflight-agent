@@ -1,0 +1,24 @@
+{
+  "verified": true,
+  "observedAt": "2026-09-01T00:00:00Z",
+  "enforcementState": "preconfigured-not-enforcing",
+  "guestFirewallEnabled": false,
+  "networks": [
+    {
+      "interface": "net0",
+      "firewallEnabled": false,
+      "ipSet": "ipfilter-net0",
+      "ipFilterCidrs": [
+        "192.0.2.10/32"
+      ]
+    },
+    {
+      "interface": "net1",
+      "firewallEnabled": false,
+      "ipSet": "ipfilter-net1",
+      "ipFilterCidrs": [
+        "2001:db8::10/128"
+      ]
+    }
+  ]
+}
