@@ -1,13 +1,16 @@
 {
   "verified": true,
   "observedAt": "2026-09-01T00:00:00Z",
-  "enforcementState": "preconfigured-not-enforcing",
-  "guestFirewallEnabled": false,
+  "guestFirewallEnabled": true,
+  "policyIn": "ACCEPT",
+  "policyOut": "ACCEPT",
+  "macFilterEnabled": true,
   "networks": [
     {
       "interface": "net0",
       "macAddress": "AA:BB:CC:DD:EE:01",
-      "firewallEnabled": false,
+      "firewallEnabled": true,
+      "ipFilterEnabled": true,
       "ipSet": "ipfilter-net0",
       "ipFilterCidrs": [
         "192.0.2.10/32"
@@ -16,7 +19,8 @@
     {
       "interface": "net1",
       "macAddress": "AA:BB:CC:DD:EE:02",
-      "firewallEnabled": false,
+      "firewallEnabled": true,
+      "ipFilterEnabled": true,
       "ipSet": "ipfilter-net1",
       "ipFilterCidrs": [
         "2001:db8::10/128"

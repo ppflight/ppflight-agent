@@ -538,6 +538,7 @@ type ipFilterVerifyP struct {
 }
 type ipFilterVerifyNetwork struct {
 	Interface     string   `json:"interface"`
+	MACAddress    *string  `json:"macAddress,omitempty"`
 	IPFilterCIDRs []string `json:"ipFilterCidrs"`
 }
 
@@ -1480,11 +1481,18 @@ func validIPFilterVerification(p ipFilterVerifyP) bool {
 		return false
 	}
 	interfaces := map[string]bool{}
+	macs := map[string]bool{}
 	for _, network := range p.Networks {
 		if !netRE.MatchString(network.Interface) || interfaces[network.Interface] || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 {
 			return false
 		}
 		interfaces[network.Interface] = true
+		if network.MACAddress != nil {
+			if !validSignedMAC(*network.MACAddress) || macs[*network.MACAddress] {
+				return false
+			}
+			macs[*network.MACAddress] = true
+		}
 		cidrs := map[string]bool{}
 		for _, value := range network.IPFilterCIDRs {
 			ip, parsed, err := net.ParseCIDR(value)
@@ -1770,6 +1778,13 @@ func verifyGuestFirewallProtection(ctx context.Context, client *pve.Client, comm
 	if err != nil || clusterOptions.Enable == nil || *clusterOptions.Enable != 1 {
 		return pve.FirewallOptions{}, errors.New("cluster firewall is not enabled")
 	}
+	// On PVE's iptables firewall, the cluster-wide ebtables switch controls
+	// generation of the layer-2 source-MAC rules. The documented default is
+	// enabled when absent, but an explicit zero makes guest macfilter=1
+	// ineffective and must therefore fail the protection proof.
+	if clusterOptions.Ebtables != nil && *clusterOptions.Ebtables != 1 {
+		return pve.FirewallOptions{}, errors.New("cluster layer-2 firewall is not enabled")
+	}
 	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	options, err := client.FirewallOptions(ctx, ref)
 	if err != nil || options.Enable == nil || *options.Enable != 1 {
@@ -1836,6 +1851,7 @@ type IPFilterVerificationResult struct {
 }
 type IPFilterVerificationNetworkResult struct {
 	Interface       string   `json:"interface"`
+	MACAddress      *string  `json:"macAddress,omitempty"`
 	FirewallEnabled bool     `json:"firewallEnabled"`
 	IPFilterEnabled bool     `json:"ipFilterEnabled"`
 	IPSet           string   `json:"ipSet"`
@@ -1860,6 +1876,9 @@ func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Comman
 		Networks: make([]IPFilterVerificationNetworkResult, 0, len(parameters.Networks)),
 	}
 	for _, expected := range parameters.Networks {
+		if err := verifyExpectedNetworkMAC(config, command.Identity.GuestType, expected); err != nil {
+			return nil, err
+		}
 		if !guestNetworkFirewallEnabled(config, expected.Interface) {
 			return nil, fmt.Errorf("guest network %s firewall is not enabled", expected.Interface)
 		}
@@ -1868,6 +1887,7 @@ func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Comman
 		}
 		result.Networks = append(result.Networks, IPFilterVerificationNetworkResult{
 			Interface:       expected.Interface,
+			MACAddress:      cloneString(expected.MACAddress),
 			FirewallEnabled: true,
 			IPFilterEnabled: true,
 			IPSet:           "ipfilter-" + expected.Interface,
@@ -1887,6 +1907,7 @@ type IPFilterSetVerificationResult struct {
 
 type IPFilterSetVerificationNetworkResult struct {
 	Interface       string   `json:"interface"`
+	MACAddress      *string  `json:"macAddress,omitempty"`
 	FirewallEnabled bool     `json:"firewallEnabled"`
 	IPSet           string   `json:"ipSet"`
 	IPFilterCIDRs   []string `json:"ipFilterCidrs"`
@@ -1914,6 +1935,9 @@ func verifyGuestIPFilterSets(ctx context.Context, client *pve.Client, command Co
 		Networks: make([]IPFilterSetVerificationNetworkResult, 0, len(parameters.Networks)),
 	}
 	for _, expected := range parameters.Networks {
+		if err := verifyExpectedNetworkMAC(config, command.Identity.GuestType, expected); err != nil {
+			return nil, err
+		}
 		if !guestNetworkFirewallDisabled(config, expected.Interface) {
 			return nil, fmt.Errorf("guest network %s firewall is not disabled", expected.Interface)
 		}
@@ -1921,11 +1945,68 @@ func verifyGuestIPFilterSets(ctx context.Context, client *pve.Client, command Co
 			return nil, err
 		}
 		result.Networks = append(result.Networks, IPFilterSetVerificationNetworkResult{
-			Interface: expected.Interface, FirewallEnabled: false, IPSet: "ipfilter-" + expected.Interface,
+			Interface: expected.Interface, MACAddress: cloneString(expected.MACAddress), FirewallEnabled: false, IPSet: "ipfilter-" + expected.Interface,
 			IPFilterCIDRs: append([]string(nil), expected.IPFilterCIDRs...),
 		})
 	}
 	return json.Marshal(result)
+}
+
+func cloneString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func validSignedMAC(value string) bool {
+	if !deliveryMACRE.MatchString(value) {
+		return false
+	}
+	parsed, err := net.ParseMAC(value)
+	if err != nil || len(parsed) != 6 || parsed[0]&1 != 0 {
+		return false
+	}
+	for _, part := range parsed {
+		if part != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func verifyExpectedNetworkMAC(config pve.GuestConfig, kind string, expected ipFilterVerifyNetwork) error {
+	if expected.MACAddress == nil {
+		return nil
+	}
+	actual, ok := guestNetworkMAC(config, kind, expected.Interface)
+	if !ok || actual != *expected.MACAddress {
+		return fmt.Errorf("guest network %s MAC address does not match the signed assignment", expected.Interface)
+	}
+	return nil
+}
+
+func guestNetworkMAC(config pve.GuestConfig, kind, interfaceRef string) (string, bool) {
+	value, ok := configString(config.Raw, interfaceRef)
+	if !ok {
+		return "", false
+	}
+	actual := ""
+	for _, segment := range strings.Split(value, ",") {
+		key, candidate, present := strings.Cut(strings.TrimSpace(segment), "=")
+		if !present {
+			return "", false
+		}
+		if kind == "qemu" && validModel(key) || kind == "lxc" && key == "hwaddr" {
+			candidate = strings.ToUpper(candidate)
+			if actual != "" || !validSignedMAC(candidate) {
+				return "", false
+			}
+			actual = candidate
+		}
+	}
+	return actual, actual != ""
 }
 
 func guestNetworkFirewallEnabled(config pve.GuestConfig, interfaceRef string) bool {

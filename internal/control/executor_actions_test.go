@@ -347,6 +347,14 @@ func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing
 }
 
 func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testing.T) {
+	parametersGolden, err := os.ReadFile("testdata/agent-v1-firewall-verify-ipfilter.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedGolden, err := os.ReadFile("testdata/agent-v1-firewall-verify-ipfilter-result.json")
+	if err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Fatalf("verification attempted a write: %s %s", r.Method, r.URL.Path)
@@ -371,14 +379,22 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 		}
 	}))
 	defer server.Close()
-	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net1","ipFilterCidrs":["2001:db8::10/128"]}]}`)
+	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", string(parametersGolden))
 	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || receipt.DryRun {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
 	}
 	var result IPFilterVerificationResult
-	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.GuestFirewallEnabled || result.PolicyIn != "ACCEPT" || result.PolicyOut != "ACCEPT" || !result.MACFilterEnabled || len(result.Networks) != 2 || !result.Networks[0].FirewallEnabled || !result.Networks[0].IPFilterEnabled || result.Networks[0].IPSet != "ipfilter-net0" {
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.GuestFirewallEnabled || result.PolicyIn != "ACCEPT" || result.PolicyOut != "ACCEPT" || !result.MACFilterEnabled || len(result.Networks) != 2 || result.Networks[0].MACAddress == nil || *result.Networks[0].MACAddress != "AA:BB:CC:DD:EE:01" || result.Networks[1].MACAddress == nil || *result.Networks[1].MACAddress != "AA:BB:CC:DD:EE:02" || !result.Networks[0].FirewallEnabled || !result.Networks[0].IPFilterEnabled || result.Networks[0].IPSet != "ipfilter-net0" {
 		t.Fatalf("result=%s", receipt.Result)
+	}
+	var expected IPFilterVerificationResult
+	if err := json.Unmarshal(expectedGolden, &expected); err != nil {
+		t.Fatal(err)
+	}
+	result.ObservedAt = expected.ObservedAt
+	if !reflect.DeepEqual(result, expected) {
+		t.Fatalf("result=%#v does not match golden=%#v", result, expected)
 	}
 	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
 		t.Fatalf("IPFilter result timestamp is not the whole-second golden: %s", receipt.Result)
@@ -447,6 +463,7 @@ func TestGuestIPFilterSetPreconfigurationVerificationFailsClosed(t *testing.T) {
 		{"NIC enforcement enabled", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=1", `[{"cidr":"192.0.2.10/32","nomatch":0}]`},
 		{"negative IPSet entry", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":1}]`},
 		{"extra IPSet entry", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"192.0.2.11/32","nomatch":0}]`},
+		{"signed MAC mismatch", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:09,bridge=vmbr0,firewall=0", `[{"cidr":"192.0.2.10/32","nomatch":0}]`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -468,9 +485,42 @@ func TestGuestIPFilterSetPreconfigurationVerificationFailsClosed(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			command := controlCommand("firewall.guest.verify-ipfilter-sets", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+			command := controlCommand("firewall.guest.verify-ipfilter-sets", "qemu", `{"networks":[{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.10/32"]}]}`)
 			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 			if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_SETS_NOT_READY" {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestGuestIPFilterVerificationRejectsSignedMACDriftForQEMUAndLXC(t *testing.T) {
+	tests := []struct {
+		name, action, kind, guestOptions, network, wantCode string
+	}{
+		{"qemu dormant", "firewall.guest.verify-ipfilter-sets", "qemu", `{"enable":0}`, "virtio=AA:BB:CC:DD:EE:09,bridge=vmbr0,firewall=0", "IPFILTER_SETS_NOT_READY"},
+		{"lxc dormant", "firewall.guest.verify-ipfilter-sets", "lxc", `{"enable":0}`, "name=eth0,hwaddr=AA:BB:CC:DD:EE:09,bridge=vmbr0,firewall=0", "IPFILTER_SETS_NOT_READY"},
+		{"qemu enforcing", "firewall.guest.verify-ipfilter", "qemu", `{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}`, "virtio=AA:BB:CC:DD:EE:09,bridge=vmbr0,firewall=1", "IPFILTER_NOT_READY"},
+		{"lxc enforcing", "firewall.guest.verify-ipfilter", "lxc", `{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}`, "name=eth0,hwaddr=AA:BB:CC:DD:EE:09,bridge=vmbr0,firewall=1", "IPFILTER_NOT_READY"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/api2/json/cluster/firewall/options":
+					_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+				case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+					_, _ = w.Write([]byte(`{"data":` + tt.guestOptions + `}`))
+				case strings.HasSuffix(r.URL.Path, "/config"):
+					_, _ = w.Write([]byte(`{"data":{"net0":` + strconv.Quote(tt.network) + `}}`))
+				default:
+					t.Fatalf("MAC mismatch must fail before IPSet reads: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+			command := controlCommand(tt.action, tt.kind, `{"networks":[{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+			if err == nil || receipt.State != "failed" || receipt.Code != tt.wantCode {
 				t.Fatalf("receipt=%#v err=%v", receipt, err)
 			}
 		})
@@ -533,6 +583,10 @@ func TestGuestIPFilterVerificationRejectsAmbiguousOrNonHostContracts(t *testing.
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.0/24"]}]}`,
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["2001:DB8::10/128"]}]}`,
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net0","ipFilterCidrs":["192.0.2.11/32"]}]}`,
+		`{"networks":[{"interface":"net0","macAddress":"aa:bb:cc:dd:ee:01","ipFilterCidrs":["192.0.2.10/32"]}]}`,
+		`{"networks":[{"interface":"net0","macAddress":"03:00:00:00:00:01","ipFilterCidrs":["192.0.2.10/32"]}]}`,
+		`{"networks":[{"interface":"net0","macAddress":"00:00:00:00:00:00","ipFilterCidrs":["192.0.2.10/32"]}]}`,
+		`{"networks":[{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.10/32"]},{"interface":"net1","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.11/32"]}]}`,
 		`{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"],"unknown":true}]}`,
 	} {
 		for _, action := range []string{"firewall.guest.verify-ipfilter", "firewall.guest.verify-ipfilter-sets"} {
@@ -584,6 +638,23 @@ func TestGuestIPFilterVerificationFailsClosedWhenClusterFirewallIsDisabled(t *te
 	}))
 	defer server.Close()
 	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" || reads != 1 {
+		t.Fatalf("reads=%d receipt=%#v err=%v", reads, receipt, err)
+	}
+}
+
+func TestGuestIPFilterVerificationFailsClosedWhenClusterEbtablesIsDisabled(t *testing.T) {
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/cluster/firewall/options" {
+			t.Fatalf("unexpected read after disabled cluster ebtables: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"enable":1,"ebtables":0}}`))
+	}))
+	defer server.Close()
+	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.10/32"]}]}`)
 	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 	if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" || reads != 1 {
 		t.Fatalf("reads=%d receipt=%#v err=%v", reads, receipt, err)

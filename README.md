@@ -86,7 +86,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 - 快照/备份：`snapshot.create`、`snapshot.delete`、`snapshot.rollback`、`backup.create`、`backup.delete`、`backup.restore`。
 - PVE 任务：`task.status`。
 - 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`。
-- 只读发现/回验：`pve.discover`、`firewall.guest.verify-ipfilter-sets`、`firewall.guest.verify-ipfilter`。前者证明每张 `ipfilter-netN` 已精确预配置且 guest/NIC enforcement 仍关闭，后者证明客户启用后的 guest/NIC/MAC/IP 防冒用保护已完整生效。
+- 只读发现/回验：`pve.discover`、`firewall.guest.verify-ipfilter-sets`、`firewall.guest.verify-ipfilter`。前者证明每张 `ipfilter-netN` 已精确预配置、当前 `netN` MAC 与签名分配一致且 guest/NIC enforcement 仍关闭，后者证明客户启用后的 guest/NIC/MAC/IP 防冒用保护已完整生效。`networks[].macAddress` 是向后兼容的可选字段；新官网流程必须提供规范大写、非零单播 MAC，Agent 才会在回执中返回并证明同一个 MAC。
 
 当前 39 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`agent.upgrade` 仅接受官网固定 manifest 制品并由独立 root helper 复验、原子替换、回验和回滚，完整合同见[安全自升级合同](docs/SELF-UPGRADE-V1.md)。`vm.reinstall` 仍因 PVE 恢复流程非事务性，且没有可被命令签名/校验的安装介质 allowlist，而刻意不实现。
 

@@ -434,8 +434,8 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
-| vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
-| vm | `firewall.guest.verify-ipfilter-sets` | 只读；默认关闭阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，同时每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效。 |
+| vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、cluster 未显式关闭 PVE 8 二层 `ebtables`、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。`networks[].macAddress` 可选以兼容旧调用；新流程必须提供规范大写、非零单播 MAC，Agent 会同时证明 PVE 当前 QEMU `virtio=<MAC>` 或 LXC `hwaddr=<MAC>` 与签名分配一致。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `macAddress`、`firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
+| vm | `firewall.guest.verify-ipfilter-sets` | 只读；默认关闭阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，按新请求同时证明每张 `netN` 的规范 MAC，并确认每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |
@@ -446,6 +446,11 @@ POST /internal/v1/monitoring/audit-events/batches
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets.json` 和
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets-result.json`
 锁定。每张 NIC 都必须出现且 `interface` 唯一；CIDR 必须是 canonical `/32` 或 `/128` host，未知字段、缺失/额外/negative IPSet entry、guest firewall 已开或任一 NIC firewall 已开都会失败。该动作不读取 cluster firewall，也不执行写操作。
+
+客户启用后的 `firewall.guest.verify-ipfilter` 请求与成功结果另由
+`internal/control/testdata/agent-v1-firewall-verify-ipfilter.json` 和
+`internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
+锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
 
 当前共有 39 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
 

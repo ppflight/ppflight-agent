@@ -341,6 +341,7 @@ type FirewallRef struct {
 // view. They omit PVE digest/concurrency fields and any IP-set entry contents.
 type FirewallOptions struct {
 	Enable      *int   `json:"enable,omitempty"`
+	Ebtables    *int   `json:"ebtables,omitempty"`
 	PolicyIn    string `json:"policy_in,omitempty"`
 	PolicyOut   string `json:"policy_out,omitempty"`
 	LogLevelIn  string `json:"log_level_in,omitempty"`
