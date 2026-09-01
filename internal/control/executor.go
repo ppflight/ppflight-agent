@@ -1391,7 +1391,15 @@ func validDelivery(p deliveryP) bool {
 	}
 	seen := map[string]bool{}
 	for _, network := range e.Networks {
-		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !*network.Firewall || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+			return false
+		}
+		// The delivery contract has two exact, non-overlapping firewall
+		// states.  An enabled NIC must carry at least one canonical host
+		// filter.  A customer-controlled, disabled NIC must carry no filter
+		// claims at all; otherwise the receipt could imply enforcement that
+		// PVE is not actually applying.
+		if *network.Firewall && len(network.IPFilterCIDRs) == 0 || !*network.Firewall && len(network.IPFilterCIDRs) != 0 {
 			return false
 		}
 		seen[network.Interface] = true
@@ -1549,7 +1557,11 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 		if !qgaAddressesMatch(observation.Interfaces, expected) {
 			return nil, fmt.Errorf("delivery network %s guest addresses are not ready", expected.Interface)
 		}
-		if err := verifyIPFilter(ctx, client, command, expected); err != nil {
+		if *expected.Firewall {
+			if err := verifyIPFilter(ctx, client, command, expected); err != nil {
+				return nil, err
+			}
+		} else if err := verifyGuestFirewallDisabled(ctx, client, command); err != nil {
 			return nil, err
 		}
 	}
@@ -1600,7 +1612,7 @@ func networkMatches(raw map[string]json.RawMessage, value string, expected deliv
 			configuredMAC = parts[model]
 		}
 	}
-	if !strings.EqualFold(configuredMAC, expected.MAC) || parts["bridge"] != expected.Bridge || parts["mtu"] != strconv.Itoa(expected.MTU) || parts["firewall"] != boolText(*expected.Firewall) || normalizedRate(parts["rate"]) != normalizedRate(expected.RateMbps) {
+	if !strings.EqualFold(configuredMAC, expected.MAC) || parts["bridge"] != expected.Bridge || parts["mtu"] != strconv.Itoa(expected.MTU) || !deliveryFirewallMatches(parts["firewall"], *expected.Firewall) || normalizedRate(parts["rate"]) != normalizedRate(expected.RateMbps) {
 		return false
 	}
 	if expected.VLAN == nil && parts["tag"] != "" || expected.VLAN != nil && parts["tag"] != strconv.Itoa(*expected.VLAN) {
@@ -1618,6 +1630,16 @@ func networkMatches(raw map[string]json.RawMessage, value string, expected deliv
 		}
 	}
 	return addresses["ip"] == expected.IPv4 && addresses["ip6"] == expected.IPv6
+}
+func deliveryFirewallMatches(raw string, expected bool) bool {
+	raw = strings.TrimSpace(raw)
+	if expected {
+		return raw == "1"
+	}
+	// PVE may serialize an explicit false as firewall=0 or omit the
+	// default-valued property entirely.  Both are authoritative disabled
+	// states; every other representation is rejected.
+	return raw == "" || raw == "0"
 }
 func normalizedRate(value string) string {
 	value = strings.TrimSpace(value)
@@ -1657,6 +1679,17 @@ func qgaAddressesMatch(interfaces []pve.GuestInterface, expected deliveryNetwork
 }
 func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, expected deliveryNetwork) error {
 	return verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs)
+}
+func verifyGuestFirewallDisabled(ctx context.Context, client *pve.Client, command Command) error {
+	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
+	options, err := client.FirewallOptions(ctx, ref)
+	if err != nil {
+		return err
+	}
+	if options.Enable != nil && *options.Enable != 0 {
+		return errors.New("guest firewall is enabled but delivery expects it disabled")
+	}
+	return nil
 }
 func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Command, interfaceRef string, expectedCIDRs []string) error {
 	if _, err := verifyGuestFirewallProtection(ctx, client, command); err != nil {

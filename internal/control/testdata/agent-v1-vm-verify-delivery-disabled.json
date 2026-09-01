@@ -1,0 +1,39 @@
+{
+  "notBefore": "2026-01-01T00:00:00Z",
+  "expected": {
+    "cores": 2,
+    "sockets": 1,
+    "memoryMiB": 1024,
+    "disk": {
+      "interface": "scsi0",
+      "minimumGiB": 20,
+      "limits": {
+        "iopsRead": 1000,
+        "iopsWrite": null,
+        "iopsReadMax": null,
+        "iopsWriteMax": null,
+        "iopsReadMaxLength": null,
+        "iopsWriteMaxLength": null,
+        "mbpsRead": 100,
+        "mbpsWrite": null,
+        "mbpsReadMax": null,
+        "mbpsWriteMax": null
+      }
+    },
+    "networks": [
+      {
+        "interface": "net0",
+        "bridge": "vmbr0",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "vlan": null,
+        "mtu": 1500,
+        "firewall": false,
+        "rateMbps": "100",
+        "ipv4": "192.0.2.10/24",
+        "ipv6": "2001:db8::10/64",
+        "ipFilterCidrs": []
+      }
+    ],
+    "timezone": "UTC"
+  }
+}

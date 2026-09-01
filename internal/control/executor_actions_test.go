@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -262,6 +264,87 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	}
 }
 
+func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing.T) {
+	disabledGolden, err := os.ReadFile("testdata/agent-v1-vm-verify-delivery-disabled.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(disabledGolden))); err != nil {
+		t.Fatalf("disabled delivery golden is invalid: %v", err)
+	}
+	tests := []struct {
+		name         string
+		network      string
+		guestOptions string
+		wantError    bool
+	}{
+		{
+			name:         "explicit disabled values",
+			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=0,rate=100",
+			guestOptions: `{"enable":0}`,
+		},
+		{
+			name:         "omitted PVE defaults",
+			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,rate=100",
+			guestOptions: `{}`,
+		},
+		{
+			name:         "guest firewall unexpectedly enabled",
+			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=0,rate=100",
+			guestOptions: `{"enable":1}`,
+			wantError:    true,
+		},
+		{
+			name:         "network firewall unexpectedly enabled",
+			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=1,rate=100",
+			guestOptions: `{"enable":0}`,
+			wantError:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/status/current"):
+					_, _ = w.Write([]byte(`{"data":{"status":"running","uptime":30}}`))
+				case strings.HasSuffix(r.URL.Path, "/config"):
+					_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=20G,iops_rd=1000,mbps_rd=100","net0":` + strconv.Quote(tt.network) + `,"ipconfig0":"ip=192.0.2.10/24,ip6=2001:db8::10/64"}}`))
+				case strings.HasSuffix(r.URL.Path, "/agent/info"):
+					_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-network-get-interfaces","enabled":true}]}}`))
+				case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
+					_, _ = w.Write([]byte(`{"data":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"},{"ip-address":"2001:db8::10","prefix":64,"ip-address-type":"ipv6"}]}]}`))
+				case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+					_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
+				case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+					if r.URL.Path == "/api2/json/cluster/firewall/options" {
+						t.Fatalf("disabled delivery must not claim or inspect cluster enforcement")
+					}
+					_, _ = w.Write([]byte(`{"data":` + tt.guestOptions + `}`))
+				default:
+					t.Fatalf("unexpected request: %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			command := controlCommand("vm.verify-delivery", "qemu", string(disabledGolden))
+			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+			if tt.wantError {
+				if err == nil || receipt.State == "succeeded" {
+					t.Fatalf("receipt=%#v err=%v, want fail-closed mismatch", receipt, err)
+				}
+				return
+			}
+			if err != nil || receipt.State != "succeeded" || receipt.DryRun {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+			var result DeliveryVerificationResult
+			if json.Unmarshal(receipt.Result, &result) != nil || !result.Ready || !result.NetworkMatched || !result.FirewallMatched {
+				t.Fatalf("result=%s", receipt.Result)
+			}
+		})
+	}
+}
+
 func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -503,6 +586,17 @@ func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
 	if err := validateParameters(controlCommand("vm.set-disk-io", "qemu", string(diskRaw))); err == nil {
 		t.Fatal("accepted IOPS burst maximum without required burst length")
 	}
+	var disabledDelivery map[string]any
+	if json.Unmarshal([]byte(fixtures["vm.verify-delivery"]), &disabledDelivery) != nil {
+		t.Fatal("invalid delivery fixture")
+	}
+	disabledNetwork := disabledDelivery["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)
+	disabledNetwork["firewall"] = false
+	disabledNetwork["ipFilterCidrs"] = []any{}
+	disabledRaw, _ := json.Marshal(disabledDelivery)
+	if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(disabledRaw))); err != nil {
+		t.Fatalf("rejected exact customer-controlled disabled delivery: %v", err)
+	}
 
 	for name, mutate := range map[string]func(map[string]any){
 		"missing nullable VLAN key": func(payload map[string]any) {
@@ -512,8 +606,11 @@ func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
 		"noncanonical MAC": func(payload map[string]any) {
 			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["mac"] = "aa:bb:cc:dd:ee:ff"
 		},
-		"firewall disabled": func(payload map[string]any) {
+		"firewall disabled with filter claims": func(payload map[string]any) {
 			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["firewall"] = false
+		},
+		"firewall enabled without filter claims": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = []any{}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
