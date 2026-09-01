@@ -1659,15 +1659,37 @@ func verifyIPFilter(ctx context.Context, client *pve.Client, command Command, ex
 	return verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs)
 }
 func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Command, interfaceRef string, expectedCIDRs []string) error {
+	if _, err := verifyGuestFirewallProtection(ctx, client, command); err != nil {
+		return err
+	}
+	return verifyExpectedIPFilterSet(ctx, client, command, interfaceRef, expectedCIDRs)
+}
+func verifyGuestFirewallProtection(ctx context.Context, client *pve.Client, command Command) (pve.FirewallOptions, error) {
 	clusterOptions, err := client.FirewallOptions(ctx, pve.FirewallRef{})
 	if err != nil || clusterOptions.Enable == nil || *clusterOptions.Enable != 1 {
-		return errors.New("cluster firewall is not enabled")
+		return pve.FirewallOptions{}, errors.New("cluster firewall is not enabled")
 	}
 	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	options, err := client.FirewallOptions(ctx, ref)
 	if err != nil || options.Enable == nil || *options.Enable != 1 {
-		return errors.New("guest firewall is not enabled")
+		return pve.FirewallOptions{}, errors.New("guest firewall is not enabled")
 	}
+	policyIn := options.PolicyIn
+	if policyIn == "" {
+		policyIn = "DROP"
+	}
+	policyOut := options.PolicyOut
+	if policyOut == "" {
+		policyOut = "ACCEPT"
+	}
+	macFilterEnabled := options.MACFilter == nil || *options.MACFilter == 1
+	if policyIn != "ACCEPT" || policyOut != "ACCEPT" || !macFilterEnabled {
+		return pve.FirewallOptions{}, errors.New("guest firewall anti-spoof policy is not delivery-safe")
+	}
+	return options, nil
+}
+func verifyExpectedIPFilterSet(ctx context.Context, client *pve.Client, command Command, interfaceRef string, expectedCIDRs []string) error {
+	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	name := "ipfilter-" + interfaceRef
 	sets, err := client.FirewallIPSets(ctx, ref)
 	if err != nil {
@@ -1703,10 +1725,13 @@ func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Com
 }
 
 type IPFilterVerificationResult struct {
-	Verified        bool                                `json:"verified"`
-	ObservedAt      time.Time                           `json:"observedAt"`
-	FirewallEnabled bool                                `json:"firewallEnabled"`
-	Networks        []IPFilterVerificationNetworkResult `json:"networks"`
+	Verified         bool                                `json:"verified"`
+	ObservedAt       time.Time                           `json:"observedAt"`
+	FirewallEnabled  bool                                `json:"firewallEnabled"`
+	PolicyIn         string                              `json:"policyIn"`
+	PolicyOut        string                              `json:"policyOut"`
+	MACFilterEnabled bool                                `json:"macFilterEnabled"`
+	Networks         []IPFilterVerificationNetworkResult `json:"networks"`
 }
 type IPFilterVerificationNetworkResult struct {
 	Interface     string   `json:"interface"`
@@ -1719,12 +1744,16 @@ func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Comman
 	if err := strictParameters(command.Parameters, &parameters); err != nil {
 		return nil, err
 	}
+	if _, err := verifyGuestFirewallProtection(ctx, client, command); err != nil {
+		return nil, err
+	}
 	result := IPFilterVerificationResult{
 		Verified: true, ObservedAt: time.Now().UTC().Truncate(time.Second), FirewallEnabled: true,
+		PolicyIn: "ACCEPT", PolicyOut: "ACCEPT", MACFilterEnabled: true,
 		Networks: make([]IPFilterVerificationNetworkResult, 0, len(parameters.Networks)),
 	}
 	for _, expected := range parameters.Networks {
-		if err := verifyExpectedIPFilter(ctx, client, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
+		if err := verifyExpectedIPFilterSet(ctx, client, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
 			return nil, err
 		}
 		result.Networks = append(result.Networks, IPFilterVerificationNetworkResult{

@@ -234,7 +234,11 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
 			_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
-			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			if r.URL.Path == "/api2/json/cluster/firewall/options" {
+				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+			}
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
@@ -265,7 +269,11 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 		}
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
-			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			if r.URL.Path == "/api2/json/cluster/firewall/options" {
+				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+			}
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
@@ -283,11 +291,40 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
 	}
 	var result IPFilterVerificationResult
-	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.FirewallEnabled || len(result.Networks) != 2 || result.Networks[0].IPSet != "ipfilter-net0" {
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.FirewallEnabled || result.PolicyIn != "ACCEPT" || result.PolicyOut != "ACCEPT" || !result.MACFilterEnabled || len(result.Networks) != 2 || result.Networks[0].IPSet != "ipfilter-net0" {
 		t.Fatalf("result=%s", receipt.Result)
 	}
 	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
 		t.Fatalf("IPFilter result timestamp is not the whole-second golden: %s", receipt.Result)
+	}
+}
+
+func TestGuestIPFilterVerificationRejectsBlockingPolicyOrDisabledMACFilter(t *testing.T) {
+	for name, guestOptions := range map[string]string{
+		"implicit input drop": `{"enable":1}`,
+		"explicit input drop": `{"enable":1,"policy_in":"DROP","policy_out":"ACCEPT","macfilter":1}`,
+		"output drop":         `{"enable":1,"policy_in":"ACCEPT","policy_out":"DROP","macfilter":1}`,
+		"MAC filter disabled": `{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":0}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api2/json/cluster/firewall/options" {
+					_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/firewall/options") {
+					_, _ = w.Write([]byte(`{"data":` + guestOptions + `}`))
+					return
+				}
+				t.Fatalf("unexpected verification read: %s", r.URL.Path)
+			}))
+			defer server.Close()
+			command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+			if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+		})
 	}
 }
 
@@ -313,7 +350,11 @@ func TestGuestIPFilterVerificationRejectsNegativeOrExtraEntries(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/firewall/options"):
-				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+				if r.URL.Path == "/api2/json/cluster/firewall/options" {
+					_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+				} else {
+					_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+				}
 			case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 				_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
 			default:
