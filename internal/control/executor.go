@@ -1785,6 +1785,10 @@ func verifyGuestFirewallProtection(ctx context.Context, client *pve.Client, comm
 	if clusterOptions.Ebtables != nil && *clusterOptions.Ebtables != 1 {
 		return pve.FirewallOptions{}, errors.New("cluster layer-2 firewall is not enabled")
 	}
+	nodeOptions, err := client.FirewallOptions(ctx, pve.FirewallRef{Node: command.Identity.NodeRef})
+	if err != nil || nodeOptions.Enable == nil || *nodeOptions.Enable != 1 {
+		return pve.FirewallOptions{}, errors.New("node firewall is not enabled")
+	}
 	ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
 	options, err := client.FirewallOptions(ctx, ref)
 	if err != nil || options.Enable == nil || *options.Enable != 1 {

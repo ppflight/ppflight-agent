@@ -106,7 +106,7 @@ IP 切换应先保留新地址，再按操作线程更新 NIC/`ipconfigN`、`ipf
 2. 创建 PVE 约定名称 `ipfilter-netN` 的 guest IPSet；用 `firewall.ipset.entry.create` 先加入新 CIDR，`entry.update` 只改该 CIDR 的 comment/`noSubnet`，验证切换后才用 `entry.delete` 移除旧 CIDR；
 3. 用 `firewall.guest.set-options` 启用 guest firewall；托管 VPS 可同时固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`，在不默认限制业务端口的前提下启用 MAC 防伪造；`ipfilter-netN` 是 PVE 约定的标准 IPFilter 集合，不依赖一个额外的 guest option；
 4. 创建/重装过程中可先用只读 `firewall.guest.verify-ipfilter-sets` 精确回验所有 `ipfilter-netN`，并确认尚未启用 enforcement；这只是中间态，页面只能标记为 `preconfigured-not-enforcing`，不能据此完成交付；
-5. 创建/重装的最终宿主商安全基线必须用 `firewall.guest.verify-ipfilter` 精确回验 cluster/guest firewall、`ACCEPT/ACCEPT`、MACFilter、每张 NIC firewall、签名 MAC 与每个集合的正向 host CIDR。客户控制台的“端口规则防火墙”可以保持关闭，因为该基线不自动添加任何端口 `DROP`/`REJECT` 规则；端口规则状态与 IP/MAC 反冒用状态必须分别投影。
+5. 创建/重装的最终宿主商安全基线必须用 `firewall.guest.verify-ipfilter` 精确回验 cluster/node/guest firewall、`ACCEPT/ACCEPT`、MACFilter、每张 NIC firewall、签名 MAC 与每个集合的正向 host CIDR。客户控制台的“端口规则防火墙”可以保持关闭，因为该基线不自动添加任何端口 `DROP`/`REJECT` 规则；端口规则状态与 IP/MAC 反冒用状态必须分别投影。
 
 这些是可编排原语，不是“一次调用即可无缝切换”的承诺。官网必须负责 IPAM 预留、顺序、补偿、digest/read-back、审批和防自锁。
 

@@ -661,6 +661,27 @@ func TestGuestIPFilterVerificationFailsClosedWhenClusterEbtablesIsDisabled(t *te
 	}
 }
 
+func TestGuestIPFilterVerificationFailsClosedWhenNodeFirewallIsDisabled(t *testing.T) {
+	reads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads++
+		switch r.URL.Path {
+		case "/api2/json/cluster/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+		case "/api2/json/nodes/pve1/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":0}}`))
+		default:
+			t.Fatalf("unexpected read after disabled node firewall: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:01","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" || reads != 2 {
+		t.Fatalf("reads=%d receipt=%#v err=%v", reads, receipt, err)
+	}
+}
+
 func TestExecutorControlledEndpointForms(t *testing.T) {
 	tests := []struct {
 		name, action, guest, parameters, method, path string
