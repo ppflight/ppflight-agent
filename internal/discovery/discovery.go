@@ -396,6 +396,9 @@ func errorCode(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return "PVE_UNAVAILABLE"
 	}
+	if errors.Is(err, pve.ErrTemplateBaselineInvalid) {
+		return "PVE_ERROR"
+	}
 	var httpErr *pve.HTTPError
 	if errors.As(err, &httpErr) {
 		switch httpErr.StatusCode {

@@ -700,6 +700,7 @@ create_template() {
     --memory "$MEMORY_MB" \
     --balloon "$BALLOON" \
     --cores "$CORES" \
+    --sockets 1 \
     --cpu "$CPU_TYPE" \
     "${network_args[@]}" \
     --scsihw virtio-scsi-single \
@@ -743,6 +744,7 @@ verify_template() {
   grep -qx "name: $name" <<< "$config" || die "$vmid has unexpected name"
   grep -Eq '^tags: .*ppflight-cloudinit([;,]|$)' <<< "$config" || die "$vmid is missing the project tag"
   grep -q '^agent: enabled=1' <<< "$config" || die "$vmid does not have QEMU Agent enabled"
+  grep -qx 'sockets: 1' <<< "$config" || die "$vmid does not have the required single CPU socket"
   grep -q '^serial0: socket' <<< "$config" || die "$vmid does not have serial0"
   grep -q '^vga: std' <<< "$config" || die "$vmid does not have VGA"
   grep -Fqx "cicustom: vendor=$FILE_STORAGE:snippets/$expected_snippet" <<< "$config" || die "$vmid has an unexpected Cloud-Init profile"

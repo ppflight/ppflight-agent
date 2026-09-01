@@ -133,6 +133,12 @@ type TemplateNetwork struct {
 	Firewall  bool   `json:"firewall"`
 }
 
+// ErrTemplateBaselineInvalid marks a locally validated PVE template whose
+// configuration cannot satisfy the frozen clone baseline. It is distinct from
+// transport unavailability so callers do not report a malformed template as a
+// connection outage. The wrapped detail is for local diagnostics only.
+var ErrTemplateBaselineInvalid = errors.New("PVE template baseline is invalid")
+
 func (c *Client) TemplateInfo(ctx context.Context, kind, node string, vmid int, name string) (TemplateInfo, error) {
 	config, err := c.GuestConfig(ctx, kind, node, vmid)
 	if err != nil {
@@ -151,7 +157,7 @@ func (c *Client) TemplateInfo(ctx context.Context, kind, node string, vmid int, 
 	}
 	baseline, err := templateBaseline(config.Raw)
 	if err != nil {
-		return TemplateInfo{}, err
+		return TemplateInfo{}, fmt.Errorf("%w: %v", ErrTemplateBaselineInvalid, err)
 	}
 	rules, err := c.FirewallRules(ctx, FirewallRef{Node: node, Kind: kind, VMID: vmid})
 	if err != nil {
@@ -179,8 +185,14 @@ func templateBaseline(raw map[string]json.RawMessage) (TemplateBaseline, error) 
 	if !ok || cores < 1 || cores > 128 {
 		return TemplateBaseline{}, errors.New("template cores baseline is unavailable")
 	}
-	sockets, ok := templateConfigInt(raw, "sockets")
-	if !ok || sockets < 1 || sockets > 16 {
+	// PVE's QEMU schema defines an omitted sockets property as one socket.
+	// Canonicalize that documented default so templates created by older
+	// PPFlight bundles remain attestable without mutating the PVE guest config.
+	sockets := 1
+	if configuredSockets, present := templateConfigInt(raw, "sockets"); present {
+		sockets = configuredSockets
+	}
+	if sockets < 1 || sockets > 16 {
 		return TemplateBaseline{}, errors.New("template sockets baseline is unavailable")
 	}
 	memory, ok := templateConfigInt(raw, "memory")

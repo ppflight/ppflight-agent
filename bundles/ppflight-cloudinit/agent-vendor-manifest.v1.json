@@ -7,7 +7,7 @@
   "files": [
     {
       "path": "build-cloud-templates.sh",
-      "sha256": "d03f802febe050940b41aac8f44f8ce72de8400748fcaa08bf834c2733d48475",
+      "sha256": "25458a7f7333c34b8e488ab5ce0f041aebfab1d23c3c0333e696d0ed4361be82",
       "requiredAtRuntime": true
     },
     {

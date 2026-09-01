@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -93,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "0fe6e9c5d57a726d9c5810a4641d26ac9960fa7add843cc8b83fda80a9c65f65"
+	const expectedManifestSHA256 = "fcac75e6fa6f015c052a5845b42af9f567312a8e94c898e1f676f11d59eec487"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -114,5 +115,21 @@ func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
 	command.Dir = "."
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("frozen vendored bundle failed verification: %v: %s", err, output)
+	}
+}
+
+func TestTemplateBuilderPinsAndVerifiesSingleSocketBaseline(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "bundles", "ppflight-cloudinit", "build-cloud-templates.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	for _, required := range []string{
+		`--sockets 1 \`,
+		`grep -qx 'sockets: 1' <<< "$config"`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("template builder is missing the frozen socket baseline check %q", required)
+		}
 	}
 }

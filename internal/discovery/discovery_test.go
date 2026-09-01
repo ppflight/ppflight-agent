@@ -65,6 +65,48 @@ func TestDiscoverTemplatesIsBoundedAndPageable(t *testing.T) {
 	}
 }
 
+func TestDiscoverTemplateBaselineFailureIsNotReportedAsConnectionOutage(t *testing.T) {
+	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/resources":
+			fmt.Fprint(w, `{"data":[{"id":"qemu/9000","type":"qemu","node":"pve","vmid":9000,"name":"ubuntu-2204","template":1}]}`)
+		case "/api2/json/nodes/pve/qemu/9000/config":
+			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"scsi0":"local-zfs:base-9000-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1","agent":"enabled=1"}}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result := service.Discover(context.Background(), Request{OperationID: "template-baseline-check", Phase: PhaseTemplates, Limit: 50})
+	if result.ErrorCode != "PVE_ERROR" || !result.Complete || len(result.Data.Templates) != 0 {
+		t.Fatalf("template baseline failure %#v", result)
+	}
+}
+
+func TestDiscoverTemplateUsesPVEDefaultSingleSocketWhenOmitted(t *testing.T) {
+	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api2/json/cluster/resources":
+			fmt.Fprint(w, `{"data":[{"id":"qemu/9000","type":"qemu","node":"pve","vmid":9000,"name":"ubuntu-2204","template":1}]}`)
+		case "/api2/json/nodes/pve/qemu/9000/config":
+			fmt.Fprint(w, `{"data":{"cores":2,"memory":2048,"scsi0":"local-zfs:base-9000-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1","agent":"enabled=1"}}`)
+		case "/api2/json/nodes/pve/qemu/9000/firewall/rules", "/api2/json/nodes/pve/qemu/9000/firewall/ipset":
+			fmt.Fprint(w, `{"data":[]}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result := service.Discover(context.Background(), Request{OperationID: "template-default-socket", Phase: PhaseTemplates, Limit: 50})
+	if result.ErrorCode != "" || !result.Complete || len(result.Data.Templates) != 1 || result.Data.Templates[0].Baseline == nil || result.Data.Templates[0].Baseline.Sockets != 1 {
+		t.Fatalf("template default socket normalization %#v", result)
+	}
+}
+
 func TestDiscoverFirewallCoversClusterNodeAndGuest(t *testing.T) {
 	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
