@@ -432,7 +432,8 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `snapshot.delete`, `snapshot.rollback` | `name`。 |
 | vm | `backup.create` | `storage`, `mode=snapshot|suspend|stop`, 可选 `compress`。 |
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
-| cluster/node/vm | `firewall.cluster.set-options`, `firewall.node.set-options`, `firewall.guest.set-options` | 当前 typed 参数仅 `enable`。 |
+| cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
+| vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
 | vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。可在 guest 停机时执行。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |

@@ -489,6 +489,12 @@ type firewallDeleteP struct {
 type firewallOptionsP struct {
 	Enable *bool `json:"enable"`
 }
+type firewallGuestOptionsP struct {
+	Enable    *bool  `json:"enable"`
+	PolicyIn  string `json:"policyIn,omitempty"`
+	PolicyOut string `json:"policyOut,omitempty"`
+	MacFilter *bool  `json:"macFilter,omitempty"`
+}
 type ipsetP struct {
 	Name    string `json:"name"`
 	Comment string `json:"comment,omitempty"`
@@ -690,10 +696,17 @@ func validateParameters(c Command) error {
 			return errors.New("invalid firewall rule")
 		}
 		return nil
-	case "firewall.cluster.set-options", "firewall.node.set-options", "firewall.guest.set-options":
+	case "firewall.cluster.set-options", "firewall.node.set-options":
 		var p firewallOptionsP
 		if err := strictParameters(c.Parameters, &p); err != nil || p.Enable == nil {
 			return errors.New("invalid firewall options")
+		}
+		return nil
+	case "firewall.guest.set-options":
+		var p firewallGuestOptionsP
+		if err := strictParameters(c.Parameters, &p); err != nil || p.Enable == nil ||
+			!validFirewallPolicy(p.PolicyIn) || !validFirewallPolicy(p.PolicyOut) {
+			return errors.New("invalid guest firewall options")
 		}
 		return nil
 	case "firewall.ipset.create", "firewall.ipset.update":
@@ -890,9 +903,19 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		_ = strictParameters(c.Parameters, &p)
 		method, path, form = http.MethodPut, node+"/firewall/options", url.Values{"enable": {boolText(*p.Enable)}}
 	case "firewall.guest.set-options":
-		var p firewallOptionsP
+		var p firewallGuestOptionsP
 		_ = strictParameters(c.Parameters, &p)
-		method, path, form = http.MethodPut, base+"/firewall/options", url.Values{"enable": {boolText(*p.Enable)}}
+		form = url.Values{"enable": {boolText(*p.Enable)}}
+		if p.PolicyIn != "" {
+			form.Set("policy_in", p.PolicyIn)
+		}
+		if p.PolicyOut != "" {
+			form.Set("policy_out", p.PolicyOut)
+		}
+		if p.MacFilter != nil {
+			form.Set("macfilter", boolText(*p.MacFilter))
+		}
+		method, path = http.MethodPut, base+"/firewall/options"
 	case "firewall.ipset.create":
 		var p ipsetP
 		_ = strictParameters(c.Parameters, &p)
@@ -1759,6 +1782,10 @@ func validFirewall(p firewallP) bool {
 		return false
 	}
 	return true
+}
+
+func validFirewallPolicy(value string) bool {
+	return value == "" || value == "ACCEPT" || value == "DROP" || value == "REJECT"
 }
 
 func validPortList(value string) bool {

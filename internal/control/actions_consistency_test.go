@@ -84,7 +84,7 @@ func validActionParameterFixtures() map[string]string {
 		"backup.restore":                 `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst","force":false}`,
 		"firewall.cluster.set-options":   `{"enable":true}`,
 		"firewall.node.set-options":      `{"enable":true}`,
-		"firewall.guest.set-options":     `{"enable":true}`,
+		"firewall.guest.set-options":     `{"enable":true,"policyIn":"ACCEPT","policyOut":"ACCEPT","macFilter":true}`,
 		"firewall.guest.verify-ipfilter": `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}]}`,
 		"firewall.guest.set-ipfilter":    `{"interface":"net0","enable":true}`,
 		"firewall.rule.create":           `{"direction":"in","action":"ACCEPT","enable":true}`,
