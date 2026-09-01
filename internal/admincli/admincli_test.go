@@ -343,7 +343,7 @@ func TestSystemOverviewShowsCoreSectionsWithoutSecrets(t *testing.T) {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 	text := output.String()
-	for _, expected := range []string{"PPFlight 系统概况", "[Agent]", "[PVE 本地读取]", "网卡/宿主机采集", "SMART 采集", "[PPFlight 官网]", "[监控站]", "[高可用与升级]", "绑定：未绑定"} {
+	for _, expected := range []string{"PPFlight 系统概况", "[Agent]", "[PVE 本地读取]", "网卡/宿主机采集", "SMART 采集", "[PVE 主机防火墙]", "现有安装更新保持防火墙原状", "[PPFlight 官网]", "[监控站]", "[高可用与升级]", "绑定：未绑定"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("overview missing %q: %s", expected, text)
 		}

@@ -83,6 +83,23 @@ for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service 
   stop_required_unit "$required_unit" || exit 1
 done
 
+# A fresh installation may have committed PPFlight-owned host ingress rules
+# and Cluster/Node option changes. Revert that durable transaction before PVE
+# credentials or recovery binaries can be removed. Absence means this was an
+# older install or an update that never owned host firewall state.
+HOST_FIREWALL_JOURNAL='/var/lib/ppflight-agent/host-firewall/transaction.json'
+HOST_FIREWALL_HELPER='/usr/local/bin/ppflight-agent'
+if [[ -e "$HOST_FIREWALL_JOURNAL" || -L "$HOST_FIREWALL_JOURNAL" ]]; then
+  [[ -x "$HOST_FIREWALL_HELPER" && ! -L "$HOST_FIREWALL_HELPER" ]] || {
+    printf 'error: PPFlight host firewall recovery helper is missing or unsafe; no credentials or files were removed\n' >&2
+    exit 1
+  }
+  "$HOST_FIREWALL_HELPER" host-firewall rollback --uninstall || {
+    printf 'error: PPFlight host firewall restoration is incomplete; recovery binary, journal, credentials, and files were preserved\n' >&2
+    exit 1
+  }
+fi
+
 # A complete purge must also revoke the cluster-side credentials created by
 # automatic local PVE preparation. Otherwise agent.env would be deleted while
 # the unreadable one-time token secret remained in PVE, making a clean

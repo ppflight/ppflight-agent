@@ -34,6 +34,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/exporter"
 	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/health"
+	"github.com/ppflight/ppflight-agent/internal/hostfirewall"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/monitorenrollment"
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
@@ -1338,6 +1339,19 @@ func (c *cli) systemOverview(filename string) int {
 	fmt.Fprintf(c.out, "  写操作：%s；control credential：%s (%s)\n", enabledLabel(pveStatus.ProductionExecution), readyLabel(pveStatus.Control.CredentialReady), pveStatus.Control.Code)
 	fmt.Fprintf(c.out, "  网卡/宿主机采集：%s；开机启动：%s\n", systemdUnitState("ppflight-node-exporter.service"), systemdUnitEnabledState("ppflight-node-exporter.service"))
 	fmt.Fprintf(c.out, "  SMART 采集：%s；开机启动：%s\n", systemdUnitState("ppflight-smartctl-exporter.service"), systemdUnitEnabledState("ppflight-smartctl-exporter.service"))
+
+	fmt.Fprintln(c.out, "\n[PVE 主机防火墙]")
+	firewallTransaction, firewallErr := hostfirewall.InspectTransaction()
+	if firewallErr != nil {
+		fmt.Fprintln(c.out, "  全新安装事务：状态文件不安全或损坏（禁止推断或修改）")
+	} else if !firewallTransaction.Present {
+		fmt.Fprintln(c.out, "  全新安装事务：无；现有安装更新保持防火墙原状")
+	} else {
+		fmt.Fprintf(c.out, "  全新安装事务：%s\n", firewallTransaction.Phase)
+		if firewallTransaction.Node != "" {
+			fmt.Fprintf(c.out, "  节点：%s；默认路由接口：%s\n", firewallTransaction.Node, strings.Join(firewallTransaction.Interfaces, ","))
+		}
+	}
 
 	c.printWebsiteOverview(cfg, local, localErr)
 	c.printMonitoringOverview(cfg, local, localErr)

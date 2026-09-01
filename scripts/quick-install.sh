@@ -107,6 +107,26 @@ cd ppflight-agent
 sha256sum --check --status ppflight-agent.sha256 \
   || die '包内 Agent 二进制 SHA-256 校验失败'
 
+# Classify before apt, install.sh, systemd, PVE credential, or configuration
+# mutation. A root-only durable marker keeps an interrupted initial install
+# from being silently reclassified as an update on retry.
+INSTALL_MODE="$(./ppflight-agent host-firewall classify)" \
+  || die '无法安全判定本次是全新安装还是现有安装更新'
+case "$INSTALL_MODE" in
+  fresh)
+    printf '%s\n' '检测到全新安装：完成全部本机回验后将启用 PVE Cluster/Node 主机入站防火墙。'
+    ;;
+  resume)
+    printf '%s\n' '检测到未完成的全新安装事务：将安全恢复并完成主机防火墙阶段。'
+    ;;
+  update)
+    printf '%s\n' '检测到现有安装：保留当前防火墙状态，本次更新不会启用或修改主机防火墙。'
+    ;;
+  *)
+    die '主机防火墙安装分类返回了未知状态'
+    ;;
+esac
+
 download_verified() {
   local url=$1 output=$2 expected=$3 label=$4
   curl \
@@ -249,5 +269,15 @@ systemctl is-active --quiet ppflight-node-exporter.service \
   || die 'ppflight-node-exporter.service 未成功启动'
 systemctl is-active --quiet ppflight-smartctl-exporter.service \
   || die 'ppflight-smartctl-exporter.service 未成功启动'
+
+if [[ "$INSTALL_MODE" == 'fresh' || "$INSTALL_MODE" == 'resume' ]]; then
+  printf '\n正在提交全新安装专用的 PVE Cluster/Node 主机入站防火墙...\n'
+  /usr/local/bin/ppflight-agent host-firewall activate \
+    || die '主机防火墙未能安全启用或回验；安装未报告成功，已尝试恢复原防火墙状态'
+  printf '%s\n' 'PVE Cluster/Node 主机防火墙已启用；默认路由接口的新入站连接已由 PPFlight 自有规则阻断。'
+  printf '%s\n' 'Agent、官网、监控、控制和更新均使用出站连接；状态和 exporter 仍仅监听 127.0.0.1。'
+else
+  printf '%s\n' '现有安装更新已完成；Cluster/Node/VM/CT 防火墙状态均保持不变。'
+fi
 
 printf '\n安装或更新完成：真实 PVE 读取已就绪，Agent 已启动并加入开机启动。现在输入 AG 进入 PPFlight 菜单。\n'

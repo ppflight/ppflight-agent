@@ -18,6 +18,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/bindingoverlay"
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/control"
+	"github.com/ppflight/ppflight-agent/internal/hostfirewall"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/selfupdate"
 )
@@ -29,6 +30,12 @@ func main() {
 }
 
 func run() int {
+	// This is an installer/uninstaller-only root helper. It is intentionally
+	// hidden from the ordinary AG menu and cannot be reached through a signed
+	// website command.
+	if len(os.Args) > 1 && os.Args[1] == "host-firewall" {
+		return hostfirewall.Run(os.Args[2:], os.Stdout, os.Stderr)
+	}
 	if base := filepath.Base(os.Args[0]); base == "ag-pve" || base == "ag" || base == "AG" {
 		return admincli.Run(os.Args[1:], version, os.Stdout, os.Stderr)
 	}
