@@ -268,6 +268,8 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 			t.Fatalf("verification attempted a write: %s %s", r.Method, r.URL.Path)
 		}
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=1","net1":"virtio=AA:BB:CC:DD:EE:02,bridge=vmbr1,firewall=1"}}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
 			if r.URL.Path == "/api2/json/cluster/firewall/options" {
 				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
@@ -291,7 +293,7 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
 	}
 	var result IPFilterVerificationResult
-	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.FirewallEnabled || result.PolicyIn != "ACCEPT" || result.PolicyOut != "ACCEPT" || !result.MACFilterEnabled || len(result.Networks) != 2 || result.Networks[0].IPSet != "ipfilter-net0" {
+	if json.Unmarshal(receipt.Result, &result) != nil || !result.Verified || !result.GuestFirewallEnabled || result.PolicyIn != "ACCEPT" || result.PolicyOut != "ACCEPT" || !result.MACFilterEnabled || len(result.Networks) != 2 || !result.Networks[0].FirewallEnabled || !result.Networks[0].IPFilterEnabled || result.Networks[0].IPSet != "ipfilter-net0" {
 		t.Fatalf("result=%s", receipt.Result)
 	}
 	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
@@ -328,6 +330,27 @@ func TestGuestIPFilterVerificationRejectsBlockingPolicyOrDisabledMACFilter(t *te
 	}
 }
 
+func TestGuestIPFilterVerificationRejectsDisabledNICFirewall(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api2/json/cluster/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
+			_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=0"}}`))
+		default:
+			t.Fatalf("unexpected verification read after disabled NIC firewall: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	command := controlCommand("firewall.guest.verify-ipfilter", "qemu", `{"networks":[{"interface":"net0","ipFilterCidrs":["192.0.2.10/32"]}]}`)
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.State != "failed" || receipt.Code != "IPFILTER_NOT_READY" {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+}
+
 func TestGuestIPFilterVerificationRejectsAmbiguousOrNonHostContracts(t *testing.T) {
 	for _, parameters := range []string{
 		`{"networks":[]}`,
@@ -349,6 +372,8 @@ func TestGuestIPFilterVerificationRejectsNegativeOrExtraEntries(t *testing.T) {
 	} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
+			case strings.HasSuffix(r.URL.Path, "/config"):
+				_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:01,bridge=vmbr0,firewall=1"}}`))
 			case strings.HasSuffix(r.URL.Path, "/firewall/options"):
 				if r.URL.Path == "/api2/json/cluster/firewall/options" {
 					_, _ = w.Write([]byte(`{"data":{"enable":1}}`))

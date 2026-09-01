@@ -434,7 +434,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
-| vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果显式返回 `policyIn`、`policyOut`、`macFilterEnabled`。可在 guest 停机时执行。 |
+| vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |

@@ -1662,6 +1662,13 @@ func verifyExpectedIPFilter(ctx context.Context, client *pve.Client, command Com
 	if _, err := verifyGuestFirewallProtection(ctx, client, command); err != nil {
 		return err
 	}
+	config, err := client.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return err
+	}
+	if !guestNetworkFirewallEnabled(config, interfaceRef) {
+		return fmt.Errorf("guest network %s firewall is not enabled", interfaceRef)
+	}
 	return verifyExpectedIPFilterSet(ctx, client, command, interfaceRef, expectedCIDRs)
 }
 func verifyGuestFirewallProtection(ctx context.Context, client *pve.Client, command Command) (pve.FirewallOptions, error) {
@@ -1725,18 +1732,20 @@ func verifyExpectedIPFilterSet(ctx context.Context, client *pve.Client, command 
 }
 
 type IPFilterVerificationResult struct {
-	Verified         bool                                `json:"verified"`
-	ObservedAt       time.Time                           `json:"observedAt"`
-	FirewallEnabled  bool                                `json:"firewallEnabled"`
-	PolicyIn         string                              `json:"policyIn"`
-	PolicyOut        string                              `json:"policyOut"`
-	MACFilterEnabled bool                                `json:"macFilterEnabled"`
-	Networks         []IPFilterVerificationNetworkResult `json:"networks"`
+	Verified             bool                                `json:"verified"`
+	ObservedAt           time.Time                           `json:"observedAt"`
+	GuestFirewallEnabled bool                                `json:"guestFirewallEnabled"`
+	PolicyIn             string                              `json:"policyIn"`
+	PolicyOut            string                              `json:"policyOut"`
+	MACFilterEnabled     bool                                `json:"macFilterEnabled"`
+	Networks             []IPFilterVerificationNetworkResult `json:"networks"`
 }
 type IPFilterVerificationNetworkResult struct {
-	Interface     string   `json:"interface"`
-	IPSet         string   `json:"ipSet"`
-	IPFilterCIDRs []string `json:"ipFilterCidrs"`
+	Interface       string   `json:"interface"`
+	FirewallEnabled bool     `json:"firewallEnabled"`
+	IPFilterEnabled bool     `json:"ipFilterEnabled"`
+	IPSet           string   `json:"ipSet"`
+	IPFilterCIDRs   []string `json:"ipFilterCidrs"`
 }
 
 func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
@@ -1747,22 +1756,45 @@ func verifyGuestIPFilter(ctx context.Context, client *pve.Client, command Comman
 	if _, err := verifyGuestFirewallProtection(ctx, client, command); err != nil {
 		return nil, err
 	}
+	config, err := client.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return nil, err
+	}
 	result := IPFilterVerificationResult{
-		Verified: true, ObservedAt: time.Now().UTC().Truncate(time.Second), FirewallEnabled: true,
+		Verified: true, ObservedAt: time.Now().UTC().Truncate(time.Second), GuestFirewallEnabled: true,
 		PolicyIn: "ACCEPT", PolicyOut: "ACCEPT", MACFilterEnabled: true,
 		Networks: make([]IPFilterVerificationNetworkResult, 0, len(parameters.Networks)),
 	}
 	for _, expected := range parameters.Networks {
+		if !guestNetworkFirewallEnabled(config, expected.Interface) {
+			return nil, fmt.Errorf("guest network %s firewall is not enabled", expected.Interface)
+		}
 		if err := verifyExpectedIPFilterSet(ctx, client, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
 			return nil, err
 		}
 		result.Networks = append(result.Networks, IPFilterVerificationNetworkResult{
-			Interface:     expected.Interface,
-			IPSet:         "ipfilter-" + expected.Interface,
-			IPFilterCIDRs: append([]string(nil), expected.IPFilterCIDRs...),
+			Interface:       expected.Interface,
+			FirewallEnabled: true,
+			IPFilterEnabled: true,
+			IPSet:           "ipfilter-" + expected.Interface,
+			IPFilterCIDRs:   append([]string(nil), expected.IPFilterCIDRs...),
 		})
 	}
 	return json.Marshal(result)
+}
+
+func guestNetworkFirewallEnabled(config pve.GuestConfig, interfaceRef string) bool {
+	value, ok := configString(config.Raw, interfaceRef)
+	if !ok {
+		return false
+	}
+	for _, segment := range strings.Split(value, ",") {
+		key, candidate, present := strings.Cut(strings.TrimSpace(segment), "=")
+		if present && key == "firewall" {
+			return candidate == "1"
+		}
+	}
+	return false
 }
 func validNetwork(p networkP, kind string) bool {
 	if !netRE.MatchString(p.Interface) || (p.Bridge == nil && p.Model == nil && p.MAC == nil && p.VLAN == nil && p.MTU == nil && p.Firewall == nil && p.RateMbps == nil && p.IPv4 == nil && p.IPv6 == nil && p.Gateway4 == nil && p.Gateway6 == nil) || (kind == "lxc" && p.Model != nil) {
