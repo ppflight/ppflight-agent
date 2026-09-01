@@ -36,15 +36,16 @@ const maxControlResultBytes = 1 << 20
 const maxJSONDepth = 64
 
 var (
-	nodeRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	netRE      = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
-	diskRE     = regexp.MustCompile(`^(scsi|virtio|sata|ide)[0-9]{1,2}$`)
-	nameRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	macRE      = regexp.MustCompile(`(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
-	storageRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-	snapRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
-	upidRE     = regexp.MustCompile(`^UPID:[A-Za-z0-9@!+,:._-]{1,511}$`)
-	portListRE = regexp.MustCompile(`^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$`)
+	nodeRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	netRE         = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
+	diskRE        = regexp.MustCompile(`^(scsi|virtio|sata|ide)[0-9]{1,2}$`)
+	nameRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	macRE         = regexp.MustCompile(`(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+	deliveryMACRE = regexp.MustCompile(`^[0-9A-F]{2}(:[0-9A-F]{2}){5}$`)
+	storageRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	snapRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
+	upidRE        = regexp.MustCompile(`^UPID:[A-Za-z0-9@!+,:._-]{1,511}$`)
+	portListRE    = regexp.MustCompile(`^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$`)
 )
 
 type Executor struct {
@@ -532,7 +533,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.clone":
 		var p cloneP
-		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
+		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || p.SourceVMID > 999999999 || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
 			return errors.New("invalid clone parameters")
 		}
 		return nil
@@ -1218,7 +1219,7 @@ func validDiskLimits(p diskIOP) bool {
 			return false
 		}
 	}
-	if !validBurst(limits.IOPSRead, limits.IOPSReadMax, limits.IOPSReadMaxLength) || !validBurst(limits.IOPSWrite, limits.IOPSWriteMax, limits.IOPSWriteMaxLength) || !validBurst(limits.MBPSRead, limits.MBPSReadMax, nil) || !validBurst(limits.MBPSWrite, limits.MBPSWriteMax, nil) {
+	if !validBurst(limits.IOPSRead, limits.IOPSReadMax, limits.IOPSReadMaxLength, true) || !validBurst(limits.IOPSWrite, limits.IOPSWriteMax, limits.IOPSWriteMaxLength, true) || !validBurst(limits.MBPSRead, limits.MBPSReadMax, nil, false) || !validBurst(limits.MBPSWrite, limits.MBPSWriteMax, nil, false) {
 		return false
 	}
 	return true
@@ -1244,6 +1245,10 @@ func exactDeliveryKeys(raw json.RawMessage) bool {
 	if json.Unmarshal(raw, &outer) != nil || !hasExactKeys(outer, "notBefore", "expected") {
 		return false
 	}
+	var notBefore string
+	if json.Unmarshal(outer["notBefore"], &notBefore) != nil || !regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`).MatchString(notBefore) {
+		return false
+	}
 	var expected map[string]json.RawMessage
 	if json.Unmarshal(outer["expected"], &expected) != nil || !hasExactKeys(expected, "cores", "sockets", "memoryMiB", "disk", "networks", "timezone") {
 		return false
@@ -1261,10 +1266,7 @@ func exactDeliveryKeys(raw json.RawMessage) bool {
 		return false
 	}
 	for _, network := range networks {
-		required := []string{"interface", "bridge", "mac", "mtu", "firewall", "rateMbps", "ipv4", "ipv6", "ipFilterCidrs"}
-		if _, hasVLAN := network["vlan"]; hasVLAN {
-			required = append(required, "vlan")
-		}
+		required := []string{"interface", "bridge", "mac", "vlan", "mtu", "firewall", "rateMbps", "ipv4", "ipv6", "ipFilterCidrs"}
 		if !hasExactKeys(network, required...) {
 			return false
 		}
@@ -1282,11 +1284,14 @@ func hasExactKeys(values map[string]json.RawMessage, keys ...string) bool {
 	}
 	return true
 }
-func validBurst(base, maximum, length *int64) bool {
+func validBurst(base, maximum, length *int64, requireLength bool) bool {
 	if maximum != nil && (base == nil || *maximum < *base) {
 		return false
 	}
-	return length == nil || maximum != nil
+	if requireLength {
+		return (maximum == nil) == (length == nil)
+	}
+	return length == nil
 }
 func validCloudInit(p cloudInitP) bool {
 	if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_-]{0,63}$`).MatchString(p.Username) || !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$`).MatchString(p.Hostname) || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || (p.PasswordFormat != "plain" && p.PasswordFormat != "crypt") || len(p.SSHAuthorizedKeys) > 16 || !*p.QGAEnabled {
@@ -1332,7 +1337,7 @@ func validDelivery(p deliveryP) bool {
 	}
 	seen := map[string]bool{}
 	for _, network := range e.Networks {
-		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !macRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !*network.Firewall || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) < 1 || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
 			return false
 		}
 		seen[network.Interface] = true

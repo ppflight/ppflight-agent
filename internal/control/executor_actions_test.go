@@ -243,7 +243,7 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	command := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`)
+	command := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`)
 	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || receipt.DryRun {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
@@ -327,6 +327,44 @@ func TestExecutorRejectsUnknownAndUnsafeParameters(t *testing.T) {
 		if err := validateParameters(c); err == nil {
 			t.Fatalf("expected rejection for %s: %s", c.Action, c.Parameters)
 		}
+	}
+}
+
+func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
+	fixtures := validActionParameterFixtures()
+	var disk map[string]any
+	if json.Unmarshal([]byte(fixtures["vm.set-disk-io"]), &disk) != nil {
+		t.Fatal("invalid test fixture")
+	}
+	disk["limits"].(map[string]any)["iopsReadMax"] = float64(1200)
+	diskRaw, _ := json.Marshal(disk)
+	if err := validateParameters(controlCommand("vm.set-disk-io", "qemu", string(diskRaw))); err == nil {
+		t.Fatal("accepted IOPS burst maximum without required burst length")
+	}
+
+	for name, mutate := range map[string]func(map[string]any){
+		"missing nullable VLAN key": func(payload map[string]any) {
+			delete(payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any), "vlan")
+		},
+		"fractional notBefore": func(payload map[string]any) { payload["notBefore"] = "2026-01-01T00:00:00.123Z" },
+		"noncanonical MAC": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["mac"] = "aa:bb:cc:dd:ee:ff"
+		},
+		"firewall disabled": func(payload map[string]any) {
+			payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["firewall"] = false
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var payload map[string]any
+			if json.Unmarshal([]byte(fixtures["vm.verify-delivery"]), &payload) != nil {
+				t.Fatal("invalid test fixture")
+			}
+			mutate(payload)
+			raw, _ := json.Marshal(payload)
+			if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(raw))); err == nil {
+				t.Fatalf("accepted drift payload: %s", raw)
+			}
+		})
 	}
 }
 
