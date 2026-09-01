@@ -633,6 +633,34 @@ func TestProvisioningGoldenRejectsCrossLanguageDrift(t *testing.T) {
 	}
 }
 
+func TestMultiNICDeliveryGoldenRequiresUniqueCanonicalMACs(t *testing.T) {
+	raw, err := os.ReadFile("testdata/agent-v1-vm-verify-delivery-multi-nic.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(raw))); err != nil {
+		t.Fatalf("multi-NIC delivery golden is invalid: %v", err)
+	}
+
+	for name, mac := range map[string]string{
+		"duplicate MAC": "AA:BB:CC:DD:EE:FF",
+		"empty MAC":     "",
+		"lowercase MAC": "aa:bb:cc:dd:ee:00",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var payload map[string]any
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatal(err)
+			}
+			payload["expected"].(map[string]any)["networks"].([]any)[1].(map[string]any)["mac"] = mac
+			mutated, _ := json.Marshal(payload)
+			if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(mutated))); err == nil {
+				t.Fatalf("accepted ambiguous multi-NIC MAC: %s", mutated)
+			}
+		})
+	}
+}
+
 func TestNetworkUpdateNeverChangesMACImplicitly(t *testing.T) {
 	bridge := "vmbr1"
 	parameters := networkP{Interface: "net0", Bridge: &bridge}

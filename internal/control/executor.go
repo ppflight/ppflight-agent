@@ -1390,8 +1390,9 @@ func validDelivery(p deliveryP) bool {
 		return false
 	}
 	seen := map[string]bool{}
+	seenMAC := map[string]bool{}
 	for _, network := range e.Networks {
-		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !validIP(network.IPv4, 4) || !validIP(network.IPv6, 6) || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
 			return false
 		}
 		// The delivery contract has two exact, non-overlapping firewall
@@ -1403,6 +1404,7 @@ func validDelivery(p deliveryP) bool {
 			return false
 		}
 		seen[network.Interface] = true
+		seenMAC[network.MAC] = true
 		cidrs := map[string]bool{}
 		for _, cidr := range network.IPFilterCIDRs {
 			ip, parsed, err := net.ParseCIDR(cidr)
