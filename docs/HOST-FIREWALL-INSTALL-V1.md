@@ -114,7 +114,10 @@ and configuration for a safe retry.
   fresh install succeeds; new public inbound SSH/8006/8888 connections fail;
   the existing installer session and Tunnel remain usable; Agent collection,
   website/monitoring delivery, control polling, and upgrades remain healthy.
-- Guest acceptance: Create/Reinstall leaves guest and every `netN` firewall
-  disabled; customer enable covers every mapped NIC with unique canonical MAC,
-  exact `/32`/`/128` IPFilter entries, MACFilter, and strict readback.
-
+- Guest acceptance: the host-firewall installer itself never rewrites existing
+  guests. A later Create/Reinstall may pass through a dormant IPSet
+  preconfiguration state, but final delivery enables guest and every managed
+  `netN` firewall with `ACCEPT/ACCEPT`, unique canonical MAC, exact
+  `/32`/`/128` IPFilter entries, MACFilter, and strict readback. This provider
+  anti-spoof baseline is separate from the customer port-rule switch and adds
+  no default `DROP`/`REJECT` rules.

@@ -435,7 +435,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
 | vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster 与 guest firewall 已启用、cluster 未显式关闭 PVE 8 二层 `ebtables`、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。`networks[].macAddress` 可选以兼容旧调用；新流程必须提供规范大写、非零单播 MAC，Agent 会同时证明 PVE 当前 QEMU `virtio=<MAC>` 或 LXC `hwaddr=<MAC>` 与签名分配一致。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `macAddress`、`firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
-| vm | `firewall.guest.verify-ipfilter-sets` | 只读；默认关闭阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，按新请求同时证明每张 `netN` 的规范 MAC，并确认每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效。 |
+| vm | `firewall.guest.verify-ipfilter-sets` | 只读；创建/重装的中间预配置阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，按新请求同时证明每张 `netN` 的规范 MAC，并确认每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效，也不得作为创建/重装最终成功条件。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |
@@ -447,7 +447,7 @@ POST /internal/v1/monitoring/audit-events/batches
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets-result.json`
 锁定。每张 NIC 都必须出现且 `interface` 唯一；CIDR 必须是 canonical `/32` 或 `/128` host，未知字段、缺失/额外/negative IPSet entry、guest firewall 已开或任一 NIC firewall 已开都会失败。该动作不读取 cluster firewall，也不执行写操作。
 
-客户启用后的 `firewall.guest.verify-ipfilter` 请求与成功结果另由
+创建/重装最终启用宿主商 IP/MAC 反冒用基线后的 `firewall.guest.verify-ipfilter` 请求与成功结果另由
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter.json` 和
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
 锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
@@ -500,7 +500,7 @@ QEMU 的 IP/gateway 写入与 `netN` 对应的 `ipconfigN`；LXC 写入 `netN` �
 
 一次 IP 切换必须共用一个 `operationId`：IPAM 预留新 IP → 更新固定 MAC/VLAN/MTU/NIC/`ipconfigN` → 更新 `ipfilter-netN` → 启用 guest/NIC firewall 与 IPFilter → 等待必要的 reboot/guest 网络就绪 → 回读/探测 → 提交 IPAM 并释放旧 IP。失败时保留旧租约并进入补偿/人工处理，不能静默释放。
 
-PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。`ipfilter-netN` 是 PVE 标准命名约定，不是 `/firewall/options` 的可写字段。默认关闭阶段必须用只读 `firewall.guest.verify-ipfilter-sets` 证明集合精确但 enforcement 未启用。客户明确启用后，NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用并固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`；这样启用 IP/MAC 防伪造但不默认限制客户业务端口。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验以上策略和集合，相关 cluster/node firewall 仍按审批启用。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
+PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ipfilter-netN`；IP 切换先用 `firewall.ipset.entry.create` 加入新 CIDR，`entry.update` 只更新同一 CIDR 的 comment/`noSubnet`，验证成功后才用 `entry.delete` 删除旧 CIDR。`ipfilter-netN` 是 PVE 标准命名约定，不是 `/firewall/options` 的可写字段。创建/重装过程中可以用只读 `firewall.guest.verify-ipfilter-sets` 证明集合精确但 enforcement 尚未启用；它只是中间态。最终交付前，NIC 自身必须 `firewall=true`，guest firewall 用 `firewall.guest.set-options` 启用并固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`；这样默认启用宿主商 IP/MAC 防伪造，但不添加任何端口 `DROP`/`REJECT` 规则，不限制客户业务端口。启动 guest 前必须用只读 `firewall.guest.verify-ipfilter` 精确回验以上策略、签名 MAC 和集合，相关 cluster/node firewall 仍按审批启用。客户控制台的端口规则防火墙状态必须与此宿主商反冒用基线分别存储和展示；关闭客户规则不得关闭反冒用基线。官网必须计算期望 digest、防止自锁并回读；Agent 没有一个可绕过逐步持久化编排的“防盗用”复合写动作。
 
 Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处于默认值的 option 可能省略字段，而各 scope 的缺省值并不相同：cluster master=`0`、node host firewall=`1`、guest=`0`。Agent 必须按 scope 补齐该有效值；显式值若不是 `0|1` 则以读取错误拒绝，官网不得把缺失值统一解释为关闭。启用 cluster master 前必须单独证明 node host firewall 不会阻断 SSH/API/Agent 管理通道。
 

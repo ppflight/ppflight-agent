@@ -86,7 +86,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 - 快照/备份：`snapshot.create`、`snapshot.delete`、`snapshot.rollback`、`backup.create`、`backup.delete`、`backup.restore`。
 - PVE 任务：`task.status`。
 - 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`。
-- 只读发现/回验：`pve.discover`、`firewall.guest.verify-ipfilter-sets`、`firewall.guest.verify-ipfilter`。前者证明每张 `ipfilter-netN` 已精确预配置、当前 `netN` MAC 与签名分配一致且 guest/NIC enforcement 仍关闭，后者证明客户启用后的 guest/NIC/MAC/IP 防冒用保护已完整生效。`networks[].macAddress` 是向后兼容的可选字段；新官网流程必须提供规范大写、非零单播 MAC，Agent 才会在回执中返回并证明同一个 MAC。
+- 只读发现/回验：`pve.discover`、`firewall.guest.verify-ipfilter-sets`、`firewall.guest.verify-ipfilter`。前者证明每张 `ipfilter-netN` 已精确预配置、当前 `netN` MAC 与签名分配一致且 guest/NIC enforcement 仍关闭，只能用于创建/重装的中间态；后者证明最终 guest/NIC/MAC/IP 反冒用基线已完整生效。`networks[].macAddress` 是向后兼容的可选字段；新官网流程必须提供规范大写、非零单播 MAC，Agent 才会在回执中返回并证明同一个 MAC。
 
 当前 39 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`agent.upgrade` 仅接受官网固定 manifest 制品并由独立 root helper 复验、原子替换、回验和回滚，完整合同见[安全自升级合同](docs/SELF-UPGRADE-V1.md)。`vm.reinstall` 仍因 PVE 恢复流程非事务性，且没有可被命令签名/校验的安装介质 allowlist，而刻意不实现。
 
@@ -105,7 +105,8 @@ IP 切换应先保留新地址，再按操作线程更新 NIC/`ipconfigN`、`ipf
 1. `vm.set-network` 设置受管固定 MAC 并启用 NIC firewall；
 2. 创建 PVE 约定名称 `ipfilter-netN` 的 guest IPSet；用 `firewall.ipset.entry.create` 先加入新 CIDR，`entry.update` 只改该 CIDR 的 comment/`noSubnet`，验证切换后才用 `entry.delete` 移除旧 CIDR；
 3. 用 `firewall.guest.set-options` 启用 guest firewall；托管 VPS 可同时固定 `policyIn=ACCEPT`、`policyOut=ACCEPT`、`macFilter=true`，在不默认限制业务端口的前提下启用 MAC 防伪造；`ipfilter-netN` 是 PVE 约定的标准 IPFilter 集合，不依赖一个额外的 guest option；
-4. 默认关闭阶段用只读 `firewall.guest.verify-ipfilter-sets` 精确回验所有 `ipfilter-netN`，并确认 guest 与每张 NIC firewall 均未启用；页面只能标记为 `preconfigured-not-enforcing`。客户明确启用后，再用 `firewall.guest.verify-ipfilter` 精确回验 cluster/guest firewall、`ACCEPT/ACCEPT`、MACFilter、每张 NIC firewall 与每个集合的正向 host CIDR。
+4. 创建/重装过程中可先用只读 `firewall.guest.verify-ipfilter-sets` 精确回验所有 `ipfilter-netN`，并确认尚未启用 enforcement；这只是中间态，页面只能标记为 `preconfigured-not-enforcing`，不能据此完成交付；
+5. 创建/重装的最终宿主商安全基线必须用 `firewall.guest.verify-ipfilter` 精确回验 cluster/guest firewall、`ACCEPT/ACCEPT`、MACFilter、每张 NIC firewall、签名 MAC 与每个集合的正向 host CIDR。客户控制台的“端口规则防火墙”可以保持关闭，因为该基线不自动添加任何端口 `DROP`/`REJECT` 规则；端口规则状态与 IP/MAC 反冒用状态必须分别投影。
 
 这些是可编排原语，不是“一次调用即可无缝切换”的承诺。官网必须负责 IPAM 预留、顺序、补偿、digest/read-back、审批和防自锁。
 
