@@ -409,9 +409,13 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
 | vm | `vm.clone` | `sourceVmid`, `name` 和必填 bool `full`；`target/storage` 可选。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
-| vm | `vm.resize` | `disk` 与 grow-only `size`，例如 `+20G`。 |
+| vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
+| vm | `vm.set-disk-limits` | QEMU only；`disk` 与可选 IOPS/MBPS base/max/burst length typed 整数。省略 limit 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
 | vm | `vm.set-network` | `interface` 及 bridge/model/MAC/VLAN/MTU/firewall/rate/IP/gateway typed 字段。 |
 | vm | `vm.set-rate` | `interface`, `rateMbps`；`0` 移除 rate。 |
+| vm | `vm.set-cloud-init` | `username/password/sshKeys/hostname/enableQGA`；QEMU 必须启用 QGA，LXC 另要求 IANA `timezone`。secret 不进入 result/receipt/audit。 |
+| vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone` 并等待 exit code 0。 |
+| vm | `vm.verify-delivery` | read-only；`interface/expectedMac/expectedAddresses/requireQGA`。要求 running、config MAC 一致；QEMU 同 MAC 的 QGA interface 必须包含全部地址。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
 | vm | `vm.reset-password` | `username`, `password`, `crypted`；当前只接受 QEMU，并在提交前检查 QGA `guest-set-user-password` capability。LXC 返回 unsupported。 |
 | vm | `snapshot.create` | `name`、必填 bool `includeRam`，可选 `description`；LXC 的 `includeRam` 只能为 false。 |
@@ -426,7 +430,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `firewall.ipset.entry.delete` | `name`, `cidr`，固定 DELETE 该 guest IPSet entry。 |
 | vm | `firewall.guest.set-ipfilter` | `interface=netN`, `enable`，映射到 PVE option `ipfilter-netN`。 |
 
-当前共有 34 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
+当前共有 38 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
@@ -480,7 +484,7 @@ PVE 的 anti-spoof/IPFilter 组合契约是：guest IPSet 使用精确名称 `ip
 
 Agent telemetry 已区分 `qga.availability.available`、`observedAt`、`freshUntil` 和 `unavailableReason`，并列出各 QGA read capability。APP 必须展示 availability 和 freshness，不能只显示最后一次成功结果，也不能把“已安装但已停止”和新鲜可用混为一谈。
 
-QEMU 的 `vm.reset-password` 以及 operation 中的 guest-network verify 依赖 QGA。QGA 被卸载、停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable；不得继续排队后再把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。当前 `vm.reset-password` 协议校验不接受 LXC；不得把执行函数中不可达的 LXC config 分支写成支持。
+QEMU 的 `vm.reset-password`、`vm.set-timezone` 以及 `vm.verify-delivery` 依赖 QGA。QGA 被卸载、停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable；不得继续排队后再把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。当前 `vm.reset-password` 协议校验不接受 LXC；不得把执行函数中不可达的 LXC config 分支写成支持。
 
 website guest telemetry 已携带 QGA availability/freshness，并输出 `capabilities.lifecycle/rootPasswordReset/guestNetworkVerify/metering`。QGA 缺失或过期会让依赖 capability unavailable，lifecycle 保持 available；capability 带 `observedAt/freshUntil/reason/executionPreflight`。Executor 已在 `vm.reset-password` 提交前只读查询 PVE QGA `agent/info` 并检查 `guest-set-user-password`；APP 消费/展示和 operation 中的 guest-network verify 仍属于远端待合并项。
 

@@ -6,6 +6,7 @@ package control
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -141,6 +142,24 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "vm.verify-delivery" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, verifyErr := verifyDelivery(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if verifyErr != nil {
+			r.State, r.Code = "failed", "DELIVERY_NOT_READY"
+			return finish(verifyErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if e.Mode != "production" || !e.ProductionExecution {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "dry_run", "DRY_RUN", true, time.Now().UTC()
 		return finish(nil)
@@ -163,8 +182,12 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
 		return finish(errors.New("PVE control client is unavailable"))
 	}
-	if command.Action == "vm.reset-password" {
-		capability, capabilityErr := e.guestAgentCommand(ctx, command, "guest-set-user-password")
+	if command.Action == "vm.reset-password" || command.Action == "vm.set-timezone" {
+		wanted := "guest-set-user-password"
+		if command.Action == "vm.set-timezone" {
+			wanted = "guest-exec"
+		}
+		capability, capabilityErr := e.guestAgentCommand(ctx, command, wanted)
 		r.FinishedAt = time.Now().UTC()
 		switch {
 		case capabilityErr != nil, capability == GuestCapabilityUnavailable:
@@ -194,7 +217,7 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	} else {
 		r.State, r.Code = "succeeded", "SUCCEEDED"
 	}
-	if command.Action != "vm.reset-password" {
+	if command.Action != "vm.reset-password" && command.Action != "vm.set-cloud-init" {
 		r.Result = result
 	}
 	return finish(nil)
@@ -317,8 +340,22 @@ type resourcesP struct {
 	MemoryMiB *int `json:"memoryMiB,omitempty"`
 }
 type resizeP struct {
-	Disk string `json:"disk"`
-	Size string `json:"size"`
+	Disk      string `json:"disk"`
+	Size      string `json:"size,omitempty"`
+	TargetGiB *int   `json:"targetGiB,omitempty"`
+}
+type diskLimitsP struct {
+	Disk               string `json:"disk"`
+	IOPSRead           *int64 `json:"iopsRead,omitempty"`
+	IOPSWrite          *int64 `json:"iopsWrite,omitempty"`
+	IOPSReadMax        *int64 `json:"iopsReadMax,omitempty"`
+	IOPSWriteMax       *int64 `json:"iopsWriteMax,omitempty"`
+	IOPSReadMaxLength  *int64 `json:"iopsReadMaxLength,omitempty"`
+	IOPSWriteMaxLength *int64 `json:"iopsWriteMaxLength,omitempty"`
+	MBPSRead           *int64 `json:"mbpsRead,omitempty"`
+	MBPSWrite          *int64 `json:"mbpsWrite,omitempty"`
+	MBPSReadMax        *int64 `json:"mbpsReadMax,omitempty"`
+	MBPSWriteMax       *int64 `json:"mbpsWriteMax,omitempty"`
 }
 type deleteP struct {
 	Purge                    *bool `json:"purge"`
@@ -346,6 +383,23 @@ type passwordP struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password"`
 	Crypted  *bool  `json:"crypted"`
+}
+type cloudInitP struct {
+	Username  string   `json:"username"`
+	Password  string   `json:"password"`
+	SSHKeys   []string `json:"sshKeys"`
+	Hostname  string   `json:"hostname"`
+	EnableQGA *bool    `json:"enableQGA"`
+	Timezone  *string  `json:"timezone,omitempty"`
+}
+type timezoneP struct {
+	Timezone string `json:"timezone"`
+}
+type deliveryP struct {
+	Interface         string   `json:"interface"`
+	ExpectedMAC       string   `json:"expectedMac"`
+	ExpectedAddresses []string `json:"expectedAddresses"`
+	RequireQGA        *bool    `json:"requireQGA"`
 }
 type snapP struct {
 	Name        string `json:"name"`
@@ -463,8 +517,19 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.resize":
 		var p resizeP
-		if strictParameters(c.Parameters, &p) != nil || !diskRE.MatchString(p.Disk) || !regexp.MustCompile(`^\+[1-9][0-9]*(K|M|G|T)$`).MatchString(p.Size) {
+		if strictParameters(c.Parameters, &p) != nil {
 			return errors.New("invalid grow-only resize parameters")
+		}
+		validRelative := p.TargetGiB == nil && regexp.MustCompile(`^\+[1-9][0-9]*(K|M|G|T)$`).MatchString(p.Size)
+		validTarget := p.Size == "" && p.TargetGiB != nil && *p.TargetGiB >= 1 && *p.TargetGiB <= 1048576
+		if !diskRE.MatchString(p.Disk) || (!validRelative && !validTarget) {
+			return errors.New("invalid grow-only resize parameters")
+		}
+		return nil
+	case "vm.set-disk-limits":
+		var p diskLimitsP
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !validDiskLimits(p) {
+			return errors.New("invalid disk IO limit parameters")
 		}
 		return nil
 	case "vm.set-network":
@@ -477,6 +542,24 @@ func validateParameters(c Command) error {
 		var p rateP
 		if strictParameters(c.Parameters, &p) != nil || !netRE.MatchString(p.Interface) || !validRate(p.RateMbps) {
 			return errors.New("invalid network rate parameters")
+		}
+		return nil
+	case "vm.set-cloud-init":
+		var p cloudInitP
+		if strictParameters(c.Parameters, &p) != nil || p.EnableQGA == nil || !validCloudInit(p, c.Identity.GuestType) {
+			return errors.New("invalid Cloud-Init parameters")
+		}
+		return nil
+	case "vm.set-timezone":
+		var p timezoneP
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !validTimezone(p.Timezone) {
+			return errors.New("invalid guest timezone parameters")
+		}
+		return nil
+	case "vm.verify-delivery":
+		var p deliveryP
+		if strictParameters(c.Parameters, &p) != nil || p.RequireQGA == nil || !validDelivery(p, c.Identity.GuestType) {
+			return errors.New("invalid delivery verification parameters")
 		}
 		return nil
 	case "vm.delete":
@@ -679,10 +762,16 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		return setResources(ctx, client, c, base)
 	case "vm.resize":
 		return resizeDisk(ctx, client, c, base)
+	case "vm.set-disk-limits":
+		return setDiskLimits(ctx, client, c, base)
 	case "vm.set-network":
 		return setNetwork(ctx, client, c, base)
 	case "vm.set-rate":
 		return setRate(ctx, client, c, base)
+	case "vm.set-cloud-init":
+		return setCloudInit(ctx, client, c, base)
+	case "vm.set-timezone":
+		return setGuestTimezone(ctx, client, c, base)
 	case "vm.delete":
 		var p deleteP
 		_ = strictParameters(c.Parameters, &p)
@@ -858,10 +947,52 @@ func resizeDisk(ctx context.Context, c *pve.Client, cmd Command, base string) (s
 	if err != nil {
 		return "", nil, err
 	}
-	if _, ok := configString(current.Raw, p.Disk); !ok {
+	drive, ok := configString(current.Raw, p.Disk)
+	if !ok {
 		return "", nil, errors.New("target disk does not exist")
 	}
-	return doPVE(ctx, c, http.MethodPut, base+"/resize", url.Values{"disk": {p.Disk}, "size": {p.Size}})
+	size := p.Size
+	if p.TargetGiB != nil {
+		currentBytes, parseErr := diskSizeBytes(drive)
+		if parseErr != nil {
+			return "", nil, parseErr
+		}
+		targetBytes := uint64(*p.TargetGiB) << 30
+		if targetBytes < currentBytes {
+			return "", nil, errors.New("disk may only increase")
+		}
+		if targetBytes == currentBytes {
+			result, _ := json.Marshal(map[string]any{"changed": false, "disk": p.Disk, "sizeGiB": *p.TargetGiB})
+			return "", result, nil
+		}
+		size = strconv.Itoa(*p.TargetGiB) + "G"
+	}
+	return doPVE(ctx, c, http.MethodPut, base+"/resize", url.Values{"disk": {p.Disk}, "size": {size}})
+}
+func setDiskLimits(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
+	var p diskLimitsP
+	_ = strictParameters(cmd.Parameters, &p)
+	current, err := guestConfig(ctx, c, cmd)
+	if err != nil {
+		return "", nil, err
+	}
+	drive, ok := configString(current.Raw, p.Disk)
+	if !ok {
+		return "", nil, errors.New("target disk does not exist")
+	}
+	updated, err := mergeDiskLimits(drive, p)
+	if err != nil {
+		return "", nil, err
+	}
+	if updated == drive {
+		result, _ := json.Marshal(map[string]any{"changed": false, "disk": p.Disk, "verified": true})
+		return "", result, nil
+	}
+	form := url.Values{p.Disk: {updated}}
+	if current.Digest != "" {
+		form.Set("digest", current.Digest)
+	}
+	return doPVE(ctx, c, http.MethodPut, base+"/config", form)
 }
 func setRate(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p rateP
@@ -913,6 +1044,88 @@ func setNetwork(ctx context.Context, c *pve.Client, cmd Command, base string) (s
 	}
 	return doPVE(ctx, c, http.MethodPut, base+"/config", form)
 }
+func setCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
+	var p cloudInitP
+	_ = strictParameters(cmd.Parameters, &p)
+	current, err := guestConfig(ctx, c, cmd)
+	if err != nil {
+		return "", nil, err
+	}
+	form := url.Values{"ciuser": {p.Username}, "cipassword": {p.Password}, "sshkeys": {url.QueryEscape(strings.Join(p.SSHKeys, "\n"))}}
+	if cmd.Identity.GuestType == "qemu" {
+		form.Set("name", p.Hostname)
+		form.Set("agent", "enabled="+boolText(*p.EnableQGA))
+	} else {
+		form.Set("hostname", p.Hostname)
+		if p.Timezone != nil {
+			form.Set("timezone", *p.Timezone)
+		}
+	}
+	if current.Digest != "" {
+		form.Set("digest", current.Digest)
+	}
+	upid, _, err := doPVE(ctx, c, http.MethodPut, base+"/config", form)
+	return upid, nil, err
+}
+func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
+	var p timezoneP
+	_ = strictParameters(cmd.Parameters, &p)
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": {"/usr/bin/timedatectl", "set-timezone", p.Timezone}})
+	if err != nil {
+		return "", nil, err
+	}
+	var pid int
+	if json.Unmarshal(raw, &pid) != nil {
+		var result struct {
+			PID int `json:"pid"`
+		}
+		if json.Unmarshal(raw, &result) != nil || result.PID < 1 {
+			return "", nil, errors.New("QGA guest-exec returned an invalid pid")
+		}
+		pid = result.PID
+	}
+	if pid < 1 {
+		return "", nil, errors.New("QGA guest-exec returned an invalid pid")
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var status struct {
+			Exited   json.RawMessage `json:"exited"`
+			ExitCode int             `json:"exitcode"`
+		}
+		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &status); err != nil {
+			return "", nil, err
+		}
+		exited, valid := boolish(status.Exited)
+		if !valid {
+			return "", nil, errors.New("QGA guest-exec returned an invalid status")
+		}
+		if exited {
+			if status.ExitCode != 0 {
+				return "", nil, errors.New("guest timezone command failed")
+			}
+			result, _ := json.Marshal(map[string]any{"timezone": p.Timezone, "verified": true})
+			return "", result, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+func boolish(raw json.RawMessage) (bool, bool) {
+	var boolean bool
+	if json.Unmarshal(raw, &boolean) == nil {
+		return boolean, true
+	}
+	var integer int
+	if json.Unmarshal(raw, &integer) == nil && (integer == 0 || integer == 1) {
+		return integer == 1, true
+	}
+	return false, false
+}
 func resetPassword(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p passwordP
 	_ = strictParameters(cmd.Parameters, &p)
@@ -935,6 +1148,237 @@ func validResources(p resourcesP) bool {
 		}
 	}
 	return any && (p.Cores == nil || *p.Cores <= 128) && (p.Sockets == nil || *p.Sockets <= 16)
+}
+func validDiskLimits(p diskLimitsP) bool {
+	if !diskRE.MatchString(p.Disk) {
+		return false
+	}
+	values := []*int64{p.IOPSRead, p.IOPSWrite, p.IOPSReadMax, p.IOPSWriteMax, p.IOPSReadMaxLength, p.IOPSWriteMaxLength, p.MBPSRead, p.MBPSWrite, p.MBPSReadMax, p.MBPSWriteMax}
+	for _, value := range values {
+		if value != nil && (*value < 1 || *value > 1000000000) {
+			return false
+		}
+	}
+	if !validBurst(p.IOPSRead, p.IOPSReadMax, p.IOPSReadMaxLength) || !validBurst(p.IOPSWrite, p.IOPSWriteMax, p.IOPSWriteMaxLength) || !validBurst(p.MBPSRead, p.MBPSReadMax, nil) || !validBurst(p.MBPSWrite, p.MBPSWriteMax, nil) {
+		return false
+	}
+	return true
+}
+func validBurst(base, maximum, length *int64) bool {
+	if maximum != nil && (base == nil || *maximum < *base) {
+		return false
+	}
+	return length == nil || maximum != nil
+}
+func validCloudInit(p cloudInitP, kind string) bool {
+	if !nameRE.MatchString(p.Username) || !nameRE.MatchString(p.Hostname) || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || len(p.SSHKeys) > 5 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, key := range p.SSHKeys {
+		if !validSSHKey(key) || seen[key] {
+			return false
+		}
+		seen[key] = true
+	}
+	if kind == "qemu" {
+		return *p.EnableQGA && p.Timezone == nil
+	}
+	return !*p.EnableQGA && p.Timezone != nil && validTimezone(*p.Timezone)
+}
+func validSSHKey(value string) bool {
+	if len(value) > 4096 || strings.TrimSpace(value) != value {
+		return false
+	}
+	match := regexp.MustCompile(`^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)) ([A-Za-z0-9+/=]+)(?: [^\r\n]{1,128})?$`).FindStringSubmatch(value)
+	if len(match) != 3 {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(match[2])
+	return err == nil && len(decoded) >= 16 && len(decoded) <= 2048
+}
+func validTimezone(value string) bool {
+	if value == "UTC" {
+		return true
+	}
+	if len(value) > 64 || !regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._+-]*(?:/[A-Za-z0-9][A-Za-z0-9._+-]*)+$`).MatchString(value) {
+		return false
+	}
+	_, err := time.LoadLocation(value)
+	return err == nil
+}
+func validDelivery(p deliveryP, kind string) bool {
+	if !netRE.MatchString(p.Interface) || !macRE.MatchString(p.ExpectedMAC) || len(p.ExpectedAddresses) < 1 || len(p.ExpectedAddresses) > 16 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, address := range p.ExpectedAddresses {
+		ip := net.ParseIP(address)
+		if ip == nil || seen[address] {
+			return false
+		}
+		seen[address] = true
+	}
+	return kind != "qemu" || *p.RequireQGA
+}
+func diskSizeBytes(drive string) (uint64, error) {
+	for _, segment := range strings.Split(drive, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok || key != "size" {
+			continue
+		}
+		match := regexp.MustCompile(`^([0-9]+(?:\.[0-9]{1,3})?)([KMGT])$`).FindStringSubmatch(value)
+		if len(match) != 3 {
+			return 0, errors.New("current disk size is invalid")
+		}
+		number, err := strconv.ParseFloat(match[1], 64)
+		if err != nil || number <= 0 {
+			return 0, errors.New("current disk size is invalid")
+		}
+		shift := map[string]uint{"K": 10, "M": 20, "G": 30, "T": 40}[match[2]]
+		bytes := number * float64(uint64(1)<<shift)
+		if bytes > float64(^uint64(0)) {
+			return 0, errors.New("current disk size is too large")
+		}
+		return uint64(bytes), nil
+	}
+	return 0, errors.New("current disk size is unavailable")
+}
+func mergeDiskLimits(drive string, p diskLimitsP) (string, error) {
+	if len(drive) > 4096 || strings.ContainsAny(drive, "\x00\r\n") {
+		return "", errors.New("unsafe existing disk configuration")
+	}
+	managed := map[string]bool{"iops_rd": true, "iops_wr": true, "iops_rd_max": true, "iops_wr_max": true, "iops_rd_max_length": true, "iops_wr_max_length": true, "mbps_rd": true, "mbps_wr": true, "mbps_rd_max": true, "mbps_wr_max": true}
+	parts := strings.Split(drive, ",")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" || strings.Contains(parts[0], "=") {
+		return "", errors.New("unsafe disk volume identity")
+	}
+	out := []string{strings.TrimSpace(parts[0])}
+	for _, segment := range parts[1:] {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		key, _, ok := strings.Cut(segment, "=")
+		if !ok || key == "" {
+			return "", errors.New("invalid existing disk configuration")
+		}
+		if !managed[key] {
+			out = append(out, segment)
+		}
+	}
+	for _, item := range []struct {
+		key string
+		val *int64
+	}{{"iops_rd", p.IOPSRead}, {"iops_wr", p.IOPSWrite}, {"iops_rd_max", p.IOPSReadMax}, {"iops_wr_max", p.IOPSWriteMax}, {"iops_rd_max_length", p.IOPSReadMaxLength}, {"iops_wr_max_length", p.IOPSWriteMaxLength}, {"mbps_rd", p.MBPSRead}, {"mbps_wr", p.MBPSWrite}, {"mbps_rd_max", p.MBPSReadMax}, {"mbps_wr_max", p.MBPSWriteMax}} {
+		if item.val != nil {
+			out = append(out, item.key+"="+strconv.FormatInt(*item.val, 10))
+		}
+	}
+	return strings.Join(out, ","), nil
+}
+
+type DeliveryVerificationResult struct {
+	State            string   `json:"state"`
+	Interface        string   `json:"interface"`
+	MAC              string   `json:"mac"`
+	MatchedAddresses []string `json:"matchedAddresses"`
+	QGAAvailable     bool     `json:"qgaAvailable"`
+	NetworkVerified  bool     `json:"networkVerified"`
+}
+
+func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
+	var p deliveryP
+	if err := strictParameters(command.Parameters, &p); err != nil {
+		return nil, err
+	}
+	current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.ToLower(strings.TrimSpace(current.Status)) != "running" {
+		return nil, errors.New("guest is not running")
+	}
+	config, err := client.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return nil, err
+	}
+	network, ok := configString(config.Raw, p.Interface)
+	if !ok {
+		return nil, errors.New("target network interface does not exist")
+	}
+	configuredMAC, err := networkMAC(command.Identity.GuestType, network)
+	if err != nil || !strings.EqualFold(configuredMAC, p.ExpectedMAC) {
+		return nil, errors.New("configured network MAC does not match delivery identity")
+	}
+	matched := make([]string, 0, len(p.ExpectedAddresses))
+	qgaAvailable := false
+	if command.Identity.GuestType == "qemu" {
+		observation, probeErr := client.ProbeGuestAgent(ctx, command.Identity.NodeRef, command.Identity.VMID)
+		if probeErr != nil {
+			return nil, probeErr
+		}
+		qgaAvailable = observation.Availability["info"] == pve.Available && observation.Availability["interfaces"] == pve.Available
+		if *p.RequireQGA && !qgaAvailable {
+			return nil, errors.New("QGA network information is unavailable")
+		}
+		for _, iface := range observation.Interfaces {
+			if !strings.EqualFold(strings.TrimSpace(iface.HardwareAddress), p.ExpectedMAC) {
+				continue
+			}
+			present := map[string]bool{}
+			for _, address := range iface.IPAddresses {
+				present[strings.TrimSpace(address.Address)] = true
+			}
+			for _, expected := range p.ExpectedAddresses {
+				if present[expected] {
+					matched = append(matched, expected)
+				}
+			}
+			break
+		}
+	} else {
+		present := lxcConfiguredAddresses(network)
+		for _, expected := range p.ExpectedAddresses {
+			if present[expected] {
+				matched = append(matched, expected)
+			}
+		}
+	}
+	if len(matched) != len(p.ExpectedAddresses) {
+		return nil, errors.New("guest network addresses are not ready")
+	}
+	result, err := json.Marshal(DeliveryVerificationResult{State: "running", Interface: p.Interface, MAC: strings.ToUpper(p.ExpectedMAC), MatchedAddresses: matched, QGAAvailable: qgaAvailable, NetworkVerified: true})
+	return result, err
+}
+func networkMAC(kind, value string) (string, error) {
+	for _, segment := range strings.Split(value, ",") {
+		key, candidate, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok {
+			continue
+		}
+		if kind == "qemu" && validModel(key) || kind == "lxc" && key == "hwaddr" {
+			if macRE.MatchString(candidate) {
+				return candidate, nil
+			}
+			return "", errors.New("configured network MAC is invalid")
+		}
+	}
+	return "", errors.New("configured network MAC is unavailable")
+}
+func lxcConfiguredAddresses(value string) map[string]bool {
+	result := map[string]bool{}
+	for _, segment := range strings.Split(value, ",") {
+		key, candidate, ok := strings.Cut(strings.TrimSpace(segment), "=")
+		if !ok || (key != "ip" && key != "ip6") {
+			continue
+		}
+		address := strings.SplitN(candidate, "/", 2)[0]
+		if net.ParseIP(address) != nil {
+			result[address] = true
+		}
+	}
+	return result
 }
 func validNetwork(p networkP, kind string) bool {
 	if !netRE.MatchString(p.Interface) || (p.Bridge == nil && p.Model == nil && p.MAC == nil && p.VLAN == nil && p.MTU == nil && p.Firewall == nil && p.RateMbps == nil && p.IPv4 == nil && p.IPv6 == nil && p.Gateway4 == nil && p.Gateway6 == nil) || (kind == "lxc" && p.Model != nil) {
