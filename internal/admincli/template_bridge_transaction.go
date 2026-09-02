@@ -282,7 +282,7 @@ func (m *pveTemplateBridgeManager) captureStableNetworkBaseline(ctx context.Cont
 		return templateBridgeNetworkBaseline{}, err
 	}
 	raw, err := m.runner.Run(ctx, templateBridgePerl,
-		"-MPVE::INotify", "-MJSON::PP", "-e", templateBridgePerlParser, "--", path)
+		"-MPVE::INotify", "-MJSON::PP", "-MIO::File", "-e", templateBridgePerlParser, "--", path)
 	if err != nil {
 		return templateBridgeNetworkBaseline{}, fmt.Errorf("PVE network parser 失败: %w", err)
 	}

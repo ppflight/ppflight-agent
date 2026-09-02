@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -280,7 +281,7 @@ type scriptedBridgeRunner struct {
 func (r *scriptedBridgeRunner) Run(_ context.Context, program string, args ...string) ([]byte, error) {
 	r.t.Helper()
 	if program == templateBridgePerl {
-		expectedArgs := []string{"-MPVE::INotify", "-MJSON::PP", "-e", templateBridgePerlParser, "--"}
+		expectedArgs := []string{"-MPVE::INotify", "-MJSON::PP", "-MIO::File", "-e", templateBridgePerlParser, "--"}
 		if len(args) != len(expectedArgs)+1 || !slices.Equal(args[:len(expectedArgs)], expectedArgs) {
 			r.t.Fatalf("unexpected parser command: %s %v", program, args)
 		}
@@ -308,6 +309,78 @@ func (r *scriptedBridgeRunner) Run(_ context.Context, program string, args ...st
 		expected.before()
 	}
 	return []byte(expected.output), expected.err
+}
+
+func TestTemplateBridgePerlParserSupportsPVE8AndPVE9PublicContracts(t *testing.T) {
+	perl, err := exec.LookPath("perl")
+	if err != nil {
+		t.Skip("perl is unavailable")
+	}
+	networkPath := filepath.Join(t.TempDir(), "interfaces")
+	if err := os.WriteFile(networkPath, []byte("auto vmbr0\niface vmbr0 inet manual\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	contracts := map[string]string{
+		"PVE8-proc-net-dev-handle": `package PVE::INotify;
+use strict; use warnings; use IO::File;
+sub __read_etc_network_interfaces {
+    my ($fh, $proc_net_dev, $active) = @_;
+    die "legacy helper did not receive a file handle" if !defined(fileno($proc_net_dev));
+    my $line = <$fh>;
+    return { ifaces => { vmbr0 => { type => 'bridge', source => $line } }, options => [] };
+}
+sub read_etc_network_interfaces {
+    my ($filename, $fh) = @_;
+    my $proc_net_dev = IO::File->new($filename, 'r') or die "fixture open";
+    return __read_etc_network_interfaces($fh, $proc_net_dev, []);
+}
+1;
+`,
+		"PVE9-ip-link-hash": `package PVE::INotify;
+use strict; use warnings;
+sub __read_etc_network_interfaces {
+    my ($fh, $ip_links, $active) = @_;
+    die "new helper did not receive an ip-link hash" if ref($ip_links) ne 'HASH';
+    my $line = <$fh>;
+    return { ifaces => { vmbr0 => { type => 'bridge', source => $line } }, options => [] };
+}
+sub read_etc_network_interfaces {
+    my ($filename, $fh) = @_;
+    return __read_etc_network_interfaces($fh, {}, []);
+}
+1;
+`,
+	}
+
+	for name, module := range contracts {
+		t.Run(name, func(t *testing.T) {
+			moduleRoot := t.TempDir()
+			moduleDir := filepath.Join(moduleRoot, "PVE")
+			if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(moduleDir, "INotify.pm"), []byte(module), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(perl,
+				"-I", moduleRoot,
+				"-MPVE::INotify", "-MJSON::PP", "-MIO::File",
+				"-e", templateBridgePerlParser, "--", networkPath,
+			)
+			raw, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("parser failed: %v: %s", err, raw)
+			}
+			semantic, err := decodeTemplateBridgeNetworkSemantic(raw)
+			if err != nil {
+				t.Fatalf("invalid parser output: %v: %s", err, raw)
+			}
+			if _, ok := templateBridgeSemanticIface(semantic, "vmbr0"); !ok {
+				t.Fatalf("vmbr0 missing from parser output: %s", raw)
+			}
+		})
+	}
 }
 
 const (

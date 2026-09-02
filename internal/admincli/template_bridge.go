@@ -25,7 +25,11 @@ const (
 	templateBridgePerl               = "/usr/bin/perl"
 	templateBridgePVESh              = "/usr/bin/pvesh"
 	templateBridgeIP                 = "/usr/sbin/ip"
-	templateBridgePerlParser         = `use strict; use warnings; my $path = shift @ARGV; open(my $fh, '<', $path) or die "open: $!"; my $cfg = PVE::INotify::__read_etc_network_interfaces($fh, {}, []); close($fh) or die "close: $!"; print JSON::PP->new->canonical(1)->encode($cfg);`
+	// Use the public parser wrapper rather than the private __read helper. PVE 8
+	// releases changed the private helper's second argument from a /proc/net/dev
+	// file handle to an ip-link hash, while this public filename/filehandle
+	// contract remains valid across PVE 8 and PVE 9.
+	templateBridgePerlParser = `use strict; use warnings; my $path = shift @ARGV; my $fh = IO::File->new($path, 'r') or die "open: $!"; my $cfg = PVE::INotify::read_etc_network_interfaces($path, $fh); $fh->close() or die "close: $!"; print JSON::PP->new->canonical(1)->encode($cfg);`
 )
 
 var templateBridgeUPIDPattern = regexp.MustCompile(`\AUPID:[A-Za-z0-9@!+,:._-]{1,511}\z`)
