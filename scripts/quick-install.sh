@@ -20,7 +20,7 @@ die() {
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die '请在 PVE root 终端执行'
 
-for required_command in curl sha256sum tar mktemp uname cut; do
+for required_command in curl sha256sum tar mktemp uname cut date; do
   command -v "$required_command" >/dev/null 2>&1 || die "缺少命令: $required_command"
 done
 
@@ -55,6 +55,11 @@ cd -- "$INSTALL_TEMP_DIR"
 printf '正在下载 PPFlight Agent %s 滚动最新版 (%s)...\n' "$RELEASE_CHANNEL" "$RELEASE_ARCH"
 rolling_verified=0
 for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
+  # rolling-main intentionally replaces the same object names.  A unique query
+  # key plus no-cache headers prevents a fresh install from receiving a
+  # coherent but obsolete SHA256SUMS/archive pair from an edge cache.  The
+  # checksum loop still protects the atomic branch-switch race.
+  rolling_cache_key="$(date -u +%s%N)-$$-$rolling_attempt"
   curl \
     --disable \
     --ipv4 \
@@ -70,7 +75,9 @@ for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
     --max-time 180 \
     --retry 3 \
     --retry-all-errors \
-    "$RELEASE_BASE/SHA256SUMS" \
+    --header 'Cache-Control: no-cache' \
+    --header 'Pragma: no-cache' \
+    "$RELEASE_BASE/SHA256SUMS?ppflight_cache=$rolling_cache_key" \
     --output SHA256SUMS
   [[ $(wc -l < SHA256SUMS) -eq 2 ]] || die '滚动发布校验清单行数无效'
   if grep -Evq '^[0-9a-f]{64}  ppflight-agent-main-linux-(amd64|arm64)\.tar\.gz$' SHA256SUMS; then
@@ -93,7 +100,9 @@ for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
     --max-time 180 \
     --retry 3 \
     --retry-all-errors \
-    "$RELEASE_BASE/$ARCHIVE" \
+    --header 'Cache-Control: no-cache' \
+    --header 'Pragma: no-cache' \
+    "$RELEASE_BASE/$ARCHIVE?ppflight_cache=$rolling_cache_key" \
     --output "$ARCHIVE"
   if printf '%s  %s\n' "$release_sha256" "$ARCHIVE" | sha256sum --check --status -; then
     rolling_verified=1

@@ -1,8 +1,8 @@
 {
   "schemaVersion": "ppflight.template-catalog/v1",
   "catalogId": "ppflight-proxmox-templates",
-  "catalogRevision": "2026-09-02.1",
-  "issuedAt": "2026-09-02T04:25:30Z",
+  "catalogRevision": "2026-09-02.2",
+  "issuedAt": "2026-09-02T04:57:29Z",
   "websitePath": "/vps/proxmox-templates",
   "items": [
     {
@@ -108,11 +108,11 @@
       "source": {
         "kind": "official-cloud-image",
         "urlKey": "debian-13-generic-amd64",
-        "sha256": "ba8c002cbb083698e652b6853a5d1ef78e73f07ac8510dff7563de812c56789f",
+        "sha256": "ce793c5de15b3d7f2294e4d054a20dc5600751018c0d2e9682ffee2d5a580939",
         "format": "qcow2",
         "upstreamChecksum": {
           "algorithm": "sha512",
-          "value": "720d9a2d21167e8aa1bb86a8a816658c7beaeec6975c376e15a0761383a869a466cbf7fe11c287c989020070309889dd81c37cd412290531245e3562334e05f3"
+          "value": "5a069019420fb9441ad4f8004c661fadb747edd5662ca54a17c8f923dee7d717e21dbdaa4ba72d6fce7f920e0217f0a9af382298a7d46ed4bc9dc33ac19181b6"
         }
       },
       "target": {
@@ -121,7 +121,7 @@
         "diskBus": "scsi0",
         "agentEnabled": true
       },
-      "minimumBytes": 433651712,
+      "minimumBytes": 435683328,
       "build": {
         "family": "debian",
         "templateName": "debian-13",
@@ -170,11 +170,11 @@
       "source": {
         "kind": "official-cloud-image",
         "urlKey": "centos-stream-9-genericcloud-amd64",
-        "sha256": "9bc2838008fc212eb9b7c7fdf6ea26f572afdeeaa254fa973ef5cd528b87adcf",
+        "sha256": "96cd8355802bd6454f8df8363cc899660a7cd9becf0af947675835e945eb7155",
         "format": "qcow2",
         "upstreamChecksum": {
           "algorithm": "sha256",
-          "value": "9bc2838008fc212eb9b7c7fdf6ea26f572afdeeaa254fa973ef5cd528b87adcf"
+          "value": "96cd8355802bd6454f8df8363cc899660a7cd9becf0af947675835e945eb7155"
         }
       },
       "target": {
@@ -183,7 +183,7 @@
         "diskBus": "scsi0",
         "agentEnabled": true
       },
-      "minimumBytes": 1277493248,
+      "minimumBytes": 1277165568,
       "build": {
         "family": "rhel",
         "templateName": "centos-stream-9",
@@ -201,11 +201,11 @@
       "source": {
         "kind": "official-cloud-image",
         "urlKey": "centos-stream-10-genericcloud-amd64",
-        "sha256": "9cff5cbfd35c0c9070619c83ce9cad65d4eab845c9b83fb72c1b9209453d085b",
+        "sha256": "d33095d9bb4b3f5a168794b92f174e5e71c031210e63ef75bfd91d9d13a7de01",
         "format": "qcow2",
         "upstreamChecksum": {
           "algorithm": "sha256",
-          "value": "9cff5cbfd35c0c9070619c83ce9cad65d4eab845c9b83fb72c1b9209453d085b"
+          "value": "d33095d9bb4b3f5a168794b92f174e5e71c031210e63ef75bfd91d9d13a7de01"
         }
       },
       "target": {
@@ -214,7 +214,7 @@
         "diskBus": "scsi0",
         "agentEnabled": true
       },
-      "minimumBytes": 1047003136,
+      "minimumBytes": 1048313856,
       "build": {
         "family": "rhel",
         "templateName": "centos-stream-10",

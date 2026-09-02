@@ -89,14 +89,14 @@ BUILDER_SETTING_KEYS = {
 URL_SPECS: Mapping[str, Mapping[str, str]] = {
     "ubuntu-jammy-release-amd64": {
         "filename": "ubuntu-22.04-server-cloudimg-amd64.img",
-        "url": "https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.img",
-        "checksumUrl": "https://cloud-images.ubuntu.com/releases/jammy/release/SHA256SUMS",
+        "url": "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/ubuntu-22.04-server-cloudimg-amd64.img",
+        "checksumUrl": "https://cloud-images.ubuntu.com/releases/jammy/release-20260826/SHA256SUMS",
         "checksumAlgorithm": "sha256",
     },
     "ubuntu-noble-release-amd64": {
         "filename": "ubuntu-24.04-server-cloudimg-amd64.img",
-        "url": "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img",
-        "checksumUrl": "https://cloud-images.ubuntu.com/releases/noble/release/SHA256SUMS",
+        "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img",
+        "checksumUrl": "https://cloud-images.ubuntu.com/releases/noble/release-20260826/SHA256SUMS",
         "checksumAlgorithm": "sha256",
     },
     "almalinux-8-genericcloud-amd64": {
@@ -106,27 +106,27 @@ URL_SPECS: Mapping[str, Mapping[str, str]] = {
         "checksumAlgorithm": "sha256",
     },
     "debian-13-generic-amd64": {
-        "filename": "debian-13-generic-amd64.qcow2",
-        "url": "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
-        "checksumUrl": "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS",
+        "filename": "debian-13-generic-amd64-20260831-2587.qcow2",
+        "url": "https://cloud.debian.org/images/cloud/trixie/20260831-2587/debian-13-generic-amd64-20260831-2587.qcow2",
+        "checksumUrl": "https://cloud.debian.org/images/cloud/trixie/20260831-2587/SHA512SUMS",
         "checksumAlgorithm": "sha512",
     },
     "debian-12-generic-amd64": {
-        "filename": "debian-12-generic-amd64.qcow2",
-        "url": "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
-        "checksumUrl": "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS",
+        "filename": "debian-12-generic-amd64-20260821-2577.qcow2",
+        "url": "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/debian-12-generic-amd64-20260821-2577.qcow2",
+        "checksumUrl": "https://cloud.debian.org/images/cloud/bookworm/20260821-2577/SHA512SUMS",
         "checksumAlgorithm": "sha512",
     },
     "centos-stream-9-genericcloud-amd64": {
-        "filename": "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
-        "url": "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
-        "checksumUrl": "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2.SHA256SUM",
+        "filename": "CentOS-Stream-GenericCloud-9-20260901.0.x86_64.qcow2",
+        "url": "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260901.0.x86_64.qcow2",
+        "checksumUrl": "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20260901.0.x86_64.qcow2.SHA256SUM",
         "checksumAlgorithm": "sha256",
     },
     "centos-stream-10-genericcloud-amd64": {
-        "filename": "CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2",
-        "url": "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2",
-        "checksumUrl": "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2.SHA256SUM",
+        "filename": "CentOS-Stream-GenericCloud-10-20260901.0.x86_64.qcow2",
+        "url": "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-20260901.0.x86_64.qcow2",
+        "checksumUrl": "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-20260901.0.x86_64.qcow2.SHA256SUM",
         "checksumAlgorithm": "sha256",
     },
 }
