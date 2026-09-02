@@ -137,7 +137,7 @@ func legacyNodeSelector(values map[string]any) bool {
 }
 
 func (b *commandBackend) VerifyRuntimeIngressDrops(ctx context.Context, journal Journal) error {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return err
 	}

@@ -35,9 +35,11 @@ var productionEvidence = []string{
 }
 
 type Service struct {
-	store    store
-	backend  backend
-	evidence []string
+	store           store
+	backend         backend
+	evidence        []string
+	transactionLock func(context.Context) (func(), error)
+	enforcementLock func(context.Context) (context.Context, func(), error)
 }
 
 // TransactionOverview is a non-secret, read-only view used by the local AG
@@ -94,7 +96,25 @@ func inspectTransactionLive(ctx context.Context, target backend, journal Journal
 }
 
 func productionService() *Service {
-	return &Service{store: productionStore(), backend: productionBackend(), evidence: productionEvidence}
+	return &Service{
+		store: productionStore(), backend: productionBackend(), evidence: productionEvidence,
+		transactionLock: acquireFirewallTransactionLock,
+		enforcementLock: acquireFirewallEnforcementLock,
+	}
+}
+
+func (service *Service) lockTransaction(ctx context.Context) (func(), error) {
+	if service.transactionLock == nil {
+		return func() {}, nil
+	}
+	return service.transactionLock(ctx)
+}
+
+func (service *Service) lockEnforcement(ctx context.Context) (context.Context, func(), error) {
+	if service.enforcementLock == nil {
+		return context.WithValue(ctx, firewallNetfilterLockContextKey{}, true), func() {}, nil
+	}
+	return service.enforcementLock(ctx)
 }
 
 func (service *Service) Classify() (InstallMode, error) {
@@ -164,7 +184,7 @@ func validateInstallationEvidence(path string) (bool, error) {
 }
 
 func (service *Service) Activate(ctx context.Context) (returnErr error) {
-	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	transactionUnlock, lockErr := service.lockTransaction(ctx)
 	if lockErr != nil {
 		return lockErr
 	}
@@ -521,7 +541,7 @@ func (service *Service) verifyRuntimeIngressDrops(ctx context.Context, journal J
 // transaction. Existing installations without a journal remain a strict no-op,
 // so an ordinary rolling update never opts a host into firewall management.
 func (service *Service) ReconcileCommitted(ctx context.Context) (bool, error) {
-	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	transactionUnlock, lockErr := service.lockTransaction(ctx)
 	if lockErr != nil {
 		return false, lockErr
 	}
@@ -571,7 +591,7 @@ func (service *Service) ReconcileCommitted(ctx context.Context) (bool, error) {
 // PVE-native top-level INPUT hooks if another firewall manager inserted rules
 // ahead of them.
 func (service *Service) EnforceCommitted(ctx context.Context) error {
-	lockedContext, enforcementUnlock, lockErr := acquireFirewallEnforcementLock(ctx)
+	lockedContext, enforcementUnlock, lockErr := service.lockEnforcement(ctx)
 	if lockErr != nil {
 		return lockErr
 	}
@@ -731,7 +751,7 @@ func rulesWithComment(rules []firewallRule, comment string) []firewallRule {
 }
 
 func (service *Service) Rollback(ctx context.Context, uninstall bool) error {
-	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	transactionUnlock, lockErr := service.lockTransaction(ctx)
 	if lockErr != nil {
 		return lockErr
 	}

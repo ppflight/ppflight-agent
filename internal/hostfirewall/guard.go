@@ -32,7 +32,7 @@ type parsedInputChain struct {
 // CaptureIngressGuard is read-only. The caller must durably persist both
 // family snapshots before any native-hook movement is permitted.
 func (b *commandBackend) CaptureIngressGuard(ctx context.Context) ([]nativeInputHookSnapshot, error) {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func (b *commandBackend) CaptureIngressGuard(ctx context.Context) ([]nativeInput
 }
 
 func (b *commandBackend) EnsureIngressGuard(ctx context.Context, journal Journal) error {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return err
 	}
@@ -75,7 +75,7 @@ func (b *commandBackend) EnsureIngressGuard(ctx context.Context, journal Journal
 // Cluster disable/reload, zero native hooks is an expected transient. When
 // PVE appends its sole exact hook again, one atomic restore batch moves it.
 func (b *commandBackend) MaintainIngressGuard(ctx context.Context, journal Journal) (bool, error) {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -118,7 +118,7 @@ func (b *commandBackend) maintainIngressGuard(ctx context.Context, journal Journ
 }
 
 func (b *commandBackend) VerifyIngressGuard(ctx context.Context, journal Journal) error {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (b *commandBackend) RemoveIngressGuard(ctx context.Context, journal Journal
 	if err := requireNativeHookSnapshots(journal); err != nil {
 		return err
 	}
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return err
 	}
@@ -351,7 +351,7 @@ func firewallTarget(fields []string) string {
 }
 
 func (b *commandBackend) InputChainOrder(ctx context.Context) ([]inputChainOrder, error) {
-	unlock, err := acquireFirewallProcessLock(ctx)
+	unlock, err := b.lockProcess(ctx)
 	if err != nil {
 		return nil, err
 	}

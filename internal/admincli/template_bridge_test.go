@@ -550,6 +550,13 @@ func TestSafeTemplateBridgeNameHonorsLinuxInterfaceLimit(t *testing.T) {
 	}
 }
 
+func TestProductionTemplateBridgeManagerRequiresRootOwnedNetworkFiles(t *testing.T) {
+	manager := newPVETemplateBridgeManager("pve", &scriptedBridgeRunner{t: t})
+	if !manager.requireRootFiles {
+		t.Fatal("production bridge manager did not require root-owned PVE network files")
+	}
+}
+
 func TestTemplateBridgeRunnerRejectsUnexpectedProgram(t *testing.T) {
 	if _, err := (templateBridgeExecRunner{}).Run(context.Background(), "/bin/sh", "-c", "true"); err == nil || !strings.Contains(err.Error(), "不允许") {
 		t.Fatalf("err=%v", err)

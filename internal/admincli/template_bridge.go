@@ -75,7 +75,7 @@ func (c *cli) ensureTemplateInternalBridge(ctx context.Context, reader *bufio.Re
 		if err != nil {
 			return false, err
 		}
-		manager = &pveTemplateBridgeManager{node: node, runner: templateBridgeExecRunner{}}
+		manager = newPVETemplateBridgeManager(node, templateBridgeExecRunner{})
 	}
 	inspectCtx, cancelInspect := context.WithTimeout(ctx, templateBridgeOperationTimeout)
 	state, err := manager.Inspect(inspectCtx, name)
@@ -278,6 +278,11 @@ type pveTemplateBridgeManager struct {
 	pendingNetworkPath string
 	networkLockPath    string
 	kernelProbe        func(string) (bool, error)
+	requireRootFiles   bool
+}
+
+func newPVETemplateBridgeManager(node string, runner templateBridgeRunner) *pveTemplateBridgeManager {
+	return &pveTemplateBridgeManager{node: node, runner: runner, requireRootFiles: true}
 }
 
 type templateBridgeFileSnapshot struct {

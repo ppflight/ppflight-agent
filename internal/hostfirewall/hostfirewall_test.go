@@ -148,6 +148,14 @@ func TestUnixFirewallLockContractIsRootOnlyNoFollowAndFlocked(t *testing.T) {
 	}
 }
 
+func TestProductionFirewallConstructorsWireRootOnlyLocks(t *testing.T) {
+	backend := productionBackend()
+	service := productionService()
+	if backend.processLock == nil || service.transactionLock == nil || service.enforcementLock == nil {
+		t.Fatal("production firewall constructors omitted a required root-only process lock")
+	}
+}
+
 func TestActivationHealthFailureRestoresExactPreimage(t *testing.T) {
 	fake := newFakeBackend()
 	fake.cluster = map[string]any{"enable": "0", "policy_in": "ACCEPT"}

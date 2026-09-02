@@ -116,7 +116,7 @@ esac
 	if start < 0 {
 		t.Fatal("could not isolate stop_required_unit from uninstaller")
 	}
-	end := strings.Index(source[start:], "\n\n# The upgrade path/service")
+	end := strings.Index(source[start:], "\n\n# The upgrade helper")
 	if end < 0 {
 		t.Fatal("could not isolate stop_required_unit from uninstaller")
 	}

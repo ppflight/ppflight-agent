@@ -26,7 +26,7 @@ func (m *pveTemplateBridgeManager) createSafely(ctx context.Context, name string
 	// PVE serializes every network create/update/delete with this same lock. The
 	// baseline must be captured while holding it, otherwise an administrator's
 	// already-pending edit could be mistaken for part of our bridge creation.
-	baselineLock, err := acquireTemplateBridgeNetworkLock(ctx, lockPath)
+	baselineLock, err := acquireTemplateBridgeNetworkLock(ctx, lockPath, m.requireRootFiles)
 	if err != nil {
 		return templateBridgeState{}, fmt.Errorf("获取 PVE network 配置锁失败: %w", err)
 	}
@@ -67,7 +67,7 @@ func (m *pveTemplateBridgeManager) createSafely(ctx context.Context, name string
 	// POST itself takes the PVE lock, but we intentionally did not hold it while
 	// invoking POST (that would self-deadlock). Reacquire the exact same lock and
 	// prove that no other active or pending change entered the gap.
-	applyLock, err := acquireTemplateBridgeNetworkLock(ctx, lockPath)
+	applyLock, err := acquireTemplateBridgeNetworkLock(ctx, lockPath, m.requireRootFiles)
 	if err != nil {
 		return templateBridgeState{}, fmt.Errorf("安全网桥已写入 pending network，但无法重新获取 PVE network 配置锁: %w；未自动应用，请在 PVE 检查 pending 配置", err)
 	}
@@ -200,14 +200,14 @@ func (m *pveTemplateBridgeManager) templateNetworkPaths() (string, string, strin
 	return active, pending, lock
 }
 
-func acquireTemplateBridgeNetworkLock(ctx context.Context, path string) (*fsutil.Lock, error) {
+func acquireTemplateBridgeNetworkLock(ctx context.Context, path string, requireRoot bool) (*fsutil.Lock, error) {
 	deadline := time.NewTimer(templateBridgeNetworkLockTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if info, err := os.Lstat(path); err == nil {
-			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !templateBridgeFileOwnedByRoot(info) || !templateBridgeFileModeSecure(info) {
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || requireRoot && !templateBridgeFileOwnedByRoot(info) || !templateBridgeFileModeSecure(info) {
 				return nil, errors.New("PVE network lock 不是 root-only 普通文件")
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -216,7 +216,7 @@ func acquireTemplateBridgeNetworkLock(ctx context.Context, path string) (*fsutil
 		lock, err := fsutil.AcquireExclusive(path)
 		if err == nil {
 			info, statErr := os.Lstat(path)
-			if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !templateBridgeFileOwnedByRoot(info) || !templateBridgeFileModeSecure(info) {
+			if statErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || requireRoot && !templateBridgeFileOwnedByRoot(info) || !templateBridgeFileModeSecure(info) {
 				_ = lock.Close()
 				if statErr != nil {
 					return nil, statErr
@@ -244,7 +244,7 @@ func requireTemplateBridgeFileAbsent(path string) error {
 	return nil
 }
 
-func captureTemplateBridgeSecureFile(path string) (templateBridgeFileSnapshot, error) {
+func captureTemplateBridgeSecureFile(path string, requireRoot bool) (templateBridgeFileSnapshot, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return templateBridgeFileSnapshot{}, err
@@ -252,7 +252,7 @@ func captureTemplateBridgeSecureFile(path string) (templateBridgeFileSnapshot, e
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return templateBridgeFileSnapshot{}, errors.New("network 配置不是普通文件或为软链接")
 	}
-	if !templateBridgeFileOwnedByRoot(info) {
+	if requireRoot && !templateBridgeFileOwnedByRoot(info) {
 		return templateBridgeFileSnapshot{}, errors.New("network 配置不属于 root")
 	}
 	if !templateBridgeFileModeSecure(info) {
@@ -277,7 +277,7 @@ func sha256Sum(raw []byte) [32]byte {
 }
 
 func (m *pveTemplateBridgeManager) captureStableNetworkBaseline(ctx context.Context, path string) (templateBridgeNetworkBaseline, error) {
-	before, err := captureTemplateBridgeSecureFile(path)
+	before, err := captureTemplateBridgeSecureFile(path, m.requireRootFiles)
 	if err != nil {
 		return templateBridgeNetworkBaseline{}, err
 	}
@@ -290,7 +290,7 @@ func (m *pveTemplateBridgeManager) captureStableNetworkBaseline(ctx context.Cont
 	if err != nil {
 		return templateBridgeNetworkBaseline{}, err
 	}
-	after, err := captureTemplateBridgeSecureFile(path)
+	after, err := captureTemplateBridgeSecureFile(path, m.requireRootFiles)
 	if err != nil {
 		return templateBridgeNetworkBaseline{}, err
 	}

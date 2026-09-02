@@ -135,15 +135,17 @@ func (buffer *cappedBuffer) Write(value []byte) (int, error) {
 }
 
 type commandBackend struct {
-	runner    commandRunner
-	client    *http.Client
-	pathProbe func(string) (bool, error)
+	runner      commandRunner
+	client      *http.Client
+	pathProbe   func(string) (bool, error)
+	processLock func(context.Context) (func(), error)
 }
 
 func productionBackend() *commandBackend {
 	return &commandBackend{
-		runner:    execRunner{},
-		pathProbe: inspectFirewallSelectorPath,
+		runner:      execRunner{},
+		pathProbe:   inspectFirewallSelectorPath,
+		processLock: acquireFirewallProcessLock,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -151,6 +153,16 @@ func productionBackend() *commandBackend {
 			},
 		},
 	}
+}
+
+func (b *commandBackend) lockProcess(ctx context.Context) (func(), error) {
+	if b.processLock == nil {
+		// Direct commandBackend values are test doubles. All production callers
+		// are created through productionBackend, which always wires the root-only
+		// no-follow flock implementation.
+		return func() {}, nil
+	}
+	return b.processLock(ctx)
 }
 
 func (b *commandBackend) pveshGet(ctx context.Context, path string) (json.RawMessage, error) {
