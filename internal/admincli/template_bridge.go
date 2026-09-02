@@ -278,11 +278,15 @@ type pveTemplateBridgeManager struct {
 	pendingNetworkPath string
 	networkLockPath    string
 	kernelProbe        func(string) (bool, error)
+	kernelMembers      func(string) ([]string, error)
 	requireRootFiles   bool
 }
 
 func newPVETemplateBridgeManager(node string, runner templateBridgeRunner) *pveTemplateBridgeManager {
-	return &pveTemplateBridgeManager{node: node, runner: runner, requireRootFiles: true}
+	return &pveTemplateBridgeManager{
+		node: node, runner: runner, requireRootFiles: true,
+		kernelMembers: templateBridgeKernelMembers,
+	}
 }
 
 type templateBridgeFileSnapshot struct {
@@ -368,7 +372,7 @@ func (m *pveTemplateBridgeManager) Inspect(ctx context.Context, name string) (te
 			}
 		}
 		if state.KernelType == "bridge" {
-			members, err := templateBridgeKernelMembers(name)
+			members, err := m.bridgeKernelMembers(name)
 			if err != nil {
 				return templateBridgeState{}, fmt.Errorf("读取内核 bridge 端口失败: %w", err)
 			}
@@ -404,6 +408,15 @@ func (m *pveTemplateBridgeManager) kernelInterfaceExists(name string) (bool, err
 		return m.kernelProbe(name)
 	}
 	return templateBridgeKernelInterfaceExists(name)
+}
+
+func (m *pveTemplateBridgeManager) bridgeKernelMembers(name string) ([]string, error) {
+	if m.kernelMembers == nil {
+		// Direct manager values are deterministic test doubles. The production
+		// constructor always wires the Linux sysfs bridge-member reader.
+		return nil, nil
+	}
+	return m.kernelMembers(name)
 }
 
 func (m *pveTemplateBridgeManager) Create(ctx context.Context, name string) (templateBridgeState, error) {

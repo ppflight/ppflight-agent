@@ -552,8 +552,8 @@ func TestSafeTemplateBridgeNameHonorsLinuxInterfaceLimit(t *testing.T) {
 
 func TestProductionTemplateBridgeManagerRequiresRootOwnedNetworkFiles(t *testing.T) {
 	manager := newPVETemplateBridgeManager("pve", &scriptedBridgeRunner{t: t})
-	if !manager.requireRootFiles {
-		t.Fatal("production bridge manager did not require root-owned PVE network files")
+	if !manager.requireRootFiles || manager.kernelMembers == nil {
+		t.Fatal("production bridge manager omitted root ownership or Linux bridge-member enforcement")
 	}
 }
 
