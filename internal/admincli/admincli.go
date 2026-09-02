@@ -247,7 +247,7 @@ func (c *cli) usage() {
   ag-pve template catalog|discover
   ag-pve template bootstrap [helper 参数]            # plan；--execute 还需原 plan ID/摘要
   ag-pve update                                      # 校验 rolling-main 制品并保留状态更新
-  ag-pve uninstall                                   # 完全卸载，必须交互输入 UNINSTALL
+  ag-pve uninstall                                   # 完全卸载，必须交互输入 y 确认
 
 bind 的一次性绑定码只能经标准输入或 --code-file 私密文件提供，绝不接受命令行参数。website bind 与 monitoring bind 都从本机 /usr/bin/pveversion 自动读取版本，成功写入后会严格回验并自动重启、确认服务加载对应新绑定。show 只显示脱敏配置；test 只做 DNS/TCP/TLS 探测，不发送业务数据；普通 set 原子写入并保留 .bak 备份，不自动重启服务。官网/监控站的远程资产查询修改 API 已预留，待服务端契约完成后补入。`)
 }
@@ -387,12 +387,12 @@ func (c *cli) menuCompleteUninstallAt(reader *bufio.Reader, filename string) int
 	}
 	fmt.Fprintln(c.out, `完全卸载会停止并删除 PPFlight Agent、systemd 服务、PPFlight 专用 PVE Token/用户/ACL、官网/监控绑定凭据、配置、持久队列和本地审计状态。
 不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存或备份文件。`)
-	confirmation, err := c.promptLine(reader, "输入 UNINSTALL 确认完全卸载（其他输入取消）: ")
+	confirmed, err := c.promptYesNo(reader, "确认完全卸载 PPFlight Agent？", false)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法读取卸载确认；未执行任何修改")
 		return 2
 	}
-	if confirmation != "UNINSTALL" {
+	if !confirmed {
 		fmt.Fprintln(c.out, "已取消，未卸载任何内容。")
 		return 0
 	}
@@ -539,13 +539,13 @@ func (c *cli) menuDiscardPendingBinding(reader *bufio.Reader, filename string, m
 		fmt.Fprintln(c.errOut, "清除未决绑定请求已拒绝：生产管理配置或状态目录不安全")
 		return 1
 	}
-	domain, target, confirmation := "website", "PPFlight 官网", "DISCARD WEBSITE PENDING"
+	domain, target := "website", "PPFlight 官网"
 	if monitoring {
-		domain, target, confirmation = "monitoring", "监控站", "DISCARD MONITORING PENDING"
+		domain, target = "monitoring", "监控站"
 	}
 	fmt.Fprintf(c.out, "仅当你已在%s确认撤销旧请求后才能继续；不会删除另一侧绑定、PVE 凭据或运行数据。\n", target)
-	value, err := c.promptLine(reader, fmt.Sprintf("输入 %s 确认清除未决请求（其他输入取消）: ", confirmation))
-	if err != nil || value != confirmation {
+	confirmed, err := c.promptYesNo(reader, fmt.Sprintf("确认清除%s未决绑定请求？", target), false)
+	if err != nil || !confirmed {
 		fmt.Fprintln(c.out, "已取消，未修改本机。")
 		return 0
 	}
@@ -648,9 +648,9 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 	if !ok {
 		return 1
 	}
-	domain, target, confirmation := "website", "PPFlight 官网", "DELETE WEBSITE"
+	domain, target := "website", "PPFlight 官网"
 	if monitoring {
-		domain, target, confirmation = "monitoring", "监控站", "DELETE MONITORING"
+		domain, target = "monitoring", "监控站"
 	}
 	marker, markerFound, markerErr := readUnbindMarker(cfg.Runtime.StateDirectory, domain)
 	if markerErr != nil {
@@ -696,12 +696,12 @@ func (c *cli) menuRemoveBinding(reader *bufio.Reader, filename string, monitorin
 	} else {
 		fmt.Fprintln(c.out, "监控绑定、监控配置和所有持久队列不会被删除；PVE 虚拟机、模板、镜像和备份不受影响。")
 	}
-	value, err := c.promptLine(reader, fmt.Sprintf("输入 %s 确认删除（其他输入取消）: ", confirmation))
+	confirmed, err := c.promptYesNo(reader, fmt.Sprintf("确认删除%s绑定？", target), false)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "无法读取删除确认；未执行任何修改")
 		return 2
 	}
-	if value != confirmation {
+	if !confirmed {
 		fmt.Fprintln(c.out, "已取消，绑定保持不变。")
 		return 0
 	}
@@ -3073,7 +3073,7 @@ func (c *cli) templateInit() int {
 		return 2
 	}
 	discovery.Storages = refreshed
-	backupEnabled, err := c.promptYesNo(reader, "模板创建完成后，是否额外生成备份文件？[Y/n]（回车=是）: ", true)
+	backupEnabled, err := c.promptYesNo(reader, "模板创建完成后，是否额外生成备份文件？", false)
 	if err != nil {
 		return 2
 	}
@@ -3096,7 +3096,7 @@ func (c *cli) templateInit() int {
 	if externalBridge == "" {
 		externalBridge = "vmbr0"
 	}
-	internalEnabled, err := c.promptYesNo(reader, "是否为模板添加内网网卡 net1？[y/N]（回车=否）: ", false)
+	internalEnabled, err := c.promptYesNo(reader, "是否为模板添加内网网卡 net1？", false)
 	if err != nil {
 		return 2
 	}
@@ -3426,8 +3426,8 @@ func (c *cli) chooseTemplateStorage(ctx context.Context, reader *bufio.Reader, s
 	fmt.Fprintln(c.out, "  说明：只增加上述能力，不删除当前已有内容或数据。")
 	fmt.Fprintf(c.out, "  底层命令：%s %s %s\n", remediation.Command.Argv[0], remediation.Command.Argv[1], remediation.Command.Argv[2])
 	fmt.Fprintf(c.out, "            %s %s\n", remediation.Command.Argv[3], remediation.Command.Argv[4])
-	confirmation, err := c.promptLine(reader, "输入 Y 确认配置并继续 [y/N]: ")
-	if err != nil || !strings.EqualFold(confirmation, "y") {
+	confirmed, err := c.promptYesNo(reader, "确认配置 storage content 并继续？", false)
+	if err != nil || !confirmed {
 		return "", storages, errors.New("未确认 storage content 配置，未执行任何变更")
 	}
 	if err := c.applyTemplateRemediation(ctx, choice.Storage, remediation); err != nil {
@@ -3614,7 +3614,12 @@ func (c *cli) promptLine(reader *bufio.Reader, prompt string) (string, error) {
 	return value, nil
 }
 
-func (c *cli) promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {
+func (c *cli) promptYesNo(reader *bufio.Reader, question string, defaultYes bool) (bool, error) {
+	defaultValue := "n"
+	if defaultYes {
+		defaultValue = "y"
+	}
+	prompt := fmt.Sprintf("%s [y/n]（回车默认：%s）: ", strings.TrimSpace(question), defaultValue)
 	for {
 		value, err := c.promptLine(reader, prompt)
 		if err != nil {
@@ -3623,31 +3628,18 @@ func (c *cli) promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) 
 		switch strings.ToLower(value) {
 		case "":
 			return defaultYes, nil
-		case "y", "yes":
+		case "y":
 			return true, nil
-		case "n", "no":
+		case "n":
 			return false, nil
 		default:
-			fmt.Fprintln(c.out, "输入无效：只接受回车、Y 或 N，请重新输入。")
+			fmt.Fprintln(c.out, "输入无效：只接受 y 或 n；直接回车使用显示的默认值。")
 		}
 	}
 }
 
 func (c *cli) promptPlanExecution(reader *bufio.Reader) (bool, error) {
-	for {
-		value, err := c.promptLine(reader, "确认执行以上模板计划？请输入 YES 执行，输入 no 或直接回车取消: ")
-		if err != nil {
-			return false, err
-		}
-		switch {
-		case strings.EqualFold(value, "yes"):
-			return true, nil
-		case value == "" || strings.EqualFold(value, "no"):
-			return false, nil
-		default:
-			fmt.Fprintln(c.out, "输入无效：只接受 YES 或 no，请重新输入。")
-		}
-	}
+	return c.promptYesNo(reader, "确认执行以上模板计划？", false)
 }
 
 func (c *cli) reserved(target, operation string) int {

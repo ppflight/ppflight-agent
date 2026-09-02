@@ -16,10 +16,7 @@ import (
 )
 
 func unbindConfirmation(domain string) string {
-	if domain == "monitoring" {
-		return "DELETE MONITORING\n"
-	}
-	return "DELETE WEBSITE\n"
+	return "y\n"
 }
 
 func beginUnbindForTest(t *testing.T, stateDirectory, domain string, website bindstate.State, monitoring bindstate.MonitoringState) bindstate.UnbindCommit {

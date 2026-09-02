@@ -105,7 +105,7 @@ func (c *cli) ensureTemplateInternalBridge(ctx context.Context, reader *bufio.Re
 	fmt.Fprintln(c.out, "  IPv4/IPv6 地址：无")
 	fmt.Fprintln(c.out, "  默认网关：无")
 	fmt.Fprintln(c.out, "  开机自动启动：是")
-	confirmed, err := c.promptYesNo(reader, fmt.Sprintf("确认创建内网网桥 %s？[y/N]: ", name), false)
+	confirmed, err := c.promptYesNo(reader, fmt.Sprintf("确认创建内网网桥 %s？", name), false)
 	if err != nil || !confirmed {
 		return false, err
 	}

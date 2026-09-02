@@ -100,8 +100,8 @@ URL_SPECS: Mapping[str, Mapping[str, str]] = {
         "checksumAlgorithm": "sha256",
     },
     "almalinux-8-genericcloud-amd64": {
-        "filename": "AlmaLinux-8-GenericCloud-latest.x86_64.qcow2",
-        "url": "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-latest.x86_64.qcow2",
+        "filename": "AlmaLinux-8-GenericCloud-8.10-20260831.x86_64.qcow2",
+        "url": "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/AlmaLinux-8-GenericCloud-8.10-20260831.x86_64.qcow2",
         "checksumUrl": "https://repo.almalinux.org/almalinux/8/cloud/x86_64/images/CHECKSUM",
         "checksumAlgorithm": "sha256",
     },

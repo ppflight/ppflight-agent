@@ -38,7 +38,7 @@ func TestCompleteUninstallAllowsIncompleteBindingMarkers(t *testing.T) {
 					return nil
 				},
 			}
-			if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || !called {
+			if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code != 0 || !called {
 				t.Fatalf("complete uninstall did not purge through incomplete %s marker: code=%d called=%t", marker, code, called)
 			}
 		})
@@ -65,7 +65,7 @@ func TestCompleteUninstallRefusesHeldBindstateTransaction(t *testing.T) {
 			return nil
 		},
 	}
-	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code == 0 || called {
+	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code == 0 || called {
 		t.Fatalf("complete uninstall proceeded while binding transaction was held: code=%d called=%t", code, called)
 	}
 }
@@ -87,10 +87,10 @@ func TestCompleteUninstallReleasesTransactionAfterHelperFailure(t *testing.T) {
 		},
 	}
 
-	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code == 0 || attempts != 1 {
+	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code == 0 || attempts != 1 {
 		t.Fatalf("first complete uninstall did not report helper failure: code=%d attempts=%d", code, attempts)
 	}
-	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || attempts != 2 {
+	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code != 0 || attempts != 2 {
 		t.Fatalf("complete uninstall could not retry after helper failure: code=%d attempts=%d", code, attempts)
 	}
 }
@@ -111,7 +111,7 @@ func TestCompleteUninstallHoldsTransactionWithoutProcessTimeout(t *testing.T) {
 			return nil
 		},
 	}
-	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || !called {
+	if code := instance.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code != 0 || !called {
 		t.Fatalf("complete uninstall code=%d called=%t", code, called)
 	}
 }

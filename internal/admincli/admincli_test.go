@@ -307,7 +307,7 @@ func TestBindingSettingsExplicitlyDiscardRevokedWebsitePendingWithoutTouchingMon
 
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in:           strings.NewReader("2\n3\nDISCARD WEBSITE PENDING\n0\n"),
+		in:           strings.NewReader("2\n3\ny\n0\n"),
 		out:          &output,
 		errOut:       &stderr,
 		effectiveUID: func() int { return 0 },
@@ -353,11 +353,11 @@ func TestSystemOverviewShowsCoreSectionsWithoutSecrets(t *testing.T) {
 	}
 }
 
-func TestMenuCompleteUninstallRequiresExactConfirmation(t *testing.T) {
+func TestMenuCompleteUninstallDefaultsToNo(t *testing.T) {
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("6\nYES\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("6\n\n"), out: &output, errOut: &stderr,
 		effectiveUID:      func() int { return 0 },
 		completeUninstall: func(context.Context) error { called = true; return nil },
 	}
@@ -399,12 +399,12 @@ func TestOneClickUpdateFailsClosedWithoutVerifiedVersion(t *testing.T) {
 	}
 }
 
-func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) {
+func TestMenuCompleteUninstallExecutesPurgeAfterYes(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var output, stderr bytes.Buffer
 	called := false
 	instance := &cli{
-		in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("6\ny\n"), out: &output, errOut: &stderr,
 		effectiveUID:       func() int { return 0 },
 		completeUninstall:  func(context.Context) error { called = true; return nil },
 		managedWritePolicy: allowManagedWriteForTest,
@@ -419,7 +419,7 @@ func TestMenuCompleteUninstallExecutesPurgeAfterExactConfirmation(t *testing.T) 
 
 func TestMenuCompleteUninstallRequiresRoot(t *testing.T) {
 	var output, stderr bytes.Buffer
-	instance := &cli{in: strings.NewReader("6\nUNINSTALL\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
+	instance := &cli{in: strings.NewReader("6\ny\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
 	if code := instance.menu("unused"); code == 0 {
 		t.Fatal("non-root complete uninstall succeeded")
 	}
@@ -436,7 +436,7 @@ func TestWebsiteBindingRemovalKeepsMonitoringTrustDomain(t *testing.T) {
 	var output, stderr bytes.Buffer
 	activated := false
 	instance := &cli{
-		in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr,
+		in: strings.NewReader("y\n"), out: &output, errOut: &stderr,
 		effectiveUID:       func() int { return 0 },
 		managedWritePolicy: allowManagedWriteForTest,
 		activateBinding: func(_ context.Context, loaded config.Config, expected bindingActivationExpectation) error {
@@ -453,7 +453,7 @@ func TestWebsiteBindingRemovalKeepsMonitoringTrustDomain(t *testing.T) {
 			return nil
 		},
 	}
-	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code != 0 {
+	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("y\n")), filename, false); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 	if !activated {
@@ -503,7 +503,7 @@ func TestMonitoringBindingRemovalKeepsWebsiteTrustDomain(t *testing.T) {
 			return nil
 		},
 	}
-	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE MONITORING\n")), filename, true); code != 0 {
+	if code := instance.menuRemoveBinding(bufio.NewReader(strings.NewReader("y\n")), filename, true); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
 	updated, err := config.LoadFile(filename)
@@ -532,7 +532,7 @@ func TestBindingRemovalRequiresRootExactConfirmationAndRollsBackActivationFailur
 	_, websiteState, _ := seedDualBindings(t, filename)
 	var output, stderr bytes.Buffer
 	nonRoot := &cli{out: &output, errOut: &stderr, effectiveUID: func() int { return 1000 }}
-	if code := nonRoot.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code == 0 {
+	if code := nonRoot.menuRemoveBinding(bufio.NewReader(strings.NewReader("y\n")), filename, false); code == 0 {
 		t.Fatal("non-root removed binding")
 	}
 	if _, err := bindstate.Load(filepath.Join(filepath.Dir(filename), "state")); err != nil {
@@ -542,7 +542,7 @@ func TestBindingRemovalRequiresRootExactConfirmationAndRollsBackActivationFailur
 	output.Reset()
 	stderr.Reset()
 	wrong := &cli{out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
-	if code := wrong.menuRemoveBinding(bufio.NewReader(strings.NewReader("YES\n")), filename, false); code != 0 {
+	if code := wrong.menuRemoveBinding(bufio.NewReader(strings.NewReader("\n")), filename, false); code != 0 {
 		t.Fatalf("wrong confirmation code=%d", code)
 	}
 	if _, err := bindstate.Load(filepath.Join(filepath.Dir(filename), "state")); err != nil {
@@ -563,7 +563,7 @@ func TestBindingRemovalRequiresRootExactConfirmationAndRollsBackActivationFailur
 			return nil
 		},
 	}
-	if code := failing.menuRemoveBinding(bufio.NewReader(strings.NewReader("DELETE WEBSITE\n")), filename, false); code == 0 {
+	if code := failing.menuRemoveBinding(bufio.NewReader(strings.NewReader("y\n")), filename, false); code == 0 {
 		t.Fatal("activation failure reported success")
 	}
 	if !recovered {
@@ -628,7 +628,7 @@ func TestPromptYesNoRejectsInvalidAndControlCharacterInput(t *testing.T) {
 	for _, input := range []string{"b^H\ny\n", "b\x08\nY\n"} {
 		var output bytes.Buffer
 		instance := &cli{out: &output, errOut: io.Discard}
-		answer, err := instance.promptYesNo(bufio.NewReader(strings.NewReader(input)), "确认？[Y/n]: ", true)
+		answer, err := instance.promptYesNo(bufio.NewReader(strings.NewReader(input)), "确认？", true)
 		if err != nil || !answer {
 			t.Fatalf("input=%q answer=%t err=%v", input, answer, err)
 		}
@@ -638,7 +638,7 @@ func TestPromptYesNoRejectsInvalidAndControlCharacterInput(t *testing.T) {
 	}
 }
 
-func TestPromptPlanExecutionAcceptsYesOrNoAndRejectsOtherInput(t *testing.T) {
+func TestPromptPlanExecutionAcceptsYOrNAndRejectsOtherInput(t *testing.T) {
 	tests := []struct {
 		name      string
 		input     string
@@ -646,11 +646,11 @@ func TestPromptPlanExecutionAcceptsYesOrNoAndRejectsOtherInput(t *testing.T) {
 		invalid   bool
 		promptCnt int
 	}{
-		{name: "yes", input: "YES\n", want: true, promptCnt: 1},
-		{name: "no", input: "no\n", want: false, promptCnt: 1},
+		{name: "yes", input: "Y\n", want: true, promptCnt: 1},
+		{name: "no", input: "n\n", want: false, promptCnt: 1},
 		{name: "empty cancels", input: "\n", want: false, promptCnt: 1},
-		{name: "invalid then yes", input: "EXECUTE\nYES\n", want: true, invalid: true, promptCnt: 2},
-		{name: "control character then no", input: "b\x08\nno\n", want: false, invalid: true, promptCnt: 2},
+		{name: "invalid then yes", input: "YES\ny\n", want: true, invalid: true, promptCnt: 2},
+		{name: "control character then no", input: "b\x08\nn\n", want: false, invalid: true, promptCnt: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -726,7 +726,7 @@ func TestChooseTemplateStorageAppliesExactContentAndRediscovers(t *testing.T) {
 	if gotStorage != "local" || gotContent != "backup,iso,snippets,vztmpl" {
 		t.Fatalf("pvesm set got storage=%q content=%q", gotStorage, gotContent)
 	}
-	for _, expected := range []string{"输入 Y", "当前能力：备份 (backup)", "需要新增：Cloud-Init 配置 (snippets)", "pvesm set local", "--content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
+	for _, expected := range []string{"[y/n]（回车默认：n）", "当前能力：备份 (backup)", "需要新增：Cloud-Init 配置 (snippets)", "pvesm set local", "--content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("output missing %q: %s", expected, output.String())
 		}
@@ -765,7 +765,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var bootstrapArgs []string
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in: strings.NewReader("\n1\nY\n1\n\n1\nvmbr0\nY\nvmbr0\nvmbr1\n\n"), out: &output, errOut: &stderr, version: "test",
+		in: strings.NewReader("\n1\ny\n1\ny\n1\nvmbr0\ny\nvmbr0\nvmbr1\n\n"), out: &output, errOut: &stderr, version: "test",
 		templateBridges: &fakeTemplateBridgeManager{inspect: []templateBridgeState{safeCreatedBridgeState()}},
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {
@@ -948,7 +948,7 @@ func TestPVEPrepareAndUnbindRefuseButCompleteUninstallPurgesIncompleteBindingTra
 	}
 
 	var output, stderr bytes.Buffer
-	unbindCLI := &cli{in: strings.NewReader("DELETE WEBSITE\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }, managedWritePolicy: allowManagedWriteForTest}
+	unbindCLI := &cli{in: strings.NewReader("y\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }, managedWritePolicy: allowManagedWriteForTest}
 	if code := unbindCLI.menuRemoveBinding(bufio.NewReader(unbindCLI.in), filename, false); code == 0 {
 		t.Fatalf("incomplete binding allowed unbind output=%s stderr=%s", output.String(), stderr.String())
 	}
@@ -964,7 +964,7 @@ func TestPVEPrepareAndUnbindRefuseButCompleteUninstallPurgesIncompleteBindingTra
 		completeUninstall:  func(context.Context) error { called = true; return nil },
 		managedWritePolicy: allowManagedWriteForTest,
 	}
-	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("UNINSTALL\n")), filename); code != 0 || !called {
+	if code := uninstallCLI.menuCompleteUninstallAt(bufio.NewReader(strings.NewReader("y\n")), filename); code != 0 || !called {
 		t.Fatalf("confirmed complete uninstall did not purge incomplete binding state: code=%d called=%t output=%s stderr=%s", code, called, output.String(), stderr.String())
 	}
 }
@@ -988,9 +988,9 @@ func TestUnbindRefusesPendingRequestInEitherBindingDomain(t *testing.T) {
 			// Delete the other domain: the shared transaction guard must still
 			// protect an unresolved request in this one.
 			removeMonitoring := pendingDomain == "website"
-			confirmation := "DELETE WEBSITE\n"
+			confirmation := "y\n"
 			if removeMonitoring {
-				confirmation = "DELETE MONITORING\n"
+				confirmation = "y\n"
 			}
 			var output, stderr bytes.Buffer
 			instance := &cli{

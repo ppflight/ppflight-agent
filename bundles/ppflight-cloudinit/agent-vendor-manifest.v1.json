@@ -1,8 +1,8 @@
 {
   "schemaVersion": "ppflight.agent-vendor-manifest/v1",
-  "bundleVersion": "3.1.0",
-  "catalogRevision": "2026-08-30.1",
-  "catalogSha256": "d716522fe98baf85ab03c2760ac56c90a6f4fc73d1833bb8f4aa46c4dafb0c75",
+  "bundleVersion": "3.1.1",
+  "catalogRevision": "2026-09-02.1",
+  "catalogSha256": "877778440ff1cd04502b4ae2c1c91c011caefeb7eab413ff54c23f0ae6644aef",
   "entrypoint": "tools/ppflight-template-bootstrap.py",
   "files": [
     {
@@ -12,12 +12,12 @@
     },
     {
       "path": "tools/ppflight-template-bootstrap.py",
-      "sha256": "b5c00b80155ce65199f4cf1473f6817b1635f7cf55730ff78185fb63e461c1ab",
+      "sha256": "9af8ca26d940801a6dfeb621632bea5a1036bfff37d0b51d9046e2f858180a35",
       "requiredAtRuntime": true
     },
     {
       "path": "catalog/template-catalog.v1.json",
-      "sha256": "d716522fe98baf85ab03c2760ac56c90a6f4fc73d1833bb8f4aa46c4dafb0c75",
+      "sha256": "877778440ff1cd04502b4ae2c1c91c011caefeb7eab413ff54c23f0ae6644aef",
       "requiredAtRuntime": true
     },
     {

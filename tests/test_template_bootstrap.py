@@ -118,6 +118,25 @@ class StorageDiscoveryTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, "PVE_LOCAL_NODE_INVALID")
 
 
+class OfficialImagePinningTest(unittest.TestCase):
+    def test_almalinux_8_uses_reviewed_immutable_official_image(self):
+        spec = BOOTSTRAP.URL_SPECS["almalinux-8-genericcloud-amd64"]
+        catalog = BOOTSTRAP.load_catalog()
+        item = next(
+            value for value in catalog["items"]
+            if value["templateRef"] == "almalinux-8"
+        )
+        expected = "66a440b458e0a0f774868f1b5d74433080c6718e40f38b59d05ff9ab269ae240"
+
+        self.assertEqual(
+            spec["filename"],
+            "AlmaLinux-8-GenericCloud-8.10-20260831.x86_64.qcow2",
+        )
+        self.assertNotIn("latest", spec["url"])
+        self.assertEqual(item["source"]["sha256"], expected)
+        self.assertEqual(item["source"]["upstreamChecksum"]["value"], expected)
+
+
 class DualBridgeRequestTest(unittest.TestCase):
     def _arguments(self, **overrides):
         values = {
