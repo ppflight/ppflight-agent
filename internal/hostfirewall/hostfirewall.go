@@ -41,13 +41,23 @@ type Service struct {
 }
 
 // TransactionOverview is a non-secret, read-only view used by the local AG
-// system overview. It reports ownership state, not a substitute for the
-// activation helper's strict live PVE readback.
+// system overview. A committed transaction includes independent live backend,
+// supervisor, native-hook and compiled DROP checks; journal phase alone is
+// never presented as proof of current protection.
 type TransactionOverview struct {
 	Present    bool
 	Phase      string
 	Node       string
 	Interfaces []string
+	Live       TransactionLiveOverview
+}
+
+type TransactionLiveOverview struct {
+	Checked                 bool
+	LegacyBackendSelected   bool
+	SupervisorActiveEnabled bool
+	NativeHooksFirst        bool
+	RuntimeDropsVerified    bool
 }
 
 func InspectTransaction() (TransactionOverview, error) {
@@ -60,10 +70,27 @@ func InspectTransaction() (TransactionOverview, error) {
 	if err != nil {
 		return TransactionOverview{}, err
 	}
-	return TransactionOverview{
+	overview := TransactionOverview{
 		Present: true, Phase: journal.Phase, Node: journal.Node,
 		Interfaces: append([]string(nil), journal.Interfaces...),
-	}, nil
+	}
+	if journal.Phase == PhaseCommitted {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		overview.Live = inspectTransactionLive(ctx, productionBackend(), journal)
+	}
+	return overview, nil
+}
+
+func inspectTransactionLive(ctx context.Context, target backend, journal Journal) TransactionLiveOverview {
+	result := TransactionLiveOverview{Checked: true}
+	result.LegacyBackendSelected = target.VerifyIngressBackend(ctx) == nil
+	result.SupervisorActiveEnabled = target.VerifyIngressGuardPersistence(ctx) == nil
+	if order, err := target.InputChainOrder(ctx); err == nil {
+		result.NativeHooksFirst = validateInputChainInspection(order) == nil
+	}
+	result.RuntimeDropsVerified = target.VerifyRuntimeIngressDrops(ctx, journal) == nil
+	return result
 }
 
 func productionService() *Service {
@@ -137,6 +164,11 @@ func validateInstallationEvidence(path string) (bool, error) {
 }
 
 func (service *Service) Activate(ctx context.Context) (returnErr error) {
+	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer transactionUnlock()
 	journal, err := service.store.load()
 	if err != nil {
 		return err
@@ -144,8 +176,20 @@ func (service *Service) Activate(ctx context.Context) (returnErr error) {
 	if journal.Phase == PhaseUninstalled {
 		return errors.New("host firewall transaction belongs to an uninstalled Agent")
 	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
 	if journal.Phase == PhaseCommitted {
-		if err := service.verify(ctx, journal, true); err != nil {
+		if err := service.ensureNativeHookSnapshots(ctx, &journal); err != nil {
+			return err
+		}
+		if err := service.backend.EnsureIngressGuard(ctx, journal); err != nil {
+			return err
+		}
+		if err := service.backend.EnableIngressGuardPersistence(ctx); err != nil {
+			return err
+		}
+		if err := service.verifyEffective(ctx, journal, true); err != nil {
 			return fmt.Errorf("committed host firewall no longer verifies: %w", err)
 		}
 		return service.backend.Health(ctx)
@@ -189,7 +233,23 @@ func (service *Service) Activate(ctx context.Context) (returnErr error) {
 	if journal.Phase != PhaseRulesEnabled {
 		return errors.New("host firewall transaction did not reach verification")
 	}
-	if err := service.verify(ctx, journal, true); err != nil {
+	// A fresh transaction may begin while the Cluster firewall is disabled,
+	// before pve-firewall has created its authoritative force-disable selector.
+	// Once Cluster/Node options and owned rules are enabled, require the strict
+	// legacy selector again before trusting or moving any live legacy hook.
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
+	if err := service.ensureNativeHookSnapshots(ctx, &journal); err != nil {
+		return err
+	}
+	if err := service.backend.EnsureIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	if err := service.backend.EnableIngressGuardPersistence(ctx); err != nil {
+		return err
+	}
+	if err := service.verifyEffective(ctx, journal, true); err != nil {
 		return err
 	}
 	if err := service.backend.Health(ctx); err != nil {
@@ -388,6 +448,210 @@ func (service *Service) verify(ctx context.Context, journal Journal, enabled boo
 	return service.verifyRules(ctx, journal, enabled)
 }
 
+func (service *Service) verifyEffective(ctx context.Context, journal Journal, enabled bool) error {
+	if err := service.verify(ctx, journal, enabled); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressGuardPersistence(ctx); err != nil {
+		return err
+	}
+	order, err := service.backend.InputChainOrder(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateInputChainInspection(order); err != nil {
+		return err
+	}
+	return service.verifyRuntimeIngressDrops(ctx, journal)
+}
+
+func (service *Service) ensureNativeHookSnapshots(ctx context.Context, journal *Journal) error {
+	if len(journal.NativeHooks) != 0 {
+		return validateNativeHookSnapshots(journal.NativeHooks)
+	}
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		snapshots, err := service.backend.CaptureIngressGuard(ctx)
+		if err == nil {
+			journal.NativeHooks = snapshots
+			// This atomic journal save must precede the first native hook move.
+			return service.store.save(*journal)
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("cannot capture PVE native INPUT hook restore state: %w", lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (service *Service) verifyRuntimeIngressDrops(ctx context.Context, journal Journal) error {
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		if err := service.backend.VerifyRuntimeIngressDrops(ctx, journal); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("runtime PVE host DROP rules did not converge: %w", lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+// ReconcileCommitted upgrades only an already-owned committed fresh-install
+// transaction. Existing installations without a journal remain a strict no-op,
+// so an ordinary rolling update never opts a host into firewall management.
+func (service *Service) ReconcileCommitted(ctx context.Context) (bool, error) {
+	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	if lockErr != nil {
+		return false, lockErr
+	}
+	defer transactionUnlock()
+	exists, err := service.store.exists()
+	if err != nil || !exists {
+		return false, err
+	}
+	journal, err := service.store.load()
+	if err != nil {
+		return false, err
+	}
+	if journal.Phase == PhaseUninstalled {
+		return false, nil
+	}
+	if journal.Phase != PhaseCommitted {
+		return false, fmt.Errorf("cannot reconcile incomplete host firewall transaction in phase %s", journal.Phase)
+	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return false, err
+	}
+	if err := service.ensureNativeHookSnapshots(ctx, &journal); err != nil {
+		return false, err
+	}
+	// Restore the previously owned local fail-closed ordering before slow PVE
+	// API readback so a rolling migration does not extend exposure.
+	if err := service.backend.EnsureIngressGuard(ctx, journal); err != nil {
+		return false, err
+	}
+	if err := service.verify(ctx, journal, true); err != nil {
+		return false, fmt.Errorf("committed PVE firewall ownership no longer verifies: %w", err)
+	}
+	if err := service.backend.EnableIngressGuardPersistence(ctx); err != nil {
+		return false, err
+	}
+	if err := service.verifyEffective(ctx, journal, true); err != nil {
+		return false, err
+	}
+	if err := service.backend.Health(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// EnforceCommitted is run by the root-only supervisor. It never creates a new
+// ownership transaction or changes PVE options/rules; it only restores the
+// PVE-native top-level INPUT hooks if another firewall manager inserted rules
+// ahead of them.
+func (service *Service) EnforceCommitted(ctx context.Context) error {
+	lockedContext, enforcementUnlock, lockErr := acquireFirewallEnforcementLock(ctx)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer enforcementUnlock()
+	ctx = lockedContext
+	journal, err := service.store.load()
+	if err != nil {
+		return err
+	}
+	if journal.Phase != PhaseRulesEnabled && journal.Phase != PhaseCommitted {
+		return fmt.Errorf("host firewall priority guard is not allowed in phase %s", journal.Phase)
+	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
+	if err := requireNativeHookSnapshots(journal); err != nil {
+		return err
+	}
+	// Promote an available native hook before slow PVE API work. An explicit
+	// runtime Cluster disable removes PVE's own chain/hook; that is observed
+	// without recreation so the supervisor can remain alive and wait for PVE to
+	// append the native hook again when the Cluster firewall is re-enabled.
+	if _, err := service.backend.MaintainIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	cluster, err := service.backend.ClusterOptions(ctx)
+	if err != nil {
+		return err
+	}
+	if !canonicalBool(cluster.Values["enable"]) {
+		return nil
+	}
+	if err := service.verify(ctx, journal, true); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	order, err := service.backend.InputChainOrder(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateInputChainInspection(order); err != nil {
+		return err
+	}
+	return service.verifyRuntimeIngressDrops(ctx, journal)
+}
+
+func (service *Service) Supervise(ctx context.Context) error {
+	journal, err := service.store.load()
+	if err != nil {
+		return err
+	}
+	if journal.Phase != PhaseRulesEnabled && journal.Phase != PhaseCommitted {
+		return fmt.Errorf("host firewall priority supervisor is not allowed in phase %s", journal.Phase)
+	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
+	if err := requireNativeHookSnapshots(journal); err != nil {
+		return err
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			// The steady-state loop is intentionally limited to two local
+			// iptables-legacy -S INPUT inspections (IPv4/IPv6). The systemd unit performs
+			// full PVE API readback once in ExecStartPre when Cluster firewall is
+			// enabled; an explicit Cluster disable is observed and left waiting.
+			if _, err := service.backend.MaintainIngressGuard(ctx, journal); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 func (service *Service) verifyOptions(ctx context.Context, journal Journal) error {
 	cluster, err := service.backend.ClusterOptions(ctx)
 	if err != nil {
@@ -467,6 +731,11 @@ func rulesWithComment(rules []firewallRule, comment string) []firewallRule {
 }
 
 func (service *Service) Rollback(ctx context.Context, uninstall bool) error {
+	transactionUnlock, lockErr := acquireFirewallTransactionLock(ctx)
+	if lockErr != nil {
+		return lockErr
+	}
+	defer transactionUnlock()
 	journal, err := service.store.load()
 	if err != nil {
 		return err
@@ -488,6 +757,13 @@ func (service *Service) rollback(ctx context.Context, journal *Journal, uninstal
 	}
 	journal.Phase = PhaseRollbackPending
 	if err := service.store.save(*journal); err != nil {
+		return err
+	}
+	// Stop the only process which may promote the hook. Keep PVE's sole native
+	// jump at the fail-closed first position while owned rules and options are
+	// being reverted; only a completely successful PVE rollback may restore the
+	// native jump to PVE's canonical tail position.
+	if err := service.backend.DisableIngressGuardPersistence(ctx); err != nil {
 		return err
 	}
 	if err := service.removeOwnedRules(ctx, *journal); err != nil {
@@ -513,6 +789,9 @@ func (service *Service) rollback(ctx context.Context, journal *Journal, uninstal
 	if len(drift) > 0 {
 		sort.Strings(drift)
 		return fmt.Errorf("administrator firewall changes were preserved; intervention required for %s", strings.Join(drift, ","))
+	}
+	if err := service.backend.RemoveIngressGuard(ctx, *journal); err != nil {
+		return err
 	}
 	if uninstall {
 		journal.Phase = PhaseUninstalled
@@ -599,7 +878,7 @@ func Run(args []string, out, errOut io.Writer) int {
 		return 1
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(errOut, "host firewall helper requires classify, activate, or rollback")
+		fmt.Fprintln(errOut, "host firewall helper requires classify, activate, reconcile, enforce, supervise, or rollback")
 		return 2
 	}
 	service := productionService()
@@ -630,6 +909,46 @@ func Run(args []string, out, errOut io.Writer) int {
 			return 1
 		}
 		fmt.Fprintln(out, "PPFlight 全新安装主机防火墙已提交并严格回验。")
+		return 0
+	case "reconcile":
+		if len(args) != 1 {
+			fmt.Fprintln(errOut, "reconcile accepts no arguments")
+			return 2
+		}
+		reconcileContext, reconcileCancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer reconcileCancel()
+		changed, err := service.ReconcileCommitted(reconcileContext)
+		if err != nil {
+			fmt.Fprintf(errOut, "host firewall reconciliation failed: %v\n", err)
+			return 1
+		}
+		if changed {
+			fmt.Fprintln(out, "PPFlight 已有主机防火墙事务已提升到宝塔/UFW 之前并严格回验。")
+		} else {
+			fmt.Fprintln(out, "当前安装没有 PPFlight 自有主机防火墙事务；防火墙保持不变。")
+		}
+		return 0
+	case "supervise":
+		if len(args) != 1 {
+			fmt.Fprintln(errOut, "supervise accepts no arguments")
+			return 2
+		}
+		if err := service.Supervise(ctx); err != nil {
+			fmt.Fprintf(errOut, "host firewall priority supervisor failed: %v\n", err)
+			return 1
+		}
+		return 0
+	case "enforce":
+		if len(args) != 1 {
+			fmt.Fprintln(errOut, "enforce accepts no arguments")
+			return 2
+		}
+		enforceContext, enforceCancel := context.WithTimeout(ctx, 90*time.Second)
+		defer enforceCancel()
+		if err := service.EnforceCommitted(enforceContext); err != nil {
+			fmt.Fprintf(errOut, "host firewall priority enforcement failed: %v\n", err)
+			return 1
+		}
 		return 0
 	case "rollback":
 		flags := flag.NewFlagSet("rollback", flag.ContinueOnError)

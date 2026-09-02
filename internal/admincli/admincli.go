@@ -53,6 +53,7 @@ type cli struct {
 	tlsServerName     func() string
 	templateRun       func(context.Context, []string, io.Writer) (templatebootstrap.Result, error)
 	pvesmSetContent   func(context.Context, string, string) error
+	templateBridges   templateBridgeManager
 	pveVersion        func(context.Context) (string, error)
 	pveBootstrap      func(context.Context) error
 	pveReadACL        func(context.Context) error
@@ -1351,6 +1352,16 @@ func (c *cli) systemOverview(filename string) int {
 		if firewallTransaction.Node != "" {
 			fmt.Fprintf(c.out, "  节点：%s；默认路由接口：%s\n", firewallTransaction.Node, strings.Join(firewallTransaction.Interfaces, ","))
 		}
+		if firewallTransaction.Live.Checked {
+			fmt.Fprintf(c.out, "  legacy backend：%s\n", healthyLabel(firewallTransaction.Live.LegacyBackendSelected))
+			fmt.Fprintf(c.out, "  优先级守护服务（active/enabled）：%s\n", healthyLabel(firewallTransaction.Live.SupervisorActiveEnabled))
+			fmt.Fprintf(c.out, "  原生 IPv4/IPv6 PVE hook 首位：%s\n", healthyLabel(firewallTransaction.Live.NativeHooksFirst))
+			fmt.Fprintf(c.out, "  IPv4/IPv6 runtime DROP：%s\n", healthyLabel(firewallTransaction.Live.RuntimeDropsVerified))
+			if !firewallTransaction.Live.LegacyBackendSelected || !firewallTransaction.Live.SupervisorActiveEnabled ||
+				!firewallTransaction.Live.NativeHooksFirst || !firewallTransaction.Live.RuntimeDropsVerified {
+				fmt.Fprintln(c.out, "  运行回验失败：已提交不等于当前防护有效，请立即检查。")
+			}
+		}
 	}
 
 	c.printWebsiteOverview(cfg, local, localErr)
@@ -1491,6 +1502,13 @@ func enabledLabel(value bool) string {
 		return "已启用"
 	}
 	return "未启用"
+}
+
+func healthyLabel(value bool) string {
+	if value {
+		return "正常"
+	}
+	return "异常"
 }
 
 func remoteStatusLabel(value string) string {
@@ -3092,10 +3110,27 @@ func (c *cli) templateInit() int {
 			if internalBridge == "" {
 				internalBridge = "vmbr1"
 			}
-			if internalBridge != externalBridge {
-				break
+			if internalBridge == externalBridge {
+				fmt.Fprintln(c.out, "内网网桥不能与外网网桥相同，请重新输入。")
+				continue
 			}
-			fmt.Fprintln(c.out, "内网网桥不能与外网网桥相同，请重新输入。")
+			if !safeTemplateBridgeName(internalBridge) {
+				fmt.Fprintln(c.out, "内网网桥名称必须是 1-15 位 ASCII 字母、数字、点、下划线或连字符，且首位必须是字母或数字。")
+				continue
+			}
+			break
+		}
+	}
+	if internalBridge != "" {
+		ready, ensureErr := c.ensureTemplateInternalBridge(ctx, reader, internalBridge)
+		if ensureErr != nil {
+			fmt.Fprintf(c.errOut, "内网网桥准备失败: %v\n", ensureErr)
+			fmt.Fprintln(c.out, "未执行任何模板变更。")
+			return 1
+		}
+		if !ready {
+			fmt.Fprintln(c.out, "已取消创建内网网桥；未执行任何模板变更。")
+			return 0
 		}
 	}
 	fmt.Fprintf(c.out, "网络配置：\n  外网 net0 -> %s\n", externalBridge)

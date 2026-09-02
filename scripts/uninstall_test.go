@@ -13,7 +13,7 @@ func TestUninstallerProvesPrimaryAgentStoppedBeforeRemoval(t *testing.T) {
 		"--property=MainPID --value \"$unit\"",
 		"[[ \"$unit\" == *.service ]]",
 		"\"$unit\" == *.service && -n \"$main_pid\" && \"$main_pid\" != '0'",
-		"ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service",
+		"ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service ppflight-host-firewall.service",
 		"stop_required_unit \"$required_unit\" || exit 1",
 		"PVE_CREDENTIAL_REMOVER='/usr/local/lib/ppflight-agent/remove-pve-credentials.sh'",
 		"HOST_FIREWALL_JOURNAL='/var/lib/ppflight-agent/host-firewall/transaction.json'",

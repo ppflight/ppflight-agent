@@ -35,6 +35,12 @@ type firewallRuleSet struct {
 	Digest string
 }
 
+type inputChainOrder struct {
+	Family          string
+	PVEJumpPosition int
+	PrecedingRules  []string
+}
+
 type backend interface {
 	LocalNode(context.Context) (string, error)
 	ClusterNodes(context.Context) ([]string, error)
@@ -47,17 +53,50 @@ type backend interface {
 	CreateNodeRule(context.Context, string, string, string, bool, int, string) error
 	SetNodeRuleEnabled(context.Context, string, int, bool, string) error
 	DeleteNodeRule(context.Context, string, int, string) error
+	VerifyIngressBackend(context.Context) error
+	CaptureIngressGuard(context.Context) ([]nativeInputHookSnapshot, error)
+	EnsureIngressGuard(context.Context, Journal) error
+	MaintainIngressGuard(context.Context, Journal) (bool, error)
+	VerifyIngressGuard(context.Context, Journal) error
+	RemoveIngressGuard(context.Context, Journal) error
+	EnableIngressGuardPersistence(context.Context) error
+	DisableIngressGuardPersistence(context.Context) error
+	VerifyIngressGuardPersistence(context.Context) error
+	InputChainOrder(context.Context) ([]inputChainOrder, error)
+	VerifyRuntimeIngressDrops(context.Context, Journal) error
 	Health(context.Context) error
 }
 
 type commandRunner interface {
 	Run(context.Context, string, ...string) ([]byte, error)
+	RunInput(context.Context, []byte, string, ...string) ([]byte, error)
 }
 
 type execRunner struct{}
 
+type firewallNetfilterLockContextKey struct{}
+
+func firewallNetfilterLockHeld(ctx context.Context) bool {
+	held, _ := ctx.Value(firewallNetfilterLockContextKey{}).(bool)
+	return held
+}
+
 func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return execRunner{}.run(ctx, nil, name, args...)
+}
+
+func (execRunner) RunInput(ctx context.Context, input []byte, name string, args ...string) ([]byte, error) {
+	if len(input) == 0 || len(input) > 64<<10 {
+		return nil, errors.New("command stdin is empty or exceeds safety limit")
+	}
+	return execRunner{}.run(ctx, input, name, args...)
+}
+
+func (execRunner) run(ctx context.Context, input []byte, name string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, name, args...)
+	if input != nil {
+		command.Stdin = bytes.NewReader(input)
+	}
 	var output cappedBuffer
 	output.maximum = 2 << 20
 	command.Stdout = &output
@@ -96,13 +135,15 @@ func (buffer *cappedBuffer) Write(value []byte) (int, error) {
 }
 
 type commandBackend struct {
-	runner commandRunner
-	client *http.Client
+	runner    commandRunner
+	client    *http.Client
+	pathProbe func(string) (bool, error)
 }
 
 func productionBackend() *commandBackend {
 	return &commandBackend{
-		runner: execRunner{},
+		runner:    execRunner{},
+		pathProbe: inspectFirewallSelectorPath,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {

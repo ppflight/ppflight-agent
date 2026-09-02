@@ -1,16 +1,20 @@
 # PPFlight fresh-install host firewall contract v1
 
-This contract applies only to the final, explicit host-firewall stage of a
-verified **fresh** PPFlight Agent installation. It does not apply to
-`ag-pve update`, an in-place reinstall that preserves Agent state, or remote
-Agent commands.
+This contract applies to the final, explicit host-firewall stage of a verified
+**fresh** PPFlight Agent installation. A later `ag-pve update` may reconcile
+the INPUT priority guard only when the machine already has a valid, committed
+PPFlight host-firewall journal. An update without that journal is a strict
+firewall no-op. Remote Agent commands cannot opt a machine into this contract.
 
 ## Operator-owned prerequisite
 
-The installer does not inspect, install, configure, or gate on `cloudflared`,
-Cloudflare Tunnel, Zero Trust, aaPanel, TCP 8888, or SSH. The operator proves
-that recovery access works before starting the fresh installation. PPFlight
-does not change the SSH daemon, its port, or any SSH allow rule.
+The installer does not install, configure, or gate on `cloudflared`, Cloudflare
+Tunnel, Zero Trust, aaPanel, TCP 8888, or SSH. The operator proves that recovery
+access works before starting the fresh installation. PPFlight does not change
+the SSH daemon, its port, or any SSH allow rule. It does inspect the base
+IPv4/IPv6 INPUT order because an earlier aaPanel/UFW accept can otherwise
+bypass PVE policy. It never deletes, reorders, or rewrites aaPanel/UFW rules;
+it only reorders PVE's single exact native `-A INPUT -j PVEFW-INPUT` hook.
 
 ## Scope separation
 
@@ -35,6 +39,14 @@ migration ports from that network. PPFlight must install an owned Node `IN
 DROP` rule for each default-route ingress interface ahead of all administrator
 and cluster rules, then verify its exact position and fields.
 
+A correct Node rule is still ineffective when an independently managed base
+INPUT rule accepts the packet before the normal `INPUT -> PVEFW-INPUT` jump.
+PPFlight therefore atomically moves PVE's one exact native jump to the first
+IPv4 INPUT position and does the same for IPv6. It never creates a second
+reference to `PVEFW-INPUT`, so PVE can still delete its hook and chain during a
+Cluster disable or backend switch. A root-only supervisor re-promotes only
+that native hook if a local firewall manager later inserts rules ahead of it.
+
 ## Fresh-install classification
 
 Before any installation mutation, the bootstrap records whether canonical
@@ -47,6 +59,9 @@ firewall journal already exist.
   back the journal; never silently reclassify it as an update.
 - Any existing installation without that pending journal: this is an update;
   preserve firewall state and skip the host-firewall stage.
+- An update with a valid committed journal may capture and reorder only PVE's
+  exact native INPUT jumps and enable their supervisor. Cluster/Node
+  options and firewall rules are read back but are not recreated or changed.
 - A complete uninstall removes the journal only after it has safely reverted
   PPFlight-owned firewall changes.
 
@@ -65,8 +80,10 @@ already enabled or the target is a standalone one-node PVE installation.
 
 The root-only journal stores schema version, node, detected ingress
 interfaces, a random ownership marker, exact pre-change Cluster and Node
-options, exact owned rules, digests, phase, and timestamps. It is durably
-written before the first PVE mutation.
+options, exact owned rules, native IPv4/IPv6 hook tail-capture proofs, digests,
+phase, and timestamps. Both hook proofs are atomically persisted before the
+first native-hook reorder. Older rc.26 committed journals are migrated this
+way before their first rolling-update reorder.
 
 1. Read Cluster options, local Node options, local Node rules, cluster status,
    and IPv4/IPv6 default-route interfaces.
@@ -79,23 +96,42 @@ written before the first PVE mutation.
    local Node `enable=1`.
 5. Enable the owned rules only after the options and disabled rules are fully
    persisted.
-6. Read back exact Cluster/Node options and every owned rule. Each owned rule
+6. Require the selected legacy `pve-firewall` backend using the Node nftables
+   selector, the official Rust force-disable flag (or verified absence of the
+   Rust binary), daemon state and subsequent live-chain proof. A simultaneously
+   active `proxmox-firewall` daemon is not by itself proof that nft is selected.
+   Prove each family has exactly one unmodified native PVE jump in PVE's
+   canonical tail position. Persist that
+   proof, then use one `iptables-legacy-restore --noflush` transaction per
+   family to move the native jump ahead of aaPanel/UFW without modifying their
+   rules. Enable the root-only supervisor and verify both native jumps are at
+   position one.
+7. Read back exact Cluster/Node options and every owned rule. Poll the compiled
+   IPv4/IPv6 `PVEFW-HOST-IN` chains until the first user-rule block exactly
+   contains one DROP for every captured default-route interface. Each owned rule
    must be enabled, match its interface/type/action/comment, and precede every
    non-owned Node rule.
-7. Re-check local Agent/exporter services and loopback health. Do not probe
+8. Re-check local Agent/exporter services and loopback health. Do not probe
    Tunnel, Zero Trust, aaPanel, port 8888, or external SSH.
-8. Commit the journal and only then print installation success.
+9. Commit the journal and only then print installation success.
 
 Any error or interruption resumes from the durable phase and rolls back. A
 failure must never print success.
 
 ## Rollback and complete uninstall
 
-Rollback disables and removes only rules matching the stored random ownership
-marker. It restores an option only when the current value still equals the
-PPFlight-applied value; a concurrent administrator change is preserved and
-reported for intervention. All updates/deletes use current PVE digests and
-bounded retries.
+Rollback first stops the PPFlight priority supervisor while leaving PVE's sole
+native INPUT jump in its fail-closed first position. It then disables/removes
+only PVE rules carrying the stored random ownership marker and restores an option
+only when the current value still equals the PPFlight-applied value. After all
+PVE mutations have succeeded, it atomically restores the native jump to PVE's
+canonical appended position. A
+concurrent administrator change is preserved and reported for intervention.
+All PVE updates/deletes use current digests and bounded retries. Runtime
+Cluster disable is observed without recreating either hook or chain; when PVE
+later appends its exact native hook again, the supervisor atomically promotes
+it. Stopping or crashing the supervisor never demotes the hook. Restarts use
+bounded rate limits.
 
 Complete uninstall stops Agent/upgrade processes first, reverts the committed
 host-firewall journal, verifies that no owned rule remains, and then continues
@@ -103,15 +139,24 @@ with credential and file removal. If firewall restoration cannot be proven,
 the uninstall stops and preserves the binary, helper, journal, credentials,
 and configuration for a safe retry.
 
+`ag-pve overview` does not treat a committed journal as proof of current
+protection. For a committed transaction it separately reports the selected
+legacy backend, the supervisor's active/enabled state, the IPv4/IPv6 native
+hook positions, and the compiled IPv4/IPv6 runtime DROP proof. Any failed live
+check is shown as an operational failure requiring immediate inspection.
+
 ## Required automated and real acceptance
 
-- Shell/Go fixtures: fresh install, ordinary update, interrupted fresh retry,
+- Shell/Go fixtures: fresh install, journal-less update, committed-journal
+  priority migration, interrupted fresh retry,
   symlink/ownership rejection, no default route, duplicate route interfaces,
   cluster already enabled, unsafe multi-node activation, digest race, partial
   rule creation, readback mismatch, rollback, uninstall restore, and
   administrator drift preservation.
 - Real standalone PVE 8/9 acceptance: operator proves Tunnel/Zero Trust first;
-  fresh install succeeds; new public inbound SSH/8006/8888 connections fail;
+  fresh install succeeds; PVE's sole native IPv4/IPv6 jumps are the first base INPUT
+  rules while existing aaPanel/UFW entries remain unchanged; new public
+  inbound SSH/8006/8888 connections fail;
   the existing installer session and Tunnel remain usable; Agent collection,
   website/monitoring delivery, control polling, and upgrades remain healthy.
 - Guest acceptance: the host-firewall installer itself never rewrites existing

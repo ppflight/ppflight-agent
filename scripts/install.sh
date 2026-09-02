@@ -454,6 +454,7 @@ fi
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent.service" "$SYSTEMD_DIR/ppflight-agent.service"
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent-upgrade.path" "$SYSTEMD_DIR/ppflight-agent-upgrade.path"
 install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-agent-upgrade.service" "$SYSTEMD_DIR/ppflight-agent-upgrade.service"
+install -m 0644 "$REPO_DIR/packaging/systemd/ppflight-host-firewall.service" "$SYSTEMD_DIR/ppflight-host-firewall.service"
 
 if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
   extract_binary() {
@@ -476,6 +477,8 @@ service_user="$(systemctl show --property=User --value ppflight-agent.service)"
 [[ "$service_user" == 'ppflight-agent' ]] || die "ppflight-agent.service must run as User=ppflight-agent (effective User=${service_user:-unset})"
 upgrade_user="$(systemctl show --property=User --value ppflight-agent-upgrade.service)"
 [[ "$upgrade_user" == 'root' ]] || die "ppflight-agent-upgrade.service must run as User=root (effective User=${upgrade_user:-unset})"
+host_firewall_user="$(systemctl show --property=User --value ppflight-host-firewall.service)"
+[[ "$host_firewall_user" == 'root' ]] || die "ppflight-host-firewall.service must run as User=root (effective User=${host_firewall_user:-unset})"
 if [[ $ENABLE -eq 1 ]]; then
   systemctl enable ppflight-agent.service ppflight-agent-upgrade.path
   if [[ $INSTALL_EXPORTERS -eq 1 ]]; then

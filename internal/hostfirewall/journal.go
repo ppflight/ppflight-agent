@@ -55,17 +55,28 @@ type ownedRule struct {
 	Comment   string `json:"comment"`
 }
 
+// nativeInputHookSnapshot proves that PVE's sole exact INPUT jump was observed
+// in PVE's canonical appended position before PPFlight moved it. Restoration
+// can therefore atomically append that same native jump without depending on
+// mutable aaPanel/UFW neighbours.
+type nativeInputHookSnapshot struct {
+	Family   string `json:"family"`
+	Captured bool   `json:"captured"`
+	WasTail  bool   `json:"wasTail"`
+}
+
 type Journal struct {
-	SchemaVersion int             `json:"schemaVersion"`
-	Kind          string          `json:"kind"`
-	InstallID     string          `json:"installId"`
-	Phase         string          `json:"phase"`
-	Node          string          `json:"node,omitempty"`
-	Interfaces    []string        `json:"interfaces,omitempty"`
-	Preimage      journalPreimage `json:"preimage,omitempty"`
-	OwnedRules    []ownedRule     `json:"ownedRules,omitempty"`
-	CreatedAt     string          `json:"createdAt"`
-	UpdatedAt     string          `json:"updatedAt"`
+	SchemaVersion int                       `json:"schemaVersion"`
+	Kind          string                    `json:"kind"`
+	InstallID     string                    `json:"installId"`
+	Phase         string                    `json:"phase"`
+	Node          string                    `json:"node,omitempty"`
+	Interfaces    []string                  `json:"interfaces,omitempty"`
+	Preimage      journalPreimage           `json:"preimage,omitempty"`
+	OwnedRules    []ownedRule               `json:"ownedRules,omitempty"`
+	NativeHooks   []nativeInputHookSnapshot `json:"nativeInputHooks,omitempty"`
+	CreatedAt     string                    `json:"createdAt"`
+	UpdatedAt     string                    `json:"updatedAt"`
 }
 
 func (j Journal) validate() error {
@@ -114,6 +125,32 @@ func (j Journal) validate() error {
 			if !seen[rule.Interface] || rule.Comment != ownedRuleComment(j.InstallID, rule.Interface) {
 				return errors.New("invalid journal owned rule")
 			}
+		}
+	}
+	if err := validateNativeHookSnapshots(j.NativeHooks); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateNativeHookSnapshots(values []nativeInputHookSnapshot) error {
+	// Omission is required for backward compatibility with committed rc.26
+	// journals. Reconciliation captures and atomically persists both families
+	// before it performs the first native-hook move.
+	if len(values) == 0 {
+		return nil
+	}
+	if len(values) != 2 {
+		return errors.New("native INPUT hook snapshot is incomplete")
+	}
+	seen := map[string]bool{}
+	for _, value := range values {
+		if (value.Family != "ipv4" && value.Family != "ipv6") || seen[value.Family] {
+			return errors.New("native INPUT hook snapshot family is invalid")
+		}
+		seen[value.Family] = true
+		if !value.Captured || !value.WasTail {
+			return errors.New("native INPUT hook snapshot lacks canonical tail proof")
 		}
 	}
 	return nil

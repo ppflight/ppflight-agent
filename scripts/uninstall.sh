@@ -77,9 +77,11 @@ stop_required_unit() {
   fi
 }
 
-# The upgrade path/service can invoke the privileged helper, so they are held
-# to the same fail-closed stop/zero-PID rule as the main Agent.
-for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service; do
+# The upgrade helper and host-firewall supervisor are privileged, so they are
+# held to the same fail-closed stop/zero-PID rule as the main Agent. Stopping
+# the supervisor before transactional rollback prevents it from racing hook
+# removal; rollback's disable operation is intentionally idempotent.
+for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service ppflight-host-firewall.service; do
   stop_required_unit "$required_unit" || exit 1
 done
 
@@ -133,7 +135,7 @@ EXPORTERS_STOPPED=1
 for exporter_unit in ppflight-node-exporter.service ppflight-smartctl-exporter.service; do
   stop_optional_exporter "$exporter_unit" || EXPORTERS_STOPPED=0
 done
-rm -f -- /etc/systemd/system/ppflight-agent.service /etc/systemd/system/ppflight-agent-upgrade.path /etc/systemd/system/ppflight-agent-upgrade.service
+rm -f -- /etc/systemd/system/ppflight-agent.service /etc/systemd/system/ppflight-agent-upgrade.path /etc/systemd/system/ppflight-agent-upgrade.service /etc/systemd/system/ppflight-host-firewall.service
 rm -f -- /usr/lib/tmpfiles.d/ppflight-agent.conf
 if [[ $REMOVE_EXPORTERS -eq 1 && $EXPORTERS_STOPPED -eq 1 ]]; then
   rm -f -- /etc/systemd/system/ppflight-node-exporter.service /etc/systemd/system/ppflight-smartctl-exporter.service

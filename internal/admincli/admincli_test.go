@@ -766,6 +766,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var output, stderr bytes.Buffer
 	instance := &cli{
 		in: strings.NewReader("\n1\nY\n1\n\n1\nvmbr0\nY\nvmbr0\nvmbr1\n\n"), out: &output, errOut: &stderr, version: "test",
+		templateBridges: &fakeTemplateBridgeManager{inspect: []templateBridgeState{safeCreatedBridgeState()}},
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {
 				t.Fatalf("unexpected storage content update: %s %s", storageID, content)

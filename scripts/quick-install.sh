@@ -120,7 +120,7 @@ case "$INSTALL_MODE" in
     printf '%s\n' '检测到未完成的全新安装事务：将安全恢复并完成主机防火墙阶段。'
     ;;
   update)
-    printf '%s\n' '检测到现有安装：保留当前防火墙状态，本次更新不会启用或修改主机防火墙。'
+    printf '%s\n' '检测到现有安装：保留全部防火墙策略；仅对已有 PPFlight committed 主机防火墙事务修复 INPUT 优先级。'
     ;;
   *)
     die '主机防火墙安装分类返回了未知状态'
@@ -277,6 +277,13 @@ if [[ "$INSTALL_MODE" == 'fresh' || "$INSTALL_MODE" == 'resume' ]]; then
   printf '%s\n' 'PVE Cluster/Node 主机防火墙已启用；默认路由接口的新入站连接已由 PPFlight 自有规则阻断。'
   printf '%s\n' 'Agent、官网、监控、控制和更新均使用出站连接；状态和 exporter 仍仅监听 127.0.0.1。'
 else
+
+  # Existing installations remain untouched unless they carry a committed,
+  # root-owned PPFlight fresh-install firewall journal. That narrow migration
+  # closes the rc.26 ordering gap where aaPanel/UFW accepted traffic before
+  # INPUT reached PVEFW-INPUT; journal-less updates are a strict no-op.
+  /usr/local/bin/ppflight-agent host-firewall reconcile \
+    || die '已有 PPFlight 主机防火墙事务无法安全提升到宝塔/UFW 之前；更新未报告成功'
   printf '%s\n' '现有安装更新已完成；Cluster/Node/VM/CT 防火墙状态均保持不变。'
 fi
 

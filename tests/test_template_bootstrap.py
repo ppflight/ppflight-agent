@@ -22,9 +22,10 @@ SPEC.loader.exec_module(BOOTSTRAP)
 
 
 class FakeRunner:
-    def __init__(self, cluster_status=None, available_bytes=9876543210):
+    def __init__(self, cluster_status=None, available_bytes=9876543210, missing_links=None):
         self.calls = []
         self.available_bytes = available_bytes
+        self.missing_links = set(missing_links or [])
         self.cluster_status = cluster_status or [
             {"type": "cluster", "name": "lab"},
             {"type": "node", "name": "pve-a", "local": 1},
@@ -69,6 +70,8 @@ class FakeRunner:
             ("ip", "link", "show", "dev", "vmbr0"),
             ("ip", "link", "show", "dev", "vmbr1"),
         ):
+            if call[4] in self.missing_links:
+                return subprocess.CompletedProcess(call, 1, "", "not found")
             return subprocess.CompletedProcess(call, 0, "", "")
         raise AssertionError(f"unexpected command: {call!r}")
 
@@ -189,6 +192,29 @@ class DualBridgeRequestTest(unittest.TestCase):
         self.assertTrue(plan["executable"])
         self.assertIsNone(plan["internalBridge"])
         self.assertNotIn("--internal-bridge", plan["command"]["argv"])
+
+    def test_direct_plan_keeps_missing_internal_bridge_fail_closed(self):
+        runner = FakeRunner(
+            available_bytes=100_000_000_000,
+            missing_links={"vmbr1"},
+        )
+
+        plan = BOOTSTRAP.prepare_plan(
+            self._arguments(),
+            BOOTSTRAP.load_catalog(),
+            runner,
+        )
+
+        self.assertFalse(plan["executable"])
+        self.assertEqual(plan["state"], "blocked")
+        self.assertEqual(plan["errors"][0]["errorCode"], "INTERNAL_BRIDGE_NOT_FOUND")
+        self.assertTrue(
+            all(item["state"] == "blocked" for item in plan["items"])
+        )
+        self.assertNotIn(
+            "/usr/bin/bash",
+            [call[0] for call in runner.calls],
+        )
 
 
 if __name__ == "__main__":

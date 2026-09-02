@@ -102,6 +102,7 @@ readonly -a RELEASE_FILES=(
   'packaging/systemd/ppflight-agent.service'
   'packaging/systemd/ppflight-agent-upgrade.path'
   'packaging/systemd/ppflight-agent-upgrade.service'
+  'packaging/systemd/ppflight-host-firewall.service'
   'packaging/systemd/ppflight-node-exporter.service'
   'packaging/systemd/ppflight-smartctl-exporter.service'
   'packaging/tmpfiles.d/ppflight-agent.conf'

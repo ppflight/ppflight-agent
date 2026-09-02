@@ -1,0 +1,29 @@
+[Unit]
+Description=Keep the PPFlight-owned PVE host firewall hook ahead of local firewall managers
+Documentation=https://github.com/ppflight/ppflight-agent
+After=network-online.target pve-firewall.service proxmox-firewall.service ufw.service firewalld.service bt.service
+Wants=network-online.target
+PartOf=pve-firewall.service
+StartLimitIntervalSec=300s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=/usr/local/bin/ppflight-agent host-firewall enforce
+ExecStart=/usr/local/bin/ppflight-agent host-firewall supervise
+Restart=always
+RestartSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run /var/lib/ppflight-agent/host-firewall
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target pve-firewall.service
