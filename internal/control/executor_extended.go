@@ -163,7 +163,7 @@ func validReinstall(command Command, value reinstallP) bool {
 		value.TemplateVMID < 100 || value.TemplateVMID > 999999999 || value.TemporaryVMID < 100 || value.TemporaryVMID > 999999999 ||
 		value.TemporaryVMID == command.Identity.VMID || value.TemporaryVMID == value.TemplateVMID || !storageRE.MatchString(value.Storage) ||
 		!bodyHashRE.MatchString(value.TemplateConfigSHA256) || value.Start == nil || !*value.Start || !validCloudInit(value.CloudInit) ||
-		value.ExpectedOS.Family != "linux" && value.ExpectedOS.Family != "windows" || !validOSIdentity(value.ExpectedOS.Name) || !validOSIdentity(value.ExpectedOS.VersionID) {
+		value.ExpectedOS.Family != "linux" || !validOSIdentity(value.ExpectedOS.Name) || !validOSIdentity(value.ExpectedOS.VersionID) {
 		return false
 	}
 	if !validDelivery(deliveryP{NotBefore: value.NotBefore, Expected: value.Expected}) || len(value.Networks) != len(value.Expected.Networks) {

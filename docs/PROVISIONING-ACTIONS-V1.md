@@ -45,7 +45,8 @@ non-template。该一次性动作可把模板基线降到最终套餐值；普�
 
 ## 固定模板重装
 
-`vm.reinstall` 目前仅支持 QEMU。exact parameters：
+`vm.reinstall` v1 目前仅支持 Linux QEMU（固定 Cloud-Init 与 `timedatectl` 回验）；Windows
+Administrator 密码重置是独立能力，不表示 Windows 重装已开放。exact parameters：
 
 ```json
 {

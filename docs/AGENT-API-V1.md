@@ -421,7 +421,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.clone` | `sourceVmid`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
 | vm | `vm.set-initial-resources` | 仅新 clone 首次定型；精确 `cores/sockets/memoryMiB` 加 `cloneOperationId/vmGeneration/templateConfigSha256`。由本机 durable journal 证明同 operation 的 clone 已成功、目标从未启动/交付/重装，且 PVE 当前为 stopped non-template；允许低于模板基线，但不构成存量降级入口。等待 UPID 并精确回读。 |
-| vm | `vm.reinstall` | QEMU only；固定 template identity/version/VMID/config SHA-256、独占 temporary VMID、完整最终资源/磁盘 IO/网络/IPFilter/Cloud-Init/OS identity 合同。先建本机完整补偿 clone，再替换并逐项回读；失败恢复或进入 indeterminate。禁止 URL/ISO/shell/guest-exec。 |
+| vm | `vm.reinstall` | Linux QEMU only；固定 template identity/version/VMID/config SHA-256、独占 temporary VMID、完整最终资源/磁盘 IO/网络/IPFilter/Cloud-Init/OS identity 合同。先建本机完整补偿 clone，再替换并逐项回读；失败恢复或进入 indeterminate。禁止 URL/ISO/shell/任意 guest-exec 参数。 |
 | vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
 | vm | `vm.set-disk-io` | QEMU only；`disk` 与 `limits`。limits 的 10 个 IOPS/MBPS base/max/burst length 键必须全部出现，值为 typed 整数或 null；null 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
 | vm | `vm.set-network` | `interface` 及 bridge/model/MAC/VLAN/MTU/firewall/rate/IP/gateway typed 字段。 |

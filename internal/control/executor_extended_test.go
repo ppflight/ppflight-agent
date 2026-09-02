@@ -389,6 +389,24 @@ func TestReinstallRequiresEveryExactNestedKey(t *testing.T) {
 	}
 }
 
+func TestReinstallRejectsWindowsUntilAWindowsRecoveryContractExists(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "agent-v1-vm-reinstall.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	document["expectedOs"].(map[string]any)["family"] = "windows"
+	document["expectedOs"].(map[string]any)["name"] = "windows"
+	document["expectedOs"].(map[string]any)["versionId"] = "2025"
+	unsafe, _ := json.Marshal(document)
+	if err := validateParameters(controlCommand("vm.reinstall", "qemu", string(unsafe))); err == nil {
+		t.Fatal("Linux Cloud-Init reinstall contract accepted a Windows guest")
+	}
+}
+
 func TestProvisioningActionGoldensValidateAndContainNoConsoleSecret(t *testing.T) {
 	initial, err := os.ReadFile("testdata/agent-v1-vm-set-initial-resources.json")
 	if err != nil {
