@@ -141,6 +141,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	} else if cfg.TaskResolver == nil && cfg.Executor.Client != nil {
 		cfg.TaskResolver = pveClientTaskResolver{client: cfg.Executor.Client}
 	}
+	if cfg.Executor.InitialResources == nil {
+		cfg.Executor.InitialResources = cfg.Journal
+	}
 	cfg.Executor.Mode = cfg.Mode
 	service := &Service{
 		agentRef: cfg.AgentRef, clusterRef: cfg.ClusterRef, bindingID: cfg.BindingID, deviceID: cfg.DeviceID,

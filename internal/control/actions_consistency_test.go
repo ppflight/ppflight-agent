@@ -66,6 +66,8 @@ func validActionParameterFixtures() map[string]string {
 		"vm.reboot":                           `{}`,
 		"vm.create":                           `{"name":"vm101","cores":2,"memoryMiB":1024,"storage":"local-lvm","diskGiB":8,"start":false}`,
 		"vm.clone":                            `{"sourceVmid":100,"name":"vm101","full":true,"target":"pve1","storage":"local-lvm","sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"vm.set-initial-resources":            `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-1","vmGeneration":1,"templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		"vm.reinstall":                        reinstallFixture(),
 		"vm.set-resources":                    `{"cores":4}`,
 		"vm.resize":                           `{"disk":"scsi0","size":"+1G"}`,
 		"vm.set-disk-io":                      `{"disk":"scsi0","limits":{"iopsRead":1000,"iopsWrite":1000,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":100,"mbpsReadMax":null,"mbpsWriteMax":null}}`,
@@ -76,12 +78,20 @@ func validActionParameterFixtures() map[string]string {
 		"vm.verify-delivery":                  `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`,
 		"vm.delete":                           `{"purge":true,"destroyUnreferencedDisks":false}`,
 		"vm.reset-password":                   `{"username":"root","password":"secret-value","crypted":false}`,
+		"vm.suspend":                          `{}`,
+		"vm.resume":                           `{}`,
+		"vm.console.create-session":           `{"ttlSeconds":60,"webSocket":true}`,
+		"vm.console.revoke-session":           `{"sessionRef":"session-1"}`,
 		"snapshot.create":                     `{"name":"before","includeRam":false}`,
 		"snapshot.delete":                     `{"name":"before"}`,
 		"snapshot.rollback":                   `{"name":"before"}`,
+		"snapshot.list":                       `{"limit":50}`,
+		"snapshot.get":                        `{"name":"before"}`,
 		"backup.create":                       `{"storage":"backup1","mode":"snapshot"}`,
 		"backup.delete":                       `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst"}`,
 		"backup.restore":                      `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst","force":false}`,
+		"backup.list":                         `{"storage":"backup1","limit":50}`,
+		"backup.get":                          `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst"}`,
 		"firewall.cluster.set-options":        `{"enable":true}`,
 		"firewall.node.set-options":           `{"enable":true}`,
 		"firewall.guest.set-options":          `{"enable":true,"policyIn":"ACCEPT","policyOut":"ACCEPT","macFilter":true}`,
@@ -98,6 +108,10 @@ func validActionParameterFixtures() map[string]string {
 		"firewall.ipset.entry.delete":         `{"name":"trusted","cidr":"10.0.0.0/24"}`,
 		"agent.upgrade":                       upgradeFixture(),
 	}
+}
+
+func reinstallFixture() string {
+	return `{"templateRef":"ubuntu-24.04","templateVersion":"24.04","templateNode":"pve1","templateGuestType":"qemu","templateVmid":9001,"templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","vmGeneration":1,"temporaryVmid":800101,"storage":"local-lvm","notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"},"expectedOs":{"family":"linux","name":"ubuntu","versionId":"24.04"},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","gateway4":"192.0.2.1","gateway6":"2001:db8::1"}],"cloudInit":{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":[],"qgaEnabled":true},"start":true}`
 }
 
 func upgradeFixture() string {

@@ -126,7 +126,7 @@ Agent 客户端接受 `wait<=25s`，验证 Ed25519 signature、exact assignment 
 POST /internal/v1/metering/usage-batches
 ```
 
-`internal/protocol.UsageBatch` 包含 `schemaVersion`、`batchId`、Agent/collector/source/cluster identity、`mode`、十进制字符串 `sequence`、`observedAt` 和 events。每个 event 包含当前 assignment identity、`eventId`、`counterEpoch`、十进制字符串 sequence、source/billing state/cutoverAt，以及 PVE 原始累计 `ingressBytes`/`egressBytes`。
+`internal/protocol.UsageBatch` 包含 `schemaVersion`、`batchId`、Agent/collector/source/cluster identity、`mode`、十进制字符串 `sequence`、`observedAt` 和 events。每个 event 包含当前 assignment identity、`eventId`、`counterEpoch`、十进制字符串 sequence、source/billing state/cutoverAt，以及 PVE 原始累计 `ingressBytes`/`egressBytes`。逐 NIC 事件另带 `interfaceRef/canonicalMac/networkRole/metered`。
 
 硬规则：
 
@@ -134,7 +134,7 @@ POST /internal/v1/metering/usage-batches
 - 只上报 PVE 累计 ingress/egress，QGA 永不参与计费；
 - 官网负责差值、乱序、重复、counter reset、账期和最终账本；Agent 不计算欠费；
 - 非 production batch 不能含 active event；未映射、generation 不匹配或计数缺失不能伪造成 0；
-- PVE `netin/netout` 当前是 guest aggregate。Agent 已实现 typed metering capability：没有 `nicBindings`、单 NIC 明确不计费、或多 NIC mixed metering 都强制 usage event 为 shadow；只有每张绑定 NIC 都显式 `metered=true` 才可能进入 active。不能把 private 流量并入公网账单；
+- 正式逐 NIC 计量使用 PVE 宿主 `tap/veth` netdev counter，按 signed `netN + canonical MAC + generation` 关联；public 必须 metered，private 必须不计费；多 NIC 的 guest aggregate 永远不能 active，只有恰好一张 public NIC 时才保留安全 aggregate fallback；
 - QGA per-interface rx/tx 只作观测/诊断，永远不是权威计费来源；
 - `batchId`/`eventId` 幂等，服务端在响应前必须 durable commit。
 

@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -89,17 +91,24 @@ func (b Batch) Validate() error {
 // agent, computes deltas, billing periods and usedBytes. All 64-bit values are
 // Counter and therefore use decimal JSON strings.
 type UsageRecord struct {
-	ServiceRef   string     `json:"serviceRef"`
-	ClusterRef   string     `json:"clusterRef"`
-	NodeRef      string     `json:"nodeRef"`
-	VMID         int        `json:"vmid"`
-	Generation   Counter    `json:"generation"`
-	InstanceUUID string     `json:"instanceUuid"`
-	GuestType    string     `json:"guestType"`
-	EventID      string     `json:"eventId"`
-	CounterEpoch string     `json:"counterEpoch"`
-	Sequence     Counter    `json:"sequence"`
-	Source       string     `json:"source"`
+	ServiceRef   string  `json:"serviceRef"`
+	ClusterRef   string  `json:"clusterRef"`
+	NodeRef      string  `json:"nodeRef"`
+	VMID         int     `json:"vmid"`
+	Generation   Counter `json:"generation"`
+	InstanceUUID string  `json:"instanceUuid"`
+	GuestType    string  `json:"guestType"`
+	EventID      string  `json:"eventId"`
+	CounterEpoch string  `json:"counterEpoch"`
+	Sequence     Counter `json:"sequence"`
+	Source       string  `json:"source"`
+	// InterfaceRef/CanonicalMAC are present only for a host-netdev backed
+	// per-NIC counter. Their absence identifies the legacy guest aggregate
+	// shadow observation. A private NIC never produces a billable record.
+	InterfaceRef string     `json:"interfaceRef,omitempty"`
+	CanonicalMAC string     `json:"canonicalMac,omitempty"`
+	NetworkRole  string     `json:"networkRole,omitempty"`
+	Metered      bool       `json:"metered,omitempty"`
 	BillingState string     `json:"billingState"`
 	CutoverAt    *time.Time `json:"cutoverAt,omitempty"`
 	ObservedAt   time.Time  `json:"observedAt"`
@@ -137,8 +146,40 @@ func (b UsageBatch) Validate() error {
 		if b.Mode != "production" && event.BillingState == "active" {
 			return errors.New("non-production usage cannot be active")
 		}
+		if event.InterfaceRef != "" {
+			if !validUsageInterface(event.InterfaceRef) || !validUsageMAC(event.CanonicalMAC) || event.NetworkRole != "public" || !event.Metered || event.Source != "pve-host-netdev" {
+				return errors.New("invalid per-interface usage identity")
+			}
+		} else if event.CanonicalMAC != "" || event.NetworkRole != "" || event.Metered {
+			return errors.New("partial per-interface usage identity")
+		} else if event.Source != "pve-cluster-resources" {
+			return errors.New("invalid aggregate usage source")
+		}
 	}
 	return nil
+}
+
+func validUsageInterface(value string) bool {
+	if !strings.HasPrefix(value, "net") || len(value) < 4 || len(value) > 5 {
+		return false
+	}
+	index, err := strconv.Atoi(strings.TrimPrefix(value, "net"))
+	return err == nil && index >= 0 && index <= 31 && value == "net"+strconv.Itoa(index)
+}
+
+func validUsageMAC(value string) bool {
+	if value == "" || value != strings.ToUpper(value) {
+		return false
+	}
+	parsed, err := net.ParseMAC(value)
+	if err != nil || len(parsed) != 6 || parsed[0]&1 != 0 {
+		return false
+	}
+	nonzero := false
+	for _, part := range parsed {
+		nonzero = nonzero || part != 0
+	}
+	return nonzero
 }
 
 // MeteringRecord remains an alias for callers created before the identity

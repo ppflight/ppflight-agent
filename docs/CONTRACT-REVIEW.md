@@ -10,7 +10,7 @@
 
 出现冲突时，以当前 Go 类型、协议测试和上述规范为准。尤其是：discovery `limit` 默认 20、最大 50；动作使用 `snapshot.*`、`backup.*`、`firewall.*`、`task.status` 等代码中的完整名称。
 
-control 当前 39 个 known actions 已用一致性测试锁住 registry/validator/executor；`firewall.guest.verify-ipfilter`、`firewall.ipset.entry.update/delete` 与 `agent.upgrade` 已实现。`agent.upgrade` 只接受官网固定 manifest 的同源制品，并经独立 root helper 二次验签、原子替换、重启回验和回滚；官网在真实 PVE 验收前保持 delivery flag 关闭。`vm.reinstall` 仍未实现，也不能以本地 template helper、任意 URL、storage volume 或 `vm.create` 替代：PVE 恢复/介质切换是非事务性流程，缺少安全回滚保证，且尚无签名命令可验证的安装介质 allowlist、摘要/来源约束和审批模型。
+control 当前 49 个 known actions 已用一致性测试锁住 registry/validator/executor。2026-09-02 起新增初次资源定型、固定模板重装、短时 console、只读 snapshot/backup、QEMU suspend/resume 与逐 NIC host-netdev 计量；当前合同见 `PROVISIONING-ACTIONS-V1.md`。`vm.reinstall` 不接受本地 template helper、任意 URL/ISO/storage volume 或 shell，只接受 signed 固定模板 identity/config SHA 与完整交付回读合同；真实 PVE 生产开放仍须由外部控制面完成 action allowlist/审批和验收。
 
 ## 仍然有效的审阅结论
 
@@ -39,7 +39,7 @@ control 当前 39 个 known actions 已用一致性测试锁住 registry/validat
 - 资源、网络、IPFilter、防火墙、快照和备份的 Executor 分支只是 Agent 原语；官网编排、回读和 feature flag 完成前不能宣称相关产品能力已上线。
 - systemd notify/watchdog、请求级采集 progress deadline、`Restart=always` 和 clean/unclean lifecycle state 已接线；重启后 `agent.previousExit.*` 会分别进入不可淘汰的 website/monitoring lifecycle 队列。外部接收/展示与真实故障演练仍待验收，这只是本地恢复原语而非远端 HA SLA。
 - 官网目标服务必须在 Agent 离线时持久排队未过期命令；本仓已实现领取后的 journal/UPID/receipt 恢复，但官网队列与 command `wait` 仍待远端交付。任何离线场景都禁止自动启用官网直连 PVE。
-- `ag-pve template init|catalog|discover|bootstrap` 是校验同一 Agent 发布包内 `bundles/ppflight-cloudinit` 后执行的本机 root 管理流程；installer 已验证依赖、strict IPv4/HTTPS redirect policy，并用不可变版本目录/原子 managed symlink 安装。真实 PVE 上创建模板/备份的 plan/execute 破坏性验收仍待完成。它不进入远程 control action registry，也不能当作 `vm.reinstall` 或远程 Agent 自升级已经实现。
+- `ag-pve template init|catalog|discover|bootstrap` 是校验同一 Agent 发布包内 `bundles/ppflight-cloudinit` 后执行的本机 root 管理流程；installer 已验证依赖、strict IPv4/HTTPS redirect policy，并用不可变版本目录/原子 managed symlink 安装。真实 PVE 上创建模板/备份的 plan/execute 破坏性验收仍待完成。它不进入远程 control action registry，也不能替代只接受固定模板身份与摘要的 `vm.reinstall` 或远程 Agent 自升级。
 - `vX.Y.Z` tag release workflow 已构建 Linux amd64/arm64，测试并用 `scripts/package-release.sh` 输出可复现、离线 tarball 与 `SHA256SUMS`；手动 dispatch 只留 artifact，不发布。应先校验 checksum 再解压，不能 `curl | bash`；SHA-256 不替代组织另行要求的发布签名/来源审批。
 
 本历史摘要不再列出旧 JSON 或旧 endpoint，以免示例被复制到新实现。

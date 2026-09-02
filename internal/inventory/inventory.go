@@ -87,21 +87,43 @@ func (a Assignment) PVEKey() string {
 }
 
 // AggregateMeteringCapability reports whether PVE guest-level netin/netout can
-// satisfy the signed NIC policy. It is safe only when every configured NIC is
-// explicitly metered; otherwise private traffic cannot be separated.
+// satisfy the signed NIC policy. It is safe only for exactly one public,
+// metered NIC; with multiple NICs, private traffic cannot be separated.
 func (a Assignment) AggregateMeteringCapability() Capability {
 	if len(a.NICBindings) == 0 {
 		return Capability{Reason: "nic_binding_required", Source: "pve-guest-aggregate"}
 	}
-	for _, binding := range a.NICBindings {
-		if !binding.Metered {
-			if len(a.NICBindings) > 1 {
-				return Capability{Reason: "multi_nic_pve_aggregate_only", Source: "pve-guest-aggregate"}
-			}
-			return Capability{Reason: "no_metered_nic", Source: "pve-guest-aggregate"}
-		}
+	if len(a.NICBindings) != 1 {
+		return Capability{Reason: "multi_nic_pve_aggregate_only", Source: "pve-guest-aggregate"}
+	}
+	binding := a.NICBindings[0]
+	if binding.Role != "public" || !binding.Metered {
+		return Capability{Reason: "no_metered_public_nic", Source: "pve-guest-aggregate"}
 	}
 	return Capability{Supported: true, Source: "pve-guest-aggregate"}
+}
+
+// PerNICMeteringCapability reports whether the signed assignment has enough
+// stable netN/MAC policy to use PVE host tap/veth counters. Unlike the legacy
+// guest aggregate, this remains safe for mixed public/private guests because
+// only public, metered bindings are emitted.
+func (a Assignment) PerNICMeteringCapability() Capability {
+	if len(a.NICBindings) == 0 {
+		return Capability{Reason: "nic_binding_required", Source: "pve-host-netdev"}
+	}
+	public := 0
+	for _, binding := range a.NICBindings {
+		if binding.Role == "public" && binding.Metered {
+			public++
+		}
+		if binding.Role == "private" && binding.Metered {
+			return Capability{Reason: "private_nic_must_not_be_metered", Source: "pve-host-netdev"}
+		}
+	}
+	if public == 0 {
+		return Capability{Reason: "public_metered_nic_required", Source: "pve-host-netdev"}
+	}
+	return Capability{Supported: true, Source: "pve-host-netdev"}
 }
 
 func Parse(contents []byte, expectedClusterRef string) (Document, error) {
@@ -224,6 +246,11 @@ func validateNICBindings(bindings []NICBinding) error {
 		}
 		if binding.Role == "public" {
 			public++
+			if !binding.Metered {
+				return fmt.Errorf("nicBindings[%d].public interface must be metered", index)
+			}
+		} else if binding.Metered {
+			return fmt.Errorf("nicBindings[%d].private interface must not be metered", index)
 		}
 		if binding.Primary {
 			primary++

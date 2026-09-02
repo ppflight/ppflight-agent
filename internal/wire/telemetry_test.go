@@ -102,8 +102,8 @@ func TestWebsiteTelemetryExposesNICPolicyAndSafeMeteringCapability(t *testing.T)
 		t.Fatal(err)
 	}
 	guest := batch.Guests[0]
-	if guest.Capabilities.Metering.Supported || guest.Capabilities.Metering.Reason != "multi_nic_pve_aggregate_only" {
-		t.Fatalf("mixed NIC policy was treated as exact metering: %#v", guest.Capabilities.Metering)
+	if !guest.Capabilities.Metering.Supported || guest.Capabilities.Metering.Source != "pve-host-netdev" {
+		t.Fatalf("mixed NIC policy did not advertise safe per-NIC metering: %#v", guest.Capabilities.Metering)
 	}
 	if len(guest.Networks) != 2 || guest.Networks[0].Binding == nil || guest.Networks[0].Binding.Role != "public" || !guest.Networks[0].PolicyMatch.Supported {
 		t.Fatalf("NIC binding was not correlated with PVE config: %#v", guest.Networks)

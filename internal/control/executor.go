@@ -59,6 +59,23 @@ type Executor struct {
 	Mode                string
 	ProductionExecution bool
 	UpgradeSubmitter    UpgradeSubmitter
+	// InitialResources authorizes the one-time exception to the normal
+	// grow-only resource policy from durable clone lineage. Production never
+	// trusts a caller-provided "new VM" boolean.
+	InitialResources InitialResourceAuthorizer
+	// ConsoleSessions escrows short-lived PVE console material through the
+	// fixed website control channel. Ticket/certificate values never enter a
+	// receipt, audit event, log, or durable Agent queue.
+	ConsoleSessions ConsoleSessionSink
+}
+
+type InitialResourceAuthorizer interface {
+	AuthorizeInitialResources(Command, string, string) error
+}
+
+type ConsoleSessionSink interface {
+	Publish(context.Context, ConsoleSessionSecret) (ConsoleSessionPublication, error)
+	Revoke(context.Context, ConsoleSessionRevoke) error
 }
 
 // UpgradeSubmitter stages an already verified agent.upgrade command for the
@@ -143,6 +160,28 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "snapshot.list" || command.Action == "snapshot.get" || command.Action == "backup.list" || command.Action == "backup.get" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, readErr := readInventoryAction(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if readErr != nil {
+			r.State, r.Code = "failed", "PVE_READ_FAILED"
+			return finish(readErr)
+		}
+		if len(result) > maxControlResultBytes {
+			r.State, r.Code = "failed", "RESULT_TOO_LARGE"
+			return finish(ErrResultTooLarge)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if command.Action == "vm.verify-delivery" {
 		client := e.ReadClient
 		if client == nil {
@@ -219,7 +258,33 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
 		return finish(errors.New("PVE control client is unavailable"))
 	}
-	if command.Action == "vm.reset-password" || command.Action == "vm.set-timezone" {
+	if command.Action == "vm.set-initial-resources" {
+		if e.InitialResources == nil {
+			r.State, r.Code, r.FinishedAt = "rejected", "CLONE_LINEAGE_UNAVAILABLE", time.Now().UTC()
+			return finish(errors.New("initial resource clone lineage is unavailable"))
+		}
+		var p initialResourcesP
+		_ = strictParameters(command.Parameters, &p)
+		if lineageErr := e.InitialResources.AuthorizeInitialResources(command, p.CloneOperationID, p.TemplateConfigSHA256); lineageErr != nil {
+			r.State, r.Code, r.FinishedAt = "rejected", "INITIAL_RESOURCE_POLICY_REJECTED", time.Now().UTC()
+			return finish(lineageErr)
+		}
+	}
+	if command.Action == "vm.console.create-session" || command.Action == "vm.console.revoke-session" {
+		if e.ConsoleSessions == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "CONSOLE_BROKER_UNAVAILABLE", time.Now().UTC()
+			return finish(errors.New("console session broker is unavailable"))
+		}
+		result, consoleErr := executeConsoleSession(ctx, e.Client, e.ConsoleSessions, command, now)
+		r.FinishedAt = time.Now().UTC()
+		if consoleErr != nil {
+			r.State, r.Code = "failed", "CONSOLE_SESSION_FAILED"
+			return finish(consoleErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
+	if (command.Action == "vm.reset-password" && command.Identity.GuestType == "qemu") || command.Action == "vm.set-timezone" {
 		wanted := "guest-set-user-password"
 		if command.Action == "vm.set-timezone" {
 			wanted = "guest-exec"
@@ -242,7 +307,11 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	r.PVETaskUPID, r.FinishedAt = upid, time.Now().UTC()
 	if err != nil {
 		var httpErr *pve.HTTPError
-		if errors.As(err, &httpErr) {
+		if errors.Is(err, ErrReinstallRolledBack) {
+			r.State, r.Code = "failed", "REINSTALL_ROLLED_BACK"
+		} else if errors.Is(err, ErrReinstallIndeterminate) {
+			r.State, r.Code = "indeterminate", "REINSTALL_INDETERMINATE"
+		} else if errors.As(err, &httpErr) {
 			r.State, r.Code = "failed", "PVE_ACTION_REJECTED"
 		} else {
 			r.State, r.Code = "indeterminate", "PVE_RESULT_INDETERMINATE"
@@ -377,6 +446,14 @@ type resourcesP struct {
 	Sockets   *int `json:"sockets,omitempty"`
 	MemoryMiB *int `json:"memoryMiB,omitempty"`
 }
+type initialResourcesP struct {
+	Cores                int    `json:"cores"`
+	Sockets              int    `json:"sockets"`
+	MemoryMiB            int    `json:"memoryMiB"`
+	CloneOperationID     string `json:"cloneOperationId"`
+	VMGeneration         uint64 `json:"vmGeneration"`
+	TemplateConfigSHA256 string `json:"templateConfigSha256"`
+}
 type resizeP struct {
 	Disk      string `json:"disk"`
 	Size      string `json:"size,omitempty"`
@@ -424,6 +501,7 @@ type passwordP struct {
 	Username string `json:"username,omitempty"`
 	Password string `json:"password"`
 	Crypted  *bool  `json:"crypted"`
+	OSFamily string `json:"osFamily,omitempty"`
 }
 type cloudInitP struct {
 	Hostname          string   `json:"hostname"`
@@ -473,6 +551,12 @@ type snapP struct {
 type namedP struct {
 	Name string `json:"name"`
 }
+type snapshotListP struct {
+	Limit int `json:"limit"`
+}
+type snapshotGetP struct {
+	Name string `json:"name"`
+}
 type backupCreateP struct {
 	Storage  string `json:"storage"`
 	Mode     string `json:"mode"`
@@ -486,6 +570,21 @@ type backupRestoreP struct {
 	Storage string `json:"storage"`
 	Volume  string `json:"volume"`
 	Force   *bool  `json:"force"`
+}
+type backupListP struct {
+	Storage string `json:"storage"`
+	Limit   int    `json:"limit"`
+}
+type backupGetP struct {
+	Storage string `json:"storage"`
+	Volume  string `json:"volume"`
+}
+type consoleCreateP struct {
+	TTLSeconds int   `json:"ttlSeconds"`
+	WebSocket  *bool `json:"webSocket"`
+}
+type consoleRevokeP struct {
+	SessionRef string `json:"sessionRef"`
 }
 type taskP struct {
 	UPID string `json:"upid"`
@@ -571,6 +670,11 @@ func validateParameters(c Command) error {
 		return err
 	case "vm.start", "vm.shutdown", "vm.stop", "vm.reboot":
 		return requireEmptyObject(c.Parameters)
+	case "vm.suspend", "vm.resume":
+		if c.Identity.GuestType != "qemu" || requireEmptyObject(c.Parameters) != nil {
+			return errors.New("suspend and resume are supported only for QEMU")
+		}
+		return nil
 	case "vm.create":
 		var p createP
 		if strictParameters(c.Parameters, &p) != nil || p.Start == nil || !nameRE.MatchString(p.Name) || p.Cores < 1 || p.Cores > 128 || p.MemoryMiB < 128 || p.MemoryMiB > 4194304 || !storageRE.MatchString(p.Storage) || p.DiskGiB < 1 || p.DiskGiB > 1048576 || (c.Identity.GuestType == "lxc" && !validTemplate(p.Template)) || (c.Identity.GuestType == "qemu" && p.Template != "") {
@@ -587,6 +691,18 @@ func validateParameters(c Command) error {
 		var p resourcesP
 		if strictParameters(c.Parameters, &p) != nil || !validResources(p) {
 			return errors.New("invalid resource parameters")
+		}
+		return nil
+	case "vm.set-initial-resources":
+		var p initialResourcesP
+		if strictParameters(c.Parameters, &p) != nil || !validInitialResources(c, p) {
+			return errors.New("invalid initial resource parameters")
+		}
+		return nil
+	case "vm.reinstall":
+		var p reinstallP
+		if strictParameters(c.Parameters, &p) != nil || !exactReinstallKeys(c.Parameters) || !validReinstall(c, p) {
+			return errors.New("invalid reinstall parameters")
 		}
 		return nil
 	case "vm.resize":
@@ -656,10 +772,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.reset-password":
 		var p passwordP
-		if c.Identity.GuestType != "qemu" {
-			return ErrUnsupported
-		}
-		if strictParameters(c.Parameters, &p) != nil || p.Crypted == nil || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || !nameRE.MatchString(p.Username) {
+		if strictParameters(c.Parameters, &p) != nil || p.Crypted == nil || p.Password == "" || len(p.Password) > 1024 || strings.ContainsAny(p.Password, "\x00\r\n") || !nameRE.MatchString(p.Username) || !validPasswordTarget(c.Identity.GuestType, p) {
 			return errors.New("invalid password reset parameters")
 		}
 		return nil
@@ -673,6 +786,18 @@ func validateParameters(c Command) error {
 		var p namedP
 		if strictParameters(c.Parameters, &p) != nil || !snapRE.MatchString(p.Name) {
 			return errors.New("invalid snapshot parameters")
+		}
+		return nil
+	case "snapshot.list":
+		var p snapshotListP
+		if strictParameters(c.Parameters, &p) != nil || p.Limit < 1 || p.Limit > 100 {
+			return errors.New("invalid snapshot list parameters")
+		}
+		return nil
+	case "snapshot.get":
+		var p snapshotGetP
+		if strictParameters(c.Parameters, &p) != nil || !snapRE.MatchString(p.Name) {
+			return errors.New("invalid snapshot get parameters")
 		}
 		return nil
 	case "backup.create":
@@ -691,6 +816,30 @@ func validateParameters(c Command) error {
 		var p backupRestoreP
 		if strictParameters(c.Parameters, &p) != nil || p.Force == nil || !storageRE.MatchString(p.Storage) || !validBackupVolume(p.Volume) {
 			return errors.New("invalid backup parameters")
+		}
+		return nil
+	case "backup.list":
+		var p backupListP
+		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || p.Limit < 1 || p.Limit > 100 {
+			return errors.New("invalid backup list parameters")
+		}
+		return nil
+	case "backup.get":
+		var p backupGetP
+		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || !validBackupVolume(p.Volume) {
+			return errors.New("invalid backup get parameters")
+		}
+		return nil
+	case "vm.console.create-session":
+		var p consoleCreateP
+		if strictParameters(c.Parameters, &p) != nil || p.WebSocket == nil || !*p.WebSocket || p.TTLSeconds < 30 || p.TTLSeconds > 300 {
+			return errors.New("invalid console session parameters")
+		}
+		return nil
+	case "vm.console.revoke-session":
+		var p consoleRevokeP
+		if strictParameters(c.Parameters, &p) != nil || !commandIDRE.MatchString(p.SessionRef) {
+			return errors.New("invalid console revoke parameters")
 		}
 		return nil
 	case "task.status":
@@ -821,6 +970,8 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	switch c.Action {
 	case "vm.start", "vm.shutdown", "vm.stop", "vm.reboot":
 		method, path = http.MethodPost, base+"/status/"+strings.TrimPrefix(c.Action, "vm.")
+	case "vm.suspend", "vm.resume":
+		return executePowerTransition(ctx, client, c, base)
 	case "vm.create":
 		var p createP
 		_ = strictParameters(c.Parameters, &p)
@@ -846,6 +997,14 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		method, path = http.MethodPost, fmt.Sprintf("/nodes/%s/%s/%d/clone", c.Identity.NodeRef, c.Identity.GuestType, p.SourceVMID)
 	case "vm.set-resources":
 		return setResources(ctx, client, c, base)
+	case "vm.set-initial-resources":
+		return setInitialResources(ctx, client, c, base)
+	case "vm.reinstall":
+		return reinstallGuest(ctx, client, c)
+	case "vm.console.create-session", "vm.console.revoke-session":
+		// Executor.Execute dispatches these through the ephemeral broker so
+		// console secrets can never enter the ordinary PVE result path.
+		return "", nil, errors.New("console action requires ephemeral broker dispatch")
 	case "vm.resize":
 		return resizeDisk(ctx, client, c, base)
 	case "vm.set-disk-io":

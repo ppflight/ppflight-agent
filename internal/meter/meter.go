@@ -10,9 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/exporter"
 	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/observation"
@@ -55,6 +58,9 @@ type counterState struct {
 	ServiceRef   string    `json:"serviceRef"`
 	Generation   uint64    `json:"generation,string"`
 	InstanceUUID string    `json:"instanceUuid"`
+	InterfaceRef string    `json:"interfaceRef,omitempty"`
+	CanonicalMAC string    `json:"canonicalMac,omitempty"`
+	Source       string    `json:"source,omitempty"`
 	CounterEpoch string    `json:"counterEpoch"`
 	Ingress      uint64    `json:"ingress,string"`
 	Egress       uint64    `json:"egress,string"`
@@ -164,7 +170,7 @@ func (m *Manager) Observe(snapshot observation.Snapshot, assignments *inventory.
 		return guests[i].GuestType < guests[j].GuestType
 	})
 	for _, guest := range guests {
-		if guest.Template || guest.PVE.IngressBytes == nil || guest.PVE.EgressBytes == nil || !guest.PVE.Availability.Available {
+		if guest.Template {
 			continue
 		}
 		assignment, ok := assignments.Lookup(m.cfg.ClusterRef, guest.GuestType, guest.VMID)
@@ -172,40 +178,37 @@ func (m *Manager) Observe(snapshot observation.Snapshot, assignments *inventory.
 			continue
 		}
 		billingState := assignment.BillingState
-		meteringCapability := assignment.AggregateMeteringCapability()
-		if !meteringCapability.Supported || m.cfg.Mode != "production" || assignment.CutoverAt == nil || snapshot.ObservedAt.Before(*assignment.CutoverAt) {
+		if m.cfg.Mode != "production" || assignment.CutoverAt == nil || snapshot.ObservedAt.Before(*assignment.CutoverAt) {
 			billingState = "shadow"
 		}
-		key := assignment.Key()
-		previous, found := newState.Counters[key]
-		epoch := previous.CounterEpoch
-		if !found || previous.ServiceRef != assignment.ServiceRef || previous.InstanceUUID != assignment.InstanceUUID || previous.Generation != assignment.Generation || *guest.PVE.IngressBytes < previous.Ingress || *guest.PVE.EgressBytes < previous.Egress {
-			var idErr error
-			epoch, idErr = protocol.NewID()
-			if idErr != nil {
-				return protocol.UsageBatch{}, false, idErr
-			}
-		}
-		eventID, err := protocol.NewID()
-		if err != nil {
-			return protocol.UsageBatch{}, false, err
-		}
-		newState.NextEventSequence++
 		nodeRef := assignment.NodeRef
 		if nodeRef == "" {
 			nodeRef = guest.Node
 		}
-		records = append(records, protocol.UsageRecord{
-			ServiceRef: assignment.ServiceRef, ClusterRef: assignment.ClusterRef, NodeRef: nodeRef,
-			VMID: assignment.VMID, Generation: protocol.Counter(assignment.Generation), InstanceUUID: assignment.InstanceUUID,
-			GuestType: assignment.GuestType, EventID: eventID, CounterEpoch: epoch,
-			Sequence: protocol.Counter(newState.NextEventSequence), Source: "pve-cluster-resources",
-			BillingState: billingState, CutoverAt: assignment.CutoverAt, ObservedAt: snapshot.ObservedAt,
-			IngressBytes: protocol.Counter(*guest.PVE.IngressBytes), EgressBytes: protocol.Counter(*guest.PVE.EgressBytes),
-		})
-		newState.Counters[key] = counterState{
-			ServiceRef: assignment.ServiceRef, Generation: assignment.Generation, InstanceUUID: assignment.InstanceUUID,
-			CounterEpoch: epoch, Ingress: *guest.PVE.IngressBytes, Egress: *guest.PVE.EgressBytes, ObservedAt: snapshot.ObservedAt,
+		perNIC, complete := resolvePerNICCounters(snapshot, guest, assignment)
+		if complete {
+			for _, counter := range perNIC {
+				if err := appendUsageRecord(&records, &newState, assignment, nodeRef, snapshot.ObservedAt, billingState, counter); err != nil {
+					return protocol.UsageBatch{}, false, err
+				}
+			}
+			// A guest with only private/unmetered bindings is a complete
+			// per-NIC observation with zero billable records. Never fall back
+			// to the whole-guest aggregate for that case.
+			continue
+		}
+		if guest.PVE.IngressBytes == nil || guest.PVE.EgressBytes == nil || !guest.PVE.Availability.Available {
+			continue
+		}
+		if !assignment.AggregateMeteringCapability().Supported {
+			billingState = "shadow"
+		}
+		// Legacy aggregate data is retained only as an explicitly source-labelled
+		// shadow signal when the NIC policy cannot yet be satisfied. It is never
+		// promoted to active billing for a mixed public/private guest.
+		counter := nicCounter{Ingress: *guest.PVE.IngressBytes, Egress: *guest.PVE.EgressBytes, Source: "pve-cluster-resources"}
+		if err := appendUsageRecord(&records, &newState, assignment, nodeRef, snapshot.ObservedAt, billingState, counter); err != nil {
+			return protocol.UsageBatch{}, false, err
 		}
 	}
 	if len(records) == 0 {
@@ -245,6 +248,94 @@ func (m *Manager) Observe(snapshot observation.Snapshot, assignments *inventory.
 		return protocol.UsageBatch{}, false, err
 	}
 	return batch, true, nil
+}
+
+type nicCounter struct {
+	InterfaceRef string
+	CanonicalMAC string
+	Role         string
+	Source       string
+	Ingress      uint64
+	Egress       uint64
+}
+
+func resolvePerNICCounters(snapshot observation.Snapshot, guest observation.Guest, assignment inventory.Assignment) ([]nicCounter, bool) {
+	if snapshot.Host == nil || len(assignment.NICBindings) == 0 {
+		return nil, false
+	}
+	observed := make(map[string]observation.Network, len(guest.Networks))
+	for _, network := range guest.Networks {
+		observed[network.Interface] = network
+	}
+	host := make(map[string]exporter.InterfaceObservation, len(snapshot.Host.Interfaces))
+	for _, item := range snapshot.Host.Interfaces {
+		host[item.Device] = item
+	}
+	result := make([]nicCounter, 0, len(assignment.NICBindings))
+	for _, binding := range assignment.NICBindings {
+		if !binding.Metered {
+			continue
+		}
+		network, ok := observed[binding.Interface]
+		if !ok || !strings.EqualFold(network.MAC, binding.ExpectedMAC) {
+			return nil, false
+		}
+		index, err := strconv.Atoi(strings.TrimPrefix(binding.Interface, "net"))
+		if err != nil || index != network.Index {
+			return nil, false
+		}
+		device := "tap" + strconv.Itoa(guest.VMID) + "i" + strconv.Itoa(index)
+		if guest.GuestType == "lxc" {
+			device = "veth" + strconv.Itoa(guest.VMID) + "i" + strconv.Itoa(index)
+		}
+		item, ok := host[device]
+		if !ok {
+			return nil, false
+		}
+		receiveText, receiveOK := exporter.CounterText(item.ReceiveBytes)
+		transmitText, transmitOK := exporter.CounterText(item.TransmitBytes)
+		receive, receiveErr := strconv.ParseUint(receiveText, 10, 64)
+		transmit, transmitErr := strconv.ParseUint(transmitText, 10, 64)
+		if !receiveOK || !transmitOK || receiveErr != nil || transmitErr != nil {
+			return nil, false
+		}
+		// Linux sees RX as bytes sent by the guest and TX as bytes delivered to
+		// it, so customer ingress/egress are intentionally reversed here.
+		result = append(result, nicCounter{InterfaceRef: binding.Interface, CanonicalMAC: strings.ToUpper(binding.ExpectedMAC), Role: binding.Role, Source: "pve-host-netdev", Ingress: transmit, Egress: receive})
+	}
+	return result, true
+}
+
+func appendUsageRecord(records *[]protocol.UsageRecord, state *meterState, assignment inventory.Assignment, nodeRef string, observedAt time.Time, billingState string, counter nicCounter) error {
+	key := assignment.Key()
+	if counter.InterfaceRef != "" {
+		key += "/" + counter.InterfaceRef
+	}
+	previous, found := state.Counters[key]
+	epoch := previous.CounterEpoch
+	if !found || previous.ServiceRef != assignment.ServiceRef || previous.InstanceUUID != assignment.InstanceUUID || previous.Generation != assignment.Generation || previous.InterfaceRef != counter.InterfaceRef || previous.CanonicalMAC != counter.CanonicalMAC || previous.Source != counter.Source || counter.Ingress < previous.Ingress || counter.Egress < previous.Egress {
+		var err error
+		epoch, err = protocol.NewID()
+		if err != nil {
+			return err
+		}
+	}
+	eventID, err := protocol.NewID()
+	if err != nil {
+		return err
+	}
+	state.NextEventSequence++
+	*records = append(*records, protocol.UsageRecord{
+		ServiceRef: assignment.ServiceRef, ClusterRef: assignment.ClusterRef, NodeRef: nodeRef,
+		VMID: assignment.VMID, Generation: protocol.Counter(assignment.Generation), InstanceUUID: assignment.InstanceUUID,
+		GuestType: assignment.GuestType, EventID: eventID, CounterEpoch: epoch,
+		Sequence: protocol.Counter(state.NextEventSequence), Source: counter.Source,
+		InterfaceRef: counter.InterfaceRef, CanonicalMAC: counter.CanonicalMAC, NetworkRole: counter.Role, Metered: counter.InterfaceRef != "",
+		BillingState: billingState, CutoverAt: assignment.CutoverAt, ObservedAt: observedAt,
+		IngressBytes: protocol.Counter(counter.Ingress), EgressBytes: protocol.Counter(counter.Egress),
+	})
+	state.Counters[key] = counterState{ServiceRef: assignment.ServiceRef, Generation: assignment.Generation, InstanceUUID: assignment.InstanceUUID, InterfaceRef: counter.InterfaceRef, CanonicalMAC: counter.CanonicalMAC, Source: counter.Source, CounterEpoch: epoch, Ingress: counter.Ingress, Egress: counter.Egress, ObservedAt: observedAt}
+	return nil
 }
 
 func cloneState(source meterState) meterState {

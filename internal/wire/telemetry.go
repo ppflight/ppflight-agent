@@ -156,12 +156,12 @@ func websiteAvailability(values map[string]observation.Availability) map[string]
 func guestCapabilities(guest observation.Guest, assignment *inventory.Assignment, now time.Time) GuestCapabilities {
 	result := GuestCapabilities{Lifecycle: ActionCapability{Available: true}}
 	if assignment == nil {
-		result.Metering = inventory.Capability{Reason: "assignment_required", Source: "pve-guest-aggregate"}
+		result.Metering = inventory.Capability{Reason: "assignment_required", Source: "pve-host-netdev"}
 	} else {
-		result.Metering = assignment.AggregateMeteringCapability()
+		result.Metering = assignment.PerNICMeteringCapability()
 	}
 	if guest.GuestType != "qemu" {
-		result.RootPasswordReset = ActionCapability{Reason: "lxc_password_reset_not_implemented"}
+		result.RootPasswordReset = ActionCapability{Available: true, ExecutionPreflight: true}
 		result.GuestNetworkVerify = ActionCapability{Reason: "qga_not_applicable"}
 		return result
 	}

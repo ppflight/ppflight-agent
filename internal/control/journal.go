@@ -36,25 +36,29 @@ type Journal struct {
 }
 
 type journalRecord struct {
-	Version        int             `json:"version"`
-	CommandID      string          `json:"commandId"`
-	OperationID    string          `json:"operationId,omitempty"`
-	AgentRef       string          `json:"agentRef"`
-	OperatorRef    string          `json:"operatorRef,omitempty"`
-	Scope          string          `json:"scope"`
-	Mutating       bool            `json:"mutating"`
-	Digest         string          `json:"digest"`
-	ResourceKey    string          `json:"resourceKey"`
-	NodeRef        string          `json:"nodeRef,omitempty"`
-	PVETaskUPID    string          `json:"pveTaskUpid,omitempty"`
-	AgentUpgradeID string          `json:"agentUpgradeId,omitempty"`
-	State          string          `json:"state"`
-	ReceiptPending bool            `json:"receiptPending,omitempty"`
-	CreatedAt      time.Time       `json:"createdAt"`
-	UpdatedAt      time.Time       `json:"updatedAt"`
-	Receipt        *Receipt        `json:"receipt,omitempty"`
-	AuditContext   *auditContext   `json:"auditContext,omitempty"`
-	AuditPending   *auditlog.Event `json:"auditPending,omitempty"`
+	Version     int    `json:"version"`
+	CommandID   string `json:"commandId"`
+	OperationID string `json:"operationId,omitempty"`
+	AgentRef    string `json:"agentRef"`
+	OperatorRef string `json:"operatorRef,omitempty"`
+	Scope       string `json:"scope"`
+	Action      string `json:"action,omitempty"`
+	// SourceConfigSHA256 is safe clone-lineage metadata. It is the reviewed
+	// template configuration digest, never a command body or credential.
+	SourceConfigSHA256 string          `json:"sourceConfigSha256,omitempty"`
+	Mutating           bool            `json:"mutating"`
+	Digest             string          `json:"digest"`
+	ResourceKey        string          `json:"resourceKey"`
+	NodeRef            string          `json:"nodeRef,omitempty"`
+	PVETaskUPID        string          `json:"pveTaskUpid,omitempty"`
+	AgentUpgradeID     string          `json:"agentUpgradeId,omitempty"`
+	State              string          `json:"state"`
+	ReceiptPending     bool            `json:"receiptPending,omitempty"`
+	CreatedAt          time.Time       `json:"createdAt"`
+	UpdatedAt          time.Time       `json:"updatedAt"`
+	Receipt            *Receipt        `json:"receipt,omitempty"`
+	AuditContext       *auditContext   `json:"auditContext,omitempty"`
+	AuditPending       *auditlog.Event `json:"auditPending,omitempty"`
 }
 
 // auditContext is the safe, immutable command projection needed to rebuild a
@@ -205,13 +209,65 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	record := journalRecord{
 		Version: SchemaVersion, CommandID: command.CommandID, OperationID: command.OperationID,
 		AgentRef: command.AgentRef, OperatorRef: command.OperatorRef,
-		Scope: command.Scope, Mutating: mutating, Digest: digest, ResourceKey: resourceKey, NodeRef: command.Identity.NodeRef,
+		Scope: command.Scope, Action: command.Action, Mutating: mutating, Digest: digest, ResourceKey: resourceKey, NodeRef: command.Identity.NodeRef,
 		State: "received", CreatedAt: now.UTC(), UpdatedAt: now.UTC(), AuditContext: audit,
+	}
+	if command.Action == "vm.clone" {
+		var parameters cloneP
+		if err := strictParameters(command.Parameters, &parameters); err != nil || !bodyHashRE.MatchString(parameters.SourceConfigSHA256) {
+			return Receipt{}, false, errors.New("clone lineage is invalid")
+		}
+		record.SourceConfigSHA256 = parameters.SourceConfigSHA256
 	}
 	if err := writeJournal(filename, record); err != nil {
 		return Receipt{}, false, err
 	}
 	return Receipt{}, false, nil
+}
+
+// AuthorizeInitialResources proves that the target generation was created by
+// a completed, journaled vm.clone in the same signed provisioning operation.
+// It also refuses the one-time exception after any successful start,
+// delivery verification, or reinstall for the same generation.
+func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, templateConfigSHA256 string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if command.Action != "vm.set-initial-resources" || cloneOperationID != command.OperationID || !commandIDRE.MatchString(cloneOperationID) || !bodyHashRE.MatchString(templateConfigSHA256) {
+		return errors.New("initial resource lineage identity is invalid")
+	}
+	resourceKey, err := journalResourceKey(command)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(j.directory)
+	if err != nil {
+		return err
+	}
+	cloneCompleted := false
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		record, readErr := readJournal(filepath.Join(j.directory, entry.Name()))
+		if readErr != nil {
+			return readErr
+		}
+		if record.ResourceKey != resourceKey {
+			continue
+		}
+		if record.Action == "vm.start" || record.Action == "vm.verify-delivery" || record.Action == "vm.reinstall" || (record.Action == "vm.set-initial-resources" && record.CommandID != command.CommandID) {
+			if record.Receipt != nil && (record.Receipt.State == "submitted" || record.Receipt.State == "waiting" || record.Receipt.State == "succeeded") {
+				return errors.New("VM generation has already been finalized, delivered, or started")
+			}
+		}
+		if record.Action == "vm.clone" && record.OperationID == cloneOperationID && strings.EqualFold(record.SourceConfigSHA256, templateConfigSHA256) && record.Receipt != nil && record.Receipt.State == "succeeded" {
+			cloneCompleted = true
+		}
+	}
+	if !cloneCompleted {
+		return errors.New("completed clone lineage was not found")
+	}
+	return nil
 }
 
 func (j *Journal) Complete(command Command, receipt Receipt) error {
@@ -691,7 +747,7 @@ func readJournal(filename string) (journalRecord, error) {
 		return journalRecord{}, err
 	}
 	var record journalRecord
-	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) {
+	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) {
 		return journalRecord{}, fmt.Errorf("control journal record is corrupt")
 	}
 	return record, nil

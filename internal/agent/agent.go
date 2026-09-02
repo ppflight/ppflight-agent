@@ -352,6 +352,10 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		if upgradeErr != nil {
 			return nil, fmt.Errorf("create self-update coordinator: %w", upgradeErr)
 		}
+		consoleSink, consoleErr := control.NewHTTPSConsoleSessionSink(cfg.Control.ResultURL, secrets.ControlReceipts.KeyID, secrets.ControlReceipts.Secret, cfg.Control.RequestTimeout.Duration)
+		if consoleErr != nil {
+			return nil, fmt.Errorf("create console session broker: %w", consoleErr)
+		}
 		service, serviceErr := control.NewService(control.ServiceConfig{
 			AgentRef: cfg.Identity.AgentRef, ClusterRef: cfg.Identity.ClusterRef,
 			BindingID: secrets.WebsiteBindingID, DeviceID: secrets.DeviceID, CredentialEpoch: secrets.WebsiteCredentialEpoch,
@@ -364,6 +368,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			Executor: control.Executor{
 				Client: writeClient, ReadClient: readClient, Discovery: discovery.New(readClient),
 				Mode: cfg.Mode, ProductionExecution: cfg.Control.ProductionExecution, UpgradeSubmitter: upgradeSubmitter,
+				ConsoleSessions: consoleSink,
 			},
 			ReceiptQueue: controlQueue, CursorFile: filepath.Join(runtimeStateDirectory, "control", "cursor.json"),
 		})

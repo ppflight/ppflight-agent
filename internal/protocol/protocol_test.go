@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 )
@@ -60,5 +61,45 @@ func TestBatchIdentityIsRequired(t *testing.T) {
 	batch.SourceRef = ""
 	if err := batch.Validate(); err == nil {
 		t.Fatal("batch without source ref validated")
+	}
+}
+
+func TestPerNICUsageIdentityIsStrictAndCanonical(t *testing.T) {
+	now := time.Now().UTC()
+	base := UsageBatch{SchemaVersion: 1, BatchID: "batch", AgentRef: "agent", CollectorRef: "collector", SourceRef: "source", ClusterRef: "cluster", Mode: "production", Sequence: 1, ObservedAt: now, Events: []UsageRecord{{
+		ServiceRef: "service", ClusterRef: "cluster", NodeRef: "pve", VMID: 101, Generation: 1, InstanceUUID: "instance", GuestType: "qemu", EventID: "event", CounterEpoch: "epoch", Sequence: 1, Source: "pve-host-netdev", InterfaceRef: "net0", CanonicalMAC: "02:00:00:00:AB:01", NetworkRole: "public", Metered: true, BillingState: "active", ObservedAt: now,
+	}}}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid per-NIC usage rejected: %v", err)
+	}
+	for _, mutate := range []func(*UsageRecord){
+		func(event *UsageRecord) { event.InterfaceRef = "net32" },
+		func(event *UsageRecord) { event.InterfaceRef = "net01" },
+		func(event *UsageRecord) { event.CanonicalMAC = "02:00:00:00:ab:01" },
+		func(event *UsageRecord) { event.CanonicalMAC = "03:00:00:00:01:01" },
+		func(event *UsageRecord) { event.NetworkRole = "private" },
+		func(event *UsageRecord) { event.Metered = false },
+	} {
+		candidate := base
+		candidate.Events = append([]UsageRecord(nil), base.Events...)
+		mutate(&candidate.Events[0])
+		if err := candidate.Validate(); err == nil {
+			t.Fatalf("invalid per-NIC identity accepted: %#v", candidate.Events[0])
+		}
+	}
+}
+
+func TestPerNICUsageGoldenPreservesUint64(t *testing.T) {
+	raw, err := os.ReadFile("testdata/usage-record-per-nic-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var event UsageRecord
+	if err := json.Unmarshal(raw, &event); err != nil {
+		t.Fatal(err)
+	}
+	batch := UsageBatch{SchemaVersion: 1, BatchID: "batch", AgentRef: "agent", CollectorRef: "collector", SourceRef: "source", ClusterRef: "cluster-1", Mode: "production", Sequence: 1, ObservedAt: event.ObservedAt, Events: []UsageRecord{event}}
+	if err := batch.Validate(); err != nil || uint64(event.IngressBytes) != 18446744073709551614 || uint64(event.EgressBytes) != 18446744073709551613 {
+		t.Fatalf("event=%#v err=%v", event, err)
 	}
 }

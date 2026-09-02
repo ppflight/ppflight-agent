@@ -416,9 +416,12 @@ POST /internal/v1/monitoring/audit-events/batches
 | node | `task.status` | `upid`，格式必须以 `UPID:<identity.nodeRef>:` 开头。 |
 | node | `agent.upgrade` | strict 固定 manifest 制品参数；需要 approval、独立 root helper、重启回验与回滚，详见 `SELF-UPGRADE-V1.md`。 |
 | vm | `vm.start`, `vm.shutdown`, `vm.stop`, `vm.reboot` | `parameters` 必须是空对象。 |
+| vm | `vm.suspend`, `vm.resume` | QEMU only；空对象；Agent 等待 UPID 并回读 `qmpstatus=paused` 或 running，LXC 明确拒绝。 |
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
 | vm | `vm.clone` | `sourceVmid`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
+| vm | `vm.set-initial-resources` | 仅新 clone 首次定型；精确 `cores/sockets/memoryMiB` 加 `cloneOperationId/vmGeneration/templateConfigSha256`。由本机 durable journal 证明同 operation 的 clone 已成功、目标从未启动/交付/重装，且 PVE 当前为 stopped non-template；允许低于模板基线，但不构成存量降级入口。等待 UPID 并精确回读。 |
+| vm | `vm.reinstall` | QEMU only；固定 template identity/version/VMID/config SHA-256、独占 temporary VMID、完整最终资源/磁盘 IO/网络/IPFilter/Cloud-Init/OS identity 合同。先建本机完整补偿 clone，再替换并逐项回读；失败恢复或进入 indeterminate。禁止 URL/ISO/shell/guest-exec。 |
 | vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
 | vm | `vm.set-disk-io` | QEMU only；`disk` 与 `limits`。limits 的 10 个 IOPS/MBPS base/max/burst length 键必须全部出现，值为 typed 整数或 null；null 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
 | vm | `vm.set-network` | `interface` 及 bridge/model/MAC/VLAN/MTU/firewall/rate/IP/gateway typed 字段。 |
@@ -427,11 +430,14 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone`、等待 exit code 0，并用固定只读 `guest-get-timezone` 回验。 |
 | vm | `vm.verify-delivery` | QEMU read-only；`notBefore` 与完整 `expected` 资源/磁盘 IO/多网卡/IPFilter/时区合同。重新读取 PVE config、QGA interfaces/timezone 和 guest firewall；全部匹配才返回 ready。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
-| vm | `vm.reset-password` | `username`, `password`, `crypted`；当前只接受 QEMU，并在提交前检查 QGA `guest-set-user-password` capability。LXC 返回 unsupported。 |
+| vm | `vm.reset-password` | `username/password/crypted/osFamily`；QEMU Linux/Windows/非 root 账户在提交前检查 QGA `guest-set-user-password`；LXC 仅 Linux、`crypted=false`，通过固定 config password 字段重置 root。secret 不进入 receipt/audit/log。 |
+| vm | `vm.console.create-session`, `vm.console.revoke-session` | create 仅接受 `ttlSeconds=30..300,webSocket=true`；Agent 获取 PVE ticket 后立即通过固定同源 HMAC HTTPS broker 发布，receipt 只返回 `sessionRef/path/expiresAt/oneTime`，绝不含 ticket/cert/user。revoke 只接受 opaque `sessionRef`。 |
 | vm | `snapshot.create` | `name`、必填 bool `includeRam`，可选 `description`；LXC 的 `includeRam` 只能为 false。 |
 | vm | `snapshot.delete`, `snapshot.rollback` | `name`。 |
+| vm | `snapshot.list`, `snapshot.get` | 只读；list 接受 `limit=1..100`，get 接受 `name`；返回 stable snapshot ID/name/time/state/parent/RAM state 与 decimal-string VM generation。 |
 | vm | `backup.create` | `storage`, `mode=snapshot|suspend|stop`, 可选 `compress`。 |
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
+| vm | `backup.list`, `backup.get` | 只读；固定查询签名 `storage` 的 backup content 和当前 VMID；返回 storage/volume/time/decimal-string size/state/guest identity/generation/restorable，不返回路径或凭据。 |
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
 | vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster、目标 node 与 guest firewall 已启用、cluster 未显式关闭 PVE 8 二层 `ebtables`、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。`networks[].macAddress` 可选以兼容旧调用；新流程必须提供规范大写、非零单播 MAC，Agent 会同时证明 PVE 当前 QEMU `virtio=<MAC>` 或 LXC `hwaddr=<MAC>` 与签名分配一致。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `macAddress`、`firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
@@ -452,13 +458,13 @@ POST /internal/v1/monitoring/audit-events/batches
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
 锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
 
-当前共有 39 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。`vm.reinstall` 仍刻意不实现：PVE 的恢复/介质切换是非事务性流程，不能保证安全回滚，且当前没有进入签名命令合同的安装 ISO/template 等介质 allowlist、摘要/来源约束和审批模型；不能以任意 URL、storage volume 或模板名补齐这个缺口。
+当前共有 49 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 的 exact JSON shape、回执及服务端接入边界见 `PROVISIONING-ACTIONS-V1.md`。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
 ### 8.1 typed NIC binding
 
-每个受管 NIC 必须用 `interface=netN` 作稳定键，不能只保存数组下标或依赖排序。向导支持 `public`、`private` 两种 role；`metered` 和 `monitoring` 是独立布尔策略，可标在 public/private NIC 上。当前 strict assignment 的持久产物如下：
+每个受管 NIC 必须用 `interface=netN` 作稳定键，不能只保存数组下标或依赖排序。向导支持 `public`、`private` 两种 role；`monitoring` 可独立选择，但计费规则固定为 public `metered=true`、private `metered=false`。当前 strict assignment 的持久产物如下：
 
 ```json
 {
@@ -478,7 +484,7 @@ POST /internal/v1/monitoring/audit-events/batches
 
 约束：
 
-- `interface` 必须是 `net0`..`net31`；`role` 为 `public|private`；同一 guest 的 `interface` 唯一；非空列表必须恰有一个 primary public NIC 和一个 monitoring NIC；
+- `interface` 必须是 `net0`..`net31`；`role` 为 `public|private`；public 必须 `metered=true`、private 必须 `metered=false`；同一 guest 的 `interface` 唯一；非空列表必须恰有一个 primary public NIC 和一个 monitoring NIC；
 - `bridge`/`vnet` 必须恰有一个非空，并且来自已确认的 node network/cluster SDN 候选；
 - `expectedMac` 必须是 canonical、非零、unicast 48-bit MAC；可选 VLAN 为 0..4094，可选 MTU 为 576..9216，并与实际 PVE config 回读一致；
 - `ipFilterPolicy` 至少明确 `required|disabled`，不能以字段缺失表示策略；公网/计费 NIC 的 disabled 必须由显式审批决定；
@@ -486,7 +492,7 @@ POST /internal/v1/monitoring/audit-events/batches
 
 `internal/inventory.Assignment` 已包含并严格验证 `nicBindings`；`observation.Network` 也为 PVE config 提供稳定 `interface=netN`、MAC、attachment、VLAN、MTU 和 NIC firewall 等回读字段。website telemetry 按 interface 关联 observed network 与 signed binding，输出 `policyMatch{supported,reason,source}`；稳定 mismatch reason 包括 `binding_missing`、`interface_missing`、`mac_mismatch`、`attachment_mismatch`、`vlan_mismatch`、`mtu_mismatch`、`nic_firewall_disabled`。这只证明 Agent schema/回读信号已实现；官网向导的编辑、签发和 APP 呈现仍待远端合并。`policyMatch` 也不能替代对 `ipfilter-netN` 条目和 firewall rule 的操作级回读。
 
-PVE status 的 `netin/netout` 是 guest 级总计数，当前不能可靠拆为每张 NIC。Agent 已实现 `AggregateMeteringCapability` 并在 meter 中强制执行：无 binding 为 `nic_binding_required`，单 NIC 明确不计费为 `no_metered_nic`，多 NIC mixed metering 为 `multi_nic_pve_aggregate_only`；这些情况即使 assignment 请求 active 也会降为 shadow。只有每张绑定 NIC 都明确 `metered=true` 且满足既有 production/cutover 条件时，PVE aggregate 才可能 active。绝不能把 private 流量静默算成公网流量。QGA 的 per-interface stats 仅供观测和诊断，永远不能升级为权威计费来源。
+PVE status 的 guest `netin/netout` 不再用于 mixed-NIC 正式计费。Agent 按 signed assignment 的稳定 `netN + canonical MAC + VM generation` 关联 PVE config，再从宿主机 `tap<vmid>i<n>`（QEMU）或 `veth<vmid>i<n>`（LXC）的 node exporter uint64 累计计数生成 `source=pve-host-netdev` 事件。仅 `role=public,metered=true` 的 NIC 会产生逐网卡计量事件；`role=private` 必须 `metered=false` 且完全不进入客户流量。缺失/错配 NIC、MAC 或 host counter 时不伪造逐网卡数据；旧 aggregate 仅保留 source-labelled shadow fallback。counter 下降、generation/MAC/source 改变会生成新 `counterEpoch`，服务端据此处理重启、热插拔、回绕和跨月账期。QGA per-interface stats 仍只供观测和诊断，永远不能升级为权威计费来源。
 
 ### 8.2 IP 切换与 IPFilter
 
@@ -508,7 +514,7 @@ Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处
 
 Agent telemetry 已区分 `qga.availability.available`、`observedAt`、`freshUntil` 和 `unavailableReason`，并列出各 QGA read capability。APP 必须展示 availability 和 freshness，不能只显示最后一次成功结果，也不能把“已安装但已停止”和新鲜可用混为一谈。
 
-QEMU 的 `vm.reset-password`、`vm.set-timezone` 以及 `vm.verify-delivery` 依赖 QGA。QGA 被卸载、停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable；不得继续排队后再把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。当前 `vm.reset-password` 协议校验不接受 LXC；不得把执行函数中不可达的 LXC config 分支写成支持。
+QEMU 的 `vm.reset-password`、`vm.set-timezone`、`vm.verify-delivery` 与重装最终回验依赖 QGA。QGA 被卸载、停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable；不得继续排队后再把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。LXC root password 使用 PVE 固定 config password 字段，不经过 QGA；Windows 和 QEMU 非 root 账户仍走 typed QGA password API。
 
 website guest telemetry 已携带 QGA availability/freshness，并输出 `capabilities.lifecycle/rootPasswordReset/guestNetworkVerify/metering`。QGA 缺失或过期会让依赖 capability unavailable，lifecycle 保持 available；capability 带 `observedAt/freshUntil/reason/executionPreflight`。Executor 已在 `vm.reset-password` 提交前只读查询 PVE QGA `agent/info` 并检查 `guest-set-user-password`；APP 消费/展示和 operation 中的 guest-network verify 仍属于远端待合并项。
 
@@ -553,9 +559,9 @@ payment_authorized
 | 操作线程/UPID | command/receipt 含 `operationId`；journal 保存 submitted/waiting UPID，runtime 在 command cycle 前后调用 reconcile 并查询原 UPID。 | Agent 与官网端到端恢复矩阵通过前不得称生产就绪。 |
 | watchdog/previousExit | systemd notify/watchdog、请求级采集 progress deadline、自动重启所需 unit 设置、`lifecycle-state.json` 和按 destination 启用的 website/monitoring 不可淘汰 lifecycle outbox 已实现并有 Linux/重启测试；未启用域保持 pending。 | 这是本地恢复与补报原语，不是远端 SLA；官网/监控接收、展示/告警以及真实故障演练仍需验收。 |
 | Agent 离线命令 | Agent 主动 poll、领取后的 journal/UPID/receipt durable recovery 已实现。 | 官网持久离线命令队列与 command `wait` 尚待实现/联调；任何离线场景都禁止自动回退官网直连 PVE。 |
-| 固定动作 Executor | 第 7 节 39 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval。 | 只是 Agent 原语；`agent.upgrade` 仍需独立产品 rollout 与真实 PVE 验收，升级业务 flag 默认关闭；`vm.reinstall` 未实现。 |
+| 固定动作 Executor | 第 7 节 49 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console 等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
-| NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching、typed metering capability 和 meter 强制 shadow gate 已实现。 | 官网向导/assignment 签发与 APP 呈现仍待远端合并；只有 all-NIC explicitly metered 才可使用 aggregate active。 |
+| NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching 与 signed netN/MAC/generation 到宿主 tap/veth counter 的逐公网 NIC 计量已实现；private NIC 不计费。 | 官网向导/assignment 签发与账本消费仍待远端合并；多 NIC guest aggregate 永远不能 active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |
 | 监控站绑定 / networkPolicy | `internal/monitorenrollment`、独立 pending/state/`networkPolicy`、运行时 credential overlay、自动可信 PVE 版本发现、写后严格回验、systemd 自动重启与本地 binding ID/epoch 加载确认、签发后 fail-closed 同码恢复、`sentAt`、持久 monitoring sequence 和 uploader tcp4 pinning 已实现；官网 bind/replace 不触碰它。 | 仍需在真实 PVE 8/9 对新绑定/轮换及服务端 ingest 做联调；不可仅凭本仓 Agent 能力宣称全部生产链路已验收。 |
 | 双绑定状态 | website/monitoring strict status clients 与 `ag-pve ... status` 已实现固定同源 HMAC GET、identity/epoch/revision/time 回钉、IPv4/no-proxy/no-redirect；scope 由服务端逐路由固定。 | 外部 `/internal/v1/agents/status` 与 `/internal/v1/monitoring/agents/status` 服务仍待交付；本地 CLI 存在不等于远端状态服务已上线。 |

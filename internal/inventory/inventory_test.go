@@ -100,6 +100,8 @@ func TestNICBindingsRequireStableRolesAndPolicy(t *testing.T) {
 		{name: "multicast mac", mutate: func(a *Assignment) { a.NICBindings[0].ExpectedMAC = "03:00:00:00:00:01" }},
 		{name: "attachment conflict", mutate: func(a *Assignment) { a.NICBindings[0].VNet = "public-vnet" }},
 		{name: "missing policy", mutate: func(a *Assignment) { a.NICBindings[0].IPFilterPolicy = "" }},
+		{name: "public not metered", mutate: func(a *Assignment) { a.NICBindings[0].Metered = false }},
+		{name: "private metered", mutate: func(a *Assignment) { a.NICBindings[1].Metered = true }},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
@@ -118,15 +120,20 @@ func TestNICBindingsRequireStableRolesAndPolicy(t *testing.T) {
 	}
 }
 
-func TestAggregateMeteringOnlyWhenEveryNICIsExplicitlyMetered(t *testing.T) {
+func TestAggregateMeteringOnlyForExactlyOnePublicNIC(t *testing.T) {
 	document, err := Parse([]byte(assignmentJSON), "cluster-test-01")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assignment := document.Assignments[0]
+	assignment.NICBindings[1].Role = "public"
 	assignment.NICBindings[1].Metered = true
+	if capability := assignment.AggregateMeteringCapability(); capability.Supported || capability.Reason != "multi_nic_pve_aggregate_only" {
+		t.Fatalf("multi-NIC aggregate policy should be rejected: %#v", capability)
+	}
+	assignment.NICBindings = assignment.NICBindings[:1]
 	if capability := assignment.AggregateMeteringCapability(); !capability.Supported || capability.Source != "pve-guest-aggregate" {
-		t.Fatalf("all-NIC aggregate policy should be supported: %#v", capability)
+		t.Fatalf("single public NIC aggregate policy should be supported: %#v", capability)
 	}
 	assignment.NICBindings = nil
 	if capability := assignment.AggregateMeteringCapability(); capability.Supported || capability.Reason != "nic_binding_required" {

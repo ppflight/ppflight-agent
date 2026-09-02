@@ -265,7 +265,7 @@ curl -4 --fail http://127.0.0.1:9633/metrics >/dev/null
 
 添加 PVE 向导必须用多个只读 `pve.discover` 操作，依次覆盖 `version/permissions`、`nodes/storage/templates`、`networks`、`capacity`、`firewall`、`readiness`。分页 `limit` 省略时为 20，合法范围 1..50。discovery 中不得顺便启用 firewall 或修改资源。
 
-`networks` 后必须让管理员按 `netN` 保存 typed NIC binding：public/private role、primary、metered/monitoring、expected MAC、bridge/vnet、VLAN、MTU 和 IPFilter policy，不能依赖网卡顺序。当前 strict assignment 已验证 interface 唯一、恰有一个 primary public NIC 和一个 monitoring NIC、canonical unicast MAC、bridge xor vnet 和范围。Agent meter 对无 binding、单 NIC 不计费或 mixed metering 多 NIC 强制 shadow；只有所有绑定 NIC 都明确 metered 才可能 active。QGA per-interface counter 只能展示，不能补作账单来源。
+`networks` 后必须让管理员按 `netN` 保存 typed NIC binding：public/private role、primary、metered/monitoring、expected MAC、bridge/vnet、VLAN、MTU 和 IPFilter policy，不能依赖网卡顺序。当前 strict assignment 已验证 interface 唯一、恰有一个 primary public NIC 和一个 monitoring NIC、canonical unicast MAC、bridge xor vnet 和范围。Agent 使用宿主 tap/veth counter 仅为 `public,metered=true` 的 NIC 生成正式逐网卡记录；private NIC 必须 `metered=false` 且不生成客户用量。只有恰好一张公网 NIC 时，旧 guest aggregate 才可作为兼容回退；多 NIC aggregate 永远不能 active。QGA per-interface counter 只能展示，不能补作账单来源。
 
 Agent website telemetry 已输出 network binding/policy match reason，以及 `lifecycle/rootPasswordReset/guestNetworkVerify/metering` capabilities。APP 还要展示原始 QGA `available/observedAt/freshUntil/unavailableReason` 和依赖动作 `available/observedAt/freshUntil/reason/executionPreflight`；QGA 不可用或过期时，QEMU password reset 和 guest-network verify 必须冻结，纯 PVE lifecycle 不受影响。Executor 已在 QEMU password reset 前读取 QGA command capability；APP 展示、官网向导消费和 guest-network verify 组合编排仍待远端合并。
 
@@ -310,7 +310,7 @@ sudo ag-pve template bootstrap \
 
 catalog 中的所有系统镜像必须使用上游官网不可变的日期/构建路径，不得使用 `latest` 或滚动 `release` 路径。每次下载都必须同时匹配 catalog 固定 SHA-256 和同一官网构建目录提供的 checksum；镜像站只能在内容通过该官网摘要链时作为传输加速，不能成为信任来源。
 
-helper 只调用本机 `pvesh/pvesm/qm/vzdump` 等固定程序，不读取官网凭据或 PVE API Token。manifest strict 固定 `networkRedirectPolicy` 为 HTTPS-only、`addressFamily=ipv4-only`、`hostPolicy=upstream-selected` 和 catalog/official-checksum 完整性链；实际 curl 固定 `--disable --ipv4`、最多五次 HTTPS redirect。上游可选择 redirect host，但下载内容仍必须通过 catalog SHA-256 与官方 checksum，不能把 redirect 当作任意 URL/代码执行入口。该模板 CLI 不进入 control 的 34 个远程动作，也不表示 `vm.reinstall` 或远程模板创建已经上线；远程 Agent 自升级是独立的 `agent.upgrade` 合同，不能调用此模板 helper，详见 `SELF-UPGRADE-V1.md`。`vm.reinstall` 仍不实现：PVE 恢复/介质切换是非事务性流程，缺少可安全回滚保证，且目前没有可纳入签名命令的安装 ISO/template 介质 allowlist、摘要/来源约束与审批模型；不能把本地 template helper 或任意 URL/storage volume 当作替代。安装与依赖检查已有自动化；发布前仍要在 PVE 8/9 非生产节点验收实际 plan/execute。
+helper 只调用本机 `pvesh/pvesm/qm/vzdump` 等固定程序，不读取官网凭据或 PVE API Token。manifest strict 固定 `networkRedirectPolicy` 为 HTTPS-only、`addressFamily=ipv4-only`、`hostPolicy=upstream-selected` 和 catalog/official-checksum 完整性链；实际 curl 固定 `--disable --ipv4`、最多五次 HTTPS redirect。上游可选择 redirect host，但下载内容仍必须通过 catalog SHA-256 与官方 checksum，不能把 redirect 当作任意 URL/代码执行入口。该模板 CLI 不进入 control 的 49 个远程动作，也不表示远程模板创建已经上线；远程 Agent 自升级是独立的 `agent.upgrade` 合同，不能调用此模板 helper，详见 `SELF-UPGRADE-V1.md`。远程 `vm.reinstall` 只接受 signed 固定 templateRef/version/VMID/config SHA 与完整交付合同，不接受本地 helper、ISO、URL、任意 storage volume 或 shell；实现合同见 `PROVISIONING-ACTIONS-V1.md`。安装与依赖检查已有自动化；发布前仍要在 PVE 8/9 非生产节点验收实际 plan/execute。
 
 ### 7.2 systemd watchdog 与重启补报
 
