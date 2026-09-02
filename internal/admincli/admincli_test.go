@@ -648,7 +648,7 @@ func TestPromptPlanExecutionAcceptsYOrNAndRejectsOtherInput(t *testing.T) {
 	}{
 		{name: "yes", input: "Y\n", want: true, promptCnt: 1},
 		{name: "no", input: "n\n", want: false, promptCnt: 1},
-		{name: "empty cancels", input: "\n", want: false, promptCnt: 1},
+		{name: "empty confirms displayed default", input: "\n", want: true, promptCnt: 1},
 		{name: "invalid then yes", input: "YES\ny\n", want: true, invalid: true, promptCnt: 2},
 		{name: "control character then no", input: "b\x08\nn\n", want: false, invalid: true, promptCnt: 2},
 	}
@@ -665,6 +665,9 @@ func TestPromptPlanExecutionAcceptsYOrNAndRejectsOtherInput(t *testing.T) {
 			}
 			if count := strings.Count(output.String(), "确认执行以上模板计划？"); count != test.promptCnt {
 				t.Fatalf("prompt count=%d want=%d output=%q", count, test.promptCnt, output.String())
+			}
+			if !strings.Contains(output.String(), "[y/n]（回车默认：y）") {
+				t.Fatalf("plan prompt did not display default y: %q", output.String())
 			}
 		})
 	}
@@ -765,7 +768,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var bootstrapArgs []string
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in: strings.NewReader("\n1\ny\n1\ny\n1\nvmbr0\ny\nvmbr0\nvmbr1\n\n"), out: &output, errOut: &stderr, version: "test",
+		in: strings.NewReader("\n1\ny\n1\ny\n1\nvmbr0\ny\nvmbr0\nvmbr1\nn\n"), out: &output, errOut: &stderr, version: "test",
 		templateBridges: &fakeTemplateBridgeManager{inspect: []templateBridgeState{safeCreatedBridgeState()}},
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {

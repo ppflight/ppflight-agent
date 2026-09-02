@@ -104,7 +104,7 @@ func inputReader(value string) io.Reader { return strings.NewReader(value) }
 func TestTemplateInitCreatesMissingInternalBridgeBeforePlan(t *testing.T) {
 	events := []string{}
 	manager := &fakeTemplateBridgeManager{created: safeCreatedBridgeState(), events: &events}
-	instance, bootstrapCalls, output, stderr := templateInitFixture(t, "\n1\n1\nn\n\ny\n\ny\n\n", manager, &events)
+	instance, bootstrapCalls, output, stderr := templateInitFixture(t, "\n1\n1\nn\n\ny\n\ny\nn\n", manager, &events)
 	if code := instance.templateInit(); code != 0 {
 		t.Fatalf("code=%d stderr=%s output=%s", code, stderr.String(), output.String())
 	}
@@ -152,12 +152,15 @@ func TestTemplateInitBridgeCreateFailureNeverPlansTemplates(t *testing.T) {
 func TestTemplateInitReusesExistingBridgeWithoutModification(t *testing.T) {
 	existing := safeCreatedBridgeState()
 	manager := &fakeTemplateBridgeManager{inspect: []templateBridgeState{existing}}
-	instance, bootstrapCalls, output, stderr := templateInitFixture(t, "\n1\n1\nn\n\ny\n\n\n", manager, nil)
+	instance, bootstrapCalls, output, stderr := templateInitFixture(t, "\n1\n1\nn\n\n\n\nn\n", manager, nil)
 	if code := instance.templateInit(); code != 0 {
 		t.Fatalf("code=%d stderr=%s output=%s", code, stderr.String(), output.String())
 	}
 	if manager.createCalls != 0 || *bootstrapCalls != 1 {
 		t.Fatalf("create=%d bootstrap=%d", manager.createCalls, *bootstrapCalls)
+	}
+	if !strings.Contains(output.String(), "是否为模板添加内网网卡 net1？ [y/n]（回车默认：y）") {
+		t.Fatalf("internal NIC prompt did not display default y: %s", output.String())
 	}
 	if !strings.Contains(output.String(), "将原样使用，不修改其端口、IP 或网关配置") {
 		t.Fatalf("output=%s", output.String())

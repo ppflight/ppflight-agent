@@ -3096,7 +3096,7 @@ func (c *cli) templateInit() int {
 	if externalBridge == "" {
 		externalBridge = "vmbr0"
 	}
-	internalEnabled, err := c.promptYesNo(reader, "是否为模板添加内网网卡 net1？", false)
+	internalEnabled, err := c.promptYesNo(reader, "是否为模板添加内网网卡 net1？", true)
 	if err != nil {
 		return 2
 	}
@@ -3639,7 +3639,7 @@ func (c *cli) promptYesNo(reader *bufio.Reader, question string, defaultYes bool
 }
 
 func (c *cli) promptPlanExecution(reader *bufio.Reader) (bool, error) {
-	return c.promptYesNo(reader, "确认执行以上模板计划？", false)
+	return c.promptYesNo(reader, "确认执行以上模板计划？", true)
 }
 
 func (c *cli) reserved(target, operation string) int {
