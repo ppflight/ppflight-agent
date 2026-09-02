@@ -330,19 +330,19 @@ func (m *pveTemplateBridgeManager) Inspect(ctx context.Context, name string) (te
 			matches++
 		}
 	}
-	if matches == 0 {
-		present, err := m.kernelInterfaceExists(name)
-		if err != nil {
-			return templateBridgeState{}, fmt.Errorf("检查同名内核接口失败: %w", err)
-		}
-		return templateBridgeState{KernelPresent: present}, nil
-	}
-	if matches != 1 {
+	if matches > 1 {
 		return templateBridgeState{}, fmt.Errorf("PVE network 列表中接口 %s 不唯一", name)
 	}
 	detailRaw, err := m.runner.Run(ctx, templateBridgePVESh, "get", path+"/"+name, "--output-format", "json")
 	if err != nil {
-		return templateBridgeState{}, err
+		if matches == 1 {
+			return templateBridgeState{}, err
+		}
+		present, probeErr := m.kernelInterfaceExists(name)
+		if probeErr != nil {
+			return templateBridgeState{}, fmt.Errorf("检查同名内核接口失败: %w", probeErr)
+		}
+		return templateBridgeState{KernelPresent: present}, nil
 	}
 	var detail map[string]json.RawMessage
 	if err := decodeSingleJSON(detailRaw, &detail); err != nil {
@@ -351,6 +351,13 @@ func (m *pveTemplateBridgeManager) Inspect(ctx context.Context, name string) (te
 	state, err := decodeTemplateBridgeState(detail)
 	if err != nil {
 		return templateBridgeState{}, err
+	}
+	if state.Iface == "" {
+		// PVE's per-interface endpoint identifies the interface in the URL and
+		// can omit the redundant iface property from its JSON response.
+		state.Iface = name
+	} else if state.Iface != name {
+		return templateBridgeState{}, fmt.Errorf("PVE network 详情接口身份为 %q，预期 %q", state.Iface, name)
 	}
 	state.Exists = true
 	linkRaw, linkErr := m.runner.Run(ctx, templateBridgeIP, "-json", "-details", "link", "show", "dev", name)

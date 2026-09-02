@@ -383,6 +383,38 @@ sub read_etc_network_interfaces {
 	}
 }
 
+func TestPVETemplateBridgeInspectUsesStrictDirectIdentityAcrossPVECollections(t *testing.T) {
+	t.Run("detail path supplies omitted iface when staged list omits bridge", func(t *testing.T) {
+		runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{
+			{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network", "--output-format", "json"}, output: `[]`},
+			{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network/vmbr1", "--output-format", "json"}, output: `{"type":"bridge","autostart":1,"bridge_ports":"","bridge_stp":"off","bridge_fd":"0","method":"manual","method6":"manual","comments":"PPFlight private template bridge\n"}`},
+			{program: templateBridgeIP, args: []string{"-json", "-details", "link", "show", "dev", "vmbr1"}, err: errors.New("not found")},
+		}}
+		manager := &pveTemplateBridgeManager{node: "pve", runner: runner}
+		state, err := manager.Inspect(context.Background(), "vmbr1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.Exists || state.Iface != "vmbr1" || state.Type != "bridge" || state.KernelPresent {
+			t.Fatalf("unexpected state: %+v", state)
+		}
+		if len(runner.results) != 0 {
+			t.Fatalf("unconsumed commands: %d", len(runner.results))
+		}
+	})
+
+	t.Run("conflicting redundant iface is rejected", func(t *testing.T) {
+		runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{
+			{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network", "--output-format", "json"}, output: `[]`},
+			{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network/vmbr1", "--output-format", "json"}, output: `{"iface":"vmbr2","type":"bridge","autostart":1}`},
+		}}
+		manager := &pveTemplateBridgeManager{node: "pve", runner: runner}
+		if _, err := manager.Inspect(context.Background(), "vmbr1"); err == nil || !strings.Contains(err.Error(), "身份") {
+			t.Fatalf("expected identity rejection, got %v", err)
+		}
+	})
+}
+
 const (
 	testNetworkBase       = "BASE\n"
 	testNetworkOwned      = "BASE+OWNED\n"
@@ -422,7 +454,8 @@ func TestPVETemplateBridgeCreateUsesFixedSafeArgumentsAndStrictReadback(t *testi
 			}
 		}},
 		{program: templateBridgePVESh, args: []string{"get", path, "--output-format", "json"}, output: `[{"iface":"vmbr1","type":"bridge"}]`},
-		{program: templateBridgePVESh, args: []string{"get", path + "/vmbr1", "--output-format", "json"}, output: `{"iface":"vmbr1","type":"bridge","autostart":1,"bridge_ports":"none","bridge_stp":0,"bridge_fd":0,"method":"manual","method6":"manual","comments":"PPFlight private template bridge"}`},
+		// PVE identifies the interface in the URL and omits iface from detail.
+		{program: templateBridgePVESh, args: []string{"get", path + "/vmbr1", "--output-format", "json"}, output: `{"type":"bridge","autostart":1,"bridge_ports":"none","bridge_stp":0,"bridge_fd":0,"method":"manual","method6":"manual","comments":"PPFlight private template bridge"}`},
 		{program: templateBridgeIP, args: []string{"-json", "-details", "link", "show", "dev", "vmbr1"}, err: errors.New("not found")},
 		{program: templateBridgePVESh, args: []string{"set", path, "--output-format", "json"}, output: `"` + upid + `"`, before: func() {
 			competing, err := fsutil.AcquireExclusive(lockPath)
@@ -477,9 +510,10 @@ func TestPVETemplateBridgeCreateRefusesPendingNetworkChanges(t *testing.T) {
 }
 
 func TestPVETemplateBridgeInspectRejectsUnmanagedKernelNameCollision(t *testing.T) {
-	runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{{
-		program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network", "--output-format", "json"}, output: `[]`,
-	}}}
+	runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{
+		{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network", "--output-format", "json"}, output: `[]`},
+		{program: templateBridgePVESh, args: []string{"get", "/nodes/pve/network/vmbr1", "--output-format", "json"}, err: errors.New("interface does not exist")},
+	}}
 	manager := &pveTemplateBridgeManager{
 		node: "pve", runner: runner,
 		kernelProbe: func(name string) (bool, error) { return name == "vmbr1", nil },
@@ -600,9 +634,10 @@ func TestPVETemplateBridgeCreateKeepsOwnedBridgeForManualRecoveryAfterStoppedRel
 
 func TestPVETemplateBridgeInspectAllowsValidLongPVENodeName(t *testing.T) {
 	node := "pve-production-node-01"
-	runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{{
-		program: templateBridgePVESh, args: []string{"get", "/nodes/" + node + "/network", "--output-format", "json"}, output: `[]`,
-	}}}
+	runner := &scriptedBridgeRunner{t: t, results: []bridgeRunResult{
+		{program: templateBridgePVESh, args: []string{"get", "/nodes/" + node + "/network", "--output-format", "json"}, output: `[]`},
+		{program: templateBridgePVESh, args: []string{"get", "/nodes/" + node + "/network/vmbr1", "--output-format", "json"}, err: errors.New("interface does not exist")},
+	}}
 	manager := &pveTemplateBridgeManager{node: node, runner: runner}
 	state, err := manager.Inspect(context.Background(), "vmbr1")
 	if err != nil || state.Exists {
