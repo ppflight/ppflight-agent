@@ -1,9 +1,11 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,23 +21,27 @@ import (
 
 type initialAuthorizerFunc func(Command, string, string) error
 
-func (f initialAuthorizerFunc) AuthorizeInitialResources(c Command, operation, digest string) error {
+func (f initialAuthorizerFunc) AuthorizeInitialResources(c Command, operation, _ string, _ int, digest string) error {
 	return f(c, operation, digest)
 }
 
 type memoryConsoleSink struct {
-	secret  ConsoleSessionSecret
-	revoked ConsoleSessionRevoke
+	registration ConsoleTunnelRegistration
+	local        ConsoleLocalEndpoint
+	revoked      ConsoleSessionRevoke
+	invalidated  bool
 }
 
-func (s *memoryConsoleSink) Publish(_ context.Context, secret ConsoleSessionSecret) (ConsoleSessionPublication, error) {
-	s.secret = secret
-	return ConsoleSessionPublication{SessionRef: secret.SessionRef, Path: "/console/session/" + secret.SessionRef, ExpiresAt: secret.ExpiresAt, OneTime: true}, nil
+func (s *memoryConsoleSink) Publish(_ context.Context, registration ConsoleTunnelRegistration, local ConsoleLocalEndpoint) (ConsoleSessionPublication, error) {
+	s.registration = registration
+	s.local = local
+	return ConsoleSessionPublication{SessionRef: registration.SessionRef, State: "ready", BrowserPath: "/console/session/" + registration.SessionRef, ExpiresAt: registration.ExpiresAt}, nil
 }
 func (s *memoryConsoleSink) Revoke(_ context.Context, revoke ConsoleSessionRevoke) error {
 	s.revoked = revoke
 	return nil
 }
+func (s *memoryConsoleSink) Invalidate() { s.invalidated = true }
 
 func TestInitialResourcesAllowsReviewedCloneDecreaseAndReadsBack(t *testing.T) {
 	requests := 0
@@ -59,10 +65,11 @@ func TestInitialResourcesAllowsReviewedCloneDecreaseAndReadsBack(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	command := controlCommand("vm.set-initial-resources", "qemu", `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-1","vmGeneration":1,"templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	command := controlCommand("vm.set-initial-resources", "qemu", `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-clone","templateRef":"ubuntu-24.04","sourceVmid":9001,"vmGeneration":"1","templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+	command.OperationID = "operation-initial"
 	authorized := false
 	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true, InitialResources: initialAuthorizerFunc(func(_ Command, operation, digest string) error {
-		authorized = operation == "operation-1" && strings.HasPrefix(digest, "aaaa")
+		authorized = operation == "operation-clone" && strings.HasPrefix(digest, "aaaa")
 		return nil
 	})}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || !authorized || requests != 4 {
@@ -70,55 +77,227 @@ func TestInitialResourcesAllowsReviewedCloneDecreaseAndReadsBack(t *testing.T) {
 	}
 }
 
-func TestInitialResourceJournalRequiresCompletedMatchingCloneAndRejectsDelivery(t *testing.T) {
+const initialResourcesFixture = `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-clone","templateRef":"ubuntu-24.04","sourceVmid":9001,"vmGeneration":"1","templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+
+func lineageCommand(action, parameters, commandID, operationID string) Command {
+	command := controlCommand(action, "qemu", parameters)
+	command.CommandID = commandID
+	command.OperationID = operationID
+	command.IdempotencyKey = commandID + "-idempotency"
+	command.AgentRef = "agent-1"
+	command.BindingID = "11111111-1111-4111-8111-111111111111"
+	command.DeviceID = "device-1"
+	command.CredentialEpoch = 1
+	command.AssignmentRevision = 7
+	return command
+}
+
+func completeLineageRecord(t *testing.T, journal *Journal, command Command, state string, at time.Time) Receipt {
+	t.Helper()
+	code := strings.ToUpper(state)
+	if state == "succeeded" {
+		code = "SUCCEEDED"
+	}
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: command.CommandID + "-receipt", CommandID: command.CommandID, OperationID: command.OperationID, AgentRef: command.AgentRef, State: state, Code: code, ExecutionMode: "production", StartedAt: at, FinishedAt: at}
+	if command.Action == "vm.set-initial-resources" && state == "succeeded" {
+		receipt.Result, _ = json.Marshal(initialResourcesResult{Configured: true, Verified: true, Cores: 1, Sockets: 1, MemoryMiB: 1024, VMGeneration: 1, TemplateRef: "ubuntu-24.04", SourceVMID: 9001, TemplateConfigSHA256: strings.Repeat("a", 64)})
+	}
+	if err := journal.Complete(command, receipt); err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
+
+func successfulCloneJournal(t *testing.T) (*Journal, Command, Command, time.Time) {
+	t.Helper()
 	now := time.Now().UTC()
 	journal, err := OpenJournal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	clone := controlCommand("vm.clone", "qemu", `{"sourceVmid":9001,"name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
-	clone.CommandID = "clone-command"
+	clone := lineageCommand("vm.clone", `{"sourceVmid":9001,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, "clone-command", "operation-clone")
 	if _, duplicate, err := journal.Claim(clone, now); err != nil || duplicate {
 		t.Fatalf("claim clone duplicate=%t err=%v", duplicate, err)
 	}
-	initial := controlCommand("vm.set-initial-resources", "qemu", `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-1","vmGeneration":1,"templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
-	if err := journal.AuthorizeInitialResources(initial, "operation-1", strings.Repeat("a", 64)); err == nil {
-		t.Fatal("unfinished clone authorized initial resources")
+	completeLineageRecord(t, journal, clone, "succeeded", now)
+	initial := lineageCommand("vm.set-initial-resources", initialResourcesFixture, "initial-command", "operation-initial")
+	return journal, clone, initial, now
+}
+
+func TestInitialResourceJournalAuthorizesDistinctSuccessfulCloneAndIsIdempotent(t *testing.T) {
+	journal, clone, initial, now := successfulCloneJournal(t)
+	if clone.OperationID == initial.OperationID {
+		t.Fatal("clone and initial resource operation IDs must be distinct")
 	}
-	cloneReceipt := Receipt{SchemaVersion: 1, ReceiptID: "clone-receipt", CommandID: clone.CommandID, OperationID: clone.OperationID, AgentRef: "agent-1", State: "succeeded", Code: "SUCCEEDED", ExecutionMode: "production", StartedAt: now, FinishedAt: now}
-	if err := journal.Complete(clone, cloneReceipt); err != nil {
-		t.Fatal(err)
+	if _, duplicate, err := journal.Claim(initial, now.Add(time.Second)); err != nil || duplicate {
+		t.Fatalf("claim initial duplicate=%t err=%v", duplicate, err)
 	}
-	if err := journal.AuthorizeInitialResources(initial, "operation-1", strings.Repeat("a", 64)); err != nil {
+	if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9001, strings.Repeat("a", 64)); err != nil {
 		t.Fatalf("completed matching clone not authorized: %v", err)
 	}
-	initial.CommandID = "initial-command"
-	if _, _, err := journal.Claim(initial, now); err != nil {
+	want := completeLineageRecord(t, journal, initial, "succeeded", now.Add(2*time.Second))
+	got, duplicate, err := journal.Claim(initial, now.Add(3*time.Second))
+	if err != nil || !duplicate || got.ReceiptID != want.ReceiptID || got.State != "succeeded" || !bytes.Equal(got.Result, want.Result) {
+		t.Fatalf("idempotent replay got=%#v duplicate=%t err=%v", got, duplicate, err)
+	}
+	second := initial
+	second.CommandID = "initial-command-2"
+	second.OperationID = "operation-initial-2"
+	second.IdempotencyKey = initial.IdempotencyKey
+	if err := journal.AuthorizeInitialResources(second, clone.OperationID, "ubuntu-24.04", 9001, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("different command replay consumed initial resource authorization twice")
+	}
+	if _, _, err := journal.Claim(second, now.Add(4*time.Second)); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("idempotency key reuse err=%v", err)
+	}
+}
+
+func TestInitialResourceJournalSurvivesRestart(t *testing.T) {
+	directory := t.TempDir()
+	now := time.Now().UTC()
+	journal, err := OpenJournal(directory)
+	if err != nil {
 		t.Fatal(err)
 	}
-	initialReceipt := cloneReceipt
-	initialReceipt.CommandID, initialReceipt.ReceiptID = initial.CommandID, "initial-receipt"
-	if err := journal.Complete(initial, initialReceipt); err != nil {
+	clone := lineageCommand("vm.clone", `{"sourceVmid":9001,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, "clone-command", "operation-clone")
+	if _, _, err := journal.Claim(clone, now); err != nil {
 		t.Fatal(err)
 	}
-	secondInitial := initial
-	secondInitial.CommandID = "second-initial-command"
-	if err := journal.AuthorizeInitialResources(secondInitial, "operation-1", strings.Repeat("a", 64)); err == nil {
-		t.Fatal("second initial resource command was authorized")
-	}
-	delivery := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"","ipFilterCidrs":["192.0.2.10/32"]}],"timezone":"UTC"}}`)
-	delivery.CommandID = "delivery-command"
-	if _, _, err := journal.Claim(delivery, now); err != nil {
+	completeLineageRecord(t, journal, clone, "succeeded", now)
+	reopened, err := OpenJournal(directory)
+	if err != nil {
 		t.Fatal(err)
 	}
-	deliveryReceipt := cloneReceipt
-	deliveryReceipt.CommandID, deliveryReceipt.ReceiptID = delivery.CommandID, "delivery-receipt"
-	if err := journal.Complete(delivery, deliveryReceipt); err != nil {
-		t.Fatal(err)
+	initial := lineageCommand("vm.set-initial-resources", initialResourcesFixture, "initial-command", "operation-initial")
+	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9001, strings.Repeat("a", 64)); err != nil {
+		t.Fatalf("durable lineage did not survive restart: %v", err)
 	}
-	if err := journal.AuthorizeInitialResources(initial, "operation-1", strings.Repeat("a", 64)); err == nil {
-		t.Fatal("delivered generation authorized initial resource override")
+}
+
+func TestInitialResourceJournalRejectsMissingOrNonSuccessfulClone(t *testing.T) {
+	for _, state := range []string{"missing", "submitted", "waiting", "failed", "rolled_back"} {
+		t.Run(state, func(t *testing.T) {
+			now := time.Now().UTC()
+			journal, err := OpenJournal(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			clone := lineageCommand("vm.clone", `{"sourceVmid":9001,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, "clone-command", "operation-clone")
+			if state != "missing" {
+				if _, _, err := journal.Claim(clone, now); err != nil {
+					t.Fatal(err)
+				}
+				completeLineageRecord(t, journal, clone, state, now)
+			}
+			initial := lineageCommand("vm.set-initial-resources", initialResourcesFixture, "initial-command", "operation-initial")
+			if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9001, strings.Repeat("a", 64)); err == nil {
+				t.Fatalf("%s clone authorized initial resources", state)
+			}
+		})
 	}
+}
+
+func TestInitialResourceJournalRejectsEveryAuthorityOrIdentityMismatch(t *testing.T) {
+	mutations := map[string]func(*Command, *string){
+		"binding":   func(c *Command, _ *string) { c.BindingID = "22222222-2222-4222-8222-222222222222" },
+		"device":    func(c *Command, _ *string) { c.DeviceID = "device-2" },
+		"agent":     func(c *Command, _ *string) { c.AgentRef = "agent-2" },
+		"cluster":   func(c *Command, _ *string) { c.Identity.ClusterRef = "cluster-2" },
+		"node":      func(c *Command, _ *string) { c.Identity.NodeRef = "pve2" },
+		"service":   func(c *Command, _ *string) { c.Identity.ServiceRef = "service-2" },
+		"instance":  func(c *Command, _ *string) { c.Identity.InstanceUUID = "instance-2" },
+		"guestType": func(c *Command, _ *string) { c.Identity.GuestType = "lxc" },
+		"vmid":      func(c *Command, _ *string) { c.Identity.VMID = 102 },
+		"generation": func(c *Command, _ *string) {
+			c.Identity.Generation = 2
+		},
+		"revision": func(c *Command, _ *string) { c.AssignmentRevision = 8 },
+		"epoch":    func(c *Command, _ *string) { c.CredentialEpoch = 2 },
+		"templateHash": func(_ *Command, digest *string) {
+			*digest = strings.Repeat("b", 64)
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			journal, clone, initial, _ := successfulCloneJournal(t)
+			digest := strings.Repeat("a", 64)
+			mutate(&initial, &digest)
+			if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9001, digest); err == nil {
+				t.Fatal("mismatched clone lineage was authorized")
+			}
+		})
+	}
+	journal, clone, initial, _ := successfulCloneJournal(t)
+	if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "debian-13", 9001, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("cross-templateRef clone lineage was authorized")
+	}
+	if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9002, strings.Repeat("a", 64)); err == nil {
+		t.Fatal("cross-sourceVmid clone lineage was authorized")
+	}
+}
+
+func TestJournalRejectsOperationIDReuseAcrossCommands(t *testing.T) {
+	journal, _, initial, now := successfulCloneJournal(t)
+	initial.OperationID = "operation-clone"
+	if _, _, err := journal.Claim(initial, now.Add(time.Second)); !errors.Is(err, ErrOperationConflict) {
+		t.Fatalf("operation reuse err=%v", err)
+	}
+}
+
+func TestInitialResourceJournalRejectsFinalizationAndGenerationAdvance(t *testing.T) {
+	for _, action := range []string{"vm.start", "vm.verify-delivery", "vm.reinstall", "generation-advance"} {
+		t.Run(action, func(t *testing.T) {
+			journal, clone, initial, now := successfulCloneJournal(t)
+			barrierAction := action
+			if action == "generation-advance" {
+				barrierAction = "vm.reinstall"
+			}
+			barrier := lineageCommand(barrierAction, `{}`, "barrier-command", "operation-barrier")
+			if action == "generation-advance" {
+				barrier.Identity.Generation = 2
+			}
+			if _, _, err := journal.Claim(barrier, now.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			completeLineageRecord(t, journal, barrier, "succeeded", now.Add(2*time.Second))
+			if err := journal.AuthorizeInitialResources(initial, clone.OperationID, "ubuntu-24.04", 9001, strings.Repeat("a", 64)); err == nil {
+				t.Fatalf("%s did not close initial resource authorization", action)
+			}
+		})
+	}
+}
+
+func TestOrdinaryResourceDowngradeAndDiskShrinkRemainRejected(t *testing.T) {
+	t.Run("CPU and memory downgrade", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+				t.Fatalf("unexpected mutation request: %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`{"data":{"digest":"current","cores":4,"sockets":1,"memory":4096}}`))
+		}))
+		defer server.Close()
+		_, _, err := executePVE(context.Background(), controlTestClient(t, server), controlCommand("vm.set-resources", "qemu", `{"cores":2,"memoryMiB":2048}`))
+		if err == nil || !strings.Contains(err.Error(), "may only increase") || requests != 1 {
+			t.Fatalf("downgrade err=%v requests=%d", err, requests)
+		}
+	})
+	t.Run("disk shrink", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+				t.Fatalf("unexpected mutation request: %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`{"data":{"digest":"current","scsi0":"local-zfs:vm-101-disk-0,size=40G"}}`))
+		}))
+		defer server.Close()
+		_, _, err := executePVE(context.Background(), controlTestClient(t, server), controlCommand("vm.resize", "qemu", `{"disk":"scsi0","targetGiB":20}`))
+		if err == nil || !strings.Contains(err.Error(), "may only increase") || requests != 1 {
+			t.Fatalf("shrink err=%v requests=%d", err, requests)
+		}
+	})
 }
 
 func TestSnapshotAndBackupInventoryAreTypedAndBounded(t *testing.T) {
@@ -149,19 +328,49 @@ func TestSnapshotAndBackupInventoryAreTypedAndBounded(t *testing.T) {
 
 func TestConsoleTicketNeverEntersReceipt(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/vncproxy") || r.Form.Get("websocket") != "1" {
+			t.Fatalf("unexpected vncproxy request: %s %s %v", r.Method, r.URL.Path, r.Form)
+		}
 		_, _ = w.Write([]byte(`{"data":{"user":"root@pam","ticket":"PVE:super-secret-ticket","cert":"-----BEGIN CERTIFICATE-----safe-----END CERTIFICATE-----","port":5901}}`))
 	}))
 	defer server.Close()
 	sink := &memoryConsoleSink{}
 	command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
-	command.CommandID, command.BindingID, command.DeviceID, command.AssignmentRevision = "console-command", "11111111-1111-4111-8111-111111111111", "device-1", 1
+	command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
 	receipt, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: sink, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
-	if err != nil || sink.secret.PVETicket == "" || receipt.State != "succeeded" {
-		t.Fatalf("receipt=%#v secret=%#v err=%v", receipt, sink.secret, err)
+	if err != nil || len(sink.local.Ticket) == 0 || sink.registration.Transport != "agent-reverse-wss-v1" || receipt.State != "succeeded" {
+		t.Fatalf("receipt=%#v registration=%#v err=%v", receipt, sink.registration, err)
 	}
 	raw, _ := json.Marshal(receipt)
 	if strings.Contains(string(raw), "super-secret-ticket") || strings.Contains(string(raw), "BEGIN CERTIFICATE") || strings.Contains(string(raw), "root@pam") {
 		t.Fatalf("console secret leaked in receipt: %s", raw)
+	}
+}
+
+func TestConsolePublicationDoesNotSurviveJournalReplayAfterAgentRestart(t *testing.T) {
+	directory := t.TempDir()
+	now := time.Now().UTC()
+	journal, err := OpenJournal(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := lineageCommand("vm.console.create-session", `{"ttlSeconds":60,"webSocket":true}`, "console-command", "console-operation")
+	if _, duplicate, err := journal.Claim(command, now); err != nil || duplicate {
+		t.Fatalf("claim console duplicate=%t err=%v", duplicate, err)
+	}
+	publication, _ := json.Marshal(ConsoleSessionPublication{SessionRef: "session-1", State: "ready", ExpiresAt: now.Add(time.Minute), BrowserPath: "/api/console/opaque-1"})
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: "console-receipt", CommandID: command.CommandID, OperationID: command.OperationID, AgentRef: command.AgentRef, State: "succeeded", Code: "SUCCEEDED", ExecutionMode: "production", StartedAt: now, FinishedAt: now, Result: publication}
+	if err := journal.Complete(command, receipt); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, duplicate, err := reopened.Claim(command, now.Add(time.Minute))
+	if err != nil || !duplicate || replayed.State != "succeeded" || len(replayed.Result) != 0 {
+		t.Fatalf("restart replay retained stale console session: receipt=%#v duplicate=%t err=%v", replayed, duplicate, err)
 	}
 }
 
@@ -348,11 +557,14 @@ func TestSuspendResumeUseFixedStatusEndpoints(t *testing.T) {
 
 func TestNewActionsRejectUnknownFieldsAndArbitrarySources(t *testing.T) {
 	cases := []Command{
-		controlCommand("vm.set-initial-resources", "qemu", `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-1","vmGeneration":1,"templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","delivered":false}`),
+		controlCommand("vm.set-initial-resources", "qemu", `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-clone","templateRef":"ubuntu-24.04","sourceVmid":9001,"vmGeneration":"1","templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","delivered":false}`),
 		controlCommand("vm.reinstall", "qemu", strings.TrimSuffix(reinstallFixture(), "}")+`,"url":"https://evil.invalid/image.qcow2"}`),
 		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true,"endpoint":"/arbitrary"}`),
 		controlCommand("snapshot.list", "qemu", `{"limit":10,"path":"/etc"}`),
 		controlCommand("backup.get", "qemu", `{"storage":"backup1","volume":"../../etc/shadow"}`),
+		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":29,"webSocket":true}`),
+		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":301,"webSocket":true}`),
+		controlCommand("vm.console.create-session", "lxc", `{"ttlSeconds":60,"webSocket":true}`),
 	}
 	for _, command := range cases {
 		if err := validateParameters(command); err == nil {
@@ -427,7 +639,15 @@ func TestProvisioningActionGoldensValidateAndContainNoConsoleSecret(t *testing.T
 		t.Fatal(err)
 	}
 	var publication ConsoleSessionPublication
-	if json.Unmarshal(console, &publication) != nil || publication.SessionRef == "" || !publication.OneTime || strings.Contains(strings.ToLower(string(console)), "ticket") || strings.Contains(strings.ToLower(string(console)), "certificate") {
+	if json.Unmarshal(console, &publication) != nil || publication.SessionRef == "" || publication.State != "ready" || publication.BrowserPath == "" || strings.Contains(strings.ToLower(string(console)), "ticket") || strings.Contains(strings.ToLower(string(console)), "certificate") {
 		t.Fatalf("unsafe console result golden: %s", console)
+	}
+	registrationRaw, err := os.ReadFile("testdata/agent-v1-console-reverse-tunnel-request.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var registration ConsoleTunnelRegistration
+	if json.Unmarshal(registrationRaw, &registration) != nil || !validConsoleRegistration(registration, time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)) || strings.Contains(strings.ToLower(string(registrationRaw)), "pveticket") || strings.Contains(strings.ToLower(string(registrationRaw)), "pveport") {
+		t.Fatalf("unsafe console tunnel request golden: %s", registrationRaw)
 	}
 }

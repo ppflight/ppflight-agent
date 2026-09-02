@@ -52,12 +52,12 @@ func TestCloneRequiresFreshTemplateBaselineHash(t *testing.T) {
 	}))
 	defer server.Close()
 	client := controlTestClient(t, server)
-	valid := fmt.Sprintf(`{"sourceVmid":100,"name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"%s"}`, digest)
+	valid := fmt.Sprintf(`{"sourceVmid":100,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"%s"}`, digest)
 	if _, _, err := executePVE(context.Background(), client, controlCommand("vm.clone", "qemu", valid)); err != nil || !mutated {
 		t.Fatalf("valid clone failed: mutated=%t err=%v", mutated, err)
 	}
 	mutated = false
-	invalid := `{"sourceVmid":100,"name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	invalid := `{"sourceVmid":100,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
 	if _, _, err := executePVE(context.Background(), client, controlCommand("vm.clone", "qemu", invalid)); err == nil || mutated {
 		t.Fatalf("stale template hash reached mutation: mutated=%t err=%v", mutated, err)
 	}

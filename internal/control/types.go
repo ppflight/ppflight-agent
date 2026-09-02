@@ -130,9 +130,9 @@ type Identity struct {
 type Command struct {
 	SchemaVersion int    `json:"schemaVersion"`
 	CommandID     string `json:"commandId"`
-	// OperationID is the control-plane operation that caused this command.  It
-	// is distinct from CommandID: retries of a command keep their CommandID,
-	// while several commands may belong to one operation.
+	// OperationID is the unique control-plane operation represented by this
+	// command. Retries keep both OperationID and CommandID; related operations
+	// are linked only through typed fields such as cloneOperationId.
 	OperationID        string           `json:"operationId,omitempty"`
 	IdempotencyKey     string           `json:"idempotencyKey"`
 	AgentRef           string           `json:"agentRef"`

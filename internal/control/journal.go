@@ -21,8 +21,10 @@ import (
 )
 
 var (
-	ErrCommandConflict = errors.New("command ID was reused with different content")
-	ErrResourceBusy    = errors.New("resource already has an active command")
+	ErrCommandConflict     = errors.New("command ID was reused with different content")
+	ErrOperationConflict   = errors.New("operation ID was reused by another command")
+	ErrIdempotencyConflict = errors.New("idempotency key was reused by another command")
+	ErrResourceBusy        = errors.New("resource already has an active command")
 )
 
 var journalNodeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -36,16 +38,29 @@ type Journal struct {
 }
 
 type journalRecord struct {
-	Version     int    `json:"version"`
-	CommandID   string `json:"commandId"`
-	OperationID string `json:"operationId,omitempty"`
-	AgentRef    string `json:"agentRef"`
-	OperatorRef string `json:"operatorRef,omitempty"`
-	Scope       string `json:"scope"`
-	Action      string `json:"action,omitempty"`
+	Version            int              `json:"version"`
+	CommandID          string           `json:"commandId"`
+	OperationID        string           `json:"operationId,omitempty"`
+	IdempotencyKey     string           `json:"idempotencyKey,omitempty"`
+	AgentRef           string           `json:"agentRef"`
+	BindingID          string           `json:"bindingId,omitempty"`
+	DeviceID           string           `json:"deviceId,omitempty"`
+	CredentialEpoch    protocol.Counter `json:"credentialEpoch,omitempty"`
+	AssignmentRevision protocol.Counter `json:"assignmentRevision,omitempty"`
+	OperatorRef        string           `json:"operatorRef,omitempty"`
+	Scope              string           `json:"scope"`
+	Action             string           `json:"action,omitempty"`
+	ClusterRef         string           `json:"clusterRef,omitempty"`
+	ServiceRef         string           `json:"serviceRef,omitempty"`
+	InstanceUUID       string           `json:"instanceUuid,omitempty"`
+	GuestType          string           `json:"guestType,omitempty"`
+	VMID               int              `json:"vmid,omitempty"`
+	Generation         protocol.Counter `json:"generation,omitempty"`
 	// SourceConfigSHA256 is safe clone-lineage metadata. It is the reviewed
 	// template configuration digest, never a command body or credential.
 	SourceConfigSHA256 string          `json:"sourceConfigSha256,omitempty"`
+	SourceTemplateRef  string          `json:"sourceTemplateRef,omitempty"`
+	SourceVMID         int             `json:"sourceVmid,omitempty"`
 	Mutating           bool            `json:"mutating"`
 	Digest             string          `json:"digest"`
 	ResourceKey        string          `json:"resourceKey"`
@@ -196,6 +211,16 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	if !errors.Is(err, fs.ErrNotExist) {
 		return Receipt{}, false, err
 	}
+	operationUsed, idempotencyUsed, err := j.identityUsedLocked(command.OperationID, command.IdempotencyKey, command.CommandID)
+	if err != nil {
+		return Receipt{}, false, err
+	}
+	if operationUsed {
+		return Receipt{}, false, ErrOperationConflict
+	}
+	if idempotencyUsed {
+		return Receipt{}, false, ErrIdempotencyConflict
+	}
 	mutating := requiresApproval(command.Action)
 	if mutating {
 		busy, err := j.resourceBusyLocked(resourceKey)
@@ -208,16 +233,32 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	}
 	record := journalRecord{
 		Version: SchemaVersion, CommandID: command.CommandID, OperationID: command.OperationID,
-		AgentRef: command.AgentRef, OperatorRef: command.OperatorRef,
+		IdempotencyKey: command.IdempotencyKey, AgentRef: command.AgentRef,
+		BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: command.CredentialEpoch,
+		AssignmentRevision: command.AssignmentRevision, OperatorRef: command.OperatorRef,
 		Scope: command.Scope, Action: command.Action, Mutating: mutating, Digest: digest, ResourceKey: resourceKey, NodeRef: command.Identity.NodeRef,
+		ClusterRef: command.Identity.ClusterRef, ServiceRef: command.Identity.ServiceRef,
+		InstanceUUID: command.Identity.InstanceUUID, GuestType: command.Identity.GuestType,
+		VMID: command.Identity.VMID, Generation: protocol.Counter(command.Identity.Generation),
 		State: "received", CreatedAt: now.UTC(), UpdatedAt: now.UTC(), AuditContext: audit,
 	}
-	if command.Action == "vm.clone" {
+	switch command.Action {
+	case "vm.clone":
 		var parameters cloneP
 		if err := strictParameters(command.Parameters, &parameters); err != nil || !bodyHashRE.MatchString(parameters.SourceConfigSHA256) {
 			return Receipt{}, false, errors.New("clone lineage is invalid")
 		}
 		record.SourceConfigSHA256 = parameters.SourceConfigSHA256
+		record.SourceTemplateRef = parameters.TemplateRef
+		record.SourceVMID = parameters.SourceVMID
+	case "vm.set-initial-resources":
+		var parameters initialResourcesP
+		if err := strictParameters(command.Parameters, &parameters); err != nil || !validInitialResources(command, parameters) {
+			return Receipt{}, false, errors.New("initial resource lineage is invalid")
+		}
+		record.SourceConfigSHA256 = parameters.TemplateConfigSHA256
+		record.SourceTemplateRef = parameters.TemplateRef
+		record.SourceVMID = parameters.SourceVMID
 	}
 	if err := writeJournal(filename, record); err != nil {
 		return Receipt{}, false, err
@@ -225,14 +266,40 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	return Receipt{}, false, nil
 }
 
+func (j *Journal) identityUsedLocked(operationID, idempotencyKey, commandID string) (bool, bool, error) {
+	if !commandIDRE.MatchString(operationID) || !commandIDRE.MatchString(idempotencyKey) || !commandIDRE.MatchString(commandID) {
+		return false, false, errors.New("journal operation identity is invalid")
+	}
+	entries, err := os.ReadDir(j.directory)
+	if err != nil {
+		return false, false, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		record, readErr := readJournal(filepath.Join(j.directory, entry.Name()))
+		if readErr != nil {
+			return false, false, readErr
+		}
+		if record.OperationID == operationID && record.CommandID != commandID {
+			return true, false, nil
+		}
+		if record.IdempotencyKey != "" && record.IdempotencyKey == idempotencyKey && record.CommandID != commandID {
+			return false, true, nil
+		}
+	}
+	return false, false, nil
+}
+
 // AuthorizeInitialResources proves that the target generation was created by
-// a completed, journaled vm.clone in the same signed provisioning operation.
-// It also refuses the one-time exception after any successful start,
-// delivery verification, or reinstall for the same generation.
-func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, templateConfigSHA256 string) error {
+// a distinct, completed, journaled vm.clone operation under exactly the same
+// signed authority and VM identity. It also refuses the one-time exception
+// after any start, delivery verification, reinstall, or generation advance.
+func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, templateRef string, sourceVMID int, templateConfigSHA256 string) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if command.Action != "vm.set-initial-resources" || cloneOperationID != command.OperationID || !commandIDRE.MatchString(cloneOperationID) || !bodyHashRE.MatchString(templateConfigSHA256) {
+	if command.Action != "vm.set-initial-resources" || cloneOperationID == command.OperationID || !commandIDRE.MatchString(cloneOperationID) || !nameRE.MatchString(templateRef) || sourceVMID < 100 || sourceVMID > 999999999 || !bodyHashRE.MatchString(templateConfigSHA256) || !validInitialLineageCommand(command) {
 		return errors.New("initial resource lineage identity is invalid")
 	}
 	resourceKey, err := journalResourceKey(command)
@@ -243,7 +310,7 @@ func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, t
 	if err != nil {
 		return err
 	}
-	cloneCompleted := false
+	records := make([]journalRecord, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
@@ -252,22 +319,78 @@ func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, t
 		if readErr != nil {
 			return readErr
 		}
-		if record.ResourceKey != resourceKey {
+		records = append(records, record)
+	}
+	var clone *journalRecord
+	for index := range records {
+		record := &records[index]
+		if record.Action != "vm.clone" || record.OperationID != cloneOperationID {
 			continue
 		}
-		if record.Action == "vm.start" || record.Action == "vm.verify-delivery" || record.Action == "vm.reinstall" || (record.Action == "vm.set-initial-resources" && record.CommandID != command.CommandID) {
-			if record.Receipt != nil && (record.Receipt.State == "submitted" || record.Receipt.State == "waiting" || record.Receipt.State == "succeeded") {
+		if clone != nil || !recordMatchesInitialLineage(*record, command, templateRef, sourceVMID, templateConfigSHA256) || !recordSucceeded(*record) {
+			return errors.New("completed clone lineage is ambiguous or does not match command authority")
+		}
+		clone = record
+	}
+	if clone == nil {
+		return errors.New("completed clone lineage was not found")
+	}
+	for _, record := range records {
+		if record.ResourceKey == resourceKey {
+			if record.Action == "vm.set-initial-resources" && record.CommandID != command.CommandID && recordMutationMayHaveHappened(record) {
+				return errors.New("VM generation already consumed its initial resource authorization")
+			}
+			if (record.Action == "vm.start" || record.Action == "vm.verify-delivery" || record.Action == "vm.reinstall") && recordMutationMayHaveHappened(record) {
 				return errors.New("VM generation has already been finalized, delivered, or started")
 			}
 		}
-		if record.Action == "vm.clone" && record.OperationID == cloneOperationID && strings.EqualFold(record.SourceConfigSHA256, templateConfigSHA256) && record.Receipt != nil && record.Receipt.State == "succeeded" {
-			cloneCompleted = true
+		if sameLineageVM(record, command) && uint64(record.Generation) != command.Identity.Generation && !record.CreatedAt.Before(clone.CreatedAt) && recordMutationMayHaveHappened(record) {
+			return errors.New("VM identity has advanced to another generation")
 		}
 	}
-	if !cloneCompleted {
-		return errors.New("completed clone lineage was not found")
-	}
 	return nil
+}
+
+func validInitialLineageCommand(command Command) bool {
+	return uuidRE.MatchString(command.BindingID) && commandIDRE.MatchString(command.DeviceID) && commandIDRE.MatchString(command.AgentRef) &&
+		command.CredentialEpoch > 0 && command.AssignmentRevision > 0 && commandIDRE.MatchString(command.Identity.ClusterRef) &&
+		journalNodeRef.MatchString(command.Identity.NodeRef) && commandIDRE.MatchString(command.Identity.ServiceRef) &&
+		commandIDRE.MatchString(command.Identity.InstanceUUID) && (command.Identity.GuestType == "qemu" || command.Identity.GuestType == "lxc") &&
+		command.Identity.VMID > 0 && command.Identity.Generation > 0
+}
+
+func recordMatchesInitialLineage(record journalRecord, command Command, templateRef string, sourceVMID int, templateConfigSHA256 string) bool {
+	return record.BindingID == command.BindingID && record.DeviceID == command.DeviceID && record.AgentRef == command.AgentRef &&
+		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&
+		record.ServiceRef == command.Identity.ServiceRef && record.InstanceUUID == command.Identity.InstanceUUID &&
+		record.GuestType == command.Identity.GuestType && record.VMID == command.Identity.VMID &&
+		uint64(record.Generation) == command.Identity.Generation && record.CredentialEpoch == command.CredentialEpoch &&
+		record.AssignmentRevision == command.AssignmentRevision && record.SourceTemplateRef == templateRef &&
+		record.SourceVMID == sourceVMID && record.SourceConfigSHA256 == templateConfigSHA256
+}
+
+func sameLineageVM(record journalRecord, command Command) bool {
+	return record.BindingID == command.BindingID && record.DeviceID == command.DeviceID && record.AgentRef == command.AgentRef &&
+		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&
+		record.ServiceRef == command.Identity.ServiceRef && record.InstanceUUID == command.Identity.InstanceUUID &&
+		record.GuestType == command.Identity.GuestType && record.VMID == command.Identity.VMID
+}
+
+func recordSucceeded(record journalRecord) bool {
+	return record.State == "succeeded" && record.Receipt != nil && record.Receipt.State == "succeeded" &&
+		record.Receipt.Code == "SUCCEEDED" && record.Receipt.CommandID == record.CommandID && record.Receipt.OperationID == record.OperationID
+}
+
+func recordMutationMayHaveHappened(record journalRecord) bool {
+	if record.Receipt == nil {
+		return record.State == "received" || record.State == "submitted" || record.State == "waiting" || record.State == "indeterminate"
+	}
+	switch record.Receipt.State {
+	case "submitted", "waiting", "succeeded", "indeterminate":
+		return true
+	default:
+		return false
+	}
 }
 
 func (j *Journal) Complete(command Command, receipt Receipt) error {
@@ -326,9 +449,13 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	}
 	ApplyReceiptCompatibility(&receipt)
 	journalReceipt := receipt
-	// Full results belong only to the website receipt delivery path. They are
-	// neither required for recovery nor safe audit metadata.
-	journalReceipt.Result = nil
+	// Full results belong only to the website receipt delivery path. The sole
+	// exception is the strictly typed, secret-free initial-resource result,
+	// which must survive a crash so an exact idempotent replay can return the
+	// first result without touching PVE again.
+	if record.Action != "vm.set-initial-resources" || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !validInitialResourcesJournalResult(record, receipt.Result) {
+		journalReceipt.Result = nil
+	}
 	record.State, record.UpdatedAt, record.Receipt, record.ReceiptPending = receipt.State, receipt.FinishedAt.UTC(), &journalReceipt, true
 	if receipt.PVETaskUPID != "" {
 		record.PVETaskUPID = receipt.PVETaskUPID
@@ -344,6 +471,20 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 		record.AuditPending = &event
 	}
 	return writeJournal(filename, *record)
+}
+
+func validInitialResourcesJournalResult(record *journalRecord, raw json.RawMessage) bool {
+	if record == nil || len(raw) == 0 {
+		return false
+	}
+	var result initialResourcesResult
+	if strictParameters(raw, &result) != nil {
+		return false
+	}
+	return result.Configured && result.Verified && result.Cores >= 1 && result.Cores <= 128 && result.Sockets >= 1 && result.Sockets <= 16 &&
+		result.MemoryMiB >= 128 && result.MemoryMiB <= 4194304 && result.VMGeneration == record.Generation &&
+		result.TemplateRef == record.SourceTemplateRef && result.SourceVMID == record.SourceVMID &&
+		result.TemplateConfigSHA256 == record.SourceConfigSHA256
 }
 
 // SubmittedWaiting returns work that can be recovered after a restart. The
@@ -747,10 +888,31 @@ func readJournal(filename string) (journalRecord, error) {
 		return journalRecord{}, err
 	}
 	var record journalRecord
-	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) {
+	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.SourceTemplateRef != "" && !nameRE.MatchString(record.SourceTemplateRef)) || record.SourceVMID < 0 || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) || !validOptionalJournalLineage(record) {
 		return journalRecord{}, fmt.Errorf("control journal record is corrupt")
 	}
 	return record, nil
+}
+
+func validOptionalJournalLineage(record journalRecord) bool {
+	fieldsPresent := record.BindingID != "" || record.DeviceID != "" || record.ClusterRef != "" || record.ServiceRef != "" || record.InstanceUUID != "" || record.GuestType != "" || record.VMID != 0 || record.Generation != 0 || record.CredentialEpoch != 0 || record.AssignmentRevision != 0
+	if !fieldsPresent {
+		// Pre-lineage journals remain readable for receipt recovery, but cannot
+		// authorize vm.set-initial-resources because exact metadata is absent.
+		return true
+	}
+	if record.BindingID == "" && record.DeviceID == "" && record.CredentialEpoch == 0 && record.AssignmentRevision == 0 {
+		// Hermetic test claims and old records may contain target metadata but no
+		// production authority. They remain readable but never satisfy lineage.
+		return true
+	}
+	if record.Scope == ScopeVM {
+		return uuidRE.MatchString(record.BindingID) && commandIDRE.MatchString(record.DeviceID) && commandIDRE.MatchString(record.AgentRef) &&
+			commandIDRE.MatchString(record.ClusterRef) && commandIDRE.MatchString(record.ServiceRef) && commandIDRE.MatchString(record.InstanceUUID) &&
+			(record.GuestType == "qemu" || record.GuestType == "lxc") && record.VMID > 0 && record.Generation > 0 &&
+			record.CredentialEpoch > 0 && record.AssignmentRevision > 0
+	}
+	return record.ClusterRef != "" && record.ServiceRef == "" && record.InstanceUUID == "" && record.GuestType == "" && record.VMID == 0 && record.Generation == 0
 }
 
 func validJournalScope(scope, nodeRef string) bool {

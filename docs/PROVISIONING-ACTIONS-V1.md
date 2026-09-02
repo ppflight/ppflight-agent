@@ -5,8 +5,9 @@
 assignment revision、VM identity/generation、approval、resource lock、durable journal、
 HMAC receipt 和 monitoring audit 规则。JSON decoder 拒绝 unknown/duplicate/trailing 字段。
 
-首个包含这些合同的 Agent 版本是 `0.1.0-rc.27`；协议版本仍为 `schemaVersion: 1`，
-这些 action 是 additive 扩展。密码、SSH key、PVE
+首个包含这些 action 的 Agent 版本是 `0.1.0-rc.27`；clone lineage 修正与可用的反向
+WSS console 合同从 `0.1.0-rc.28` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
+是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 
 ## 初次资源定型
@@ -18,8 +19,10 @@ ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt�
   "cores": 1,
   "sockets": 1,
   "memoryMiB": 1024,
-  "cloneOperationId": "operation-01",
-  "vmGeneration": 1,
+  "cloneOperationId": "operation-clone-01",
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
+  "vmGeneration": "1",
   "templateConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 }
 ```
@@ -32,16 +35,21 @@ ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt�
   "cores": 1,
   "memoryMiB": 1024,
   "sockets": 1,
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
   "templateConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "verified": true,
   "vmGeneration": "1"
 }
 ```
 
-`cloneOperationId` 必须等于 command `operationId`。本机 journal 还必须存在同 target、
-generation、operation、template SHA 的已成功 `vm.clone`，且同 generation 不得已有成功或
-未决的 `vm.start`、`vm.verify-delivery`、`vm.reinstall`。PVE 回读必须为 stopped、
-non-template。该一次性动作可把模板基线降到最终套餐值；普通 `vm.set-resources` 仍只扩容。
+当前 command 使用独立的新 `operationId`；`cloneOperationId` 必须引用此前已经成功终态的
+`vm.clone`，两者不得相同。本机 durable journal 会精确核对 clone 与当前命令的 binding、
+device、agent/cluster/node、service/instance、guest/VMID/generation、assignment revision、
+credential epoch、templateRef/sourceVmid 和 template SHA。clone 未完成、失败、回滚、身份不符或不存在时均拒绝。
+同 generation 只允许成功一次；目标已经启动、交付、重装或进入其他代次后拒绝。PVE 回读
+必须为 stopped、non-template。该一次性动作可把模板基线降到最终套餐值；普通
+`vm.set-resources` 仍只扩容，磁盘仍只允许扩容。
 
 ## 固定模板重装
 
@@ -151,40 +159,54 @@ create parameters：
 成功 result：
 
 ```json
-{"sessionRef":"<uuid>","path":"/console/session/<uuid>","expiresAt":"2026-09-02T00:01:00Z","oneTime":true}
+{"sessionRef":"<uuid>","state":"ready","expiresAt":"2026-09-02T00:01:00Z","browserPath":"/api/pve-agent/v1/console/<opaque>"}
 ```
 
-Agent 使用 control token 向固定 VM `vncproxy` 获取临时材料，并立即 POST 到由 receipt URL
-同源推导的固定 `/console-sessions` broker；请求使用 control-receipts HMAC。secret 只存在于
-该 HTTPS 请求内存，普通 receipt/outbox/audit 不持有它。broker 返回的 path、sessionRef、TTL
-必须与请求一致。官网不得持有长期 PVE credential，也不得自行请求 PVE ticket。
+Agent 使用 control token 向固定 QEMU VM `vncproxy` 请求 `websocket=1`，只通过 IPv4
+`127.0.0.1:<temporary-port>` 连接该本地端口，并在内存中完成 PVE VNC ticket/RFB 认证。
+随后 Agent 先向由 receipt URL 同源推导的固定 `/console-sessions` 注册不含 secret 的 session，
+再主动连接固定 `wss://<same-origin>/console-sessions/<sessionRef>/agent-tunnel`。两个请求均使用
+现有 control-receipts HMAC；原始 create command 仍须先通过 Ed25519、binding、epoch 和
+assignment 校验。浏览器只获得 opaque `browserPath`，不接收 PVE 地址、端口、user、ticket、
+certificate 或 API token。Agent 对浏览器呈现一次性无密码 RFB 握手，随后只转发内存字节流。
 
-broker create request 的 exact shape（这是唯一包含临时 secret 的边界）：
+broker registration request 的 exact shape（完全不含 PVE secret 或本地端口）：
 
 ```json
 {
   "schemaVersion": 1,
+  "transport": "agent-reverse-wss-v1",
   "sessionRef": "<uuid>",
   "commandId": "command-01",
   "idempotencyKey": "provision-console-01",
   "operationId": "operation-01",
   "bindingId": "<uuid>",
   "deviceId": "device-01",
+  "credentialEpoch": "2",
   "assignmentRevision": "7",
+  "agentRef": "agent-01",
+  "clusterRef": "cluster-01",
   "serviceRef": "service-01",
   "instanceUuid": "instance-01",
   "generation": "3",
   "nodeRef": "pve1",
   "guestType": "qemu",
   "vmid": 101,
-  "pveUser": "ppflight-control@pve",
-  "pveTicket": "<ephemeral-secret>",
-  "pveCertificate": "<ephemeral-cert>",
-  "pvePort": 5901,
   "expiresAt": "2026-09-02T00:01:00Z",
   "oneTime": true
 }
 ```
+
+成功 result：
+
+```json
+{"sessionRef":"<uuid>","state":"ready","expiresAt":"2026-09-02T00:01:00Z","browserPath":"/api/pve-agent/v1/console/<opaque>"}
+```
+
+WSS 连接只允许系统 CA、正确 Host/SNI、IPv4，transport 明确禁用代理和重定向。TTL 为
+30–300 秒且只能领取一次；本地或浏览器断开、TTL 到期、revoke、assignment authority 更新、
+binding/credential 重载或 Agent 退出都会关闭本地 PVE socket 与 WSS。所有帧、ticket 和临时
+连接元数据均不写 journal、receipt、audit、telemetry 或日志。
 
 revoke parameters/result：
 

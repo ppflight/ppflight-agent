@@ -87,37 +87,55 @@ type BackupInventoryResult struct {
 	Items      []BackupInventoryItem `json:"items"`
 }
 
-// ConsoleSessionSecret is passed only to the ephemeral website escrow sink.
-// Implementations must not persist or log this value.  JSON tags exist solely
-// for the fixed HTTPS broker implementation and are never used by Receipt.
-type ConsoleSessionSecret struct {
+type initialResourcesResult struct {
+	Configured           bool             `json:"configured"`
+	Verified             bool             `json:"verified"`
+	Cores                int              `json:"cores"`
+	Sockets              int              `json:"sockets"`
+	MemoryMiB            int              `json:"memoryMiB"`
+	VMGeneration         protocol.Counter `json:"vmGeneration"`
+	TemplateRef          string           `json:"templateRef"`
+	SourceVMID           int              `json:"sourceVmid"`
+	TemplateConfigSHA256 string           `json:"templateConfigSha256"`
+}
+
+// ConsoleTunnelRegistration is the secret-free identity sent to the website
+// broker before the Agent establishes its outbound WSS connection.
+type ConsoleTunnelRegistration struct {
 	SchemaVersion      int              `json:"schemaVersion"`
+	Transport          string           `json:"transport"`
 	SessionRef         string           `json:"sessionRef"`
 	CommandID          string           `json:"commandId"`
 	IdempotencyKey     string           `json:"idempotencyKey"`
 	OperationID        string           `json:"operationId"`
 	BindingID          string           `json:"bindingId"`
 	DeviceID           string           `json:"deviceId"`
+	CredentialEpoch    protocol.Counter `json:"credentialEpoch"`
 	AssignmentRevision protocol.Counter `json:"assignmentRevision"`
+	AgentRef           string           `json:"agentRef"`
+	ClusterRef         string           `json:"clusterRef"`
 	ServiceRef         string           `json:"serviceRef"`
 	InstanceUUID       string           `json:"instanceUuid"`
 	Generation         protocol.Counter `json:"generation"`
 	NodeRef            string           `json:"nodeRef"`
 	GuestType          string           `json:"guestType"`
 	VMID               int              `json:"vmid"`
-	PVEUser            string           `json:"pveUser"`
-	PVETicket          string           `json:"pveTicket"`
-	PVECertificate     string           `json:"pveCertificate,omitempty"`
-	PVEPort            int              `json:"pvePort"`
 	ExpiresAt          time.Time        `json:"expiresAt"`
 	OneTime            bool             `json:"oneTime"`
 }
 
+// ConsoleLocalEndpoint is intentionally not JSON serializable. It exists only
+// long enough for the sink to authenticate the PVE localhost VNC socket.
+type ConsoleLocalEndpoint struct {
+	Port   int
+	Ticket []byte
+}
+
 type ConsoleSessionPublication struct {
-	SessionRef string    `json:"sessionRef"`
-	Path       string    `json:"path"`
-	ExpiresAt  time.Time `json:"expiresAt"`
-	OneTime    bool      `json:"oneTime"`
+	SessionRef  string    `json:"sessionRef"`
+	State       string    `json:"state"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	BrowserPath string    `json:"browserPath"`
 }
 
 type ConsoleSessionRevoke struct {
@@ -128,7 +146,10 @@ type ConsoleSessionRevoke struct {
 	OperationID        string           `json:"operationId"`
 	BindingID          string           `json:"bindingId"`
 	DeviceID           string           `json:"deviceId"`
+	CredentialEpoch    protocol.Counter `json:"credentialEpoch"`
 	AssignmentRevision protocol.Counter `json:"assignmentRevision"`
+	AgentRef           string           `json:"agentRef"`
+	ClusterRef         string           `json:"clusterRef"`
 	ServiceRef         string           `json:"serviceRef"`
 	InstanceUUID       string           `json:"instanceUuid"`
 	Generation         protocol.Counter `json:"generation"`
@@ -139,8 +160,9 @@ type ConsoleSessionRevoke struct {
 
 func validInitialResources(command Command, value initialResourcesP) bool {
 	return value.Cores >= 1 && value.Cores <= 128 && value.Sockets >= 1 && value.Sockets <= 16 &&
-		value.MemoryMiB >= 128 && value.MemoryMiB <= 4194304 && value.VMGeneration == command.Identity.Generation &&
-		value.CloneOperationID == command.OperationID && commandIDRE.MatchString(value.CloneOperationID) &&
+		value.MemoryMiB >= 128 && value.MemoryMiB <= 4194304 && uint64(value.VMGeneration) == command.Identity.Generation &&
+		value.CloneOperationID != command.OperationID && commandIDRE.MatchString(value.CloneOperationID) &&
+		nameRE.MatchString(value.TemplateRef) && value.SourceVMID >= 100 && value.SourceVMID <= 999999999 &&
 		bodyHashRE.MatchString(value.TemplateConfigSHA256)
 }
 
@@ -417,7 +439,7 @@ func setInitialResources(ctx context.Context, client *pve.Client, command Comman
 			return upid, nil, errors.New("initial resource readback does not match")
 		}
 	}
-	result, _ := json.Marshal(map[string]any{"configured": true, "verified": true, "cores": parameters.Cores, "sockets": parameters.Sockets, "memoryMiB": parameters.MemoryMiB, "vmGeneration": protocol.Counter(parameters.VMGeneration), "templateConfigSha256": parameters.TemplateConfigSHA256})
+	result, _ := json.Marshal(initialResourcesResult{Configured: true, Verified: true, Cores: parameters.Cores, Sockets: parameters.Sockets, MemoryMiB: parameters.MemoryMiB, VMGeneration: parameters.VMGeneration, TemplateRef: parameters.TemplateRef, SourceVMID: parameters.SourceVMID, TemplateConfigSHA256: parameters.TemplateConfigSHA256})
 	return "", result, nil
 }
 
@@ -496,7 +518,7 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	if command.Action == "vm.console.revoke-session" {
 		var parameters consoleRevokeP
 		_ = strictParameters(command.Parameters, &parameters)
-		err := sink.Revoke(ctx, ConsoleSessionRevoke{SchemaVersion: 1, SessionRef: parameters.SessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, AssignmentRevision: command.AssignmentRevision, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID})
+		err := sink.Revoke(ctx, ConsoleSessionRevoke{SchemaVersion: 1, SessionRef: parameters.SessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: command.CredentialEpoch, AssignmentRevision: command.AssignmentRevision, AgentRef: command.AgentRef, ClusterRef: command.Identity.ClusterRef, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID})
 		if err != nil {
 			return nil, err
 		}
@@ -505,35 +527,36 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	var parameters consoleCreateP
 	_ = strictParameters(command.Parameters, &parameters)
 	var response struct {
-		User   string `json:"user"`
 		Ticket string `json:"ticket"`
-		Cert   string `json:"cert"`
 		Port   int    `json:"port"`
 	}
 	base := fmt.Sprintf("/nodes/%s/%s/%d/vncproxy", command.Identity.NodeRef, command.Identity.GuestType, command.Identity.VMID)
 	if err := client.Do(ctx, http.MethodPost, base, nil, url.Values{"websocket": {"1"}}, &response); err != nil {
 		return nil, err
 	}
-	if response.Ticket == "" || len(response.Ticket) > 8192 || response.Port < 1 || response.Port > 65535 || response.User == "" || len(response.User) > 256 || strings.ContainsAny(response.Ticket+response.User+response.Cert, "\x00") {
+	if response.Ticket == "" || len(response.Ticket) > 8192 || response.Port < 1 || response.Port > 65535 || strings.ContainsAny(response.Ticket, "\x00") {
 		return nil, errors.New("PVE returned invalid console material")
 	}
+	ticket := []byte(response.Ticket)
+	response.Ticket = ""
+	defer func() {
+		for index := range ticket {
+			ticket[index] = 0
+		}
+	}()
 	sessionRef, err := protocol.NewID()
 	if err != nil {
 		return nil, err
 	}
 	expiresAt := now.UTC().Add(time.Duration(parameters.TTLSeconds) * time.Second)
-	publication, err := sink.Publish(ctx, ConsoleSessionSecret{SchemaVersion: 1, SessionRef: sessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, AssignmentRevision: command.AssignmentRevision, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, PVEUser: response.User, PVETicket: response.Ticket, PVECertificate: response.Cert, PVEPort: response.Port, ExpiresAt: expiresAt, OneTime: true})
-	// Drop every reference to PVE secret material before constructing Result.
-	response = struct {
-		User   string `json:"user"`
-		Ticket string `json:"ticket"`
-		Cert   string `json:"cert"`
-		Port   int    `json:"port"`
-	}{}
+	registration := ConsoleTunnelRegistration{SchemaVersion: 1, Transport: "agent-reverse-wss-v1", SessionRef: sessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: command.CredentialEpoch, AssignmentRevision: command.AssignmentRevision, AgentRef: command.AgentRef, ClusterRef: command.Identity.ClusterRef, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, ExpiresAt: expiresAt, OneTime: true}
+	port := response.Port
+	response.Port = 0
+	publication, err := sink.Publish(ctx, registration, ConsoleLocalEndpoint{Port: port, Ticket: ticket})
 	if err != nil {
 		return nil, err
 	}
-	if publication.SessionRef != sessionRef || publication.ExpiresAt.After(expiresAt) || publication.ExpiresAt.Before(now.UTC()) || !publication.OneTime || publication.Path == "" || len(publication.Path) > 512 || strings.ContainsAny(publication.Path, "\x00\r\n") {
+	if publication.SessionRef != sessionRef || publication.State != "ready" || publication.ExpiresAt.After(expiresAt) || publication.ExpiresAt.Before(now.UTC()) || publication.BrowserPath == "" || len(publication.BrowserPath) > 512 || strings.ContainsAny(publication.BrowserPath, "\x00\r\n") || !strings.HasPrefix(publication.BrowserPath, "/") {
 		return nil, errors.New("console broker returned invalid publication")
 	}
 	return json.Marshal(publication)
@@ -599,7 +622,7 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 	}
 	replacementCreated = true
 	resourceCommand := command
-	resourceCommand.Parameters, _ = json.Marshal(initialResourcesP{Cores: parameters.Expected.Cores, Sockets: parameters.Expected.Sockets, MemoryMiB: parameters.Expected.MemoryMiB, CloneOperationID: command.OperationID, VMGeneration: command.Identity.Generation, TemplateConfigSHA256: parameters.TemplateConfigSHA256})
+	resourceCommand.Parameters, _ = json.Marshal(initialResourcesP{Cores: parameters.Expected.Cores, Sockets: parameters.Expected.Sockets, MemoryMiB: parameters.Expected.MemoryMiB, CloneOperationID: command.OperationID, TemplateRef: parameters.TemplateRef, SourceVMID: parameters.TemplateVMID, VMGeneration: protocol.Counter(command.Identity.Generation), TemplateConfigSHA256: parameters.TemplateConfigSHA256})
 	if _, _, err := setInitialResources(ctx, client, resourceCommand, targetBase); err != nil {
 		return "", nil, compensate(err)
 	}

@@ -63,19 +63,20 @@ type Executor struct {
 	// grow-only resource policy from durable clone lineage. Production never
 	// trusts a caller-provided "new VM" boolean.
 	InitialResources InitialResourceAuthorizer
-	// ConsoleSessions escrows short-lived PVE console material through the
-	// fixed website control channel. Ticket/certificate values never enter a
-	// receipt, audit event, log, or durable Agent queue.
+	// ConsoleSessions starts a short-lived Agent-originated reverse WSS tunnel.
+	// PVE ticket and localhost details remain inside the Agent process and never
+	// enter a receipt, audit event, broker registration, log, or durable queue.
 	ConsoleSessions ConsoleSessionSink
 }
 
 type InitialResourceAuthorizer interface {
-	AuthorizeInitialResources(Command, string, string) error
+	AuthorizeInitialResources(Command, string, string, int, string) error
 }
 
 type ConsoleSessionSink interface {
-	Publish(context.Context, ConsoleSessionSecret) (ConsoleSessionPublication, error)
+	Publish(context.Context, ConsoleTunnelRegistration, ConsoleLocalEndpoint) (ConsoleSessionPublication, error)
 	Revoke(context.Context, ConsoleSessionRevoke) error
+	Invalidate()
 }
 
 // UpgradeSubmitter stages an already verified agent.upgrade command for the
@@ -265,7 +266,7 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		}
 		var p initialResourcesP
 		_ = strictParameters(command.Parameters, &p)
-		if lineageErr := e.InitialResources.AuthorizeInitialResources(command, p.CloneOperationID, p.TemplateConfigSHA256); lineageErr != nil {
+		if lineageErr := e.InitialResources.AuthorizeInitialResources(command, p.CloneOperationID, p.TemplateRef, p.SourceVMID, p.TemplateConfigSHA256); lineageErr != nil {
 			r.State, r.Code, r.FinishedAt = "rejected", "INITIAL_RESOURCE_POLICY_REJECTED", time.Now().UTC()
 			return finish(lineageErr)
 		}
@@ -426,6 +427,7 @@ func validTaskState(status string) bool {
 
 type cloneP struct {
 	SourceVMID         int    `json:"sourceVmid"`
+	TemplateRef        string `json:"templateRef"`
 	Name               string `json:"name"`
 	Target             string `json:"target"`
 	Storage            string `json:"storage"`
@@ -447,12 +449,14 @@ type resourcesP struct {
 	MemoryMiB *int `json:"memoryMiB,omitempty"`
 }
 type initialResourcesP struct {
-	Cores                int    `json:"cores"`
-	Sockets              int    `json:"sockets"`
-	MemoryMiB            int    `json:"memoryMiB"`
-	CloneOperationID     string `json:"cloneOperationId"`
-	VMGeneration         uint64 `json:"vmGeneration"`
-	TemplateConfigSHA256 string `json:"templateConfigSha256"`
+	Cores                int              `json:"cores"`
+	Sockets              int              `json:"sockets"`
+	MemoryMiB            int              `json:"memoryMiB"`
+	CloneOperationID     string           `json:"cloneOperationId"`
+	TemplateRef          string           `json:"templateRef"`
+	SourceVMID           int              `json:"sourceVmid"`
+	VMGeneration         protocol.Counter `json:"vmGeneration"`
+	TemplateConfigSHA256 string           `json:"templateConfigSha256"`
 }
 type resizeP struct {
 	Disk      string `json:"disk"`
@@ -683,7 +687,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.clone":
 		var p cloneP
-		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || p.SourceVMID > 999999999 || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
+		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || p.SourceVMID > 999999999 || !nameRE.MatchString(p.TemplateRef) || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
 			return errors.New("invalid clone parameters")
 		}
 		return nil
@@ -832,13 +836,13 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.console.create-session":
 		var p consoleCreateP
-		if strictParameters(c.Parameters, &p) != nil || p.WebSocket == nil || !*p.WebSocket || p.TTLSeconds < 30 || p.TTLSeconds > 300 {
+		if c.Identity.GuestType != "qemu" || strictParameters(c.Parameters, &p) != nil || p.WebSocket == nil || !*p.WebSocket || p.TTLSeconds < 30 || p.TTLSeconds > 300 {
 			return errors.New("invalid console session parameters")
 		}
 		return nil
 	case "vm.console.revoke-session":
 		var p consoleRevokeP
-		if strictParameters(c.Parameters, &p) != nil || !commandIDRE.MatchString(p.SessionRef) {
+		if c.Identity.GuestType != "qemu" || strictParameters(c.Parameters, &p) != nil || !commandIDRE.MatchString(p.SessionRef) {
 			return errors.New("invalid console revoke parameters")
 		}
 		return nil
@@ -1171,7 +1175,7 @@ func verifyCloneSource(ctx context.Context, c *pve.Client, cmd Command, paramete
 	if !found {
 		return errors.New("clone source is not the assigned PVE template")
 	}
-	info, err := c.TemplateInfo(ctx, cmd.Identity.GuestType, cmd.Identity.NodeRef, parameters.SourceVMID, "")
+	info, err := c.TemplateInfo(ctx, cmd.Identity.GuestType, cmd.Identity.NodeRef, parameters.SourceVMID, parameters.TemplateRef)
 	if err != nil {
 		return err
 	}

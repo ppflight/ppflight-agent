@@ -418,9 +418,9 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.start`, `vm.shutdown`, `vm.stop`, `vm.reboot` | `parameters` 必须是空对象。 |
 | vm | `vm.suspend`, `vm.resume` | QEMU only；空对象；Agent 等待 UPID 并回读 `qmpstatus=paused` 或 running，LXC 明确拒绝。 |
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
-| vm | `vm.clone` | `sourceVmid`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256。 |
+| vm | `vm.clone` | `sourceVmid`, `templateRef`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256，Journal 固化 templateRef/sourceVmid 供后续 lineage 使用。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
-| vm | `vm.set-initial-resources` | 仅新 clone 首次定型；精确 `cores/sockets/memoryMiB` 加 `cloneOperationId/vmGeneration/templateConfigSha256`。由本机 durable journal 证明同 operation 的 clone 已成功、目标从未启动/交付/重装，且 PVE 当前为 stopped non-template；允许低于模板基线，但不构成存量降级入口。等待 UPID 并精确回读。 |
+| vm | `vm.set-initial-resources` | 仅新 clone 首次定型；精确 `cores/sockets/memoryMiB` 加 `cloneOperationId/templateRef/sourceVmid/vmGeneration/templateConfigSha256`，其中 `vmGeneration` 是十进制字符串。当前命令使用独立 operationId，`cloneOperationId` 引用此前成功终态的 clone；本机 durable journal 精确核对 authority、VM identity、generation、template identity 与 SHA，并证明目标从未启动/交付/重装或进入其他代次。PVE 当前须为 stopped non-template；允许低于模板基线，但不构成存量降级入口。等待 UPID 并精确回读。 |
 | vm | `vm.reinstall` | Linux QEMU only；固定 template identity/version/VMID/config SHA-256、独占 temporary VMID、完整最终资源/磁盘 IO/网络/IPFilter/Cloud-Init/OS identity 合同。先建本机完整补偿 clone，再替换并逐项回读；失败恢复或进入 indeterminate。禁止 URL/ISO/shell/任意 guest-exec 参数。 |
 | vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
 | vm | `vm.set-disk-io` | QEMU only；`disk` 与 `limits`。limits 的 10 个 IOPS/MBPS base/max/burst length 键必须全部出现，值为 typed 整数或 null；null 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
@@ -431,7 +431,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.verify-delivery` | QEMU read-only；`notBefore` 与完整 `expected` 资源/磁盘 IO/多网卡/IPFilter/时区合同。重新读取 PVE config、QGA interfaces/timezone 和 guest firewall；全部匹配才返回 ready。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
 | vm | `vm.reset-password` | `username/password/crypted/osFamily`；QEMU Linux/Windows/非 root 账户在提交前检查 QGA `guest-set-user-password`；LXC 仅 Linux、`crypted=false`，通过固定 config password 字段重置 root。secret 不进入 receipt/audit/log。 |
-| vm | `vm.console.create-session`, `vm.console.revoke-session` | create 仅接受 `ttlSeconds=30..300,webSocket=true`；Agent 获取 PVE ticket 后立即通过固定同源 HMAC HTTPS broker 发布，receipt 只返回 `sessionRef/path/expiresAt/oneTime`，绝不含 ticket/cert/user。revoke 只接受 opaque `sessionRef`。 |
+| vm | `vm.console.create-session`, `vm.console.revoke-session` | QEMU only；create 仅接受 `ttlSeconds=30..300,webSocket=true`。Agent 在 `tcp4 127.0.0.1:<PVE temporary port>` 内存认证后主动接入固定同源 HMAC WSS broker；secret-free registration 绑定完整 authority/VM generation，receipt 只返回 `sessionRef/state/expiresAt/browserPath`。revoke 只接受 opaque `sessionRef` 并立即关闭本地 socket/WSS。 |
 | vm | `snapshot.create` | `name`、必填 bool `includeRam`，可选 `description`；LXC 的 `includeRam` 只能为 false。 |
 | vm | `snapshot.delete`, `snapshot.rollback` | `name`。 |
 | vm | `snapshot.list`, `snapshot.get` | 只读；list 接受 `limit=1..100`，get 接受 `name`；返回 stable snapshot ID/name/time/state/parent/RAM state 与 decimal-string VM generation。 |

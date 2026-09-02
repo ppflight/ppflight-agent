@@ -203,6 +203,7 @@ func TestJournalSerializesResourceAndMakesClaimCrashIndeterminate(t *testing.T) 
 	second := first
 	second.CommandID = "command-2"
 	second.OperationID = "operation-2"
+	second.IdempotencyKey = "idempotency-2"
 	second.Signature = SignCommand(second, []byte("secret"))
 	if _, _, err := journal.Claim(second, now); !errors.Is(err, ErrResourceBusy) {
 		t.Fatalf("resource conflict error=%v", err)
@@ -213,6 +214,7 @@ func TestJournalSerializesResourceAndMakesClaimCrashIndeterminate(t *testing.T) 
 	third := second
 	third.CommandID = "command-3"
 	third.OperationID = "operation-3"
+	third.IdempotencyKey = "idempotency-3"
 	third.Signature = SignCommand(third, []byte("secret"))
 	if _, _, err := journal.Claim(third, now); !errors.Is(err, ErrResourceBusy) {
 		t.Fatalf("indeterminate mutation did not retain resource lock: %v", err)
@@ -246,7 +248,7 @@ func TestJournalReadOnlyScopesCanRetryAndDoNotTakeMutationLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := Command{
-		SchemaVersion: 1, CommandID: "discover-1", OperationID: "operation-1", AgentRef: "agent-1", Scope: ScopeCluster,
+		SchemaVersion: 1, CommandID: "discover-1", OperationID: "operation-1", IdempotencyKey: "discover-idempotency-1", AgentRef: "agent-1", Scope: ScopeCluster,
 		Identity: Identity{ClusterRef: "cluster-1"}, Action: "pve.discover",
 		Parameters: json.RawMessage(`{"operationId":"operation-1","phase":"version","limit":1}`), OperatorRef: "operator-1",
 	}
@@ -262,6 +264,7 @@ func TestJournalReadOnlyScopesCanRetryAndDoNotTakeMutationLock(t *testing.T) {
 	second := command
 	second.CommandID = "discover-2"
 	second.OperationID = "operation-2"
+	second.IdempotencyKey = "discover-idempotency-2"
 	second.Parameters = json.RawMessage(`{"operationId":"operation-2","phase":"version","limit":1}`)
 	if _, duplicate, err := journal.Claim(second, now); err != nil || duplicate {
 		t.Fatalf("concurrent read claim duplicate=%v err=%v", duplicate, err)

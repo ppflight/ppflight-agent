@@ -228,6 +228,9 @@ func (s *Service) ApplyAssignmentAuthority(document inventory.Document, revision
 	s.allowed = AllowedSet(actions)
 	s.assignmentRevision = revision
 	s.dynamicAuthority = true
+	if s.executor.ConsoleSessions != nil {
+		s.executor.ConsoleSessions.Invalidate()
+	}
 	return nil
 }
 
@@ -298,6 +301,10 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		switch {
 		case errors.Is(claimErr, ErrCommandConflict):
 			receipt, err = s.rejection(command, "COMMAND_ID_CONFLICT", now)
+		case errors.Is(claimErr, ErrOperationConflict):
+			receipt, err = s.rejection(command, "OPERATION_ID_CONFLICT", now)
+		case errors.Is(claimErr, ErrIdempotencyConflict):
+			receipt, err = s.rejection(command, "IDEMPOTENCY_KEY_CONFLICT", now)
 		case errors.Is(claimErr, ErrResourceBusy):
 			receipt, err = s.rejection(command, "RESOURCE_BUSY", now)
 		case claimErr != nil:
