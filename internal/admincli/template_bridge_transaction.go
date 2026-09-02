@@ -59,7 +59,6 @@ func (m *pveTemplateBridgeManager) createSafely(ctx context.Context, name string
 		"--iface", name,
 		"--type", "bridge",
 		"--autostart", "1",
-		"--bridge_ports", "none",
 		"--comments", templateBridgeOwnershipComment); err != nil {
 		return templateBridgeState{}, err
 	}

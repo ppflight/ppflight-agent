@@ -416,7 +416,7 @@ func TestPVETemplateBridgeCreateUsesFixedSafeArgumentsAndStrictReadback(t *testi
 	active, pending, lockPath := testBridgeNetworkPaths(t)
 	lockWasHeldAcrossReload := false
 	runner := &scriptedBridgeRunner{t: t, networkSemanticByInput: testNetworkSemantics(), results: []bridgeRunResult{
-		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--bridge_ports", "none", "--comments", templateBridgeOwnershipComment}, output: "null\n", before: func() {
+		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--comments", templateBridgeOwnershipComment}, output: "null\n", before: func() {
 			if err := os.WriteFile(pending, []byte(testNetworkOwned), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -494,7 +494,7 @@ func TestPVETemplateBridgeCreateRefusesKernelRaceBeforeReload(t *testing.T) {
 	path := "/nodes/pve/network"
 	active, pending, lockPath := testBridgeNetworkPaths(t)
 	runner := &scriptedBridgeRunner{t: t, networkSemanticByInput: testNetworkSemantics(), results: []bridgeRunResult{
-		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--bridge_ports", "none", "--comments", templateBridgeOwnershipComment}, before: func() {
+		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--comments", templateBridgeOwnershipComment}, before: func() {
 			if err := os.WriteFile(pending, []byte(testNetworkOwned), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -522,7 +522,7 @@ func TestPVETemplateBridgeCreateRefusesConcurrentPendingMutationBeforeReload(t *
 	path := "/nodes/pve/network"
 	active, pending, lockPath := testBridgeNetworkPaths(t)
 	runner := &scriptedBridgeRunner{t: t, networkSemanticByInput: testNetworkSemantics(), results: []bridgeRunResult{
-		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--bridge_ports", "none", "--comments", templateBridgeOwnershipComment}, before: func() {
+		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--comments", templateBridgeOwnershipComment}, before: func() {
 			if err := os.WriteFile(pending, []byte(testNetworkConcurrent), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -541,7 +541,7 @@ func TestPVETemplateBridgeCreateRefusesActiveMutationInBaselineToPOSTWindow(t *t
 	path := "/nodes/pve/network"
 	active, pending, lockPath := testBridgeNetworkPaths(t)
 	runner := &scriptedBridgeRunner{t: t, networkSemanticByInput: testNetworkSemantics(), results: []bridgeRunResult{
-		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--bridge_ports", "none", "--comments", templateBridgeOwnershipComment}, before: func() {
+		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--comments", templateBridgeOwnershipComment}, before: func() {
 			if err := os.WriteFile(active, []byte(testNetworkAdminOnly), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -568,7 +568,7 @@ func TestPVETemplateBridgeCreateKeepsOwnedBridgeForManualRecoveryAfterStoppedRel
 	safeList := `[{"iface":"vmbr1","type":"bridge"}]`
 	safeDetail := `{"iface":"vmbr1","type":"bridge","autostart":1,"bridge_ports":"none","bridge_stp":0,"bridge_fd":0,"method":"manual","method6":"manual","comments":"PPFlight private template bridge"}`
 	runner := &scriptedBridgeRunner{t: t, networkSemanticByInput: testNetworkSemantics(), results: []bridgeRunResult{
-		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--bridge_ports", "none", "--comments", templateBridgeOwnershipComment}, before: func() {
+		{program: templateBridgePVESh, args: []string{"create", path, "--iface", "vmbr1", "--type", "bridge", "--autostart", "1", "--comments", templateBridgeOwnershipComment}, before: func() {
 			if err := os.WriteFile(pending, []byte(testNetworkOwned), 0o600); err != nil {
 				t.Fatal(err)
 			}
