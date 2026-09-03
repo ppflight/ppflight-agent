@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.1-rc.5"
+		repositoryVersion = "0.1.1-rc.6"
 		nodeAMD64         = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
 		nodeARM64         = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
 		smartAMD64        = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
@@ -24,8 +24,16 @@ func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T)
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	for _, required := range []string{
 		"readonly RELEASE_CHANNEL='main'",
-		"readonly RELEASE_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent/rolling-main'",
+		"readonly RELEASE_REF_API='https://api.github.com/repos/ppflight/ppflight-agent/git/ref/heads/rolling-main'",
+		"readonly RELEASE_RAW_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent'",
+		`readonly RELEASE_BASE="$RELEASE_RAW_BASE/$ROLLING_COMMIT_SHA"`,
 		`readonly ARCHIVE="ppflight-agent-main-linux-${RELEASE_ARCH}.tar.gz"`,
+		`ROLLING_COMMIT_SHA="$(python3 -I -c '`,
+		`"$RELEASE_REF_API?ppflight_cache=$rolling_ref_cache"`,
+		`$RELEASE_BASE/manifest.json?ppflight_cache=$rolling_cache_key`,
+		`value.get("sourceCommitSha")`,
+		`manifest_sha256`,
+		`manifest_size`,
 		`rolling_cache_key="$(date -u +%s%N)-$$-$rolling_attempt"`,
 		`SHA256SUMS?ppflight_cache=$rolling_cache_key`,
 		`$ARCHIVE?ppflight_cache=$rolling_cache_key`,
@@ -280,6 +288,16 @@ func TestQuickInstallStartsAndVerifiesBothUnitsAfterLocalPreparation(t *testing.
 	if !strings.Contains(output, "安装或更新完成") {
 		t.Fatalf("quick installer omitted its success confirmation: %s", output)
 	}
+	for _, immutableURL := range []string{
+		"https://api.github.com/repos/ppflight/ppflight-agent/git/ref/heads/rolling-main",
+		"https://raw.githubusercontent.com/ppflight/ppflight-agent/1111111111111111111111111111111111111111/manifest.json",
+		"https://raw.githubusercontent.com/ppflight/ppflight-agent/1111111111111111111111111111111111111111/SHA256SUMS",
+		"https://raw.githubusercontent.com/ppflight/ppflight-agent/1111111111111111111111111111111111111111/ppflight-agent-main-linux-amd64.tar.gz",
+	} {
+		if !strings.Contains(log, immutableURL) {
+			t.Fatalf("quick installer did not fetch immutable release URL %q:\n%s", immutableURL, log)
+		}
+	}
 }
 
 func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, error) {
@@ -294,7 +312,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	writeQuickInstallMock(t, ag, "#!/usr/bin/env bash\nprintf 'prepare:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nexit \"${TEST_PREPARE_EXIT:?}\"\n")
 	smartctl := filepath.Join(root, "smartctl")
 	writeQuickInstallMock(t, smartctl, "#!/usr/bin/env bash\nexit 0\n")
-	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\nif [[ ${out##*/} == SHA256SUMS ]]; then\n  printf '%064d  ppflight-agent-main-linux-amd64.tar.gz\\n%064d  ppflight-agent-main-linux-arm64.tar.gz\\n' 0 0 >\"$out\"\nelse\n  printf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\nsmartctl_device_info{device=\"/dev/sda\"} 1\\n' >\"$out\"\nfi\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf 'curl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\ncase ${out##*/} in\n  rolling-ref.json) printf '%s\\n' '{\"ref\":\"refs/heads/rolling-main\",\"object\":{\"type\":\"commit\",\"sha\":\"1111111111111111111111111111111111111111\"}}' >\"$out\" ;;\n  manifest.json) printf '%s\\n' '{\"schemaVersion\":1,\"channel\":\"main\",\"sourceCommitSha\":\"2222222222222222222222222222222222222222\",\"artifacts\":[{\"arch\":\"amd64\",\"name\":\"ppflight-agent-main-linux-amd64.tar.gz\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"size\":8}]}' >\"$out\" ;;\n  SHA256SUMS) printf '%064d  ppflight-agent-main-linux-amd64.tar.gz\\n%064d  ppflight-agent-main-linux-arm64.tar.gz\\n' 0 0 >\"$out\" ;;\n  ppflight-agent-main-linux-amd64.tar.gz) printf 'archive\\n' >\"$out\" ;;\n  *) printf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\nsmartctl_device_info{device=\"/dev/sda\"} 1\\n' >\"$out\" ;;\nesac\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf '#!/usr/bin/env bash\\nif [[ $1 == host-firewall && $2 == classify ]]; then printf \\\"update\\\\n\\\"; exit 0; fi\\nif [[ $1 == host-firewall && $2 == reconcile ]]; then exit 0; fi\\nexit 97\\n' >ppflight-agent/ppflight-agent\nchmod 0700 ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")

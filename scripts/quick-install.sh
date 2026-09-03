@@ -7,7 +7,8 @@ IFS=$'\n\t'
 umask 077
 
 readonly RELEASE_CHANNEL='main'
-readonly RELEASE_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent/rolling-main'
+readonly RELEASE_REF_API='https://api.github.com/repos/ppflight/ppflight-agent/git/ref/heads/rolling-main'
+readonly RELEASE_RAW_BASE='https://raw.githubusercontent.com/ppflight/ppflight-agent'
 readonly NODE_EXPORTER_VERSION='1.12.1'
 readonly NODE_EXPORTER_BASE="https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION"
 readonly SMARTCTL_EXPORTER_VERSION='0.14.0'
@@ -20,7 +21,7 @@ die() {
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die '请在 PVE root 终端执行'
 
-for required_command in curl sha256sum tar mktemp uname cut date; do
+for required_command in curl sha256sum tar mktemp uname cut date python3 stat; do
   command -v "$required_command" >/dev/null 2>&1 || die "缺少命令: $required_command"
 done
 
@@ -53,13 +54,71 @@ trap cleanup EXIT
 
 cd -- "$INSTALL_TEMP_DIR"
 printf '正在下载 PPFlight Agent %s 滚动最新版 (%s)...\n' "$RELEASE_CHANNEL" "$RELEASE_ARCH"
+
+# Resolve the mutable rolling branch once through the GitHub API, then fetch
+# every release object through that immutable commit. A CDN can otherwise
+# return a coherent but obsolete checksum/archive pair and make a stale build
+# look successfully verified.
+rolling_ref_cache="$(date -u +%s%N)-$$-ref"
+curl \
+  --disable \
+  --ipv4 \
+  --fail \
+  --show-error \
+  --silent \
+  --location \
+  --max-redirs 5 \
+  --proto '=https' \
+  --proto-redir '=https' \
+  --tlsv1.2 \
+  --connect-timeout 15 \
+  --max-time 60 \
+  --retry 3 \
+  --retry-all-errors \
+  --header 'Accept: application/vnd.github+json' \
+  --header 'X-GitHub-Api-Version: 2022-11-28' \
+  --header 'Cache-Control: no-cache' \
+  --header 'Pragma: no-cache' \
+  "$RELEASE_REF_API?ppflight_cache=$rolling_ref_cache" \
+  --output rolling-ref.json
+ROLLING_COMMIT_SHA="$(python3 -I -c '
+import json, re, sys
+with open(sys.argv[1], "rb") as stream:
+    value = json.load(stream)
+sha = value.get("object", {}).get("sha")
+kind = value.get("object", {}).get("type")
+ref = value.get("ref")
+if ref != "refs/heads/rolling-main" or kind != "commit" or not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+    raise SystemExit(1)
+print(sha)
+' rolling-ref.json)" || die 'GitHub rolling-main 引用响应无效'
+readonly ROLLING_COMMIT_SHA
+readonly RELEASE_BASE="$RELEASE_RAW_BASE/$ROLLING_COMMIT_SHA"
+
 rolling_verified=0
 for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
-  # rolling-main intentionally replaces the same object names.  A unique query
-  # key plus no-cache headers prevents a fresh install from receiving a
-  # coherent but obsolete SHA256SUMS/archive pair from an edge cache.  The
-  # checksum loop still protects the atomic branch-switch race.
+  # Immutable object URLs prevent a branch-switch race. Unique query keys and
+  # no-cache headers additionally prevent a stale or corrupted edge response.
   rolling_cache_key="$(date -u +%s%N)-$$-$rolling_attempt"
+  curl \
+    --disable \
+    --ipv4 \
+    --fail \
+    --show-error \
+    --silent \
+    --location \
+    --max-redirs 5 \
+    --proto '=https' \
+    --proto-redir '=https' \
+    --tlsv1.2 \
+    --connect-timeout 15 \
+    --max-time 180 \
+    --retry 3 \
+    --retry-all-errors \
+    --header 'Cache-Control: no-cache' \
+    --header 'Pragma: no-cache' \
+    "$RELEASE_BASE/manifest.json?ppflight_cache=$rolling_cache_key" \
+    --output manifest.json
   curl \
     --disable \
     --ipv4 \
@@ -85,6 +144,31 @@ for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
   fi
   release_sha256="$(awk -v name="$ARCHIVE" '$2 == name {print $1}' SHA256SUMS)"
   [[ $release_sha256 =~ ^[0-9a-f]{64}$ ]] || die '滚动发布缺少当前架构的 SHA-256'
+  mapfile -t manifest_values < <(python3 -I -c '
+import json, re, sys
+with open(sys.argv[1], "rb") as stream:
+    value = json.load(stream)
+if value.get("schemaVersion") != 1 or value.get("channel") != "main":
+    raise SystemExit(1)
+source = value.get("sourceCommitSha")
+if not isinstance(source, str) or re.fullmatch(r"[0-9a-f]{40}", source) is None:
+    raise SystemExit(1)
+matches = [item for item in value.get("artifacts", []) if isinstance(item, dict) and item.get("name") == sys.argv[2]]
+if len(matches) != 1:
+    raise SystemExit(1)
+item = matches[0]
+digest, size = item.get("sha256"), item.get("size")
+if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None or not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+    raise SystemExit(1)
+print(source)
+print(digest)
+print(size)
+' manifest.json "$ARCHIVE") || die '滚动发布 manifest 无效'
+  [[ ${#manifest_values[@]} -eq 3 ]] || die '滚动发布 manifest 字段缺失'
+  source_commit_sha="${manifest_values[0]}"
+  manifest_sha256="${manifest_values[1]}"
+  manifest_size="${manifest_values[2]}"
+  [[ "$manifest_sha256" == "$release_sha256" ]] || die 'manifest 与 SHA256SUMS 不一致'
   curl \
     --disable \
     --ipv4 \
@@ -104,12 +188,14 @@ for ((rolling_attempt = 0; rolling_attempt < 3; rolling_attempt++)); do
     --header 'Pragma: no-cache' \
     "$RELEASE_BASE/$ARCHIVE?ppflight_cache=$rolling_cache_key" \
     --output "$ARCHIVE"
-  if printf '%s  %s\n' "$release_sha256" "$ARCHIVE" | sha256sum --check --status -; then
+  if [[ $(stat -c '%s' "$ARCHIVE") == "$manifest_size" ]] \
+      && printf '%s  %s\n' "$release_sha256" "$ARCHIVE" | sha256sum --check --status -; then
     rolling_verified=1
     break
   fi
 done
 [[ $rolling_verified -eq 1 ]] || die '滚动发布包 SHA-256 校验失败；可能正逢 main 更新，请稍后重试'
+printf '已锁定 rolling commit %s（源码提交 %s）。\n' "$ROLLING_COMMIT_SHA" "$source_commit_sha"
 
 tar -xzf "$ARCHIVE"
 cd ppflight-agent

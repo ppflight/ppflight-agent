@@ -20,6 +20,8 @@ curl -4fsSL -H 'Cache-Control: no-cache' "https://raw.githubusercontent.com/ppfl
 
 `quick-install.sh` 会自动识别 `amd64`/`arm64`，固定 IPv4/HTTPS 从唯一的 `rolling-main` 联调分支下载最近一次通过全量 CI 的两个架构制品和 `SHA256SUMS`；联调期间不会为每次修改创建 GitHub tag/Release。入口脚本、清单和压缩包请求都带每次安装唯一的缓存键及 `no-cache` 请求头，避免 GitHub Raw/CDN 在滚动分支覆盖后返回完整但过期的旧快照；若清单与制品正逢原子分支切换而不匹配，脚本会用新缓存键重新读取，三次仍不一致就拒绝安装。它还会下载固定版本的官方 `node_exporter`/`smartctl_exporter` 并逐项校验 SHA-256，自动创建或复用本机隔离的 read/control PVE Token，为专用 control role 在 `/` 授予固定的 VPS 管理权限（不含用户/RBAC、主机电源或主机控制台权限），安装并启用仅监听回环地址的宿主机/网卡/磁盘 IO/SMART 采集服务，并把遗留配置中的 exporter 禁用状态迁移为固定 `127.0.0.1:9100/9633` 采集。随后校验真实网卡累计收发字节、磁盘累计读写字节以及至少一块可读取的 SMART 设备，再校验 CA/SNI、真实 PVE API、版本、节点、权限、node status/storage 和首轮真实采集，切换到 `mode=production`/`pve.source=api`，启动 Agent 与签名升级监听，并把 Agent、升级监听和两个 exporter 全部加入开机启动。任何下载、指标、准备、权限或启动回验失败都会让一键安装以错误结束，不能把 disabled/test/simulator 或缺少网卡、磁盘数据的状态报告成成功。安装不会代替官网/监控的一次性绑定；官网签名命令通道与独立监控 telemetry/audit 两个绑定都稳定后，`productionExecution` 自动启用，无需再运行 ACL 或配置命令。发布版不含 simulator 采集器；后续远程升级仍须通过官网签名命令、固定清单和本机回验，不能执行任意 URL 或命令。
 
+为避免 CDN 同时返回一整套彼此匹配但过期的滚动文件，更新器会先通过 GitHub API 解析 `rolling-main` 当前 commit，再只从该不可变 commit URL 下载 `manifest.json`、`SHA256SUMS` 和归档，并交叉核对源码提交、架构、文件名、大小和 SHA-256。
+
 一键安装优先复用 PVE 已有的 `/usr/sbin/smartctl`。只有它确实缺失时，安装器才会使用与 PVE 8/9 对应的 Debian 官方 HTTPS 固定源，并通过独立 `sources.list`、IPv4 和 Debian archive 签名安装 `smartmontools`；不会读取、修改或更新操作者配置的 Proxmox Enterprise/Ceph 软件源。
 
 安装完成后只输入：
