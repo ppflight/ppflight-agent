@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -77,6 +78,39 @@ func TestClientReportsProgressAfterSuccessAndFailure(t *testing.T) {
 	}
 	if progress.Load() != 2 {
 		t.Fatalf("progress=%d", progress.Load())
+	}
+}
+
+func TestHTTPErrorExtractsOnlyBoundedTopLevelPVEMessage(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"data":null,"message":"Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist","errors":{"message":"nested value"}}`)
+	}))
+	defer server.Close()
+	var result map[string]any
+	err := c.Do(context.Background(), http.MethodDelete, "/nodes/pve1/qemu/101", nil, nil, &result)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error=%v", err)
+	}
+	if httpErr.StatusCode != http.StatusInternalServerError || httpErr.Reason != "Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist" {
+		t.Fatalf("HTTP error=%#v", httpErr)
+	}
+	if !strings.Contains(httpErr.Body, `"nested value"`) {
+		t.Fatalf("bounded diagnostic body=%q", httpErr.Body)
+	}
+}
+
+func TestHTTPErrorDoesNotPromotePlainTextToStructuredReason(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Configuration file does not exist", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	var result map[string]any
+	err := c.Do(context.Background(), http.MethodDelete, "/nodes/pve1/qemu/101", nil, nil, &result)
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) || httpErr.Reason != "" {
+		t.Fatalf("error=%#v", err)
 	}
 }
 func TestClientWriteAndUPID(t *testing.T) {

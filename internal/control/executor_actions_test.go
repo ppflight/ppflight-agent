@@ -88,6 +88,78 @@ func controlCommand(action, guest string, parameters string) Command {
 	return command
 }
 
+func TestVMDeleteIsConvergentAndClassifiesPVEHTTPFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		body      string
+		wantState string
+		wantCode  string
+		wantErr   bool
+	}{
+		{name: "normal task submission", status: http.StatusOK, body: `{"data":"UPID:pve1:delete"}`, wantState: "submitted", wantCode: "PVE_TASK_SUBMITTED"},
+		{name: "already absent", status: http.StatusNotFound, body: `{"errors":{"vmid":"not found"}}`, wantState: "succeeded", wantCode: "SUCCEEDED"},
+		{name: "PVE missing config is already absent", status: http.StatusInternalServerError, body: `{"data":null,"message":"Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist"}`, wantState: "succeeded", wantCode: "SUCCEEDED"},
+		{name: "different missing config is not accepted", status: http.StatusInternalServerError, body: `{"data":null,"message":"Configuration file 'nodes/pve1/qemu-server/102.conf' does not exist"}`, wantState: "indeterminate", wantCode: "PVE_ACTION_INDETERMINATE", wantErr: true},
+		{name: "unstructured missing text is not accepted", status: http.StatusInternalServerError, body: `Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist`, wantState: "indeterminate", wantCode: "PVE_ACTION_INDETERMINATE", wantErr: true},
+		{name: "forbidden", status: http.StatusForbidden, body: `{"errors":{"permission":"denied"}}`, wantState: "failed", wantCode: "PVE_ACTION_FORBIDDEN", wantErr: true},
+		{name: "conflict", status: http.StatusConflict, body: `{"errors":{"lock":"busy"}}`, wantState: "failed", wantCode: "PVE_ACTION_CONFLICT", wantErr: true},
+		{name: "server failure", status: http.StatusBadGateway, body: `{"errors":{"proxy":"unavailable"}}`, wantState: "indeterminate", wantCode: "PVE_ACTION_INDETERMINATE", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests++
+				if r.Method != http.MethodDelete || r.URL.Path != "/api2/json/nodes/pve1/qemu/101" {
+					t.Fatalf("request %s %s", r.Method, r.URL.Path)
+				}
+				body, err := io.ReadAll(r.Body)
+				form, parseErr := url.ParseQuery(string(body))
+				if err != nil || parseErr != nil || form.Get("purge") != "1" || form.Get("destroy-unreferenced-disks") != "1" {
+					t.Fatalf("form=%v readErr=%v parseErr=%v", form, err, parseErr)
+				}
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+
+			command := controlCommand("vm.delete", "qemu", `{"purge":true,"destroyUnreferencedDisks":true}`)
+			receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
+			if (err != nil) != tt.wantErr || receipt.State != tt.wantState || receipt.Code != tt.wantCode || requests != 1 {
+				t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+			}
+			if !tt.wantErr && tt.wantState == "succeeded" && string(receipt.Result) != `{"deleted":true,"alreadyAbsent":true}` {
+				t.Fatalf("not-found result=%s", receipt.Result)
+			}
+		})
+	}
+}
+
+func TestVMDeleteMissingConfigRequiresExactSignedGuestIdentity(t *testing.T) {
+	qemu := controlCommand("vm.delete", "qemu", `{"purge":true,"destroyUnreferencedDisks":true}`)
+	lxc := controlCommand("vm.delete", "lxc", `{"purge":true,"destroyUnreferencedDisks":true}`)
+	tests := []struct {
+		name    string
+		command Command
+		reason  string
+		want    bool
+	}{
+		{name: "qemu", command: qemu, reason: "Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist", want: true},
+		{name: "lxc", command: lxc, reason: "Configuration file 'nodes/pve1/lxc/101.conf' does not exist", want: true},
+		{name: "different node", command: qemu, reason: "Configuration file 'nodes/pve2/qemu-server/101.conf' does not exist"},
+		{name: "different guest type", command: qemu, reason: "Configuration file 'nodes/pve1/lxc/101.conf' does not exist"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := vmDeleteTargetAlreadyAbsent(tt.command, &pve.HTTPError{StatusCode: http.StatusInternalServerError, Reason: tt.reason})
+			if got != tt.want {
+				t.Fatalf("already absent=%t want=%t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExecutorResourceAndNetworkUseConfigDigest(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -81,6 +81,13 @@ func TestResetAssignmentRefreshAuthorityRemovesOnlyExactStateFile(t *testing.T) 
 // continues to require the installed configuration and state root.
 func allowManagedWriteForTest(string, config.Config) error { return nil }
 
+// allowBindingRuntimeValidationForTest keeps fixture-only credential material
+// out of the host environment. Production leaves the validator nil and always
+// performs the real disk and environment-overlay readback.
+func allowBindingRuntimeValidationForTest(string, config.Config, bindingActivationExpectation) error {
+	return nil
+}
+
 func runMonitoringBindForTest(args []string, version string, in io.Reader, out, errOut io.Writer) int {
 	c := &cli{
 		in:      in,
@@ -106,7 +113,8 @@ func runMonitoringBindForTest(args []string, version string, in io.Reader, out, 
 			}
 			return nil
 		},
-		managedWritePolicy: allowManagedWriteForTest,
+		managedWritePolicy:      allowManagedWriteForTest,
+		bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
 	}
 	return c.run(args)
 }
@@ -131,7 +139,8 @@ func runWebsiteBindForTest(args []string, version string, in io.Reader, out, err
 			}
 			return nil
 		},
-		managedWritePolicy: allowManagedWriteForTest,
+		managedWritePolicy:      allowManagedWriteForTest,
+		bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
 	}
 	return c.run(args)
 }
@@ -1569,8 +1578,10 @@ func TestWebsiteBindActivationFailurePreservesServerIssuedState(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	c := &cli{
 		in: strings.NewReader("WEBSITE-ROLLBACK-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
-		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		managedWritePolicy:      allowManagedWriteForTest,
+		bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
+		bindingPVE:              func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
+		pveVersion:              func(context.Context) (string, error) { return "9.0.8", nil },
 		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
 			if expected.BindingID == "" {
 				recoveryCalled = true
@@ -1757,8 +1768,9 @@ func TestMalformedBindingCodesDoNotPreparePersistQuiesceOrSend(t *testing.T) {
 			var output, stderr bytes.Buffer
 			instance := &cli{
 				in: strings.NewReader("b^H\n"), out: &output, errOut: &stderr, version: "test",
-				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				managedWritePolicy: allowManagedWriteForTest,
+				bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 				quiesceBinding: func(context.Context) error {
 					quiesces++
 					return nil
@@ -1809,8 +1821,9 @@ func TestAmbiguousBindingCannotReuseRequestIDAtDifferentEndpoint(t *testing.T) {
 			var output, stderr bytes.Buffer
 			instance := &cli{
 				out: &output, errOut: &stderr, version: "test",
-				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				managedWritePolicy: allowManagedWriteForTest,
+				bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 				quiesceBinding: func(context.Context) error {
 					quiesces++
 					return nil
@@ -1850,6 +1863,7 @@ func TestBindingFinalizeFailureWindowsRemainRecoverable(t *testing.T) {
 				filename, cfg, expected := prepareFinalizationFixture(t, domain)
 				arms := 0
 				instance := &cli{
+					managedWritePolicy: allowManagedWriteForTest,
 					armBinding: func(context.Context) error {
 						arms++
 						return nil
@@ -1876,6 +1890,8 @@ func TestBindingFinalizeFailureWindowsRemainRecoverable(t *testing.T) {
 				filename, cfg, expected := prepareFinalizationFixture(t, domain)
 				arms := 0
 				instance := &cli{
+					managedWritePolicy:      allowManagedWriteForTest,
+					bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
 					armBinding: func(context.Context) error {
 						arms++
 						return nil
@@ -1997,8 +2013,9 @@ func TestPendingOnlyBindingRetryReusesRequestIDAndCompletes(t *testing.T) {
 			var output, stderr bytes.Buffer
 			instance := &cli{
 				out: &output, errOut: &stderr, version: "test", effectiveUID: func() int { return 1000 },
-				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
+				bindingPVE:              func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion:              func(context.Context) (string, error) { return "9.0.8", nil },
 				quiesceBinding: func(context.Context) error {
 					quiesces++
 					return nil
@@ -2148,8 +2165,10 @@ func TestMonitoringBindActivationFailurePreservesServerIssuedState(t *testing.T)
 	var stdout, stderr bytes.Buffer
 	c := &cli{
 		in: strings.NewReader("MONITOR-ROLLBACK-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
-		bindingPVE: func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
+		managedWritePolicy:      allowManagedWriteForTest,
+		bindingRuntimeValidator: allowBindingRuntimeValidationForTest,
+		pveVersion:              func(context.Context) (string, error) { return "9.0.8", nil },
+		bindingPVE:              func(_ context.Context, _ string, cfg config.Config) (config.Config, error) { return cfg, nil },
 		activateBinding: func(_ context.Context, _ config.Config, expected bindingActivationExpectation) error {
 			if expected.BindingID == "" {
 				recoveryCalled = true
@@ -2198,8 +2217,9 @@ func TestWebsiteActiveBindingRejectionClearsPendingAndRestoresPreviousService(t 
 	var stdout, stderr bytes.Buffer
 	instance := &cli{
 		in: strings.NewReader("ACTIVE-BINDING-REJECT-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-		bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-		pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+		managedWritePolicy: allowManagedWriteForTest,
+		bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+		pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 		quiesceBinding: func(context.Context) error {
 			quiesced = true
 			return nil
@@ -2268,8 +2288,9 @@ func TestBindingFourXXNeverClearsIntentAndRestoresPreviousService(t *testing.T) 
 				var stdout, stderr bytes.Buffer
 				instance := &cli{
 					in: strings.NewReader("DEFINITE-REJECT-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-					bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-					pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+					managedWritePolicy: allowManagedWriteForTest,
+					bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+					pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 					quiesceBinding: func(context.Context) error {
 						quiesced = true
 						return nil
@@ -2349,8 +2370,9 @@ func TestBindingAmbiguousFailureRetainsIntentAndKeepsAgentQuiesced(t *testing.T)
 			var stdout, stderr bytes.Buffer
 			instance := &cli{
 				in: strings.NewReader("AMBIGUOUS-FAILURE-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				managedWritePolicy: allowManagedWriteForTest,
+				bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 				quiesceBinding: func(context.Context) error {
 					quiesced = true
 					return nil
@@ -2404,8 +2426,9 @@ func TestCommittedBindingFourXXDoesNotAuthorizeRollback(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			instance := &cli{
 				in: strings.NewReader(codeValue + "\n"), out: &stdout, errOut: &stderr, version: "test",
-				bindingPVE: func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
-				pveVersion: func(context.Context) (string, error) { return "9.0.8", nil },
+				managedWritePolicy: allowManagedWriteForTest,
+				bindingPVE:         func(_ context.Context, _ string, value config.Config) (config.Config, error) { return value, nil },
+				pveVersion:         func(context.Context) (string, error) { return "9.0.8", nil },
 				quiesceBinding: func(context.Context) error {
 					return nil
 				},
@@ -2447,7 +2470,8 @@ func TestMonitoringBindRejectsUserSuppliedPVEVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	c := &cli{
 		in: strings.NewReader("MONITOR-123456\n"), out: &stdout, errOut: &stderr, version: "test",
-		pveVersion: func(context.Context) (string, error) { called = true; return "9.0.8", nil },
+		managedWritePolicy: allowManagedWriteForTest,
+		pveVersion:         func(context.Context) (string, error) { called = true; return "9.0.8", nil },
 	}
 	code := c.run([]string{"--config", filename, "monitoring", "bind", "--endpoint", "https://moniter.ppflight.com/internal/v1/monitoring/agents/bind", "--pve-version", "9.0.8"})
 	if code != 2 || called {
@@ -2471,6 +2495,7 @@ func TestWebsiteBindFailsRealPVEReadinessBeforeReadingCode(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	c := &cli{
 		in: reader, out: &stdout, errOut: &stderr, version: "test",
+		managedWritePolicy: allowManagedWriteForTest,
 		bindingPVE: func(context.Context, string, config.Config) (config.Config, error) {
 			return config.Config{}, errors.New("simulator is forbidden")
 		},
@@ -2502,7 +2527,8 @@ func TestProductionBindingEndpointFailsBeforePVEReadinessOrCode(t *testing.T) {
 		readinessCalled := false
 		instance := &cli{
 			in: reader, out: io.Discard, errOut: io.Discard, version: "test",
-			activatePVE: func(context.Context, config.Config) error { readinessCalled = true; return nil },
+			managedWritePolicy: allowManagedWriteForTest,
+			activatePVE:        func(context.Context, config.Config) error { readinessCalled = true; return nil },
 		}
 		if code := instance.run(args); code != 2 {
 			t.Fatalf("unsafe endpoint exit=%d args=%v", code, args)
@@ -2519,7 +2545,8 @@ func TestMonitoringMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testin
 	c := &cli{
 		in:  strings.NewReader("3\n2\nhttps://moniter.ppflight.com/internal/v1/monitoring/agents/bind\nSHOULD-NOT-BE-READ\n"),
 		out: &stdout, errOut: &stderr, version: "test",
-		pveVersion: func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
+		managedWritePolicy: allowManagedWriteForTest,
+		pveVersion:         func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
 	}
 	if code := c.run([]string{"--config", filename}); code == 0 {
 		t.Fatal("menu accepted failed trusted PVE discovery")
@@ -2538,7 +2565,8 @@ func TestWebsiteMenuDoesNotPromptForPVEVersionOrCodeBeforeDiscovery(t *testing.T
 	c := &cli{
 		in:  strings.NewReader("2\n2\nhttps://www.ppflight.com/api/pve-agent/v1/enrollments/redeem\nSHOULD-NOT-BE-READ\n"),
 		out: &stdout, errOut: &stderr, version: "test",
-		pveVersion: func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
+		managedWritePolicy: allowManagedWriteForTest,
+		pveVersion:         func(context.Context) (string, error) { return "", errors.New("not a PVE host") },
 	}
 	if code := c.run([]string{"--config", filename}); code == 0 {
 		t.Fatal("menu accepted failed trusted PVE discovery")

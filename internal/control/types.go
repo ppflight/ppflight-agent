@@ -42,7 +42,25 @@ var (
 // assignment revision. Callers may safely emit a denied audit event for this
 // class because the signature has already been verified.
 var (
-	ErrCommandAuthorityMismatch = errors.New("command authority does not match active binding")
+	// These pre-authentication categories are intentionally coarse. They are
+	// safe receipt codes for diagnosing command-channel rollout failures, but
+	// they must never trigger a denied-command audit event.
+	ErrCommandBodyHashInvalid    = errors.New("command parameter hash is invalid")
+	ErrCommandSigningKeyMismatch = errors.New("command signing key does not match active binding")
+	ErrCommandSignatureInvalid   = errors.New("command signature is invalid")
+	ErrCommandAuthorityMismatch  = errors.New("command authority does not match active binding")
+	// The errors below are authenticated-policy categories only. They are never
+	// serialized directly: Service maps them to bounded receipt codes so a
+	// caller can distinguish an authority rollout mismatch from an invalid
+	// payload without learning local binding, inventory, or configuration data.
+	ErrCommandEnvelopeInvalid      = errors.New("command envelope is invalid")
+	ErrCommandActionNotAllowed     = errors.New("command action is not allowed")
+	ErrCommandExpired              = errors.New("command timing is invalid")
+	ErrCommandScopeInvalid         = errors.New("command scope is invalid")
+	ErrCommandInventoryUnavailable = errors.New("command inventory is unavailable")
+	ErrCommandIdentityMismatch     = errors.New("command identity does not match assignment")
+	ErrCommandParametersInvalid    = errors.New("command parameters are invalid")
+	ErrCommandApprovalMissing      = errors.New("command approval is missing")
 	// ErrAuthenticatedPolicy marks a command whose website signature was valid
 	// but which local authority, freshness, allowlist, target, or parameter
 	// policy rejected. These rejections are safe to project as denied audits.
@@ -234,33 +252,33 @@ func Verify(command Command, cfg VerifyConfig) error {
 	// so the service can emit a denied audit without auditing unauthenticated
 	// internet input.
 	if len(command.Parameters) == 0 || !json.Valid(command.Parameters) || !bodyHashRE.MatchString(command.BodySHA256) || protocol.BodyHash(command.Parameters) != command.BodySHA256 {
-		return errors.New("command parameter hash is invalid")
+		return ErrCommandBodyHashInvalid
 	}
 	if err := verifySignature(command, cfg); err != nil {
-		return errors.New("command signature is invalid")
+		return err
 	}
 	deny := func(err error) error { return fmt.Errorf("%w: %w", ErrAuthenticatedPolicy, err) }
 	if command.SchemaVersion != SchemaVersion || !commandIDRE.MatchString(command.CommandID) || !commandIDRE.MatchString(command.OperationID) || command.AgentRef != cfg.AgentRef || !actionRE.MatchString(command.Action) || !commandIDRE.MatchString(command.OperatorRef) {
-		return deny(errors.New("invalid command envelope"))
+		return deny(ErrCommandEnvelopeInvalid)
 	}
 	authorityPresent := command.BindingID != "" || command.DeviceID != "" || command.CredentialEpoch != 0 || command.AssignmentRevision != 0 || command.IdempotencyKey != ""
 	if authorityPresent && (!uuidRE.MatchString(command.BindingID) || !commandIDRE.MatchString(command.DeviceID) || command.CredentialEpoch == 0 || command.AssignmentRevision == 0 || !commandIDRE.MatchString(command.IdempotencyKey)) {
-		return deny(errors.New("invalid command authority envelope"))
+		return deny(ErrCommandEnvelopeInvalid)
 	}
 	if cfg.Mode != "test" && !authorityPresent {
-		return deny(errors.New("production command authority envelope is required"))
+		return deny(ErrCommandEnvelopeInvalid)
 	}
 	if command.SigningKeyID != "" && !commandIDRE.MatchString(command.SigningKeyID) {
-		return deny(errors.New("invalid command signing key ID"))
+		return deny(ErrCommandEnvelopeInvalid)
 	}
 	if command.ApprovalRef != "" && !commandIDRE.MatchString(command.ApprovalRef) {
-		return deny(errors.New("invalid command approval reference"))
+		return deny(ErrCommandEnvelopeInvalid)
 	}
 	if _, ok := protocolActions[command.Action]; !ok {
-		return deny(errors.New("command action is not part of the control protocol"))
+		return deny(ErrCommandActionNotAllowed)
 	}
 	if !cfg.Allowed[command.Action] {
-		return deny(errors.New("command action is not allowed"))
+		return deny(ErrCommandActionNotAllowed)
 	}
 	now := cfg.Now.UTC()
 	if now.IsZero() {
@@ -275,7 +293,7 @@ func Verify(command Command, cfg VerifyConfig) error {
 		lifetime = 15 * time.Minute
 	}
 	if command.IssuedAt.IsZero() || command.ExpiresAt.IsZero() || !command.ExpiresAt.After(command.IssuedAt) || command.IssuedAt.After(now.Add(skew)) || command.IssuedAt.Before(now.Add(-lifetime)) || !command.ExpiresAt.After(now) || command.ExpiresAt.Sub(command.IssuedAt) > lifetime {
-		return deny(errors.New("command is expired or outside the allowed clock window"))
+		return deny(ErrCommandExpired)
 	}
 	if err := verifyAuthority(command, cfg); err != nil {
 		return deny(err)
@@ -284,10 +302,10 @@ func Verify(command Command, cfg VerifyConfig) error {
 		return deny(err)
 	}
 	if err := validateParameters(command); err != nil {
-		return deny(fmt.Errorf("command parameters are invalid: %w", err))
+		return deny(fmt.Errorf("%w: %w", ErrCommandParametersInvalid, err))
 	}
 	if requiresApproval(command.Action) && strings.TrimSpace(command.ApprovalRef) == "" {
-		return deny(errors.New("high-risk command requires approvalRef"))
+		return deny(ErrCommandApprovalMissing)
 	}
 	return nil
 }
@@ -309,30 +327,30 @@ func verifyAuthority(command Command, cfg VerifyConfig) error {
 
 func verifyScope(command Command, cfg VerifyConfig) error {
 	if command.Identity.ClusterRef != cfg.ClusterRef {
-		return errors.New("command cluster is invalid")
+		return ErrCommandScopeInvalid
 	}
 	switch command.Scope {
 	case ScopeCluster:
 		if !validActionScope(command.Action, command.Scope) || command.Identity.NodeRef != "" || command.Identity.VMID != 0 || command.Identity.Generation != 0 || command.Identity.ServiceRef != "" || command.Identity.InstanceUUID != "" || command.Identity.GuestType != "" {
-			return errors.New("command cluster scope is invalid")
+			return ErrCommandScopeInvalid
 		}
 	case ScopeNode:
 		if !validActionScope(command.Action, command.Scope) || !nodeRE.MatchString(command.Identity.NodeRef) || command.Identity.VMID != 0 || command.Identity.Generation != 0 || command.Identity.ServiceRef != "" || command.Identity.InstanceUUID != "" || command.Identity.GuestType != "" {
-			return errors.New("command node scope is invalid")
+			return ErrCommandScopeInvalid
 		}
 	case ScopeVM:
 		if !validActionScope(command.Action, command.Scope) || command.Identity.VMID < 1 || command.Identity.Generation == 0 || (command.Identity.GuestType != "qemu" && command.Identity.GuestType != "lxc") || !nodeRE.MatchString(command.Identity.NodeRef) || !commandIDRE.MatchString(command.Identity.ServiceRef) || !commandIDRE.MatchString(command.Identity.InstanceUUID) {
-			return errors.New("command VM target is invalid")
+			return ErrCommandScopeInvalid
 		}
 		if cfg.Assignments == nil {
-			return errors.New("command inventory is unavailable")
+			return ErrCommandInventoryUnavailable
 		}
 		assignment, ok := cfg.Assignments.Lookup(command.Identity.ClusterRef, command.Identity.GuestType, command.Identity.VMID)
 		if !ok || assignment.ServiceRef != command.Identity.ServiceRef || assignment.InstanceUUID != command.Identity.InstanceUUID || assignment.Generation != command.Identity.Generation || (assignment.NodeRef != "" && assignment.NodeRef != command.Identity.NodeRef) {
-			return errors.New("command identity does not match current assignment")
+			return ErrCommandIdentityMismatch
 		}
 	default:
-		return errors.New("command scope is invalid")
+		return ErrCommandScopeInvalid
 	}
 	return nil
 }
@@ -355,28 +373,28 @@ func vmAction(action string) bool {
 func verifySignature(command Command, cfg VerifyConfig) error {
 	if cfg.Mode == "test" && len(cfg.PublicKey) == 0 {
 		if len(cfg.Secret) == 0 {
-			return errors.New("test signing secret is unavailable")
+			return ErrCommandSigningKeyMismatch
 		}
 		provided, err := hex.DecodeString(command.Signature)
 		if err != nil || hex.EncodeToString(provided) != command.Signature {
-			return errors.New("invalid test HMAC encoding")
+			return ErrCommandSignatureInvalid
 		}
 		expected, _ := hex.DecodeString(SignCommand(command, cfg.Secret))
 		if !hmac.Equal(provided, expected) {
-			return errors.New("invalid test HMAC")
+			return ErrCommandSignatureInvalid
 		}
 		return nil
 	}
 	if cfg.SigningKeyID == "" || command.SigningKeyID != cfg.SigningKeyID || len(cfg.PublicKey) != ed25519.PublicKeySize {
-		return errors.New("Ed25519 verification key is unavailable")
+		return ErrCommandSigningKeyMismatch
 	}
 	provided, err := base64.StdEncoding.Strict().DecodeString(command.Signature)
 	if err != nil || base64.StdEncoding.EncodeToString(provided) != command.Signature || len(provided) != ed25519.SignatureSize {
-		return errors.New("invalid Ed25519 signature encoding")
+		return ErrCommandSignatureInvalid
 	}
 	payload, err := CanonicalCommandBody(command)
 	if err != nil || !ed25519.Verify(cfg.PublicKey, payload, provided) {
-		return errors.New("invalid Ed25519 signature")
+		return ErrCommandSignatureInvalid
 	}
 	return nil
 }

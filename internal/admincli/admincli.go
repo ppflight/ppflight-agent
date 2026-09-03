@@ -86,6 +86,11 @@ type cli struct {
 	// production-path ownership validation. Real CLI construction leaves it nil
 	// and therefore always uses the fixed installer paths on Linux root.
 	managedWritePolicy func(string, config.Config) error
+	// bindingRuntimeValidator is an explicit in-process test/embedding boundary
+	// for the final runtime-overlay readback. Production CLI construction leaves
+	// it nil, so production always reopens the committed disk state and resolves
+	// the real environment-backed binding overlay before releasing its marker.
+	bindingRuntimeValidator func(string, config.Config, bindingActivationExpectation) error
 }
 
 func (c *cli) verifyLocalExporters(ctx context.Context, exporters config.ExportersConfig) error {
@@ -1622,7 +1627,7 @@ func (c *cli) finalizeWebsiteBindingCommit(filename string, cfg config.Config, e
 	if err := c.finishBindingCommitState(cfg.Runtime.StateDirectory, "website"); err != nil {
 		return errors.New("finish website binding commit marker")
 	}
-	if err := validateWebsiteBindingFiles(filename, expected); err != nil {
+	if err := c.validateBindingRuntime(filename, cfg, expected); err != nil {
 		// The marker is the fail-closed guard after a post-clear runtime
 		// validation failure. It is intentionally restored rather than
 		// resurrecting a server-revoked credential generation.
@@ -1657,13 +1662,26 @@ func (c *cli) finalizeMonitoringBindingCommit(filename string, cfg config.Config
 	if err := c.finishBindingCommitState(cfg.Runtime.StateDirectory, "monitoring"); err != nil {
 		return errors.New("finish monitoring binding commit marker")
 	}
-	if err := validateMonitoringBindingFiles(filename, expected); err != nil {
+	if err := c.validateBindingRuntime(filename, cfg, expected); err != nil {
 		if markerErr := bindstate.BeginMonitoringCommit(cfg.Runtime.StateDirectory, expected.BindingID, expected.CredentialEpoch); markerErr != nil {
 			return errors.New("monitoring runtime validation failed and commit marker could not be restored")
 		}
 		return errors.New("monitoring runtime binding overlay validation failed")
 	}
 	return nil
+}
+
+func (c *cli) validateBindingRuntime(filename string, cfg config.Config, expected bindingActivationExpectation) error {
+	if c.bindingRuntimeValidator != nil {
+		return c.bindingRuntimeValidator(filename, cfg, expected)
+	}
+	if expected.Domain == "website" {
+		return validateWebsiteBindingFiles(filename, expected)
+	}
+	if expected.Domain == "monitoring" {
+		return validateMonitoringBindingFiles(filename, expected)
+	}
+	return errors.New("binding runtime validation domain is invalid")
 }
 
 func (c *cli) clearBindingPendingState(stateDirectory, domain string) error {

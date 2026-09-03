@@ -265,7 +265,7 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			Allowed: s.allowed, Assignments: s.assignments, Now: now,
 		})
 		if verifyErr != nil {
-			code := "COMMAND_REJECTED"
+			code := verificationRejectionCode(verifyErr)
 			if errors.Is(verifyErr, ErrAuthenticatedPolicy) && requiresApproval(command.Action) && s.auditSink == nil {
 				code = "AUDIT_UNAVAILABLE"
 			}
@@ -340,6 +340,45 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		return processed, err
 	}
 	return processed, nil
+}
+
+// verificationRejectionCode exposes only a fixed authentication or policy
+// category. Do not return wrapped errors: in particular, they can include
+// local authority and assignment identifiers.
+func verificationRejectionCode(err error) string {
+	switch {
+	case errors.Is(err, ErrCommandBodyHashInvalid):
+		return "COMMAND_BODY_HASH_INVALID"
+	case errors.Is(err, ErrCommandSigningKeyMismatch):
+		return "COMMAND_SIGNING_KEY_MISMATCH"
+	case errors.Is(err, ErrCommandSignatureInvalid):
+		return "COMMAND_SIGNATURE_INVALID"
+	}
+	if !errors.Is(err, ErrAuthenticatedPolicy) {
+		return "COMMAND_REJECTED"
+	}
+	switch {
+	case errors.Is(err, ErrCommandAuthorityMismatch):
+		return "COMMAND_AUTHORITY_MISMATCH"
+	case errors.Is(err, ErrCommandActionNotAllowed):
+		return "COMMAND_ACTION_NOT_ALLOWED"
+	case errors.Is(err, ErrCommandExpired):
+		return "COMMAND_EXPIRED"
+	case errors.Is(err, ErrCommandInventoryUnavailable):
+		return "COMMAND_INVENTORY_UNAVAILABLE"
+	case errors.Is(err, ErrCommandIdentityMismatch):
+		return "COMMAND_IDENTITY_MISMATCH"
+	case errors.Is(err, ErrCommandScopeInvalid):
+		return "COMMAND_SCOPE_INVALID"
+	case errors.Is(err, ErrCommandParametersInvalid):
+		return "INVALID_PARAMETERS"
+	case errors.Is(err, ErrCommandApprovalMissing):
+		return "APPROVAL_REQUIRED"
+	case errors.Is(err, ErrCommandEnvelopeInvalid):
+		return "COMMAND_ENVELOPE_INVALID"
+	default:
+		return "COMMAND_REJECTED"
+	}
 }
 
 func claimRejectionCode(err error) string {

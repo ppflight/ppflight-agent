@@ -1,15 +1,19 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/auditlog"
+	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
 	"github.com/ppflight/ppflight-agent/internal/store"
 	"github.com/ppflight/ppflight-agent/internal/uploader"
@@ -122,6 +126,154 @@ func TestServiceLegacyAuthorityReadsRefreshedRevisionUntilDynamicSwitch(t *testi
 	var receipt Receipt
 	if err := json.Unmarshal(queue.payloads[0], &receipt); err != nil || receipt.Code != "DRY_RUN" {
 		t.Fatalf("legacy refreshed revision was not used: receipt=%#v err=%v", receipt, err)
+	}
+}
+
+func TestServiceSetNetworkPolicyRejectionCodesAreStableAndDoNotLeakAuthority(t *testing.T) {
+	now := time.Now().UTC()
+	newCommand := func(parameters string, revision uint64) (Command, *inventory.Store) {
+		command, assignments := signedCommand(t, now)
+		command.Action = "vm.set-network"
+		command.AssignmentRevision = protocol.Counter(revision)
+		command.Parameters = json.RawMessage(parameters)
+		command.ApprovalRef = "approval-network-1"
+		command.BodySHA256 = protocolHash(command.Parameters)
+		command.Signature = SignCommand(command, []byte("secret"))
+		return command, assignments
+	}
+	newService := func(t *testing.T, command Command, assignments *inventory.Store, allowed []string, revision uint64) (*memoryReceiptQueue, error) {
+		t.Helper()
+		directory := t.TempDir()
+		journal, err := OpenJournal(directory + "/journal")
+		if err != nil {
+			return nil, err
+		}
+		queue := &memoryReceiptQueue{}
+		service, err := NewService(ServiceConfig{
+			AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "test", CommandSecret: []byte("secret"),
+			BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: uint64(command.CredentialEpoch),
+			AssignmentRevision: func() uint64 { return revision }, AllowedActions: allowed, Assignments: assignments,
+			Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
+			Journal: journal, Executor: Executor{Mode: "test"}, ReceiptQueue: queue, AuditSink: &memoryAuditSink{}, AgentVersion: "test-version",
+			CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+		})
+		if err != nil {
+			return nil, err
+		}
+		if processed, err := service.PollOnce(context.Background()); err != nil || processed != 1 {
+			return nil, fmt.Errorf("processed=%d: %w", processed, err)
+		}
+		return queue, nil
+	}
+	readCode := func(t *testing.T, queue *memoryReceiptQueue) string {
+		t.Helper()
+		if len(queue.payloads) != 1 {
+			t.Fatalf("receipt count=%d", len(queue.payloads))
+		}
+		var receipt Receipt
+		if err := json.Unmarshal(queue.payloads[0], &receipt); err != nil {
+			t.Fatal(err)
+		}
+		return receipt.Code
+	}
+
+	t.Run("legal signed command uses the runtime authority", func(t *testing.T) {
+		command, assignments := newCommand(`{"interface":"net0","bridge":"vmbr1"}`, 7)
+		queue, err := newService(t, command, assignments, []string{"vm.set-network"}, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := readCode(t, queue); code != "DRY_RUN" {
+			t.Fatalf("legal vm.set-network receipt code=%q", code)
+		}
+	})
+
+	t.Run("runtime action authority is reported without its contents", func(t *testing.T) {
+		command, assignments := newCommand(`{"interface":"net0","bridge":"vmbr1"}`, 7)
+		queue, err := newService(t, command, assignments, []string{"vm.start"}, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := readCode(t, queue); code != "COMMAND_ACTION_NOT_ALLOWED" {
+			t.Fatalf("action authority receipt code=%q", code)
+		}
+	})
+
+	t.Run("illegal parameters do not collapse to COMMAND_REJECTED", func(t *testing.T) {
+		command, assignments := newCommand(`{"interface":"net0","macAddress":"AA:BB:CC:DD:EE:00"}`, 7)
+		queue, err := newService(t, command, assignments, []string{"vm.set-network"}, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := readCode(t, queue); code != "INVALID_PARAMETERS" {
+			t.Fatalf("illegal vm.set-network receipt code=%q", code)
+		}
+	})
+}
+
+func TestProductionServiceReportsBoundedPreAuthenticationRejectionCodes(t *testing.T) {
+	now := time.Now().UTC()
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	otherPrivateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
+
+	tests := []struct {
+		name string
+		want string
+		edit func(*Command)
+	}{
+		{name: "body hash", want: "COMMAND_BODY_HASH_INVALID", edit: func(command *Command) {
+			command.BodySHA256 = strings.Repeat("0", 64)
+			command.Signature, _ = SignCommandEd25519(*command, privateKey)
+		}},
+		{name: "signing key", want: "COMMAND_SIGNING_KEY_MISMATCH", edit: func(command *Command) {
+			command.SigningKeyID = "website-key-2"
+			command.Signature, _ = SignCommandEd25519(*command, privateKey)
+		}},
+		{name: "signature", want: "COMMAND_SIGNATURE_INVALID", edit: func(command *Command) {
+			command.Signature, _ = SignCommandEd25519(*command, otherPrivateKey)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			command, assignments := signedCommand(t, now)
+			command.SigningKeyID = "website-key-1"
+			command.Signature, _ = SignCommandEd25519(command, privateKey)
+			tt.edit(&command)
+			queue := &memoryReceiptQueue{}
+			audit := &memoryAuditSink{}
+			directory := t.TempDir()
+			journal, err := OpenJournal(directory + "/journal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			service, err := NewService(ServiceConfig{
+				AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "production",
+				BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: uint64(command.CredentialEpoch),
+				AssignmentRevision:  func() uint64 { return uint64(command.AssignmentRevision) },
+				CommandSigningKeyID: "website-key-1", CommandPublicKey: publicKey,
+				AllowedActions: []string{command.Action}, Assignments: assignments,
+				Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
+				Journal: journal, Executor: Executor{Mode: "production"}, ReceiptQueue: queue, AuditSink: audit,
+				AgentVersion: "0.1.1-rc.4", CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if processed, err := service.PollOnce(context.Background()); err != nil || processed != 1 {
+				t.Fatalf("processed=%d err=%v", processed, err)
+			}
+			if len(queue.payloads) != 1 {
+				t.Fatalf("receipt count=%d", len(queue.payloads))
+			}
+			if len(audit.events) != 0 {
+				t.Fatalf("unauthenticated rejection produced %d audit events", len(audit.events))
+			}
+			var receipt Receipt
+			if err := json.Unmarshal(queue.payloads[0], &receipt); err != nil || receipt.Code != tt.want {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+		})
 	}
 }
 

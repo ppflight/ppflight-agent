@@ -34,6 +34,21 @@ func TestVerifySignedMappedCommand(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsVMDeleteIdentityMismatch(t *testing.T) {
+	now := time.Now().UTC()
+	command, assignments := signedCommand(t, now)
+	command.Action = "vm.delete"
+	command.Parameters = json.RawMessage(`{"purge":true,"destroyUnreferencedDisks":true}`)
+	command.BodySHA256 = protocolHash(command.Parameters)
+	command.Signature = SignCommand(command, []byte("secret"))
+	command.Identity.ServiceRef = "other-service"
+	command.Signature = SignCommand(command, []byte("secret"))
+	err := Verify(command, VerifyConfig{AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "test", Secret: []byte("secret"), Allowed: AllowedSet([]string{"vm.delete"}), Assignments: assignments, Now: now})
+	if !errors.Is(err, ErrCommandIdentityMismatch) {
+		t.Fatalf("identity-mismatched delete err=%v", err)
+	}
+}
+
 func TestVerifyRejectsNonPositiveCommandLifetime(t *testing.T) {
 	now := time.Now().UTC()
 	command, assignments := signedCommand(t, now)

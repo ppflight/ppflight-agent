@@ -415,7 +415,19 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		} else if errors.Is(err, ErrReinstallIndeterminate) {
 			r.State, r.Code = "indeterminate", "REINSTALL_INDETERMINATE"
 		} else if errors.As(err, &httpErr) {
-			r.State, r.Code = "failed", "PVE_ACTION_REJECTED"
+			switch {
+			case httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden:
+				r.State, r.Code = "failed", "PVE_ACTION_FORBIDDEN"
+			case httpErr.StatusCode == http.StatusConflict:
+				r.State, r.Code = "failed", "PVE_ACTION_CONFLICT"
+			case httpErr.StatusCode >= http.StatusInternalServerError:
+				// A server-side failure can occur after PVE accepted the mutation.
+				// Keep the journal lock and require reconciliation rather than
+				// permitting a duplicate destructive submission.
+				r.State, r.Code = "indeterminate", "PVE_ACTION_INDETERMINATE"
+			default:
+				r.State, r.Code = "failed", "PVE_ACTION_REJECTED"
+			}
 		} else {
 			r.State, r.Code = "indeterminate", "PVE_RESULT_INDETERMINATE"
 		}
@@ -1272,7 +1284,40 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	default:
 		return "", nil, ErrUnsupported
 	}
-	return doPVE(ctx, client, method, path, form)
+	upid, result, err := doPVE(ctx, client, method, path, form)
+	if c.Action == "vm.delete" {
+		var httpErr *pve.HTTPError
+		if errors.As(err, &httpErr) && vmDeleteTargetAlreadyAbsent(c, httpErr) {
+			// Deletion is convergent: if the scoped guest is already absent, the
+			// requested end state has been reached. This exception is deliberately
+			// limited to vm.delete; no other PVE action treats absence as success.
+			return "", json.RawMessage(`{"deleted":true,"alreadyAbsent":true}`), nil
+		}
+	}
+	return upid, result, err
+}
+
+func vmDeleteTargetAlreadyAbsent(command Command, httpErr *pve.HTTPError) bool {
+	if httpErr == nil {
+		return false
+	}
+	if httpErr.StatusCode == http.StatusNotFound {
+		return true
+	}
+	// PVE's guest destroy handlers load the configuration before submitting a
+	// task. A missing configuration can therefore be returned as HTTP 500. Only
+	// the exact top-level message for this signed node/type/VMID is convergent;
+	// locks, permissions, storage failures and all other server errors remain
+	// indeterminate.
+	if httpErr.StatusCode != http.StatusInternalServerError {
+		return false
+	}
+	directory := "lxc"
+	if command.Identity.GuestType == "qemu" {
+		directory = "qemu-server"
+	}
+	want := fmt.Sprintf("Configuration file 'nodes/%s/%s/%d.conf' does not exist", command.Identity.NodeRef, directory, command.Identity.VMID)
+	return httpErr.Reason == want
 }
 
 func doPVE(ctx context.Context, c *pve.Client, method, path string, form url.Values) (string, json.RawMessage, error) {
