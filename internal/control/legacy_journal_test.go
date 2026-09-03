@@ -25,7 +25,7 @@ func legacyAuthorityCommand(action, parameters, commandID, operationID string) C
 
 func makeLegacyRecord(t *testing.T, journal *Journal, command Command, state, code string, now time.Time) journalRecord {
 	t.Helper()
-	if _, duplicate, err := journal.ClaimWithAudit(command, now, "0.1.0-rc.27"); err != nil || duplicate {
+	if _, duplicate, err := journal.ClaimWithAudit(command, now, "0.1.0-rc.26"); err != nil || duplicate {
 		t.Fatalf("legacy claim duplicate=%t err=%v", duplicate, err)
 	}
 	receipt := Receipt{SchemaVersion: 1, ReceiptID: "11111111-1111-4111-8111-111111111111", CommandID: command.CommandID,
@@ -38,7 +38,7 @@ func makeLegacyRecord(t *testing.T, journal *Journal, command Command, state, co
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reproduce the rc.27 durable shape: the audit target, Agent ref, node,
+	// Reproduce the rc.26 durable shape: the audit target, Agent ref, node,
 	// resource key and source hash existed, while the exact authority columns
 	// and clone template identity did not.
 	record.IdempotencyKey = ""
@@ -103,6 +103,31 @@ func legacyInitialResourcesCommand(t *testing.T, clone, migration Command, param
 	return initial
 }
 
+func legacyDeleteCommand(migration Command, commandID, operationID string) Command {
+	command := legacyAuthorityCommand("vm.delete", `{"purge":true,"destroyUnreferencedDisks":true}`, commandID, operationID)
+	command.AssignmentRevision = migration.AssignmentRevision
+	command.Identity = migration.Identity
+	return command
+}
+
+func completeAuditedLegacyRecord(t *testing.T, journal *Journal, command Command, state string, at time.Time) {
+	t.Helper()
+	receiptID, err := protocol.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := strings.ToUpper(state)
+	if state == "succeeded" {
+		code = "SUCCEEDED"
+	}
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: receiptID, CommandID: command.CommandID,
+		OperationID: command.OperationID, AgentRef: command.AgentRef, State: state, Code: code,
+		ExecutionMode: "production", StartedAt: at, FinishedAt: at}
+	if err := journal.Complete(command, receipt); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *testing.T) {
 	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
 	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); err != nil || duplicate {
@@ -162,6 +187,64 @@ func TestRetirementDoesNotReleaseResourceLockBeforeMigrationCompletion(t *testin
 	initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "incomplete-initial-command", "incomplete-initial-operation")
 	if _, _, err := journal.ClaimWithAudit(initial, now.Add(4*time.Second), "0.1.1-rc.3"); !errors.Is(err, ErrResourceBusy) {
 		t.Fatalf("uncommitted migration released resource lock: %v", err)
+	}
+}
+
+func TestRC26LegacyMigrationReleasesDeleteLockAfterCompletionAndRestart(t *testing.T) {
+	journal, _, migration, parameters, now := legacyMigrationFixture(t)
+	delete := legacyDeleteCommand(migration, "rc26-delete-command", "rc26-delete-operation")
+	if _, _, err := journal.ClaimWithAudit(delete, now.Add(2*time.Second), "0.1.1-rc.3"); !errors.Is(err, ErrResourceBusy) {
+		t.Fatalf("unmigrated rc26 indeterminate record did not hold delete lock: %v", err)
+	}
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+		t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultRaw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrationReceipt := Receipt{SchemaVersion: 1, ReceiptID: "88888888-8888-4888-8888-888888888888", CommandID: migration.CommandID,
+		OperationID: migration.OperationID, AgentRef: migration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(3 * time.Second), FinishedAt: now.Add(4 * time.Second), Result: resultRaw}
+	if err := journal.Complete(migration, migrationReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenJournal(journal.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, duplicate, err := reopened.ClaimWithAudit(delete, now.Add(5*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+		t.Fatalf("completed migration still blocked delete after restart: duplicate=%t err=%v", duplicate, err)
+	}
+	completeAuditedLegacyRecord(t, reopened, delete, "succeeded", now.Add(6*time.Second))
+	if receipt, duplicate, err := reopened.ClaimWithAudit(delete, now.Add(7*time.Second), "0.1.1-rc.3"); err != nil || !duplicate || receipt.State != "succeeded" {
+		t.Fatalf("delete replay=%#v duplicate=%t err=%v", receipt, duplicate, err)
+	}
+}
+
+func TestTerminalDeleteRecordsDoNotHoldResourceLock(t *testing.T) {
+	for _, state := range []string{"succeeded", "failed"} {
+		t.Run(state, func(t *testing.T) {
+			now := time.Now().UTC()
+			journal, err := OpenJournal(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := legacyAuthorityCommand("vm.delete", `{"purge":true,"destroyUnreferencedDisks":true}`, "terminal-delete-"+state, "terminal-delete-operation-"+state)
+			if _, duplicate, err := journal.ClaimWithAudit(first, now, "0.1.1-rc.3"); err != nil || duplicate {
+				t.Fatalf("first claim duplicate=%t err=%v", duplicate, err)
+			}
+			completeAuditedLegacyRecord(t, journal, first, state, now.Add(time.Second))
+			second := legacyAuthorityCommand("vm.delete", `{"purge":true,"destroyUnreferencedDisks":true}`, "next-delete-"+state, "next-delete-operation-"+state)
+			if _, duplicate, err := journal.ClaimWithAudit(second, now.Add(2*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+				t.Fatalf("terminal delete held resource lock: duplicate=%t err=%v", duplicate, err)
+			}
+		})
 	}
 }
 

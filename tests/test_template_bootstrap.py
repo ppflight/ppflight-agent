@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
+import sys
 import types
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ SPEC = importlib.util.spec_from_file_location("ppflight_template_bootstrap", MOD
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("could not load template bootstrap module")
 BOOTSTRAP = importlib.util.module_from_spec(SPEC)
+sys.dont_write_bytecode = True
 SPEC.loader.exec_module(BOOTSTRAP)
 
 

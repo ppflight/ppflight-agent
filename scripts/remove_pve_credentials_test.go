@@ -56,9 +56,15 @@ func newRemoveCredentialsFixture(t *testing.T) *removeCredentialsFixture {
 	}
 
 	raw := readDeploymentFile(t, "remove-pve-credentials.sh")
-	patched := strings.Replace(raw, "readonly EXPECTED_OWNER_UID=0", fmt.Sprintf("readonly EXPECTED_OWNER_UID=%d", uid), 1)
-	if patched == raw {
-		t.Fatal("could not patch root guard for isolated fixture")
+	patched := raw
+	// Do not weaken the production guard through an environment variable.  A
+	// non-root test runner receives a private copy with its real UID substituted;
+	// a root test runner exercises the unmodified production root guard.
+	if uid != 0 {
+		patched = strings.Replace(raw, "readonly EXPECTED_OWNER_UID=0", fmt.Sprintf("readonly EXPECTED_OWNER_UID=%d", uid), 1)
+		if patched == raw {
+			t.Fatal("could not patch root guard for isolated fixture")
+		}
 	}
 	script := filepath.Join(root, "remove-pve-credentials.sh")
 	if err := os.WriteFile(script, []byte(patched), 0o700); err != nil {

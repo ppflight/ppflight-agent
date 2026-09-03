@@ -220,7 +220,11 @@ func (c *Client) do(ctx context.Context, method, apiPath, escapedAPIPath string,
 		return fmt.Errorf("pve response exceeds %d bytes", c.maxBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return &HTTPError{StatusCode: resp.StatusCode, Body: boundedText(responseBody, 1024)}
+		return &HTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       boundedText(responseBody, 1024),
+			Reason:     boundedPVEErrorReason(responseBody, 512),
+		}
 	}
 	var envelope struct {
 		Data json.RawMessage `json:"data"`
@@ -246,6 +250,20 @@ func (c *Client) do(ctx context.Context, method, apiPath, escapedAPIPath string,
 	return nil
 }
 
+// boundedPVEErrorReason extracts only PVE's top-level JSON error message. The
+// raw, bounded Body remains available for local diagnostics, while callers
+// that need to classify one documented error do not have to parse arbitrary
+// text or accidentally match an unrelated nested field.
+func boundedPVEErrorReason(value []byte, limit int) string {
+	var envelope struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(value, &envelope); err != nil {
+		return ""
+	}
+	return boundedText([]byte(envelope.Message), limit)
+}
+
 // get is kept private so all collection calls remain visibly read-only.
 func (c *Client) get(ctx context.Context, apiPath string, query url.Values, out any) error {
 	return c.Do(ctx, http.MethodGet, apiPath, query, nil, out)
@@ -258,10 +276,12 @@ func boundedText(value []byte, limit int) string {
 	return strings.TrimSpace(string(value))
 }
 
-// HTTPError is returned for a non-success PVE API response. Body is truncated.
+// HTTPError is returned for a non-success PVE API response. Body and Reason
+// are truncated. Reason is populated only from the top-level JSON message.
 type HTTPError struct {
 	StatusCode int
 	Body       string
+	Reason     string
 }
 
 func (e *HTTPError) Error() string {
