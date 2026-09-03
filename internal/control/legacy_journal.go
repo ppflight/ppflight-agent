@@ -36,7 +36,7 @@ type LegacyJournalMigrationResult struct {
 }
 
 func validLegacyJournalMigration(command Command, value legacyJournalMigrationP) bool {
-	if value.LegacyAssignmentRevision == 0 ||
+	if command.Identity.GuestType != "qemu" || value.LegacyAssignmentRevision == 0 ||
 		(command.AssignmentRevision > 0 && value.LegacyAssignmentRevision >= command.AssignmentRevision) ||
 		!commandIDRE.MatchString(value.LegacyCloneCommandID) || !commandIDRE.MatchString(value.LegacyCloneOperationID) ||
 		value.LegacyCloneCommandID == command.CommandID || value.LegacyCloneOperationID == command.OperationID ||
@@ -74,12 +74,12 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 	clone, err := readJournal(clonePath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return result, errors.New("legacy clone journal was not found")
+			return result, ErrCloneLineageMismatch
 		}
 		return result, err
 	}
 	if !legacyCloneEligible(clone, command, parameters, resourceKey) {
-		return result, errors.New("legacy clone journal does not match signed VM authority")
+		return result, ErrCloneLineageMismatch
 	}
 	retirements := make([]struct {
 		path   string
@@ -89,7 +89,7 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 		filename := j.path(commandID)
 		record, readErr := readJournal(filename)
 		if readErr != nil || !legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, commandID) {
-			return result, fmt.Errorf("legacy indeterminate journal %s is not eligible", commandID)
+			return result, fmt.Errorf("%w: %s", ErrListedRecordNotEligible, commandID)
 		}
 		retirements = append(retirements, struct {
 			path   string
@@ -121,18 +121,38 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 		RetiredIndeterminateCommandIDs: append([]string(nil), parameters.RetireIndeterminateCommandIDs...)}, nil
 }
 
-func (j *Journal) resourceBusyForLegacyMigrationLocked(command Command, parameters legacyJournalMigrationP) (bool, error) {
+// validateLegacyMigrationClaimLocked makes the narrow migration exception to
+// the normal per-resource mutation lock. Only the exact signed clone lineage
+// and explicitly listed, no-UPID indeterminate records may pass. A record is
+// eligible whether its authority columns are absent (older schema) or fully
+// populated with the exact historical authority; partially or differently
+// populated authority remains fail-closed.
+func (j *Journal) validateLegacyMigrationClaimLocked(command Command, parameters legacyJournalMigrationP) error {
 	resourceKey, err := journalResourceKey(command)
 	if err != nil {
-		return false, err
+		return err
+	}
+	clone, err := readJournal(j.path(parameters.LegacyCloneCommandID))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return ErrCloneLineageMismatch
+		}
+		return err
+	}
+	if !legacyCloneEligible(clone, command, parameters, resourceKey) {
+		return ErrCloneLineageMismatch
 	}
 	allowed := make(map[string]struct{}, len(parameters.RetireIndeterminateCommandIDs))
 	for _, commandID := range parameters.RetireIndeterminateCommandIDs {
+		record, readErr := readJournal(j.path(commandID))
+		if readErr != nil || !legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, commandID) {
+			return fmt.Errorf("%w: %s", ErrListedRecordNotEligible, commandID)
+		}
 		allowed[commandID] = struct{}{}
 	}
 	entries, err := os.ReadDir(j.directory)
 	if err != nil {
-		return false, err
+		return err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
@@ -140,18 +160,20 @@ func (j *Journal) resourceBusyForLegacyMigrationLocked(command Command, paramete
 		}
 		record, readErr := readJournal(filepath.Join(j.directory, entry.Name()))
 		if readErr != nil {
-			return false, readErr
+			return readErr
 		}
 		if !record.Mutating || record.ResourceKey != resourceKey || record.RetiredByCommandID != "" ||
 			(record.State != "received" && record.State != "submitted" && record.State != "waiting" && record.State != "indeterminate") {
 			continue
 		}
-		if _, listed := allowed[record.CommandID]; !listed ||
-			!legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, record.CommandID) {
-			return true, nil
+		if _, listed := allowed[record.CommandID]; !listed {
+			return fmt.Errorf("%w: %s", ErrUnlistedActiveMutation, record.CommandID)
+		}
+		if !legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, record.CommandID) {
+			return fmt.Errorf("%w: %s", ErrListedRecordNotEligible, record.CommandID)
 		}
 	}
-	return false, nil
+	return nil
 }
 
 func legacyCloneEligible(record journalRecord, command Command, parameters legacyJournalMigrationP, resourceKey string) bool {
@@ -164,7 +186,7 @@ func legacyCloneEligible(record journalRecord, command Command, parameters legac
 		return record.MigratedByCommandID == command.CommandID && record.SourceTemplateRef == parameters.TemplateRef &&
 			record.SourceVMID == parameters.SourceVMID && recordAuthorityEquals(record, command)
 	}
-	return record.SourceTemplateRef == "" && record.SourceVMID == 0 && isLegacyJournalRecord(record) &&
+	return record.SourceTemplateRef == "" && record.SourceVMID == 0 &&
 		legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision)
 }
 
@@ -179,7 +201,7 @@ func legacyIndeterminateEligible(record journalRecord, command Command, legacyAs
 	if record.RetiredByCommandID != "" {
 		return record.RetiredByCommandID == command.CommandID && recordAuthorityEquals(record, command)
 	}
-	return isLegacyJournalRecord(record) && legacyRecordAuthorityMatches(record, command, legacyAssignmentRevision)
+	return legacyRecordAuthorityMatches(record, command, legacyAssignmentRevision)
 }
 
 func legacyRecordAuthorityMatches(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter) bool {
@@ -199,12 +221,6 @@ func legacyRecordAuthorityMatches(record journalRecord, command Command, legacyA
 		optionalStringMatches(record.ClusterRef, command.Identity.ClusterRef) && optionalStringMatches(record.ServiceRef, command.Identity.ServiceRef) &&
 		optionalStringMatches(record.InstanceUUID, command.Identity.InstanceUUID) && optionalStringMatches(record.GuestType, command.Identity.GuestType) &&
 		optionalIntMatches(record.VMID, command.Identity.VMID) && optionalCounterMatches(record.Generation, protocol.Counter(command.Identity.Generation))
-}
-
-func isLegacyJournalRecord(record journalRecord) bool {
-	return record.BindingID == "" || record.DeviceID == "" || record.CredentialEpoch == 0 || record.AssignmentRevision == 0 ||
-		record.ClusterRef == "" || record.ServiceRef == "" || record.InstanceUUID == "" || record.GuestType == "" ||
-		record.VMID == 0 || record.Generation == 0
 }
 
 func backfillLegacyAuthority(record *journalRecord, command Command) {

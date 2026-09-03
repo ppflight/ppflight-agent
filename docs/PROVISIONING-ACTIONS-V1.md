@@ -54,6 +54,13 @@ revision 的后续定型命令。Agent 执行前还会重新读取
 都会使整个动作 fail closed。clone 的 migration marker 使不同 command 无法二次消费；同一
 command/idempotency digest 可在进程崩溃后继续未完成的本地迁移，并在完成后只返回第一次结果。
 
+历史记录可以是缺少新增 authority 列的早期 schema，也可以已经带有完整 authority；后者必须与
+显式 `legacyAssignmentRevision` 及当前命令的 binding、device、epoch、signing key、VM 身份和
+generation 逐项精确匹配。迁移资格不再以“必须缺字段”判断。Claim 前拒绝会返回脱敏细分码：
+存在未列出的活动 mutation 为 `UNLISTED_ACTIVE_MUTATION`，列出记录不满足无 UPID、终态或身份
+限制为 `LISTED_RECORD_NOT_ELIGIBLE`，clone command/operation/digest/template lineage 不匹配为
+`CLONE_LINEAGE_MISMATCH`；这些分类不会放宽成通用 Journal 清理接口。
+
 成功 result：
 
 ```json

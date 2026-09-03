@@ -21,10 +21,13 @@ import (
 )
 
 var (
-	ErrCommandConflict     = errors.New("command ID was reused with different content")
-	ErrOperationConflict   = errors.New("operation ID was reused by another command")
-	ErrIdempotencyConflict = errors.New("idempotency key was reused by another command")
-	ErrResourceBusy        = errors.New("resource already has an active command")
+	ErrCommandConflict         = errors.New("command ID was reused with different content")
+	ErrOperationConflict       = errors.New("operation ID was reused by another command")
+	ErrIdempotencyConflict     = errors.New("idempotency key was reused by another command")
+	ErrResourceBusy            = errors.New("resource already has an active command")
+	ErrUnlistedActiveMutation  = errors.New("legacy migration found an unlisted active mutation")
+	ErrListedRecordNotEligible = errors.New("listed legacy journal record is not eligible")
+	ErrCloneLineageMismatch    = errors.New("legacy clone lineage does not match signed authority")
 )
 
 var journalNodeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -261,7 +264,8 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 			if decodeErr := strictParameters(command.Parameters, &parameters); decodeErr != nil {
 				return Receipt{}, false, decodeErr
 			}
-			busy, err = j.resourceBusyForLegacyMigrationLocked(command, parameters)
+			err = j.validateLegacyMigrationClaimLocked(command, parameters)
+			busy = false
 		}
 		if err != nil {
 			return Receipt{}, false, err

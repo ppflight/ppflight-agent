@@ -309,6 +309,12 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		}
 		var parameters legacyJournalMigrationP
 		_ = strictParameters(command.Parameters, &parameters)
+		sourceConfig, sourceConfigErr := e.Client.GuestConfig(ctx, "qemu", command.Identity.NodeRef, parameters.SourceVMID)
+		sourceOSType, sourceOSTypeOK := configString(sourceConfig.Raw, "ostype")
+		if sourceConfigErr != nil || !sourceOSTypeOK || (sourceOSType != "l24" && sourceOSType != "l26") {
+			r.State, r.Code, r.FinishedAt = "rejected", "LEGACY_JOURNAL_SOURCE_REJECTED", time.Now().UTC()
+			return finish(errors.New("legacy journal migration requires a Linux QEMU source template"))
+		}
 		full := true
 		if sourceErr := verifyCloneSource(ctx, e.Client, command, cloneP{SourceVMID: parameters.SourceVMID, TemplateRef: parameters.TemplateRef, Name: "legacy-lineage-proof", Target: command.Identity.NodeRef, Storage: "local", Full: &full, SourceConfigSHA256: parameters.SourceConfigSHA256}); sourceErr != nil {
 			r.State, r.Code, r.FinishedAt = "rejected", "LEGACY_JOURNAL_SOURCE_REJECTED", time.Now().UTC()
@@ -317,7 +323,10 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		result, migrationErr := e.LegacyJournal.MigrateLegacyVMJournal(command, parameters, now)
 		r.FinishedAt = time.Now().UTC()
 		if migrationErr != nil {
-			r.State, r.Code = "rejected", "LEGACY_JOURNAL_MIGRATION_REJECTED"
+			r.State, r.Code = "rejected", claimRejectionCode(migrationErr)
+			if r.Code == "JOURNAL_UNAVAILABLE" {
+				r.Code = "LEGACY_JOURNAL_MIGRATION_REJECTED"
+			}
 			return finish(migrationErr)
 		}
 		r.State, r.Code = "succeeded", "SUCCEEDED"

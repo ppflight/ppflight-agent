@@ -305,16 +305,8 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		}
 		journaled := false
 		switch {
-		case errors.Is(claimErr, ErrCommandConflict):
-			receipt, err = s.rejection(command, "COMMAND_ID_CONFLICT", now)
-		case errors.Is(claimErr, ErrOperationConflict):
-			receipt, err = s.rejection(command, "OPERATION_ID_CONFLICT", now)
-		case errors.Is(claimErr, ErrIdempotencyConflict):
-			receipt, err = s.rejection(command, "IDEMPOTENCY_KEY_CONFLICT", now)
-		case errors.Is(claimErr, ErrResourceBusy):
-			receipt, err = s.rejection(command, "RESOURCE_BUSY", now)
 		case claimErr != nil:
-			receipt, err = s.rejection(command, "JOURNAL_UNAVAILABLE", now)
+			receipt, err = s.rejection(command, claimRejectionCode(claimErr), now)
 		case duplicate:
 			journaled = true
 			err = nil
@@ -348,6 +340,27 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		return processed, err
 	}
 	return processed, nil
+}
+
+func claimRejectionCode(err error) string {
+	switch {
+	case errors.Is(err, ErrCommandConflict):
+		return "COMMAND_ID_CONFLICT"
+	case errors.Is(err, ErrOperationConflict):
+		return "OPERATION_ID_CONFLICT"
+	case errors.Is(err, ErrIdempotencyConflict):
+		return "IDEMPOTENCY_KEY_CONFLICT"
+	case errors.Is(err, ErrResourceBusy):
+		return "RESOURCE_BUSY"
+	case errors.Is(err, ErrUnlistedActiveMutation):
+		return "UNLISTED_ACTIVE_MUTATION"
+	case errors.Is(err, ErrListedRecordNotEligible):
+		return "LISTED_RECORD_NOT_ELIGIBLE"
+	case errors.Is(err, ErrCloneLineageMismatch):
+		return "CLONE_LINEAGE_MISMATCH"
+	default:
+		return "JOURNAL_UNAVAILABLE"
+	}
 }
 
 // ReconcileOnce turns durable submitted/waiting UPIDs into fresh receipt

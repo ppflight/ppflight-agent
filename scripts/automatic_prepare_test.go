@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.0-rc.32"
+		repositoryVersion = "0.1.1-rc.1"
 		nodeAMD64         = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
 		nodeARM64         = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
 		smartAMD64        = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"

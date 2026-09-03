@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -181,6 +182,14 @@ func TestLegacyJournalMigrationRequiresExplicitOlderExactRevision(t *testing.T) 
 	}
 }
 
+func TestLegacyJournalMigrationIsLinuxQEMUOnly(t *testing.T) {
+	_, _, migration, parameters, _ := legacyMigrationFixture(t)
+	migration.Identity.GuestType = "lxc"
+	if validLegacyJournalMigration(migration, parameters) {
+		t.Fatal("LXC legacy migration was accepted")
+	}
+}
+
 func TestLegacyJournalMigrationRejectsRetirementFromDifferentLegacyRevision(t *testing.T) {
 	journal, _, migration, parameters, now := legacyMigrationFixture(t)
 	path := journal.path(parameters.RetireIndeterminateCommandIDs[0])
@@ -233,7 +242,7 @@ func TestLegacyJournalMigrationAcceptsOnlyExactHistoricalIndeterminateCodes(t *t
 		if err := writeJournal(path, record); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrResourceBusy) {
+		if _, _, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrListedRecordNotEligible) {
 			t.Fatalf("unsupported historical code did not retain resource lock: %v", err)
 		}
 	})
@@ -273,10 +282,147 @@ func TestLegacyJournalMigrationRejectsNonTerminalCloneUPIDAndUnlistedIndetermina
 		parameters.RetireIndeterminateCommandIDs = []string{}
 		raw, _ := json.Marshal(parameters)
 		migration.Parameters = raw
-		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrResourceBusy) {
+		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrUnlistedActiveMutation) {
 			t.Fatalf("unlisted mutation claim err=%v", err)
 		}
 	})
+}
+
+func restoreExactHistoricalAuthority(t *testing.T, journal *Journal, command Command) {
+	t.Helper()
+	record, err := readJournal(journal.path(command.CommandID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.IdempotencyKey = command.IdempotencyKey
+	record.BindingID = command.BindingID
+	record.DeviceID = command.DeviceID
+	record.CredentialEpoch = command.CredentialEpoch
+	record.AssignmentRevision = command.AssignmentRevision
+	record.ClusterRef = command.Identity.ClusterRef
+	record.ServiceRef = command.Identity.ServiceRef
+	record.InstanceUUID = command.Identity.InstanceUUID
+	record.GuestType = command.Identity.GuestType
+	record.VMID = command.Identity.VMID
+	record.Generation = protocol.Counter(command.Identity.Generation)
+	resourceKey, err := journalResourceKey(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.ResourceKey = resourceKey
+	if err := writeJournal(journal.path(command.CommandID), record); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This is the exact production regression shape which rc.32 incorrectly
+// rejected before Claim: both historical records have complete authority,
+// the clone succeeded at revision 3, and the explicitly listed no-UPID
+// mutation ended with the older PVE_RESULT_INDETERMINATE code. The currently
+// signed migration is revision 6.
+func TestLegacyJournalMigrationAcceptsCompleteHistoricalAuthorityProductionShape(t *testing.T) {
+	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+	migration.AssignmentRevision = 6
+	migration.Identity.VMID = 100
+	clone.Identity.VMID = 100
+	restoreExactHistoricalAuthority(t, journal, clone)
+
+	indeterminateID := parameters.RetireIndeterminateCommandIDs[0]
+	indeterminatePath := journal.path(indeterminateID)
+	indeterminate, err := readJournal(indeterminatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indeterminateCommand := legacyAuthorityCommand(indeterminate.Action, `{}`, indeterminate.CommandID, indeterminate.OperationID)
+	indeterminateCommand.AssignmentRevision = parameters.LegacyAssignmentRevision
+	indeterminateCommand.Identity.VMID = 100
+	restoreExactHistoricalAuthority(t, journal, indeterminateCommand)
+	indeterminate, err = readJournal(indeterminatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indeterminate.Receipt.Code = "PVE_RESULT_INDETERMINATE"
+	if err := writeJournal(indeterminatePath, indeterminate); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.1-rc.1"); err != nil || duplicate {
+		t.Fatalf("production migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
+	if err != nil || !result.Migrated || len(result.RetiredIndeterminateCommandIDs) != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	retired, err := readJournal(indeterminatePath)
+	if err != nil || retired.RetiredByCommandID != migration.CommandID || retired.RetiredAt == nil {
+		t.Fatalf("retired record=%#v err=%v", retired, err)
+	}
+	if _, statErr := os.Stat(indeterminatePath); statErr != nil {
+		t.Fatalf("retired journal file was deleted: %v", statErr)
+	}
+
+	resultRaw, _ := json.Marshal(result)
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: "44444444-4444-4444-8444-444444444444", CommandID: migration.CommandID,
+		OperationID: migration.OperationID, AgentRef: migration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(2 * time.Second), FinishedAt: now.Add(3 * time.Second), Result: resultRaw}
+	if err := journal.Complete(migration, receipt); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(journal.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.1-rc.1")
+	if err != nil || !duplicate || replayed.Code != "SUCCEEDED" || !bytes.Equal(replayed.Result, resultRaw) {
+		t.Fatalf("restart replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
+	}
+
+	initial := legacyAuthorityCommand("vm.set-initial-resources", initialResourcesFixture, "production-initial-command", "production-initial-operation")
+	initial.AssignmentRevision = migration.AssignmentRevision
+	initial.Identity.VMID = 100
+	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
+		t.Fatalf("initial resources remained blocked after migration: %v", err)
+	}
+}
+
+func TestLegacyJournalMigrationClaimReturnsSpecificConflictClasses(t *testing.T) {
+	t.Run("clone lineage mismatch", func(t *testing.T) {
+		journal, _, migration, parameters, now := legacyMigrationFixture(t)
+		parameters.LegacyCloneDigest = strings.Repeat("c", 64)
+		raw, _ := json.Marshal(parameters)
+		migration.Parameters = raw
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.1"); !errors.Is(err, ErrCloneLineageMismatch) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("listed record not eligible", func(t *testing.T) {
+		journal, _, migration, parameters, now := legacyMigrationFixture(t)
+		record, _ := readJournal(journal.path(parameters.RetireIndeterminateCommandIDs[0]))
+		record.PVETaskUPID = "UPID:pve1:1:2:3:qmconfig:100:root@pam!api:"
+		record.Receipt.PVETaskUPID = record.PVETaskUPID
+		if err := writeJournal(journal.path(record.CommandID), record); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.1"); !errors.Is(err, ErrListedRecordNotEligible) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+}
+
+func TestLegacyJournalMigrationConflictReceiptCodesAreStableAndRedacted(t *testing.T) {
+	tests := []struct {
+		err  error
+		code string
+	}{
+		{fmt.Errorf("wrapped record id: %w", ErrUnlistedActiveMutation), "UNLISTED_ACTIVE_MUTATION"},
+		{fmt.Errorf("wrapped record id: %w", ErrListedRecordNotEligible), "LISTED_RECORD_NOT_ELIGIBLE"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneLineageMismatch), "CLONE_LINEAGE_MISMATCH"},
+	}
+	for _, test := range tests {
+		if got := claimRejectionCode(test.err); got != test.code || strings.Contains(got, "record id") {
+			t.Fatalf("error=%v code=%q want=%q", test.err, got, test.code)
+		}
+	}
 }
 
 func TestLegacyJournalMigrationIsOneTimeAcrossCommands(t *testing.T) {
