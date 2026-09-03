@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -137,6 +138,23 @@ func TestClientWriteAndUPID(t *testing.T) {
 	}
 	if _, err := c.TaskStatus(context.Background(), "pve1", upid); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientRejectsDeleteFormBodyBeforeRequest(t *testing.T) {
+	requests := 0
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		fmt.Fprint(w, `{"data":null}`)
+	}))
+	defer server.Close()
+	var result json.RawMessage
+	err := c.Do(context.Background(), http.MethodDelete, "/nodes/pve1/qemu/101", nil, url.Values{"purge": {"1"}}, &result)
+	if err == nil || err.Error() != "pve DELETE parameters must be encoded in query" {
+		t.Fatalf("error=%v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests=%d, want 0", requests)
 	}
 }
 func TestProbeAbsentAgentIsUnavailable(t *testing.T) {

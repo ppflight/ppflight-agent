@@ -115,9 +115,9 @@ func TestVMDeleteIsConvergentAndClassifiesPVEHTTPFailures(t *testing.T) {
 					t.Fatalf("request %s %s", r.Method, r.URL.Path)
 				}
 				body, err := io.ReadAll(r.Body)
-				form, parseErr := url.ParseQuery(string(body))
-				if err != nil || parseErr != nil || form.Get("purge") != "1" || form.Get("destroy-unreferenced-disks") != "1" {
-					t.Fatalf("form=%v readErr=%v parseErr=%v", form, err, parseErr)
+				query := r.URL.Query()
+				if err != nil || len(body) != 0 || r.ContentLength > 0 || r.Header.Get("Content-Type") != "" || query.Get("purge") != "1" || query.Get("destroy-unreferenced-disks") != "1" {
+					t.Fatalf("query=%v body=%q contentLength=%d contentType=%q readErr=%v", query, body, r.ContentLength, r.Header.Get("Content-Type"), err)
 				}
 				w.WriteHeader(tt.status)
 				_, _ = w.Write([]byte(tt.body))
@@ -784,7 +784,10 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 				gotForm := r.Form
 				if r.Method == http.MethodDelete {
 					body, _ := io.ReadAll(r.Body)
-					gotForm, _ = url.ParseQuery(string(body))
+					if len(body) != 0 || r.ContentLength > 0 || r.Header.Get("Content-Type") != "" {
+						t.Fatalf("DELETE sent request content: length=%d contentLength=%d contentType=%q", len(body), r.ContentLength, r.Header.Get("Content-Type"))
+					}
+					gotForm = r.URL.Query()
 				}
 				for key, want := range tt.form {
 					if got := gotForm[key]; strings.Join(got, ",") != strings.Join(want, ",") {

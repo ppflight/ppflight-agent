@@ -1322,7 +1322,15 @@ func vmDeleteTargetAlreadyAbsent(command Command, httpErr *pve.HTTPError) bool {
 
 func doPVE(ctx context.Context, c *pve.Client, method, path string, form url.Values) (string, json.RawMessage, error) {
 	var out json.RawMessage
-	if err := c.Do(ctx, method, path, nil, form, &out); err != nil {
+	var query url.Values
+	// PVE rejects any request content on DELETE with HTTP 501
+	// ("Unexpected content for method 'DELETE'"). DELETE parameters belong in
+	// the URI query; keeping the conversion here also covers internal
+	// compensation paths such as vm.reinstall cleanup.
+	if method == http.MethodDelete {
+		query, form = form, nil
+	}
+	if err := c.Do(ctx, method, path, query, form, &out); err != nil {
 		return "", nil, err
 	}
 	var text string

@@ -187,6 +187,11 @@ func (c *Client) do(ctx context.Context, method, apiPath, escapedAPIPath string,
 	default:
 		return fmt.Errorf("unsupported pve method %q", method)
 	}
+	// pve-api-daemon rejects DELETE requests that contain a body before route
+	// dispatch (HTTP 501). Callers must encode DELETE parameters in query.
+	if method == http.MethodDelete && form != nil {
+		return errors.New("pve DELETE parameters must be encoded in query")
+	}
 	u := *c.baseURL
 	u.Path = path.Join(c.baseURL.Path, "/api2/json", apiPath)
 	if escapedAPIPath != "" {
