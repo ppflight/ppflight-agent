@@ -7,7 +7,8 @@ HMAC receipt 和 monitoring audit 规则。JSON decoder 拒绝 unknown/duplicate
 
 首个包含这些 action 的 Agent 版本是 `0.1.0-rc.27`；clone lineage 修正与可用的反向
 WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 guest firewall rules
-严格回验从 `0.1.0-rc.29` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
+严格回验从 `0.1.0-rc.29` 开始；跨 assignment revision 的精确 legacy 恢复合同从
+`0.1.0-rc.30` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 
@@ -22,6 +23,7 @@ exact parameters：
 
 ```json
 {
+  "legacyAssignmentRevision": "3",
   "legacyCloneCommandId": "legacy-clone-command-01",
   "legacyCloneOperationId": "legacy-clone-operation-01",
   "legacyCloneDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -33,10 +35,15 @@ exact parameters：
 ```
 
 `retireIndeterminateCommandIds` 必须显式出现、按字典序严格递增、无重复，最多 64 项；可为
-空数组。目标 clone 必须是参数逐项引用的成功终态 `vm.clone`，保有相同 Agent、node、VM
-resource key、audit assignment/signing key/target，且任何已存在的 binding/device/epoch/
-assignment/VMID/generation 字段不得与当前命令冲突。RC.27 缺失的 authority 字段只能由当前
-已验签并获批的恢复命令补齐，不能由本地 CLI 或自报 payload 补齐。Agent 执行前还会重新读取
+空数组。`legacyAssignmentRevision` 必须显式给出、非零且严格小于当前已验签 command envelope
+的 `assignmentRevision`；它不是范围或查询条件，而必须与目标 clone 及每条退休记录中持久化的
+audit assignment 完全一致。因此当前 revision 只能精确批准一组已知旧 revision 记录，不能访问
+“任意历史 revision”。目标 clone 必须是参数逐项引用的成功终态 `vm.clone`，保有相同 Agent、node、
+VM resource key、audit signing key/target，且任何已存在的 binding/device/epoch/assignment/VMID/
+generation 字段必须分别与当前 authority 或显式 legacy revision 一致。RC.27 缺失的 authority 字段
+只能由当前已验签并获批的恢复命令补齐，不能由本地 CLI 或自报 payload 补齐；原始 audit context
+继续保留 `legacyAssignmentRevision`，迁移后的 lineage authority 则提升到当前 revision，以允许当前
+revision 的后续定型命令。Agent 执行前还会重新读取
 `sourceVmid`，确认它仍是当前 node 上的同 guest type 模板，并重算 `sourceConfigSha256`。
 
 只允许把所列、同 VM generation、状态恰为
@@ -50,6 +57,7 @@ command/idempotency digest 可在进程崩溃后继续未完成的本地迁移�
 ```json
 {
   "migrated": true,
+  "legacyAssignmentRevision": "3",
   "legacyCloneCommandId": "legacy-clone-command-01",
   "legacyCloneOperationId": "legacy-clone-operation-01",
   "templateRef": "ubuntu-24.04",

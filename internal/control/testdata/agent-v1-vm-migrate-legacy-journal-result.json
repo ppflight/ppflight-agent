@@ -1,5 +1,6 @@
 {
   "migrated": true,
+  "legacyAssignmentRevision": "3",
   "legacyCloneCommandId": "legacy-clone-command-01",
   "legacyCloneOperationId": "legacy-clone-operation-01",
   "templateRef": "ubuntu-24.04",

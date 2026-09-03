@@ -82,7 +82,7 @@ Agent 或官网离线时都不得回退为官网直连 PVE。目标官网服务�
 
 Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代码中的动作名是：
 
-- 生命周期/资源与交付：`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot`、`vm.suspend`、`vm.resume`、`vm.create`、`vm.clone`、`vm.set-initial-resources`、`vm.migrate-legacy-journal`、`vm.reinstall`、`vm.set-resources`、`vm.resize`、`vm.set-disk-io`、`vm.set-network`、`vm.set-rate`、`vm.set-cloud-init`、`vm.set-timezone`、`vm.verify-delivery`、`vm.delete`、`vm.reset-password`、`vm.console.create-session`、`vm.console.revoke-session`。
+- 生命周期/资源与交付：`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot`、`vm.suspend`、`vm.resume`、`vm.create`、`vm.clone`、`vm.set-initial-resources`、`vm.migrate-legacy-journal`、`vm.reinstall`、`vm.set-resources`、`vm.resize`、`vm.set-disk-io`、`vm.set-network`、`vm.set-rate`、`vm.set-cloud-init`、`vm.set-timezone`、`vm.verify-delivery`、`vm.delete`、`vm.reset-password`、`vm.console.create-session`、`vm.console.revoke-session`。legacy Journal 恢复必须由当前有效 authority 签名审批，并显式锁定一个更旧且与精确记录 audit 一致的 assignment revision；不支持 revision 枚举或通用清理。
 - 快照/备份：`snapshot.create`、`snapshot.delete`、`snapshot.rollback`、`snapshot.list`、`snapshot.get`、`backup.create`、`backup.delete`、`backup.restore`、`backup.list`、`backup.get`。
 - PVE 任务：`task.status`。
 - 防火墙：`firewall.cluster.set-options`、`firewall.node.set-options`、`firewall.guest.set-options`、`firewall.rule.create`、`firewall.rule.update`、`firewall.rule.delete`、`firewall.ipset.create`、`firewall.ipset.update`、`firewall.ipset.delete`、`firewall.ipset.entry.create`、`firewall.ipset.entry.update`、`firewall.ipset.entry.delete`。

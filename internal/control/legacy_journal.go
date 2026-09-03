@@ -14,27 +14,31 @@ import (
 const maxLegacyJournalRetirements = 64
 
 type legacyJournalMigrationP struct {
-	LegacyCloneCommandID          string   `json:"legacyCloneCommandId"`
-	LegacyCloneOperationID        string   `json:"legacyCloneOperationId"`
-	LegacyCloneDigest             string   `json:"legacyCloneDigest"`
-	TemplateRef                   string   `json:"templateRef"`
-	SourceVMID                    int      `json:"sourceVmid"`
-	SourceConfigSHA256            string   `json:"sourceConfigSha256"`
-	RetireIndeterminateCommandIDs []string `json:"retireIndeterminateCommandIds"`
+	LegacyAssignmentRevision      protocol.Counter `json:"legacyAssignmentRevision"`
+	LegacyCloneCommandID          string           `json:"legacyCloneCommandId"`
+	LegacyCloneOperationID        string           `json:"legacyCloneOperationId"`
+	LegacyCloneDigest             string           `json:"legacyCloneDigest"`
+	TemplateRef                   string           `json:"templateRef"`
+	SourceVMID                    int              `json:"sourceVmid"`
+	SourceConfigSHA256            string           `json:"sourceConfigSha256"`
+	RetireIndeterminateCommandIDs []string         `json:"retireIndeterminateCommandIds"`
 }
 
 type LegacyJournalMigrationResult struct {
-	Migrated                       bool     `json:"migrated"`
-	LegacyCloneCommandID           string   `json:"legacyCloneCommandId"`
-	LegacyCloneOperationID         string   `json:"legacyCloneOperationId"`
-	TemplateRef                    string   `json:"templateRef"`
-	SourceVMID                     int      `json:"sourceVmid"`
-	SourceConfigSHA256             string   `json:"sourceConfigSha256"`
-	RetiredIndeterminateCommandIDs []string `json:"retiredIndeterminateCommandIds"`
+	Migrated                       bool             `json:"migrated"`
+	LegacyAssignmentRevision       protocol.Counter `json:"legacyAssignmentRevision"`
+	LegacyCloneCommandID           string           `json:"legacyCloneCommandId"`
+	LegacyCloneOperationID         string           `json:"legacyCloneOperationId"`
+	TemplateRef                    string           `json:"templateRef"`
+	SourceVMID                     int              `json:"sourceVmid"`
+	SourceConfigSHA256             string           `json:"sourceConfigSha256"`
+	RetiredIndeterminateCommandIDs []string         `json:"retiredIndeterminateCommandIds"`
 }
 
 func validLegacyJournalMigration(command Command, value legacyJournalMigrationP) bool {
-	if !commandIDRE.MatchString(value.LegacyCloneCommandID) || !commandIDRE.MatchString(value.LegacyCloneOperationID) ||
+	if value.LegacyAssignmentRevision == 0 ||
+		(command.AssignmentRevision > 0 && value.LegacyAssignmentRevision >= command.AssignmentRevision) ||
+		!commandIDRE.MatchString(value.LegacyCloneCommandID) || !commandIDRE.MatchString(value.LegacyCloneOperationID) ||
 		value.LegacyCloneCommandID == command.CommandID || value.LegacyCloneOperationID == command.OperationID ||
 		!bodyHashRE.MatchString(value.LegacyCloneDigest) || !nameRE.MatchString(value.TemplateRef) ||
 		value.SourceVMID < 100 || value.SourceVMID > 999999999 || !bodyHashRE.MatchString(value.SourceConfigSHA256) ||
@@ -84,7 +88,7 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 	for _, commandID := range parameters.RetireIndeterminateCommandIDs {
 		filename := j.path(commandID)
 		record, readErr := readJournal(filename)
-		if readErr != nil || !legacyIndeterminateEligible(record, command, resourceKey, commandID) {
+		if readErr != nil || !legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, commandID) {
 			return result, fmt.Errorf("legacy indeterminate journal %s is not eligible", commandID)
 		}
 		retirements = append(retirements, struct {
@@ -110,7 +114,8 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 			return result, err
 		}
 	}
-	return LegacyJournalMigrationResult{Migrated: true, LegacyCloneCommandID: parameters.LegacyCloneCommandID,
+	return LegacyJournalMigrationResult{Migrated: true, LegacyAssignmentRevision: parameters.LegacyAssignmentRevision,
+		LegacyCloneCommandID:   parameters.LegacyCloneCommandID,
 		LegacyCloneOperationID: parameters.LegacyCloneOperationID, TemplateRef: parameters.TemplateRef,
 		SourceVMID: parameters.SourceVMID, SourceConfigSHA256: parameters.SourceConfigSHA256,
 		RetiredIndeterminateCommandIDs: append([]string(nil), parameters.RetireIndeterminateCommandIDs...)}, nil
@@ -141,7 +146,8 @@ func (j *Journal) resourceBusyForLegacyMigrationLocked(command Command, paramete
 			(record.State != "received" && record.State != "submitted" && record.State != "waiting" && record.State != "indeterminate") {
 			continue
 		}
-		if _, listed := allowed[record.CommandID]; !listed || !legacyIndeterminateEligible(record, command, resourceKey, record.CommandID) {
+		if _, listed := allowed[record.CommandID]; !listed ||
+			!legacyIndeterminateEligible(record, command, parameters.LegacyAssignmentRevision, resourceKey, record.CommandID) {
 			return true, nil
 		}
 	}
@@ -158,10 +164,11 @@ func legacyCloneEligible(record journalRecord, command Command, parameters legac
 		return record.MigratedByCommandID == command.CommandID && record.SourceTemplateRef == parameters.TemplateRef &&
 			record.SourceVMID == parameters.SourceVMID && recordAuthorityEquals(record, command)
 	}
-	return record.SourceTemplateRef == "" && record.SourceVMID == 0 && isLegacyJournalRecord(record) && legacyRecordAuthorityMatches(record, command)
+	return record.SourceTemplateRef == "" && record.SourceVMID == 0 && isLegacyJournalRecord(record) &&
+		legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision)
 }
 
-func legacyIndeterminateEligible(record journalRecord, command Command, resourceKey, commandID string) bool {
+func legacyIndeterminateEligible(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter, resourceKey, commandID string) bool {
 	if record.CommandID != commandID || record.ResourceKey != resourceKey || !record.Mutating || record.Action == "vm.migrate-legacy-journal" ||
 		record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
 		record.Receipt.State != "indeterminate" || record.Receipt.Code != "EXECUTION_INDETERMINATE" ||
@@ -172,12 +179,12 @@ func legacyIndeterminateEligible(record journalRecord, command Command, resource
 	if record.RetiredByCommandID != "" {
 		return record.RetiredByCommandID == command.CommandID && recordAuthorityEquals(record, command)
 	}
-	return isLegacyJournalRecord(record) && legacyRecordAuthorityMatches(record, command)
+	return isLegacyJournalRecord(record) && legacyRecordAuthorityMatches(record, command, legacyAssignmentRevision)
 }
 
-func legacyRecordAuthorityMatches(record journalRecord, command Command) bool {
+func legacyRecordAuthorityMatches(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter) bool {
 	if record.AuditContext == nil || record.AgentRef != command.AgentRef || record.NodeRef != command.Identity.NodeRef ||
-		record.Scope != ScopeVM || record.AuditContext.AssignmentRevision != command.AssignmentRevision ||
+		record.Scope != ScopeVM || record.AuditContext.AssignmentRevision != legacyAssignmentRevision ||
 		record.AuditContext.CommandID != record.CommandID || record.AuditContext.OperationID != record.OperationID ||
 		record.AuditContext.Action != record.Action || record.AuditContext.Scope != ScopeVM ||
 		record.AuditContext.WebsiteCommandKeyID != command.SigningKeyID || record.AuditContext.ApprovalRef == "" {
@@ -188,7 +195,7 @@ func legacyRecordAuthorityMatches(record journalRecord, command Command) bool {
 		return false
 	}
 	return optionalStringMatches(record.BindingID, command.BindingID) && optionalStringMatches(record.DeviceID, command.DeviceID) &&
-		optionalCounterMatches(record.CredentialEpoch, command.CredentialEpoch) && optionalCounterMatches(record.AssignmentRevision, command.AssignmentRevision) &&
+		optionalCounterMatches(record.CredentialEpoch, command.CredentialEpoch) && optionalCounterMatches(record.AssignmentRevision, legacyAssignmentRevision) &&
 		optionalStringMatches(record.ClusterRef, command.Identity.ClusterRef) && optionalStringMatches(record.ServiceRef, command.Identity.ServiceRef) &&
 		optionalStringMatches(record.InstanceUUID, command.Identity.InstanceUUID) && optionalStringMatches(record.GuestType, command.Identity.GuestType) &&
 		optionalIntMatches(record.VMID, command.Identity.VMID) && optionalCounterMatches(record.Generation, protocol.Counter(command.Identity.Generation))

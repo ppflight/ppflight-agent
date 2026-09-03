@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ppflight/ppflight-agent/internal/protocol"
 )
 
 func legacyAuthorityCommand(action, parameters, commandID, operationID string) Command {
@@ -67,10 +69,12 @@ func legacyMigrationFixture(t *testing.T) (*Journal, Command, Command, legacyJou
 		t.Fatal(err)
 	}
 	clone := legacyAuthorityCommand("vm.clone", `{"sourceVmid":9001,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, "legacy-clone-command", "legacy-clone-operation")
+	clone.AssignmentRevision = 3
 	cloneRecord := makeLegacyRecord(t, journal, clone, "succeeded", "SUCCEEDED", now)
 	indeterminate := legacyAuthorityCommand("vm.set-resources", `{"cores":2}`, "legacy-indeterminate-command", "legacy-indeterminate-operation")
+	indeterminate.AssignmentRevision = 3
 	makeLegacyRecord(t, journal, indeterminate, "indeterminate", "EXECUTION_INDETERMINATE", now.Add(time.Second))
-	parameters := legacyJournalMigrationP{LegacyCloneCommandID: clone.CommandID, LegacyCloneOperationID: clone.OperationID,
+	parameters := legacyJournalMigrationP{LegacyAssignmentRevision: 3, LegacyCloneCommandID: clone.CommandID, LegacyCloneOperationID: clone.OperationID,
 		LegacyCloneDigest: cloneRecord.Digest, TemplateRef: "ubuntu-24.04", SourceVMID: 9001,
 		SourceConfigSHA256: strings.Repeat("a", 64), RetireIndeterminateCommandIDs: []string{indeterminate.CommandID}}
 	raw, err := json.Marshal(parameters)
@@ -78,12 +82,13 @@ func legacyMigrationFixture(t *testing.T) (*Journal, Command, Command, legacyJou
 		t.Fatal(err)
 	}
 	migration := legacyAuthorityCommand("vm.migrate-legacy-journal", string(raw), "legacy-migration-command", "legacy-migration-operation")
+	migration.AssignmentRevision = 4
 	return journal, clone, migration, parameters, now
 }
 
 func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *testing.T) {
 	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
-	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.29"); err != nil || duplicate {
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.30"); err != nil || duplicate {
 		t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
 	}
 	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
@@ -113,11 +118,12 @@ func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.0-rc.29")
+	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.0-rc.30")
 	if err != nil || !duplicate || replayed.State != "succeeded" || !bytes.Equal(replayed.Result, resultRaw) {
 		t.Fatalf("replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
 	}
 	initial := legacyAuthorityCommand("vm.set-initial-resources", initialResourcesFixture, "initial-command", "initial-operation")
+	initial.AssignmentRevision = migration.AssignmentRevision
 	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
 		t.Fatalf("migrated lineage not authorized after restart: %v", err)
 	}
@@ -125,11 +131,13 @@ func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *
 
 func TestLegacyJournalMigrationRejectsAuthorityMismatchAndGenericClear(t *testing.T) {
 	mutations := map[string]func(*journalRecord){
-		"binding":    func(r *journalRecord) { r.BindingID = "22222222-2222-4222-8222-222222222222" },
-		"device":     func(r *journalRecord) { r.DeviceID = "device-2" },
-		"epoch":      func(r *journalRecord) { r.CredentialEpoch = 2 },
-		"assignment": func(r *journalRecord) { r.AssignmentRevision = 8 },
-		"vmid":       func(r *journalRecord) { r.VMID = 102 },
+		"binding":        func(r *journalRecord) { r.BindingID = "22222222-2222-4222-8222-222222222222" },
+		"device":         func(r *journalRecord) { r.DeviceID = "device-2" },
+		"epoch":          func(r *journalRecord) { r.CredentialEpoch = 2 },
+		"assignment":     func(r *journalRecord) { r.AssignmentRevision = 8 },
+		"audit revision": func(r *journalRecord) { r.AuditContext.AssignmentRevision = 2 },
+		"signing key":    func(r *journalRecord) { r.AuditContext.WebsiteCommandKeyID = "website-key-2" },
+		"vmid":           func(r *journalRecord) { r.VMID = 102 },
 		"generation": func(r *journalRecord) {
 			r.Generation = 2
 		},
@@ -153,6 +161,39 @@ func TestLegacyJournalMigrationRejectsAuthorityMismatchAndGenericClear(t *testin
 	command := controlCommand("vm.migrate-legacy-journal", "qemu", `{"clear":true}`)
 	if err := validateParameters(command); err == nil {
 		t.Fatal("generic Journal clear contract was accepted")
+	}
+}
+
+func TestLegacyJournalMigrationRequiresExplicitOlderExactRevision(t *testing.T) {
+	for name, revision := range map[string]uint64{"missing": 0, "current": 4, "future": 5, "wrong historical": 2} {
+		t.Run(name, func(t *testing.T) {
+			journal, _, migration, parameters, now := legacyMigrationFixture(t)
+			parameters.LegacyAssignmentRevision = protocol.Counter(revision)
+			raw, err := json.Marshal(parameters)
+			if err != nil {
+				t.Fatal(err)
+			}
+			migration.Parameters = raw
+			if _, err := journal.MigrateLegacyVMJournal(migration, parameters, now); err == nil {
+				t.Fatalf("legacy revision %d was accepted", revision)
+			}
+		})
+	}
+}
+
+func TestLegacyJournalMigrationRejectsRetirementFromDifferentLegacyRevision(t *testing.T) {
+	journal, _, migration, parameters, now := legacyMigrationFixture(t)
+	path := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+	record, err := readJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.AuditContext.AssignmentRevision = 2
+	if err := writeJournal(path, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := journal.MigrateLegacyVMJournal(migration, parameters, now); err == nil {
+		t.Fatal("retirement from another legacy revision was accepted")
 	}
 }
 
@@ -190,7 +231,7 @@ func TestLegacyJournalMigrationRejectsNonTerminalCloneUPIDAndUnlistedIndetermina
 		parameters.RetireIndeterminateCommandIDs = []string{}
 		raw, _ := json.Marshal(parameters)
 		migration.Parameters = raw
-		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.29"); !errors.Is(err, ErrResourceBusy) {
+		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.30"); !errors.Is(err, ErrResourceBusy) {
 			t.Fatalf("unlisted mutation claim err=%v", err)
 		}
 	})
@@ -232,8 +273,11 @@ func TestLegacyMigrationAndGuestFirewallGoldens(t *testing.T) {
 		t.Fatalf("legacy migration golden: %v", err)
 	}
 	resultRaw, err := os.ReadFile(filepath.Join("testdata", "agent-v1-vm-migrate-legacy-journal-result.json"))
-	if err != nil || !validLegacyMigrationJournalResult(resultRaw) {
+	if err != nil || !validLegacyMigrationJournalResult(&journalRecord{AssignmentRevision: 4}, resultRaw) {
 		t.Fatalf("legacy migration result golden err=%v", err)
+	}
+	if validLegacyMigrationJournalResult(&journalRecord{AssignmentRevision: 3}, resultRaw) {
+		t.Fatal("legacy migration result was accepted without an older revision")
 	}
 	listRaw, err := os.ReadFile(filepath.Join("testdata", "agent-v1-firewall-guest-rules-list-result.json"))
 	if err != nil {

@@ -40,16 +40,18 @@ func TestLegacyJournalMigrationRevalidatesCurrentTemplateBeforeLocalWrite(t *tes
 		}
 	}))
 	defer server.Close()
-	parameters := legacyJournalMigrationP{LegacyCloneCommandID: "legacy-clone-command", LegacyCloneOperationID: "legacy-clone-operation",
+	parameters := legacyJournalMigrationP{LegacyAssignmentRevision: 3, LegacyCloneCommandID: "legacy-clone-command", LegacyCloneOperationID: "legacy-clone-operation",
 		LegacyCloneDigest: strings.Repeat("b", 64), TemplateRef: "ubuntu-24.04", SourceVMID: 9001,
 		SourceConfigSHA256: digest, RetireIndeterminateCommandIDs: []string{}}
 	raw, _ := json.Marshal(parameters)
 	command := legacyAuthorityCommand("vm.migrate-legacy-journal", string(raw), "migration-command", "migration-operation")
+	command.AssignmentRevision = 4
 	called := false
 	executor := Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true,
 		LegacyJournal: legacyMigratorFunc(func(_ Command, got legacyJournalMigrationP, _ time.Time) (LegacyJournalMigrationResult, error) {
 			called = got.SourceConfigSHA256 == digest
-			return LegacyJournalMigrationResult{Migrated: true, LegacyCloneCommandID: got.LegacyCloneCommandID,
+			return LegacyJournalMigrationResult{Migrated: true, LegacyAssignmentRevision: got.LegacyAssignmentRevision,
+				LegacyCloneCommandID:   got.LegacyCloneCommandID,
 				LegacyCloneOperationID: got.LegacyCloneOperationID, TemplateRef: got.TemplateRef, SourceVMID: got.SourceVMID,
 				SourceConfigSHA256: got.SourceConfigSHA256, RetiredIndeterminateCommandIDs: []string{}}, nil
 		})}

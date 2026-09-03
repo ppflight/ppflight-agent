@@ -67,7 +67,7 @@ func validActionParameterFixtures() map[string]string {
 		"vm.create":                           `{"name":"vm101","cores":2,"memoryMiB":1024,"storage":"local-lvm","diskGiB":8,"start":false}`,
 		"vm.clone":                            `{"sourceVmid":100,"templateRef":"ubuntu-24.04","name":"vm101","full":true,"target":"pve1","storage":"local-lvm","sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
 		"vm.set-initial-resources":            `{"cores":1,"sockets":1,"memoryMiB":1024,"cloneOperationId":"operation-clone","templateRef":"ubuntu-24.04","sourceVmid":100,"vmGeneration":"1","templateConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
-		"vm.migrate-legacy-journal":           `{"legacyCloneCommandId":"command-clone","legacyCloneOperationId":"operation-clone","legacyCloneDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","templateRef":"ubuntu-24.04","sourceVmid":100,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","retireIndeterminateCommandIds":[]}`,
+		"vm.migrate-legacy-journal":           `{"legacyAssignmentRevision":"3","legacyCloneCommandId":"command-clone","legacyCloneOperationId":"operation-clone","legacyCloneDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","templateRef":"ubuntu-24.04","sourceVmid":100,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","retireIndeterminateCommandIds":[]}`,
 		"vm.reinstall":                        reinstallFixture(),
 		"vm.set-resources":                    `{"cores":4}`,
 		"vm.resize":                           `{"disk":"scsi0","size":"+1G"}`,

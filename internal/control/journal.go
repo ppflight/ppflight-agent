@@ -478,7 +478,7 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	// which must survive a crash so an exact idempotent replay can return the
 	// first result without touching PVE again.
 	safeReplayResult := record.Action == "vm.set-initial-resources" && validInitialResourcesJournalResult(record, receipt.Result) ||
-		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(receipt.Result)
+		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(record, receipt.Result)
 	if receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !safeReplayResult {
 		journalReceipt.Result = nil
 	}
@@ -499,14 +499,16 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	return writeJournal(filename, *record)
 }
 
-func validLegacyMigrationJournalResult(raw json.RawMessage) bool {
-	if len(raw) == 0 {
+func validLegacyMigrationJournalResult(record *journalRecord, raw json.RawMessage) bool {
+	if record == nil || len(raw) == 0 {
 		return false
 	}
 	var result LegacyJournalMigrationResult
 	if strictParameters(raw, &result) != nil || !result.Migrated || !commandIDRE.MatchString(result.LegacyCloneCommandID) ||
 		!commandIDRE.MatchString(result.LegacyCloneOperationID) || !nameRE.MatchString(result.TemplateRef) ||
-		result.SourceVMID < 100 || result.SourceVMID > 999999999 || !bodyHashRE.MatchString(result.SourceConfigSHA256) ||
+		result.LegacyAssignmentRevision == 0 || result.LegacyAssignmentRevision >= record.AssignmentRevision ||
+		result.SourceVMID < 100 || result.SourceVMID > 999999999 ||
+		!bodyHashRE.MatchString(result.SourceConfigSHA256) ||
 		result.RetiredIndeterminateCommandIDs == nil || len(result.RetiredIndeterminateCommandIDs) > maxLegacyJournalRetirements {
 		return false
 	}
