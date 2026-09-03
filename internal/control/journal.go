@@ -102,6 +102,7 @@ type auditContext struct {
 	Action              string           `json:"action"`
 	Scope               string           `json:"scope"`
 	TargetRef           string           `json:"targetRef"`
+	Target              *auditlog.Target `json:"target,omitempty"`
 	WebsiteCommandKeyID string           `json:"websiteCommandKeyId"`
 	ReceivedAt          time.Time        `json:"receivedAt"`
 	AcceptedAt          time.Time        `json:"acceptedAt"`
@@ -176,6 +177,29 @@ func (j *Journal) ClaimWithAudit(command Command, now time.Time, agentVersion st
 		return Receipt{}, false, err
 	}
 	return j.claim(command, now, &context)
+}
+
+// RecordAuditGuestName enriches an already claimed VM mutation with the
+// bounded guest name read from the local PVE API. It cannot change the stable
+// typed target identity and never stores the PVE config response.
+func (j *Journal) RecordAuditGuestName(command Command, guestName string) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(command.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return err
+	}
+	if record.Digest != Digest(command) || record.AuditContext == nil || record.AuditContext.Target == nil {
+		return errors.New("journal audit target does not match command")
+	}
+	target := *record.AuditContext.Target
+	target.GuestName = guestName
+	if err := target.Validate(); err != nil {
+		return err
+	}
+	record.AuditContext.Target = &target
+	return writeJournal(filename, record)
 }
 
 func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Receipt, bool, error) {
@@ -945,6 +969,10 @@ func newAuditContext(command Command, now time.Time, agentVersion string) (audit
 		RequestedByRef: command.OperatorRef, PayloadDigest: "sha256:" + command.BodySHA256,
 		AgentVersion: agentVersion,
 	}
+	if command.Scope == ScopeVM {
+		result.Target = &auditlog.Target{ClusterRef: command.Identity.ClusterRef, NodeRef: command.Identity.NodeRef,
+			GuestType: command.Identity.GuestType, VMID: command.Identity.VMID}
+	}
 	if err := result.validate(); err != nil {
 		return auditContext{}, err
 	}
@@ -957,6 +985,15 @@ func (c auditContext) validate() error {
 	}
 	if c.ReceivedAt.IsZero() || c.AcceptedAt.IsZero() || c.AcceptedAt.Before(c.ReceivedAt) {
 		return errors.New("journal audit context timing is invalid")
+	}
+	if c.Target != nil {
+		if c.Scope != ScopeVM || c.Target.Validate() != nil {
+			return errors.New("journal audit target is invalid")
+		}
+		parts := strings.Split(c.TargetRef, ":")
+		if len(parts) != 5 || parts[0] != "vm" || parts[1] != c.Target.ClusterRef || parts[2] != c.Target.GuestType {
+			return errors.New("journal audit target does not match targetRef")
+		}
 	}
 	if c.ApprovalRef != "" && !commandIDRE.MatchString(c.ApprovalRef) || !commandIDRE.MatchString(c.RequestedByRef) || strings.Contains(c.RequestedByRef, "@") {
 		return errors.New("journal audit context actor reference is invalid")
@@ -981,7 +1018,15 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 		value := receipt.StartedAt.UTC()
 		startedAt = &value
 	}
-	if !receipt.FinishedAt.IsZero() {
+	if receipt.State == "indeterminate" {
+		// A recovered indeterminate receipt proves neither when execution began
+		// nor when it ended. Receipt compatibility still carries bounded local
+		// timestamps, but the monitoring audit must not present them as facts.
+		startedAt = nil
+	}
+	terminalTimeKnown := receipt.State == "dry_run" || receipt.State == "succeeded" || receipt.State == "failed" ||
+		receipt.State == "rolled_back" || receipt.State == "rejected"
+	if terminalTimeKnown && !receipt.FinishedAt.IsZero() {
 		value := receipt.FinishedAt.UTC()
 		finishedAt = &value
 	}
@@ -990,6 +1035,15 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 		policy = "denied"
 	}
 	outcome := receipt.State
+	failureStage := ""
+	switch receipt.State {
+	case "rejected":
+		failureStage = "policy"
+	case "failed":
+		failureStage = "execution"
+	case "indeterminate":
+		failureStage = "receipt"
+	}
 	if context.Action == "agent.upgrade" {
 		switch {
 		case receipt.State == "waiting":
@@ -1008,10 +1062,10 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 	event := auditlog.Event{
 		EventID: receipt.ReceiptID, AssignmentRevision: context.AssignmentRevision,
 		CommandID: context.CommandID, IdempotencyKey: context.IdempotencyKey,
-		Action: context.Action, Scope: context.Scope, TargetRef: context.TargetRef,
+		Action: context.Action, Scope: context.Scope, TargetRef: context.TargetRef, Target: context.Target,
 		WebsiteCommandKeyID: context.WebsiteCommandKeyID, ReceivedAt: context.ReceivedAt.UTC(),
-		AcceptedAt: &acceptedAt, StartedAt: startedAt, FinishedAt: finishedAt,
-		Outcome: outcome, ErrorCode: receipt.Code, UPID: upidDigest,
+		AcceptedAt: &acceptedAt, StartedAt: startedAt, EndedAt: finishedAt, FinishedAt: finishedAt,
+		Outcome: outcome, ErrorCode: receipt.Code, FailureStage: failureStage, UPID: upidDigest,
 		ApprovalRef: context.ApprovalRef, RequestedByRef: context.RequestedByRef,
 		PayloadDigest: context.PayloadDigest, ResultDigest: resultDigest,
 		PolicyDecision: policy, AgentVersion: context.AgentVersion,

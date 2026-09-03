@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "batchId": "77777777-7777-4777-8777-777777777777",
+  "monitoringAgentRef": "monitor-agent-1",
+  "deviceId": "device-1",
+  "credentialEpoch": "4",
+  "sequence": "15",
+  "bootId": "88888888-8888-4888-8888-888888888888",
+  "observedAt": "2026-09-03T12:18:17Z",
+  "sentAt": "2026-09-03T12:18:18Z",
+  "deliveryState": {
+    "pendingItems": "0",
+    "pendingBytes": "0",
+    "lastDeliveryError": "",
+    "authBlocked": false
+  },
+  "events": [
+    {
+      "eventId": "77777777-7777-4777-8777-777777777777",
+      "assignmentRevision": "6",
+      "commandId": "delete-command-1",
+      "idempotencyKey": "delete-idempotency-1",
+      "action": "vm.delete",
+      "scope": "vm",
+      "targetRef": "vm:cluster-13:qemu:8daf6bdb-2348-40a1-a838-56d314f76c8c:1",
+      "target": {
+        "clusterRef": "cluster-13",
+        "nodeRef": "pve",
+        "guestType": "qemu",
+        "vmid": 100,
+        "guestName": "customer-vm-100"
+      },
+      "websiteCommandKeyId": "ppflight-www-command-ed25519-v1",
+      "receivedAt": "2026-09-03T12:18:17Z",
+      "acceptedAt": "2026-09-03T12:18:17Z",
+      "endedAt": "2026-09-03T12:18:17Z",
+      "finishedAt": "2026-09-03T12:18:17Z",
+      "outcome": "failed",
+      "errorCode": "RESOURCE_BUSY",
+      "failureStage": "admission",
+      "approvalRef": "approval-delete-1",
+      "requestedByRef": "operator-1",
+      "payloadDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "resultDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "policyDecision": "allowed",
+      "agentVersion": "0.1.1-rc.next"
+    }
+  ]
+}

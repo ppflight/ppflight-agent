@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,11 +162,150 @@ func TestAuthenticatedPolicyRejectionsAreAuditedButBadSignatureIsNot(t *testing.
 			}
 			if test.audited {
 				event := sink.events[0]
-				if event.PolicyDecision != "denied" || event.Outcome != "rejected" || event.AcceptedAt != nil || event.StartedAt != nil {
+				if event.PolicyDecision != "denied" || event.Outcome != "rejected" || event.FailureStage != "policy" || event.AcceptedAt != nil || event.StartedAt != nil {
 					t.Fatalf("denied event=%#v", event)
 				}
 			}
 		})
+	}
+}
+
+func TestResourceBusyAuditIsAllowedAdmissionFailureWithRedactedVMTarget(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 18, 17, 0, time.UTC)
+	command, assignments := signedCommand(t, now)
+	command.Action = "vm.delete"
+	command.Parameters = json.RawMessage(`{"purge":true,"destroyUnreferencedDisks":true}`)
+	command.BodySHA256 = protocolHash(command.Parameters)
+	command.Signature = SignCommand(command, []byte("secret"))
+
+	directory := t.TempDir()
+	sink := &memoryAuditSink{}
+	receipts := &memoryReceiptQueue{}
+	service, journal := auditTestService(t, directory, command, assignments, receipts, sink, now, []string{command.Action})
+	busy := command
+	busy.CommandID = "busy-command"
+	busy.OperationID = "busy-operation"
+	busy.IdempotencyKey = "busy-idempotency"
+	busy.Action = "vm.set-resources"
+	busy.Parameters = json.RawMessage(`{"cores":2}`)
+	busy.BodySHA256 = protocolHash(busy.Parameters)
+	if _, duplicate, err := journal.ClaimWithAudit(busy, now.Add(-time.Second), "test-version"); err != nil || duplicate {
+		t.Fatalf("busy claim duplicate=%t err=%v", duplicate, err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve-1/qemu/101/config" {
+			t.Fatalf("unexpected guest-name request: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"name":"customer-vm-101"}}`))
+	}))
+	defer server.Close()
+	service.executor.Client = controlTestClient(t, server)
+
+	if processed, err := service.PollOnce(context.Background()); err != nil || processed != 1 {
+		t.Fatalf("processed=%d err=%v", processed, err)
+	}
+	if len(sink.events) != 1 {
+		t.Fatalf("audit events=%d", len(sink.events))
+	}
+	event := sink.events[0]
+	if event.Action != "vm.delete" || event.ErrorCode != "RESOURCE_BUSY" || event.PolicyDecision != "allowed" ||
+		event.Outcome != "failed" || event.FailureStage != "admission" || event.AcceptedAt == nil || event.StartedAt != nil ||
+		event.EndedAt == nil || event.FinishedAt == nil || event.Target == nil || event.Target.ClusterRef != "cluster-1" ||
+		event.Target.NodeRef != "pve-1" || event.Target.GuestType != "qemu" || event.Target.VMID != 101 ||
+		event.Target.GuestName != "customer-vm-101" {
+		t.Fatalf("resource-busy audit=%#v", event)
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"parameters", "rawError", "PVE response", "pveTaskUpid", "UPID:", "password", "tokenSecret", "hmacSecret"} {
+		if strings.Contains(strings.ToLower(string(raw)), strings.ToLower(forbidden)) {
+			t.Fatalf("audit contains forbidden %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestExecutionFailureAuditRemainsPolicyAllowed(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 18, 17, 0, time.UTC)
+	command, _ := signedCommand(t, now)
+	context, err := newAuditContext(command, now, "test-version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: "66666666-6666-4666-8666-666666666666", CommandID: command.CommandID,
+		OperationID: command.OperationID, AgentRef: command.AgentRef, State: "failed", Code: "PVE_TASK_FAILED",
+		ExecutionMode: "production", StartedAt: now.Add(time.Second), FinishedAt: now.Add(2 * time.Second)}
+	event, err := auditEventFromReceipt(context, receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.PolicyDecision != "allowed" || event.Outcome != "failed" || event.FailureStage != "execution" ||
+		event.AcceptedAt == nil || event.StartedAt == nil || event.EndedAt == nil {
+		t.Fatalf("execution-failure event=%#v", event)
+	}
+}
+
+func TestAuditGuestNameSurvivesDurableJournalReopen(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 18, 17, 0, time.UTC)
+	command, _ := signedCommand(t, now)
+	directory := filepath.Join(t.TempDir(), "journal")
+	journal, err := OpenJournal(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, duplicate, err := journal.ClaimWithAudit(command, now, "test-version"); err != nil || duplicate {
+		t.Fatalf("claim duplicate=%t err=%v", duplicate, err)
+	}
+	if err := journal.RecordAuditGuestName(command, "customer-vm-101"); err != nil {
+		t.Fatal(err)
+	}
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: "66666666-6666-4666-8666-666666666666", CommandID: command.CommandID,
+		OperationID: command.OperationID, AgentRef: command.AgentRef, State: "failed", Code: "PVE_TASK_FAILED",
+		ExecutionMode: "production", StartedAt: now.Add(time.Second), FinishedAt: now.Add(2 * time.Second)}
+	if err := journal.Complete(command, receipt); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, pending, err := reopened.PendingAuditForReceipt(command.CommandID, receipt.ReceiptID)
+	if err != nil || !pending {
+		t.Fatalf("pending=%t err=%v", pending, err)
+	}
+	if event.Target == nil || event.Target.GuestName != "customer-vm-101" || event.Target.NodeRef != command.Identity.NodeRef {
+		t.Fatalf("durable target=%#v", event.Target)
+	}
+}
+
+func TestAuditOmitsUnknownAndNonTerminalEndTimes(t *testing.T) {
+	now := time.Date(2026, 9, 3, 12, 18, 17, 0, time.UTC)
+	command, _ := signedCommand(t, now)
+	auditContext, err := newAuditContext(command, now, "test-version")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		state, code string
+		wantStarted bool
+		wantStage   string
+	}{
+		{"submitted", "PVE_TASK_SUBMITTED", true, ""},
+		{"waiting", "PVE_TASK_WAITING", true, ""},
+		{"indeterminate", "PVE_RESULT_INDETERMINATE", false, "receipt"},
+	} {
+		receipt := Receipt{SchemaVersion: 1, ReceiptID: "99999999-9999-4999-8999-999999999999", CommandID: command.CommandID,
+			OperationID: command.OperationID, AgentRef: command.AgentRef, State: test.state, Code: test.code,
+			ExecutionMode: "production", StartedAt: now.Add(time.Second), FinishedAt: now.Add(2 * time.Second)}
+		event, err := auditEventFromReceipt(auditContext, receipt)
+		if err != nil {
+			t.Fatalf("state=%s err=%v", test.state, err)
+		}
+		if (event.StartedAt != nil) != test.wantStarted || event.EndedAt != nil || event.FinishedAt != nil || event.FailureStage != test.wantStage {
+			t.Fatalf("state=%s event=%#v", test.state, event)
+		}
 	}
 }
 

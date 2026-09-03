@@ -351,7 +351,7 @@ VM 命令必须与当前 signed assignment 完全一致。绑定时 allowlist �
 POST /internal/v1/monitoring/audit-events/batches
 ```
 
-这是与 monitoring telemetry、官网 receipt 和 metering 分离的 durable outbox。每个不可变状态事件有稳定 event ID；重试必须复用同一 ID 和 exact body。audit stream 维护自己的跨重启单调 `sequence`，不能借用 telemetry sequence；`bootId` 只关联产生 batch 的 Agent 进程，不能取代 sequence。batch 必须同时携带事件观察时间 `observedAt` 和实际构造/发送时间 `sentAt`，event 另保留受限的 received/accepted/started/finished 时间。只有监控站 durable commit 后才能 ACK 并删除 outbox item；网络失败、Agent 重启或服务端重复接收都不得丢失、重排为新事件或触发原 PVE mutation 重放。Agent 在启动任何 delivery worker 前先同步 reconcile control journal，使“outbox 已落盘、journal queued marker 尚未来得及更新”的崩溃窗口也按原 event ID恢复，而不是生成新事件。
+这是与 monitoring telemetry、官网 receipt 和 metering 分离的 durable outbox。每个不可变状态事件有稳定 event ID；重试必须复用同一 ID 和 exact body。audit stream 维护自己的跨重启单调 `sequence`，不能借用 telemetry sequence；`bootId` 只关联产生 batch 的 Agent 进程，不能取代 sequence。batch 必须同时携带事件观察时间 `observedAt` 和实际构造/发送时间 `sentAt`，event 另保留受限的 received/accepted/started/ended 时间；`finishedAt` 暂为 audit-v1 兼容镜像。未知时间必须省略，不能写 `null` 或伪造。只有监控站 durable commit 后才能 ACK 并删除 outbox item；网络失败、Agent 重启或服务端重复接收都不得丢失、重排为新事件或触发原 PVE mutation 重放。Agent 在启动任何 delivery worker 前先同步 reconcile control journal，使“outbox 已落盘、journal queued marker 尚未来得及更新”的崩溃窗口也按原 event ID恢复，而不是生成新事件。
 
 冻结的 `audit-v1` wire shape 如下。所有 counter 都是 JSON 十进制字符串；`assignmentRevision` 必须大于 0，来源是已认证 command 的 remote Bundle authority，不是 inventory 文档的自由文本 `revision`。所有时间都是 canonical RFC3339 UTC `Z`；`events` 允许 1..500 项且 event ID 不得重复。当前 Agent 每批只放一个 event 并复用其 UUID 作为 `batchId`，但接收端不得把二者相等写成协议不变量。
 
@@ -382,10 +382,18 @@ POST /internal/v1/monitoring/audit-events/batches
       "action": "vm.set-network",
       "scope": "vm",
       "targetRef": "vm:cluster-01:qemu:instance-01:3",
+      "target": {
+        "clusterRef": "cluster-01",
+        "nodeRef": "pve-01",
+        "guestType": "qemu",
+        "vmid": 100,
+        "guestName": "customer-vm-100"
+      },
       "websiteCommandKeyId": "website-command-key-01",
       "receivedAt": "2026-08-30T00:00:00Z",
       "acceptedAt": "2026-08-30T00:00:00Z",
       "startedAt": "2026-08-30T00:00:01Z",
+      "endedAt": "2026-08-30T00:00:02Z",
       "finishedAt": "2026-08-30T00:00:02Z",
       "outcome": "succeeded",
       "upid": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -400,9 +408,11 @@ POST /internal/v1/monitoring/audit-events/batches
 }
 ```
 
-`deliveryState` 的必填键是 `pendingItems`、`pendingBytes`、`lastDeliveryError` 和 `authBlocked`；`authBlockedSince` 与 `oldestObservedAt` 可选，且前者只有在 `authBlocked=true` 时出现并固定为本轮首次认证阻断时间。`lastDeliveryError` 的 exact allowlist 是空字符串、`AUTH_BLOCKED`、`DELIVERY_FAILED`、`QUEUE_CAPACITY`。Event 必填 `eventId/assignmentRevision/commandId/idempotencyKey/action/scope/targetRef/websiteCommandKeyId/receivedAt/outcome/payloadDigest/policyDecision/agentVersion`；`acceptedAt/startedAt/finishedAt/errorCode/upid/approvalRef/requestedByRef/resultDigest` 可选。`requestedByRef` 只能是受限的不透明引用，不能是邮箱或自由文本身份。通用 `outcome` 是 `dry_run|submitted|waiting|succeeded|failed|rolled_back|indeterminate|rejected`；`rolled_back` 只由 `agent.upgrade` 的回滚终态 builder 产生。升级 receipt 的 `waiting` 在 audit 中规范映射为 `submitted`，不会输出升级专用 `waiting`。`policyDecision` 只能是 `allowed|denied`，且 `rejected` 必须对应 `denied`。
+`deliveryState` 的必填键是 `pendingItems`、`pendingBytes`、`lastDeliveryError` 和 `authBlocked`；`authBlockedSince` 与 `oldestObservedAt` 可选，且前者只有在 `authBlocked=true` 时出现并固定为本轮首次认证阻断时间。`lastDeliveryError` 的 exact allowlist 是空字符串、`AUTH_BLOCKED`、`DELIVERY_FAILED`、`QUEUE_CAPACITY`。Event 必填 `eventId/assignmentRevision/commandId/idempotencyKey/action/scope/targetRef/websiteCommandKeyId/receivedAt/outcome/payloadDigest/policyDecision/agentVersion`；`target/acceptedAt/startedAt/endedAt/finishedAt/errorCode/failureStage/upid/approvalRef/requestedByRef/resultDigest` 可选。`target` 只用于 VM scope，严格必填 `clusterRef/nodeRef/guestType/vmid`，可选 `guestName`；`guestType` 只允许 `qemu|lxc`。`failureStage` 只允许 `admission|policy|execution|receipt`。所有新增字段均为 optional，旧 payload 保持有效；任何未知字段或显式 `null` 都必须拒绝。`requestedByRef` 只能是受限的不透明引用，不能是邮箱或自由文本身份。通用 `outcome` 是 `dry_run|submitted|waiting|succeeded|failed|rolled_back|indeterminate|rejected`；`rolled_back` 只由 `agent.upgrade` 的回滚终态 builder 产生。升级 receipt 的 `waiting` 在 audit 中规范映射为 `submitted`，不会输出升级专用 `waiting`。`policyDecision` 只能是 `allowed|denied`，且 `rejected` 必须对应 `denied`。
 
-`targetRef` 只能由已验签的 typed identity 在 Agent 内部构造，调用者不能自由填写：cluster 为 `cluster:<clusterRef>`，node 为 `node:<clusterRef>:<nodeRef>`，VM 为 `vm:<clusterRef>:<guestType>:<instanceUuid>:<generation>`。审计 schema 故意不含 `operationId` 或 `executionMode`；它们可以保留在 website command/receipt，但不能被额外塞入 monitoring audit payload。
+`targetRef` 只能由已验签的 typed identity 在 Agent 内部构造，调用者不能自由填写：cluster 为 `cluster:<clusterRef>`，node 为 `node:<clusterRef>:<nodeRef>`，VM 为 `vm:<clusterRef>:<guestType>:<instanceUuid>:<generation>`。可选 `target` 是同一 VM 身份的脱敏显示投影，cluster/guestType 必须与 `targetRef` 一致，node/VMID 来自 typed identity，名称只来自本机 PVE 受限配置回读。审计 schema 故意不含 `operationId` 或 `executionMode`；它们可以保留在 website command/receipt，但不能被额外塞入 monitoring audit payload。
+
+策略与失败阶段不可混用：已认证命令在 assignment、动作 allowlist 或审批策略上明确拒绝时使用 `policyDecision=denied/outcome=rejected/failureStage=policy`；命令已获准但被本机 Journal 锁阻断（包括 `RESOURCE_BUSY`）时使用 `allowed/failed/admission`；PVE 执行后失败使用 `allowed/failed/execution`；已提交操作的终态无法确认使用 `allowed/indeterminate/receipt`。未通过身份认证的命令不产生 monitoring audit。监控端依据稳定 action/errorCode/failureStage/policyDecision 显示中文，Agent 不上传中文描述或自由错误文本。
 
 威胁模型包括：command 参数主动携带密码/Token，PVE error/result 回显敏感数据，跨 trust-domain credential 混用，telemetry ACK 误删 audit，崩溃造成审计缺口，以及重试重复执行 mutation。实现必须从 typed command/receipt 投影上列固定字段，不能先序列化完整对象再做字符串替换。严禁上传 command `parameters`、receipt `result`、完整 command/receipt payload、原始 PVE response/error/UPID，以及 secret、root/其他密码、PVE/API token、HMAC/Ed25519 material。`payloadDigest` 绑定已签 command body；`resultDigest` 只散列不含 `result` 的 canonical safe receipt projection，绝不能先对原始 PVE/result body 求 hash 再借该字段外传。`upid` 字段若出现，只能是原始 UPID 的 `sha256:<lowercase hex>`；原始值只可保留在本地 journal 和 website receipt。相同禁令适用于 outbox 文件名/元数据、dead letter、日志、指标和错误。digest 只能用于一致性证明，不能代替敏感原文进入监控站。监控服务端须以 event ID 幂等落库，并让 UI 至少可按 event/command/action/target/time/outcome 查询；UI 和服务端由监控站交付，不能因本文目标契约而宣称已上线。
 

@@ -44,6 +44,17 @@ type DeliveryState struct {
 	OldestObservedAt  *time.Time       `json:"oldestObservedAt,omitempty"`
 }
 
+// Target is an optional, redacted VM/CT identity projection. It deliberately
+// excludes command parameters, network addresses, credentials and PVE task
+// identifiers. TargetRef remains the stable generation identity.
+type Target struct {
+	ClusterRef string `json:"clusterRef"`
+	NodeRef    string `json:"nodeRef"`
+	GuestType  string `json:"guestType"`
+	VMID       int    `json:"vmid"`
+	GuestName  string `json:"guestName,omitempty"`
+}
+
 // Event is the complete allowlist for a website control audit event. Do not
 // add command parameters or Receipt.Result to this type.
 type Event struct {
@@ -54,20 +65,25 @@ type Event struct {
 	Action              string           `json:"action"`
 	Scope               string           `json:"scope"`
 	TargetRef           string           `json:"targetRef"`
+	Target              *Target          `json:"target,omitempty"`
 	WebsiteCommandKeyID string           `json:"websiteCommandKeyId"`
 	ReceivedAt          time.Time        `json:"receivedAt"`
 	AcceptedAt          *time.Time       `json:"acceptedAt,omitempty"`
 	StartedAt           *time.Time       `json:"startedAt,omitempty"`
-	FinishedAt          *time.Time       `json:"finishedAt,omitempty"`
-	Outcome             string           `json:"outcome"`
-	ErrorCode           string           `json:"errorCode,omitempty"`
-	UPID                string           `json:"upid,omitempty"`
-	ApprovalRef         string           `json:"approvalRef,omitempty"`
-	RequestedByRef      string           `json:"requestedByRef,omitempty"`
-	PayloadDigest       string           `json:"payloadDigest"`
-	ResultDigest        string           `json:"resultDigest,omitempty"`
-	PolicyDecision      string           `json:"policyDecision"`
-	AgentVersion        string           `json:"agentVersion"`
+	EndedAt             *time.Time       `json:"endedAt,omitempty"`
+	// FinishedAt is retained as the audit-v1 compatibility name. New events
+	// mirror EndedAt into this field; old payloads without EndedAt remain valid.
+	FinishedAt     *time.Time `json:"finishedAt,omitempty"`
+	Outcome        string     `json:"outcome"`
+	ErrorCode      string     `json:"errorCode,omitempty"`
+	FailureStage   string     `json:"failureStage,omitempty"`
+	UPID           string     `json:"upid,omitempty"`
+	ApprovalRef    string     `json:"approvalRef,omitempty"`
+	RequestedByRef string     `json:"requestedByRef,omitempty"`
+	PayloadDigest  string     `json:"payloadDigest"`
+	ResultDigest   string     `json:"resultDigest,omitempty"`
+	PolicyDecision string     `json:"policyDecision"`
+	AgentVersion   string     `json:"agentVersion"`
 }
 
 // Batch is sent only to POST /internal/v1/monitoring/audit-events/batches.
@@ -126,20 +142,37 @@ func (e Event) Validate() error {
 	if !actionRE.MatchString(e.Action) || !validTargetRef(e.Scope, e.TargetRef) {
 		return errors.New("audit event action, scope, or targetRef is invalid")
 	}
+	if e.Target != nil {
+		if e.Scope != "vm" || e.Target.Validate() != nil || !targetMatchesRef(*e.Target, e.TargetRef) {
+			return errors.New("audit event target is invalid")
+		}
+	}
 	if !validUTCTime(e.ReceivedAt) {
 		return errors.New("audit event timing is invalid")
 	}
 	if e.FinishedAt != nil && (!validUTCTime(*e.FinishedAt) || e.FinishedAt.Before(e.ReceivedAt)) {
 		return errors.New("audit event finishedAt is invalid")
 	}
-	if e.AcceptedAt != nil && (!validUTCTime(*e.AcceptedAt) || e.AcceptedAt.Before(e.ReceivedAt) || e.FinishedAt != nil && e.AcceptedAt.After(*e.FinishedAt)) {
+	if e.EndedAt != nil && (!validUTCTime(*e.EndedAt) || e.EndedAt.Before(e.ReceivedAt)) {
+		return errors.New("audit event endedAt is invalid")
+	}
+	if e.EndedAt != nil && e.FinishedAt != nil && !e.EndedAt.Equal(*e.FinishedAt) {
+		return errors.New("audit event endedAt and finishedAt differ")
+	}
+	if e.AcceptedAt != nil && (!validUTCTime(*e.AcceptedAt) || e.AcceptedAt.Before(e.ReceivedAt) ||
+		e.FinishedAt != nil && e.AcceptedAt.After(*e.FinishedAt) || e.EndedAt != nil && e.AcceptedAt.After(*e.EndedAt)) {
 		return errors.New("audit event acceptedAt is invalid")
 	}
-	if e.StartedAt != nil && (!validUTCTime(*e.StartedAt) || e.StartedAt.Before(e.ReceivedAt) || e.FinishedAt != nil && e.StartedAt.After(*e.FinishedAt)) {
+	if e.StartedAt != nil && (!validUTCTime(*e.StartedAt) || e.StartedAt.Before(e.ReceivedAt) ||
+		e.AcceptedAt != nil && e.StartedAt.Before(*e.AcceptedAt) || e.FinishedAt != nil && e.StartedAt.After(*e.FinishedAt) ||
+		e.EndedAt != nil && e.StartedAt.After(*e.EndedAt)) {
 		return errors.New("audit event startedAt is invalid")
 	}
 	if !validOutcome(e.Outcome) || e.ErrorCode != "" && !errorCodeRE.MatchString(e.ErrorCode) {
 		return errors.New("audit event outcome or errorCode is invalid")
+	}
+	if !validFailureStage(e.FailureStage) {
+		return errors.New("audit event failureStage is invalid")
 	}
 	if e.UPID != "" && !digestRE.MatchString(e.UPID) {
 		return errors.New("audit event UPID must be a SHA-256 digest")
@@ -153,10 +186,43 @@ func (e Event) Validate() error {
 	if (e.Outcome == "rejected") != (e.PolicyDecision == "denied") {
 		return errors.New("audit event policyDecision does not match outcome")
 	}
+	if !failureStageMatchesOutcome(e.FailureStage, e.PolicyDecision, e.Outcome) {
+		return errors.New("audit event failureStage does not match policy or outcome")
+	}
 	if !validBoundedText(e.AgentVersion, 128, false) {
 		return errors.New("audit event agentVersion is invalid")
 	}
 	return nil
+}
+
+func (t Target) Validate() error {
+	if !targetPartRE.MatchString(t.ClusterRef) || !targetPartRE.MatchString(t.NodeRef) ||
+		(t.GuestType != "qemu" && t.GuestType != "lxc") || t.VMID < 1 ||
+		(t.GuestName != "" && !validBoundedText(t.GuestName, 128, false)) {
+		return errors.New("audit target is invalid")
+	}
+	return nil
+}
+
+func (t Target) MarshalJSON() ([]byte, error) {
+	if err := t.Validate(); err != nil {
+		return nil, err
+	}
+	type wire Target
+	return json.Marshal(wire(t))
+}
+
+func (t *Target) UnmarshalJSON(raw []byte) error {
+	type wire Target
+	var value wire
+	if err := decodeStrictObject(raw, &value); err != nil {
+		return err
+	}
+	if err := rejectNullFields(raw, "clusterRef", "nodeRef", "guestType", "vmid", "guestName"); err != nil {
+		return err
+	}
+	*t = Target(value)
+	return t.Validate()
 }
 
 func (b Batch) Validate() error {
@@ -199,6 +265,9 @@ func (d *DeliveryState) UnmarshalJSON(raw []byte) error {
 	if err := decodeStrictObject(raw, &value); err != nil {
 		return err
 	}
+	if err := rejectNullFields(raw, "pendingItems", "pendingBytes", "lastDeliveryError", "authBlocked", "authBlockedSince", "oldestObservedAt"); err != nil {
+		return err
+	}
 	if err := requireUTCFields(raw, "authBlockedSince", "oldestObservedAt"); err != nil {
 		return err
 	}
@@ -220,7 +289,13 @@ func (e *Event) UnmarshalJSON(raw []byte) error {
 	if err := decodeStrictObject(raw, &value); err != nil {
 		return err
 	}
-	if err := requireUTCFields(raw, "receivedAt", "acceptedAt", "startedAt", "finishedAt"); err != nil {
+	if err := rejectNullFields(raw,
+		"eventId", "assignmentRevision", "commandId", "idempotencyKey", "action", "scope", "targetRef", "target",
+		"websiteCommandKeyId", "receivedAt", "acceptedAt", "startedAt", "endedAt", "finishedAt", "outcome", "errorCode",
+		"failureStage", "upid", "approvalRef", "requestedByRef", "payloadDigest", "resultDigest", "policyDecision", "agentVersion"); err != nil {
+		return err
+	}
+	if err := requireUTCFields(raw, "receivedAt", "acceptedAt", "startedAt", "endedAt", "finishedAt"); err != nil {
 		return err
 	}
 	*e = Event(value)
@@ -241,6 +316,9 @@ func (b *Batch) UnmarshalJSON(raw []byte) error {
 	if err := decodeStrictObject(raw, &value); err != nil {
 		return err
 	}
+	if err := rejectNullFields(raw, "schemaVersion", "batchId", "monitoringAgentRef", "deviceId", "credentialEpoch", "sequence", "bootId", "observedAt", "sentAt", "deliveryState", "events"); err != nil {
+		return err
+	}
 	if err := requireUTCFields(raw, "observedAt", "sentAt"); err != nil {
 		return err
 	}
@@ -255,6 +333,41 @@ func validOutcome(value string) bool {
 	default:
 		return false
 	}
+}
+
+func validFailureStage(value string) bool {
+	switch value {
+	case "", "admission", "policy", "execution", "receipt":
+		return true
+	default:
+		return false
+	}
+}
+
+func failureStageMatchesOutcome(stage, policy, outcome string) bool {
+	if stage == "" {
+		return true // legacy audit-v1 payload
+	}
+	if policy == "denied" {
+		return stage == "policy" && outcome == "rejected"
+	}
+	switch stage {
+	case "admission":
+		return outcome == "failed"
+	case "policy":
+		return false
+	case "execution":
+		return outcome == "failed" || outcome == "rolled_back"
+	case "receipt":
+		return outcome == "failed" || outcome == "indeterminate"
+	default:
+		return false
+	}
+}
+
+func targetMatchesRef(target Target, targetRef string) bool {
+	parts := strings.Split(targetRef, ":")
+	return len(parts) == 5 && parts[0] == "vm" && parts[1] == target.ClusterRef && parts[2] == target.GuestType
 }
 
 func validTargetRef(scope, value string) bool {
@@ -416,6 +529,19 @@ func requireUTCFields(raw []byte, names ...string) error {
 		parsed, err := time.Parse(time.RFC3339Nano, text)
 		if err != nil || parsed.UTC().Format(time.RFC3339Nano) != text {
 			return fmt.Errorf("%s must be canonical RFC3339 UTC", name)
+		}
+	}
+	return nil
+}
+
+func rejectNullFields(raw []byte, names ...string) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if value, ok := object[name]; ok && bytes.Equal(value, []byte("null")) {
+			return fmt.Errorf("%s must be omitted instead of null", name)
 		}
 	}
 	return nil

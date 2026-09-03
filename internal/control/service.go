@@ -304,16 +304,31 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			receipt, duplicate, claimErr = s.journal.Claim(command, now)
 		}
 		journaled := false
+		admissionFailed := false
 		switch {
 		case claimErr != nil:
 			receipt, err = s.rejection(command, claimRejectionCode(claimErr), now)
+			admissionFailed = true
 		case duplicate:
 			journaled = true
 			err = nil
 		default:
+			guestNameCaptured := false
+			if auditable {
+				var captureErr error
+				guestNameCaptured, captureErr = s.captureAuditGuestName(ctx, command)
+				if captureErr != nil {
+					return processed, captureErr
+				}
+			}
 			receipt, err = s.executor.Execute(ctx, command, now)
 			receipt.OperationID = command.OperationID
 			ApplyReceiptCompatibility(&receipt)
+			if auditable && !guestNameCaptured {
+				if _, captureErr := s.captureAuditGuestName(ctx, command); captureErr != nil {
+					return processed, captureErr
+				}
+			}
 			// The public receipt carries only bounded safe codes. The underlying
 			// PVE error is intentionally not serialized or returned to the API.
 			if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
@@ -326,6 +341,8 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		}
 		if journaled {
 			err = s.enqueueJournaled(command.CommandID, receipt)
+		} else if admissionFailed && auditable && s.auditSink != nil {
+			err = s.enqueueAdmissionFailureAudit(ctx, command, receipt, now)
 		} else if auditable && s.auditSink != nil {
 			err = s.enqueueDeniedAudit(command, receipt, now)
 		} else {
@@ -340,6 +357,40 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		return processed, err
 	}
 	return processed, nil
+}
+
+func (s *Service) captureAuditGuestName(ctx context.Context, command Command) (bool, error) {
+	guestName, ok := s.lookupAuditGuestName(ctx, command)
+	if !ok {
+		return false, nil
+	}
+	if err := s.journal.RecordAuditGuestName(command, guestName); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Service) lookupAuditGuestName(ctx context.Context, command Command) (string, bool) {
+	if command.Scope != ScopeVM || s.executor.Client == nil {
+		return "", false
+	}
+	config, err := s.executor.Client.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return "", false
+	}
+	guestName, ok := configString(config.Raw, "name")
+	if !ok && command.Identity.GuestType == "lxc" {
+		guestName, ok = configString(config.Raw, "hostname")
+	}
+	if !ok || guestName == "" {
+		return "", false
+	}
+	target := auditlog.Target{ClusterRef: command.Identity.ClusterRef, NodeRef: command.Identity.NodeRef,
+		GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, GuestName: guestName}
+	if target.Validate() != nil {
+		return "", false
+	}
+	return guestName, true
 }
 
 func claimRejectionCode(err error) string {
@@ -638,6 +689,38 @@ func (s *Service) enqueueDeniedAudit(command Command, receipt Receipt, receivedA
 	// A denied command was authenticated but never accepted for execution.
 	event.AcceptedAt = nil
 	event.StartedAt = nil
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	if err := s.auditSink.Enqueue(event); err != nil {
+		return err
+	}
+	return s.enqueue(receipt)
+}
+
+func (s *Service) enqueueAdmissionFailureAudit(ctx context.Context, command Command, receipt Receipt, receivedAt time.Time) error {
+	if s.auditSink == nil {
+		return errors.New("control audit sink is unavailable")
+	}
+	context, err := newAuditContext(command, receivedAt, s.agentVersion)
+	if err != nil {
+		return err
+	}
+	event, err := auditEventFromReceipt(context, receipt)
+	if err != nil {
+		return err
+	}
+	// Signature, assignment, allowlist and approval already succeeded. The
+	// local durable admission gate rejected execution before it started.
+	event.PolicyDecision = "allowed"
+	event.Outcome = "failed"
+	event.FailureStage = "admission"
+	event.StartedAt = nil
+	if guestName, ok := s.lookupAuditGuestName(ctx, command); ok && event.Target != nil {
+		target := *event.Target
+		target.GuestName = guestName
+		event.Target = &target
+	}
 	if err := event.Validate(); err != nil {
 		return err
 	}
