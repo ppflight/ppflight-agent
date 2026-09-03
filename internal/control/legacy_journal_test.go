@@ -88,7 +88,7 @@ func legacyMigrationFixture(t *testing.T) (*Journal, Command, Command, legacyJou
 
 func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *testing.T) {
 	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
-	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.30"); err != nil || duplicate {
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); err != nil || duplicate {
 		t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
 	}
 	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
@@ -118,7 +118,7 @@ func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.0-rc.30")
+	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.0-rc.31")
 	if err != nil || !duplicate || replayed.State != "succeeded" || !bytes.Equal(replayed.Result, resultRaw) {
 		t.Fatalf("replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
 	}
@@ -197,6 +197,48 @@ func TestLegacyJournalMigrationRejectsRetirementFromDifferentLegacyRevision(t *t
 	}
 }
 
+func TestLegacyJournalMigrationAcceptsOnlyExactHistoricalIndeterminateCodes(t *testing.T) {
+	t.Run("PVE result indeterminate", func(t *testing.T) {
+		journal, _, migration, parameters, now := legacyMigrationFixture(t)
+		path := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+		record, err := readJournal(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Receipt.Code = "PVE_RESULT_INDETERMINATE"
+		if err := writeJournal(path, record); err != nil {
+			t.Fatal(err)
+		}
+		if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); err != nil || duplicate {
+			t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
+		}
+		result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
+		if err != nil || !result.Migrated || len(result.RetiredIndeterminateCommandIDs) != 1 {
+			t.Fatalf("result=%#v err=%v", result, err)
+		}
+		record, err = readJournal(path)
+		if err != nil || record.RetiredByCommandID != migration.CommandID {
+			t.Fatalf("retired record=%#v err=%v", record, err)
+		}
+	})
+
+	t.Run("other code", func(t *testing.T) {
+		journal, _, migration, parameters, now := legacyMigrationFixture(t)
+		path := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+		record, err := readJournal(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record.Receipt.Code = "OTHER_INDETERMINATE"
+		if err := writeJournal(path, record); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrResourceBusy) {
+			t.Fatalf("unsupported historical code did not retain resource lock: %v", err)
+		}
+	})
+}
+
 func TestLegacyJournalMigrationRejectsNonTerminalCloneUPIDAndUnlistedIndeterminate(t *testing.T) {
 	t.Run("clone not succeeded", func(t *testing.T) {
 		journal, clone, migration, parameters, now := legacyMigrationFixture(t)
@@ -231,7 +273,7 @@ func TestLegacyJournalMigrationRejectsNonTerminalCloneUPIDAndUnlistedIndetermina
 		parameters.RetireIndeterminateCommandIDs = []string{}
 		raw, _ := json.Marshal(parameters)
 		migration.Parameters = raw
-		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.30"); !errors.Is(err, ErrResourceBusy) {
+		if _, _, err := journal.ClaimWithAudit(migration, now.Add(3*time.Second), "0.1.0-rc.31"); !errors.Is(err, ErrResourceBusy) {
 			t.Fatalf("unlisted mutation claim err=%v", err)
 		}
 	})

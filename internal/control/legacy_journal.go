@@ -171,9 +171,9 @@ func legacyCloneEligible(record journalRecord, command Command, parameters legac
 func legacyIndeterminateEligible(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter, resourceKey, commandID string) bool {
 	if record.CommandID != commandID || record.ResourceKey != resourceKey || !record.Mutating || record.Action == "vm.migrate-legacy-journal" ||
 		record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
-		record.Receipt.State != "indeterminate" || record.Receipt.Code != "EXECUTION_INDETERMINATE" ||
+		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code) ||
 		record.Receipt.CommandID != record.CommandID || record.Receipt.OperationID != record.OperationID ||
-		record.Receipt.AgentRef != record.AgentRef || record.Receipt.PVETaskUPID != "" {
+		record.Receipt.AgentRef != record.AgentRef || record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "" {
 		return false
 	}
 	if record.RetiredByCommandID != "" {
@@ -235,6 +235,10 @@ func optionalCounterMatches(value, expected protocol.Counter) bool {
 	return value == 0 || value == expected
 }
 
+func legacyIndeterminateReceiptCode(code string) bool {
+	return code == "EXECUTION_INDETERMINATE" || code == "PVE_RESULT_INDETERMINATE"
+}
+
 func validJournalMigrationMarkers(record journalRecord) bool {
 	if (record.MigratedByCommandID == "") != (record.MigratedAt == nil) ||
 		(record.RetiredByCommandID == "") != (record.RetiredAt == nil) ||
@@ -250,7 +254,7 @@ func validJournalMigrationMarkers(record journalRecord) bool {
 	}
 	if record.RetiredByCommandID != "" && (record.Action == "vm.migrate-legacy-journal" || record.State != "indeterminate" ||
 		record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
-		record.Receipt.State != "indeterminate" || record.Receipt.Code != "EXECUTION_INDETERMINATE" ||
+		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code) ||
 		record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "") {
 		return false
 	}

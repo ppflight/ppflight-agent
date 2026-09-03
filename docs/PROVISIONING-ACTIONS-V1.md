@@ -8,7 +8,8 @@ HMAC receipt 和 monitoring audit 规则。JSON decoder 拒绝 unknown/duplicate
 首个包含这些 action 的 Agent 版本是 `0.1.0-rc.27`；clone lineage 修正与可用的反向
 WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 guest firewall rules
 严格回验从 `0.1.0-rc.29` 开始；跨 assignment revision 的精确 legacy 恢复合同从
-`0.1.0-rc.30` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
+`0.1.0-rc.30` 开始；旧版 `PVE_RESULT_INDETERMINATE` 精确恢复兼容从 `0.1.0-rc.31`
+开始。协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 
@@ -47,7 +48,8 @@ revision 的后续定型命令。Agent 执行前还会重新读取
 `sourceVmid`，确认它仍是当前 node 上的同 guest type 模板，并重算 `sourceConfigSha256`。
 
 只允许把所列、同 VM generation、状态恰为
-`indeterminate/EXECUTION_INDETERMINATE` 且 Journal 与 receipt 都没有 UPID/upgrade ID 的旧记录
+`state=indeterminate` 且 code 精确为 `EXECUTION_INDETERMINATE` 或旧版
+`PVE_RESULT_INDETERMINATE`、Journal 与 receipt 都没有 UPID/upgrade ID 的旧记录
 标记为 retired。记录文件和审计证据保留；未列出的活动 mutation、带 UPID、身份冲突或损坏记录
 都会使整个动作 fail closed。clone 的 migration marker 使不同 command 无法二次消费；同一
 command/idempotency digest 可在进程崩溃后继续未完成的本地迁移，并在完成后只返回第一次结果。
