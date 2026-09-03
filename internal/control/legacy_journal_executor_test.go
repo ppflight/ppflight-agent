@@ -83,9 +83,14 @@ func TestLegacyJournalMigrationRevalidatesCurrentTemplateBeforeLocalWrite(t *tes
 	}
 	sourceOSType = "l26"
 	for failure, code := range map[error]string{
-		ErrUnlistedActiveMutation:  "UNLISTED_ACTIVE_MUTATION",
-		ErrListedRecordNotEligible: "LISTED_RECORD_NOT_ELIGIBLE",
-		ErrCloneLineageMismatch:    "CLONE_LINEAGE_MISMATCH",
+		ErrUnlistedActiveMutation:        "UNLISTED_ACTIVE_MUTATION",
+		ErrListedRecordNotEligible:       "LISTED_RECORD_NOT_ELIGIBLE",
+		ErrCloneJournalNotFound:          "CLONE_JOURNAL_NOT_FOUND",
+		ErrCloneDigestMismatch:           "CLONE_DIGEST_MISMATCH",
+		ErrCloneResourceIdentityMismatch: "CLONE_RESOURCE_IDENTITY_MISMATCH",
+		ErrCloneTerminalReceiptInvalid:   "CLONE_TERMINAL_RECEIPT_INVALID",
+		ErrCloneLegacyAuthorityMismatch:  "CLONE_LEGACY_AUTHORITY_MISMATCH",
+		ErrCloneAlreadyMigrated:          "CLONE_ALREADY_MIGRATED",
 	} {
 		migrationFailure = failure
 		called = false

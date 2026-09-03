@@ -356,8 +356,18 @@ func claimRejectionCode(err error) string {
 		return "UNLISTED_ACTIVE_MUTATION"
 	case errors.Is(err, ErrListedRecordNotEligible):
 		return "LISTED_RECORD_NOT_ELIGIBLE"
-	case errors.Is(err, ErrCloneLineageMismatch):
-		return "CLONE_LINEAGE_MISMATCH"
+	case errors.Is(err, ErrCloneJournalNotFound):
+		return "CLONE_JOURNAL_NOT_FOUND"
+	case errors.Is(err, ErrCloneDigestMismatch):
+		return "CLONE_DIGEST_MISMATCH"
+	case errors.Is(err, ErrCloneResourceIdentityMismatch):
+		return "CLONE_RESOURCE_IDENTITY_MISMATCH"
+	case errors.Is(err, ErrCloneTerminalReceiptInvalid):
+		return "CLONE_TERMINAL_RECEIPT_INVALID"
+	case errors.Is(err, ErrCloneLegacyAuthorityMismatch):
+		return "CLONE_LEGACY_AUTHORITY_MISMATCH"
+	case errors.Is(err, ErrCloneAlreadyMigrated):
+		return "CLONE_ALREADY_MIGRATED"
 	default:
 		return "JOURNAL_UNAVAILABLE"
 	}

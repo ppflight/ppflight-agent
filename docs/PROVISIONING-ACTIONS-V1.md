@@ -9,7 +9,8 @@ HMAC receipt 和 monitoring audit 规则。JSON decoder 拒绝 unknown/duplicate
 WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 guest firewall rules
 严格回验从 `0.1.0-rc.29` 开始；跨 assignment revision 的精确 legacy 恢复合同从
 `0.1.0-rc.30` 开始；旧版 `PVE_RESULT_INDETERMINATE` 精确恢复兼容从 `0.1.0-rc.31`
-开始。协议版本仍为 `schemaVersion: 1`，这些 action
+开始；旧生产 Journal 缺失 record-level action 与 clone source identity 的签名审计恢复从
+`0.1.1-rc.2` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 
@@ -44,7 +45,10 @@ VM resource key、audit signing key/target，且任何已存在的 binding/devic
 generation 字段必须分别与当前 authority 或显式 legacy revision 一致。RC.27 缺失的 authority 字段
 只能由当前已验签并获批的恢复命令补齐，不能由本地 CLI 或自报 payload 补齐；原始 audit context
 继续保留 `legacyAssignmentRevision`，迁移后的 lineage authority 则提升到当前 revision，以允许当前
-revision 的后续定型命令。Agent 执行前还会重新读取
+revision 的后续定型命令。旧记录缺失 record-level `action` 时，只能从该记录自身已经持久化且通过
+校验的 signed audit action 恢复，并且必须是 known、mutating、VM-scope action；clone 必须精确恢复为
+`vm.clone`。缺失的 clone source identity 只能在 Agent 重新读取当前 PVE 模板并核对签名参数中的
+source config SHA-256 后补齐。Agent 执行前还会重新读取
 `sourceVmid`，确认它仍是当前 node 上的同 guest type 模板，并重算 `sourceConfigSha256`。
 
 只允许把所列、同 VM generation、状态恰为
@@ -58,8 +62,11 @@ command/idempotency digest 可在进程崩溃后继续未完成的本地迁移�
 显式 `legacyAssignmentRevision` 及当前命令的 binding、device、epoch、signing key、VM 身份和
 generation 逐项精确匹配。迁移资格不再以“必须缺字段”判断。Claim 前拒绝会返回脱敏细分码：
 存在未列出的活动 mutation 为 `UNLISTED_ACTIVE_MUTATION`，列出记录不满足无 UPID、终态或身份
-限制为 `LISTED_RECORD_NOT_ELIGIBLE`，clone command/operation/digest/template lineage 不匹配为
-`CLONE_LINEAGE_MISMATCH`；这些分类不会放宽成通用 Journal 清理接口。
+限制为 `LISTED_RECORD_NOT_ELIGIBLE`。clone 分别使用 `CLONE_JOURNAL_NOT_FOUND`、
+`CLONE_DIGEST_MISMATCH`、`CLONE_RESOURCE_IDENTITY_MISMATCH`、
+`CLONE_TERMINAL_RECEIPT_INVALID`、`CLONE_LEGACY_AUTHORITY_MISMATCH` 和
+`CLONE_ALREADY_MIGRATED`；这些分类只暴露拒绝类别，不输出 Journal 内容、参数或密钥，也不会放宽成
+通用 Journal 清理接口。
 
 成功 result：
 

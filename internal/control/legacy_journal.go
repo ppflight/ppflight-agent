@@ -74,12 +74,12 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 	clone, err := readJournal(clonePath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return result, ErrCloneLineageMismatch
+			return result, ErrCloneJournalNotFound
 		}
 		return result, err
 	}
-	if !legacyCloneEligible(clone, command, parameters, resourceKey) {
-		return result, ErrCloneLineageMismatch
+	if eligibilityErr := legacyCloneEligibilityError(clone, command, parameters, resourceKey); eligibilityErr != nil {
+		return result, eligibilityErr
 	}
 	retirements := make([]struct {
 		path   string
@@ -98,6 +98,7 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 	}
 	migratedAt := now.UTC()
 	backfillLegacyAuthority(&clone, command)
+	clone.SourceConfigSHA256 = parameters.SourceConfigSHA256
 	clone.SourceTemplateRef = parameters.TemplateRef
 	clone.SourceVMID = parameters.SourceVMID
 	clone.MigratedByCommandID = command.CommandID
@@ -135,12 +136,12 @@ func (j *Journal) validateLegacyMigrationClaimLocked(command Command, parameters
 	clone, err := readJournal(j.path(parameters.LegacyCloneCommandID))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return ErrCloneLineageMismatch
+			return ErrCloneJournalNotFound
 		}
 		return err
 	}
-	if !legacyCloneEligible(clone, command, parameters, resourceKey) {
-		return ErrCloneLineageMismatch
+	if eligibilityErr := legacyCloneEligibilityError(clone, command, parameters, resourceKey); eligibilityErr != nil {
+		return eligibilityErr
 	}
 	allowed := make(map[string]struct{}, len(parameters.RetireIndeterminateCommandIDs))
 	for _, commandID := range parameters.RetireIndeterminateCommandIDs {
@@ -176,22 +177,41 @@ func (j *Journal) validateLegacyMigrationClaimLocked(command Command, parameters
 	return nil
 }
 
-func legacyCloneEligible(record journalRecord, command Command, parameters legacyJournalMigrationP, resourceKey string) bool {
-	if record.CommandID != parameters.LegacyCloneCommandID || record.OperationID != parameters.LegacyCloneOperationID ||
-		record.Digest != parameters.LegacyCloneDigest || record.Action != "vm.clone" || record.SourceConfigSHA256 != parameters.SourceConfigSHA256 ||
-		record.ResourceKey != resourceKey || !recordSucceeded(record) {
-		return false
+func legacyCloneEligibilityError(record journalRecord, command Command, parameters legacyJournalMigrationP, resourceKey string) error {
+	if record.CommandID != parameters.LegacyCloneCommandID || record.OperationID != parameters.LegacyCloneOperationID || record.ResourceKey != resourceKey {
+		return ErrCloneResourceIdentityMismatch
+	}
+	action, actionOK := legacyRecordAction(record)
+	if !actionOK || action != "vm.clone" {
+		return ErrCloneResourceIdentityMismatch
+	}
+	if record.Digest != parameters.LegacyCloneDigest ||
+		(record.SourceConfigSHA256 != "" && record.SourceConfigSHA256 != parameters.SourceConfigSHA256) {
+		return ErrCloneDigestMismatch
+	}
+	if !recordSucceeded(record) || record.Receipt.AgentRef != record.AgentRef {
+		return ErrCloneTerminalReceiptInvalid
 	}
 	if record.MigratedByCommandID != "" {
-		return record.MigratedByCommandID == command.CommandID && record.SourceTemplateRef == parameters.TemplateRef &&
-			record.SourceVMID == parameters.SourceVMID && recordAuthorityEquals(record, command)
+		if record.MigratedByCommandID == command.CommandID && record.SourceConfigSHA256 == parameters.SourceConfigSHA256 &&
+			record.SourceTemplateRef == parameters.TemplateRef &&
+			record.SourceVMID == parameters.SourceVMID && recordAuthorityEquals(record, command) {
+			return nil
+		}
+		return ErrCloneAlreadyMigrated
 	}
-	return record.SourceTemplateRef == "" && record.SourceVMID == 0 &&
-		legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision)
+	if !legacySourceIdentityMatches(record, parameters) {
+		return ErrCloneResourceIdentityMismatch
+	}
+	if !legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision) {
+		return ErrCloneLegacyAuthorityMismatch
+	}
+	return nil
 }
 
 func legacyIndeterminateEligible(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter, resourceKey, commandID string) bool {
-	if record.CommandID != commandID || record.ResourceKey != resourceKey || !record.Mutating || record.Action == "vm.migrate-legacy-journal" ||
+	action, actionOK := legacyRecordAction(record)
+	if !actionOK || record.CommandID != commandID || record.ResourceKey != resourceKey || !record.Mutating || action == "vm.migrate-legacy-journal" ||
 		record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
 		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code) ||
 		record.Receipt.CommandID != record.CommandID || record.Receipt.OperationID != record.OperationID ||
@@ -205,10 +225,12 @@ func legacyIndeterminateEligible(record journalRecord, command Command, legacyAs
 }
 
 func legacyRecordAuthorityMatches(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter) bool {
+	_, actionOK := legacyRecordAction(record)
 	if record.AuditContext == nil || record.AgentRef != command.AgentRef || record.NodeRef != command.Identity.NodeRef ||
+		!actionOK ||
 		record.Scope != ScopeVM || record.AuditContext.AssignmentRevision != legacyAssignmentRevision ||
 		record.AuditContext.CommandID != record.CommandID || record.AuditContext.OperationID != record.OperationID ||
-		record.AuditContext.Action != record.Action || record.AuditContext.Scope != ScopeVM ||
+		record.AuditContext.Scope != ScopeVM ||
 		record.AuditContext.WebsiteCommandKeyID != command.SigningKeyID || record.AuditContext.ApprovalRef == "" {
 		return false
 	}
@@ -223,7 +245,35 @@ func legacyRecordAuthorityMatches(record journalRecord, command Command, legacyA
 		optionalIntMatches(record.VMID, command.Identity.VMID) && optionalCounterMatches(record.Generation, protocol.Counter(command.Identity.Generation))
 }
 
+// legacyRecordAction accepts a missing record-level action only when the
+// durable signed audit projection supplies a known, mutating VM action. This
+// is the exact rc.27 production shape; it never derives an action from the
+// migration request or from untrusted free-form data.
+func legacyRecordAction(record journalRecord) (string, bool) {
+	if record.AuditContext == nil || record.AuditContext.Action == "" ||
+		!validActionScope(record.AuditContext.Action, ScopeVM) || !requiresApproval(record.AuditContext.Action) {
+		return "", false
+	}
+	if record.Action != "" && record.Action != record.AuditContext.Action {
+		return "", false
+	}
+	return record.AuditContext.Action, true
+}
+
+func legacySourceIdentityMatches(record journalRecord, parameters legacyJournalMigrationP) bool {
+	templateMatches := record.SourceTemplateRef == "" || record.SourceTemplateRef == parameters.TemplateRef
+	vmidMatches := record.SourceVMID == 0 || record.SourceVMID == parameters.SourceVMID
+	// Reject partially populated old source identity. It must be entirely
+	// absent or already equal to the independently re-read PVE source.
+	identityAbsent := record.SourceTemplateRef == "" && record.SourceVMID == 0
+	identityComplete := record.SourceTemplateRef != "" && record.SourceVMID != 0
+	return templateMatches && vmidMatches && (identityAbsent || identityComplete)
+}
+
 func backfillLegacyAuthority(record *journalRecord, command Command) {
+	if record.Action == "" && record.AuditContext != nil {
+		record.Action = record.AuditContext.Action
+	}
 	record.IdempotencyKey = record.AuditContext.IdempotencyKey
 	record.BindingID = command.BindingID
 	record.DeviceID = command.DeviceID

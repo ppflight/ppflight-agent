@@ -385,13 +385,178 @@ func TestLegacyJournalMigrationAcceptsCompleteHistoricalAuthorityProductionShape
 	}
 }
 
+// This reproduces the older production records observed on VMID 100: the
+// record-level action and clone source identity were absent, while the signed
+// audit projection retained the exact action, revision, signer and VM target.
+func TestLegacyJournalMigrationRecoversMissingActionAndCloneSourceFromSignedAudit(t *testing.T) {
+	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+	migration.AssignmentRevision = 6
+
+	clonePath := journal.path(clone.CommandID)
+	cloneRecord, err := readJournal(clonePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloneRecord.Action = ""
+	cloneRecord.SourceConfigSHA256 = ""
+	cloneRecord.SourceTemplateRef = ""
+	cloneRecord.SourceVMID = 0
+	cloneRecord.PVETaskUPID = "UPID:pve1:1:2:3:qmclone:101:root@pam!api:"
+	cloneRecord.Receipt.PVETaskUPID = cloneRecord.PVETaskUPID
+	if err := writeJournal(clonePath, cloneRecord); err != nil {
+		t.Fatal(err)
+	}
+
+	indeterminatePath := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+	indeterminate, err := readJournal(indeterminatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indeterminate.Action = ""
+	indeterminate.Receipt.Code = "PVE_RESULT_INDETERMINATE"
+	if err := writeJournal(indeterminatePath, indeterminate); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.1-rc.2"); err != nil || duplicate {
+		t.Fatalf("production migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
+	if err != nil || !result.Migrated {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+
+	cloneRecord, err = readJournal(clonePath)
+	if err != nil || cloneRecord.Action != "vm.clone" || cloneRecord.SourceConfigSHA256 != parameters.SourceConfigSHA256 ||
+		cloneRecord.SourceTemplateRef != parameters.TemplateRef || cloneRecord.SourceVMID != parameters.SourceVMID ||
+		cloneRecord.MigratedByCommandID != migration.CommandID {
+		t.Fatalf("migrated clone=%#v err=%v", cloneRecord, err)
+	}
+	indeterminate, err = readJournal(indeterminatePath)
+	if err != nil || indeterminate.Action != "vm.set-resources" || indeterminate.RetiredByCommandID != migration.CommandID {
+		t.Fatalf("retired record=%#v err=%v", indeterminate, err)
+	}
+	if _, err := os.Stat(clonePath); err != nil {
+		t.Fatalf("clone journal file was removed: %v", err)
+	}
+	if _, err := os.Stat(indeterminatePath); err != nil {
+		t.Fatalf("retired journal file was removed: %v", err)
+	}
+	resultRaw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := Receipt{SchemaVersion: 1, ReceiptID: "55555555-5555-4555-8555-555555555555", CommandID: migration.CommandID,
+		OperationID: migration.OperationID, AgentRef: migration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(2 * time.Second), FinishedAt: now.Add(3 * time.Second), Result: resultRaw}
+	if err := journal.Complete(migration, receipt); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenJournal(journal.directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, duplicate, err := reopened.ClaimWithAudit(migration, now.Add(4*time.Second), "0.1.1-rc.2")
+	if err != nil || !duplicate || replayed.Code != "SUCCEEDED" || !bytes.Equal(replayed.Result, resultRaw) {
+		t.Fatalf("restart replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
+	}
+
+	initial := legacyAuthorityCommand("vm.set-initial-resources", initialResourcesFixture, "recovered-initial-command", "recovered-initial-operation")
+	initial.AssignmentRevision = migration.AssignmentRevision
+	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
+		t.Fatalf("recovered clone lineage did not authorize initial resources: %v", err)
+	}
+}
+
+func TestLegacyJournalMigrationRejectsMissingOrUntrustedAuditAction(t *testing.T) {
+	for name, auditAction := range map[string]string{
+		"missing":   "",
+		"read only": "vm.verify-delivery",
+		"wrong":     "vm.delete",
+	} {
+		t.Run(name, func(t *testing.T) {
+			journal, clone, migration, parameters, _ := legacyMigrationFixture(t)
+			record, err := readJournal(journal.path(clone.CommandID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			record.Action = ""
+			record.AuditContext.Action = auditAction
+			resourceKey, err := journalResourceKey(migration)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := legacyCloneEligibilityError(record, migration, parameters, resourceKey); !errors.Is(err, ErrCloneResourceIdentityMismatch) {
+				t.Fatalf("eligibility error=%v", err)
+			}
+		})
+	}
+}
+
 func TestLegacyJournalMigrationClaimReturnsSpecificConflictClasses(t *testing.T) {
-	t.Run("clone lineage mismatch", func(t *testing.T) {
+	t.Run("clone journal not found", func(t *testing.T) {
+		journal, clone, migration, _, now := legacyMigrationFixture(t)
+		if err := os.Remove(journal.path(clone.CommandID)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.2"); !errors.Is(err, ErrCloneJournalNotFound) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("clone digest mismatch", func(t *testing.T) {
 		journal, _, migration, parameters, now := legacyMigrationFixture(t)
 		parameters.LegacyCloneDigest = strings.Repeat("c", 64)
 		raw, _ := json.Marshal(parameters)
 		migration.Parameters = raw
-		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.1"); !errors.Is(err, ErrCloneLineageMismatch) {
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.2"); !errors.Is(err, ErrCloneDigestMismatch) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("clone resource identity mismatch", func(t *testing.T) {
+		journal, clone, migration, _, now := legacyMigrationFixture(t)
+		record, _ := readJournal(journal.path(clone.CommandID))
+		record.ResourceKey = "vm:cluster-1:qemu:999:1"
+		if err := writeJournal(journal.path(clone.CommandID), record); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.2"); !errors.Is(err, ErrCloneResourceIdentityMismatch) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("clone terminal receipt invalid", func(t *testing.T) {
+		journal, clone, migration, _, now := legacyMigrationFixture(t)
+		record, _ := readJournal(journal.path(clone.CommandID))
+		record.State = "failed"
+		record.Receipt.State = "failed"
+		record.Receipt.Code = "PVE_TASK_FAILED"
+		if err := writeJournal(journal.path(clone.CommandID), record); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.2"); !errors.Is(err, ErrCloneTerminalReceiptInvalid) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("clone legacy authority mismatch", func(t *testing.T) {
+		journal, clone, migration, _, now := legacyMigrationFixture(t)
+		record, _ := readJournal(journal.path(clone.CommandID))
+		record.AuditContext.WebsiteCommandKeyID = "website-key-2"
+		if err := writeJournal(journal.path(clone.CommandID), record); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := journal.ClaimWithAudit(migration, now, "0.1.1-rc.2"); !errors.Is(err, ErrCloneLegacyAuthorityMismatch) {
+			t.Fatalf("claim error=%v", err)
+		}
+	})
+	t.Run("clone already migrated", func(t *testing.T) {
+		journal, _, migration, parameters, now := legacyMigrationFixture(t)
+		if _, err := journal.MigrateLegacyVMJournal(migration, parameters, now); err != nil {
+			t.Fatal(err)
+		}
+		second := migration
+		second.CommandID = "second-migration-command"
+		second.OperationID = "second-migration-operation"
+		second.IdempotencyKey = "second-migration-idempotency"
+		if _, _, err := journal.ClaimWithAudit(second, now.Add(time.Second), "0.1.1-rc.2"); !errors.Is(err, ErrCloneAlreadyMigrated) {
 			t.Fatalf("claim error=%v", err)
 		}
 	})
@@ -416,7 +581,12 @@ func TestLegacyJournalMigrationConflictReceiptCodesAreStableAndRedacted(t *testi
 	}{
 		{fmt.Errorf("wrapped record id: %w", ErrUnlistedActiveMutation), "UNLISTED_ACTIVE_MUTATION"},
 		{fmt.Errorf("wrapped record id: %w", ErrListedRecordNotEligible), "LISTED_RECORD_NOT_ELIGIBLE"},
-		{fmt.Errorf("wrapped record id: %w", ErrCloneLineageMismatch), "CLONE_LINEAGE_MISMATCH"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneJournalNotFound), "CLONE_JOURNAL_NOT_FOUND"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneDigestMismatch), "CLONE_DIGEST_MISMATCH"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneResourceIdentityMismatch), "CLONE_RESOURCE_IDENTITY_MISMATCH"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneTerminalReceiptInvalid), "CLONE_TERMINAL_RECEIPT_INVALID"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneLegacyAuthorityMismatch), "CLONE_LEGACY_AUTHORITY_MISMATCH"},
+		{fmt.Errorf("wrapped record id: %w", ErrCloneAlreadyMigrated), "CLONE_ALREADY_MIGRATED"},
 	}
 	for _, test := range tests {
 		if got := claimRejectionCode(test.err); got != test.code || strings.Contains(got, "record id") {
