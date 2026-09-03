@@ -317,6 +317,8 @@ GET /api2/json/nodes/{node}/tasks/{UPID}/status
 
 `queued/running` 对应 `waiting/PVE_TASK_WAITING`；终态 `exitstatus=OK` 对应 `succeeded`，其他终态对应 `failed/PVE_TASK_FAILED`。Agent 重启后继续查询同一 UPID，绝不能重新提交原 mutation。若崩溃发生在 durable claim 之后、UPID 持久化之前，只能返回 `indeterminate/EXECUTION_INDETERMINATE`，不得猜测失败后重试。
 
+`vm.cloud-init-snippet.delete` 在通用 command state 之外保存严格单调的安全阶段：`validated`、`reference_proven`、`detached`、`delete_submitted`、`deleted`、`verified`、`succeeded`。记录只含签名 identity、storage identifier 和 exact volume 的 SHA-256；原始 volume、`cicustom`、路径与 PVE response 不可表示。detach 后重启可凭同一 command digest、先前 reference proof 与当前 absent 回读继续；delete UPID 在返回 submitted receipt 前先落盘。UPID `stopped/OK` 之后仍必须读取 target config 和 `content=snippets` 清单并按 volume digest 证明两处 absent，才从 `deleted` 推进到 `verified/succeeded`。状态读取失败保留 waiting/indeterminate，非 OK 终态失败，均不得重新提交 DELETE。最终网站 receipt 不公开原始 UPID。
+
 ### 5.1 systemd watchdog、previousExit 与离线命令
 
 生产 unit 当前固定 `Type=notify`、`NotifyAccess=main`、`WatchdogSec=60s`、`Restart=always`、`RestartSec=3s` 和 `StartLimitIntervalSec=0`；显式 `systemctl stop/disable` 仍是管理员的权威操作。Agent 在 tcp4 health listener 已成功监听后才发送 `READY=1`，正常退出发送 `STOPPING=1`。watchdog 心跳不是无条件定时器：采集器会报告请求级 progress，活动采集在完整 watchdog timeout 内无进展、或空闲循环超过下一次 `sampleInterval + watchdog timeout` 仍无进展时，Agent 停止 heartbeat 并返回错误，让 systemd 重启。该机制只监督本机进程，不执行 PVE mutation，也不证明官网/监控站可用。
@@ -428,6 +430,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.set-network` | `interface` 及 bridge/model/MAC/VLAN/MTU/firewall/rate/IP/gateway typed 字段。 |
 | vm | `vm.set-rate` | `interface`, `rateMbps`；`0` 移除 rate。 |
 | vm | `vm.set-cloud-init` | QEMU only；`hostname/username/password/passwordFormat/sshAuthorizedKeys/qgaEnabled`，且 `qgaEnabled=true`。secret 不进入 result/receipt/audit。 |
+| vm | `vm.cloud-init-snippet.delete` | Linux QEMU only、修改类且必须审批。exact 参数为 `volume/attachment/deleteUnreferenced`；attachment 只能是 `network`，bool 只能为 true，volume 只能是 `<storage>:snippets/<filename>`。执行前精确证明目标 `cicustom.network` 引用并无任何其他 QEMU/LXC 引用，使用 config digest 只解除 network，再删除一个 URL-encoded storage content；同步或 UPID 终态后均回读目标 config 与 storage。Journal 只保存 storage ID、volume SHA-256 和 `validated → reference_proven → detached → delete_submitted → deleted → verified → succeeded` 阶段，不保存 volume/config/PVE response。成功 result 固定为 `detached/deleted/alreadyAbsent` 三个 bool。 |
 | vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone`、等待 exit code 0，并用固定只读 `guest-get-timezone` 回验。 |
 | vm | `vm.verify-delivery` | QEMU read-only；`notBefore` 与完整 `expected` 资源/磁盘 IO/多网卡/IPFilter/时区合同。重新读取 PVE config、QGA interfaces/timezone 和 guest firewall；全部匹配才返回 ready。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
@@ -450,6 +453,34 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `firewall.ipset.entry.update` | `name`, `cidr`，以及可选 `comment/noSubnet`；后两者至少提供一项，固定 PUT 到该 guest IPSet entry。 |
 | vm | `firewall.ipset.entry.delete` | `name`, `cidr`，固定 DELETE 该 guest IPSet entry。 |
 
+### 7.1 安全删除 legacy Cloud-Init network snippet
+
+`vm.cloud-init-snippet.delete` 的 parameters 是 exact object；未知字段、重复字段、缺字段、false 或其他 attachment 全部拒绝：
+
+```json
+{
+  "volume": "local:snippets/example.yaml",
+  "attachment": "network",
+  "deleteUnreferenced": true
+}
+```
+
+volume 只接受 canonical `<storage>:snippets/<filename>`；filename 不能为空、`.`、`..`、隐藏/绝对/分层路径，不能含反斜线、重复斜线、percent、NUL、控制字符或非受限文件名字节。node、VMID、guest type、generation 和全部 authority 只取自签名 envelope。目标必须是明确的 Linux QEMU（当前 PVE `ostype=l24|l26`）；LXC 与 Windows 拒绝，但全 cluster 引用证明仍逐个读取 QEMU/LXC config，任何读取错误、未知 guest 行、重复资源、畸形 `cicustom` 或未找到目标都会 fail closed。
+
+成功 result 也是 exact object：
+
+```json
+{
+  "detached": true,
+  "deleted": true,
+  "alreadyAbsent": false
+}
+```
+
+首次完整执行固定 `alreadyAbsent=false`。只有同一 durable command 已推进到 detach/delete 恢复点，且当前 config 与 storage 双回读均 absent 时才可为 true。同步和异步路径都不把 volume、路径、`cicustom`、PVE response 或原始 UPID返回给官网；监控审计仍只含既有 action/typed target/outcome/digest 白名单。跨语言字节向量固定在 `internal/control/testdata/agent-v1-vm-cloud-init-snippet-delete.json` 和 `internal/control/testdata/agent-v1-vm-cloud-init-snippet-delete-result.json`。
+
+稳定失败分类为 `CLOUD_INIT_SNIPPET_VOLUME_INVALID`、`CLOUD_INIT_SNIPPET_REFERENCE_MISMATCH`、`CLOUD_INIT_SNIPPET_SHARED`、`CLOUD_INIT_SNIPPET_SCAN_INCOMPLETE`、`CLOUD_INIT_SNIPPET_CONFIG_CONFLICT`、`CLOUD_INIT_SNIPPET_DELETE_FAILED`、`CLOUD_INIT_SNIPPET_DELETE_INDETERMINATE` 与 `CLOUD_INIT_SNIPPET_VERIFY_FAILED`。错误正文不投影上游响应、volume 或配置。
+
 `firewall.guest.verify-ipfilter-sets` 的请求与成功结果由
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets.json` 和
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-sets-result.json`
@@ -460,7 +491,7 @@ POST /internal/v1/monitoring/audit-events/batches
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
 锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
 
-当前共有 53 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 的 exact JSON shape、回执及服务端接入边界见 `PROVISIONING-ACTIONS-V1.md`。
+当前共有 54 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot/snippet 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 与安全 snippet 删除的 exact JSON shape、回执及服务端接入边界见本节和 `PROVISIONING-ACTIONS-V1.md`。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
@@ -561,7 +592,7 @@ payment_authorized
 | 操作线程/UPID | command/receipt 含 `operationId`；journal 保存 submitted/waiting UPID，runtime 在 command cycle 前后调用 reconcile 并查询原 UPID。 | Agent 与官网端到端恢复矩阵通过前不得称生产就绪。 |
 | watchdog/previousExit | systemd notify/watchdog、请求级采集 progress deadline、自动重启所需 unit 设置、`lifecycle-state.json` 和按 destination 启用的 website/monitoring 不可淘汰 lifecycle outbox 已实现并有 Linux/重启测试；未启用域保持 pending。 | 这是本地恢复与补报原语，不是远端 SLA；官网/监控接收、展示/告警以及真实故障演练仍需验收。 |
 | Agent 离线命令 | Agent 主动 poll、领取后的 journal/UPID/receipt durable recovery 已实现。 | 官网持久离线命令队列与 command `wait` 尚待实现/联调；任何离线场景都禁止自动回退官网直连 PVE。 |
-| 固定动作 Executor | 第 7 节 53 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console 等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
+| 固定动作 Executor | 第 7 节 54 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console、snippet 删除等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching 与 signed netN/MAC/generation 到宿主 tap/veth counter 的逐公网 NIC 计量已实现；private NIC 不计费。 | 官网向导/assignment 签发与账本消费仍待远端合并；多 NIC guest aggregate 永远不能 active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |

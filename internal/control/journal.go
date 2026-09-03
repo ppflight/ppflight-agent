@@ -71,6 +71,9 @@ type journalRecord struct {
 	NodeRef             string          `json:"nodeRef,omitempty"`
 	PVETaskUPID         string          `json:"pveTaskUpid,omitempty"`
 	AgentUpgradeID      string          `json:"agentUpgradeId,omitempty"`
+	SnippetDeletePhase  string          `json:"snippetDeletePhase,omitempty"`
+	SnippetStorageID    string          `json:"snippetStorageId,omitempty"`
+	SnippetVolumeSHA256 string          `json:"snippetVolumeSha256,omitempty"`
 	State               string          `json:"state"`
 	ReceiptPending      bool            `json:"receiptPending,omitempty"`
 	CreatedAt           time.Time       `json:"createdAt"`
@@ -103,14 +106,29 @@ type auditContext struct {
 // SubmittedTask is the safe recovery view of an asynchronous command.
 // It intentionally has no command parameters.
 type SubmittedTask struct {
-	CommandID      string
-	OperationID    string
-	Digest         string
-	ResourceKey    string
-	NodeRef        string
-	PVETaskUPID    string
-	AgentUpgradeID string
-	Receipt        Receipt
+	CommandID           string
+	OperationID         string
+	Digest              string
+	ResourceKey         string
+	NodeRef             string
+	PVETaskUPID         string
+	AgentUpgradeID      string
+	Receipt             Receipt
+	Action              string
+	GuestType           string
+	VMID                int
+	SnippetDeletePhase  string
+	SnippetStorageID    string
+	SnippetVolumeSHA256 string
+	BindingID           string
+	DeviceID            string
+	CredentialEpoch     protocol.Counter
+	AssignmentRevision  protocol.Counter
+	AgentRef            string
+	ClusterRef          string
+	ServiceRef          string
+	InstanceUUID        string
+	Generation          protocol.Counter
 }
 
 // PendingReceipt is an outbox entry whose journal state is durable but whose
@@ -186,10 +204,10 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 		if existing.Receipt != nil {
 			return *existing.Receipt, true, nil
 		}
-		if existing.Action == "vm.migrate-legacy-journal" {
-			// This action only applies a deterministic local metadata transaction.
-			// The exact signed command may safely finish a crash-interrupted partial
-			// migration, while a different command is rejected by one-time markers.
+		if existing.Action == "vm.migrate-legacy-journal" || existing.Action == "vm.cloud-init-snippet.delete" {
+			// These actions have their own durable, monotonic recovery markers. The
+			// exact signed command may safely finish a partial operation; a different
+			// command remains blocked by digest and resource identity.
 			existing.UpdatedAt = now.UTC()
 			if writeErr := writeJournal(filename, existing); writeErr != nil {
 				return Receipt{}, false, writeErr
@@ -431,6 +449,102 @@ func (j *Journal) Complete(command Command, receipt Receipt) error {
 	return j.completeLocked(filename, &record, receipt)
 }
 
+// BeginCloudInitSnippetDelete binds a safe one-way projection of the exact
+// volume to the existing signed claim. Raw volume IDs and config strings are
+// deliberately not representable in the journal record.
+func (j *Journal) BeginCloudInitSnippetDelete(command Command, storage, volumeSHA256 string, now time.Time) (CloudInitSnippetDeleteProgress, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(command.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return CloudInitSnippetDeleteProgress{}, err
+	}
+	if record.Action != "vm.cloud-init-snippet.delete" || record.Digest != Digest(command) || !storageRE.MatchString(storage) || !bodyHashRE.MatchString(volumeSHA256) ||
+		record.BindingID != command.BindingID || record.DeviceID != command.DeviceID || record.CredentialEpoch != command.CredentialEpoch ||
+		record.AssignmentRevision != command.AssignmentRevision || record.AgentRef != command.AgentRef || record.ClusterRef != command.Identity.ClusterRef ||
+		record.NodeRef != command.Identity.NodeRef || record.ServiceRef != command.Identity.ServiceRef || record.InstanceUUID != command.Identity.InstanceUUID ||
+		record.GuestType != "qemu" || record.VMID != command.Identity.VMID || uint64(record.Generation) != command.Identity.Generation {
+		return CloudInitSnippetDeleteProgress{}, ErrCommandConflict
+	}
+	resumed := record.SnippetDeletePhase != ""
+	if record.SnippetDeletePhase == "" {
+		record.SnippetDeletePhase = snippetPhaseValidated
+		record.SnippetStorageID = storage
+		record.SnippetVolumeSHA256 = volumeSHA256
+	} else if record.SnippetStorageID != storage || record.SnippetVolumeSHA256 != volumeSHA256 {
+		return CloudInitSnippetDeleteProgress{}, ErrCommandConflict
+	}
+	record.UpdatedAt = now.UTC()
+	if err := writeJournal(filename, record); err != nil {
+		return CloudInitSnippetDeleteProgress{}, err
+	}
+	return CloudInitSnippetDeleteProgress{Phase: record.SnippetDeletePhase, Resumed: resumed}, nil
+}
+
+func (j *Journal) AdvanceCloudInitSnippetDelete(command Command, phase string, now time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(command.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return err
+	}
+	if record.Action != "vm.cloud-init-snippet.delete" || record.Digest != Digest(command) || !validDirectSnippetPhase(phase) ||
+		snippetPhaseOrder[phase] < snippetPhaseOrder[record.SnippetDeletePhase] || record.SnippetStorageID == "" || record.SnippetVolumeSHA256 == "" {
+		return ErrCommandConflict
+	}
+	record.SnippetDeletePhase, record.UpdatedAt = phase, now.UTC()
+	return writeJournal(filename, record)
+}
+
+func (j *Journal) RecordCloudInitSnippetDeleteSubmitted(command Command, receipt Receipt, upid string, now time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(command.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return err
+	}
+	if record.Action != "vm.cloud-init-snippet.delete" || record.Digest != Digest(command) || !upidRE.MatchString(upid) ||
+		record.SnippetDeletePhase != snippetPhaseDetached || receipt.CommandID != command.CommandID || receipt.PVETaskUPID != "" {
+		return ErrCommandConflict
+	}
+	record.PVETaskUPID = upid
+	record.SnippetDeletePhase, record.UpdatedAt = snippetPhaseDeleteSubmitted, now.UTC()
+	return j.completeLocked(filename, &record, receipt)
+}
+
+func validSnippetJournalPhase(phase string) bool {
+	_, ok := snippetPhaseOrder[phase]
+	return ok && phase != ""
+}
+
+func validDirectSnippetPhase(phase string) bool {
+	switch phase {
+	case snippetPhaseReferenceProven, snippetPhaseDetached, snippetPhaseDeleted, snippetPhaseVerified:
+		return true
+	default:
+		return false
+	}
+}
+
+func (j *Journal) AdvanceSubmittedSnippetDelete(task SubmittedTask, phase string, now time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(task.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return err
+	}
+	if task.Action != "vm.cloud-init-snippet.delete" || record.Action != task.Action || record.Digest != task.Digest || record.PVETaskUPID != task.PVETaskUPID ||
+		(phase != snippetPhaseDeleted && phase != snippetPhaseVerified) || snippetPhaseOrder[phase] < snippetPhaseOrder[record.SnippetDeletePhase] {
+		return ErrCommandConflict
+	}
+	record.SnippetDeletePhase, record.UpdatedAt = phase, now.UTC()
+	return writeJournal(filename, record)
+}
+
 // CompleteSubmitted persists a terminal or waiting receipt produced while
 // reconciling an existing UPID. Digest prevents a caller from changing an
 // unrelated record with the same command ID.
@@ -478,11 +592,15 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	// which must survive a crash so an exact idempotent replay can return the
 	// first result without touching PVE again.
 	safeReplayResult := record.Action == "vm.set-initial-resources" && validInitialResourcesJournalResult(record, receipt.Result) ||
-		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(record, receipt.Result)
+		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(record, receipt.Result) ||
+		record.Action == "vm.cloud-init-snippet.delete" && validSnippetDeleteJournalResult(record, receipt.Result)
 	if receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !safeReplayResult {
 		journalReceipt.Result = nil
 	}
 	record.State, record.UpdatedAt, record.Receipt, record.ReceiptPending = receipt.State, receipt.FinishedAt.UTC(), &journalReceipt, true
+	if record.Action == "vm.cloud-init-snippet.delete" && receipt.State == "succeeded" && receipt.Code == "SUCCEEDED" && safeReplayResult {
+		record.SnippetDeletePhase = snippetPhaseSucceeded
+	}
 	if receipt.PVETaskUPID != "" {
 		record.PVETaskUPID = receipt.PVETaskUPID
 	}
@@ -497,6 +615,11 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 		record.AuditPending = &event
 	}
 	return writeJournal(filename, *record)
+}
+
+func validSnippetDeleteJournalResult(record *journalRecord, raw json.RawMessage) bool {
+	var result CloudInitSnippetDeleteResult
+	return record != nil && record.SnippetDeletePhase == snippetPhaseVerified && strictParameters(raw, &result) == nil && result.Detached && result.Deleted
 }
 
 func validLegacyMigrationJournalResult(record *journalRecord, raw json.RawMessage) bool {
@@ -560,7 +683,10 @@ func (j *Journal) SubmittedWaiting() ([]SubmittedTask, error) {
 		result = append(result, SubmittedTask{
 			CommandID: record.CommandID, OperationID: record.OperationID, Digest: record.Digest,
 			ResourceKey: record.ResourceKey, NodeRef: record.NodeRef, PVETaskUPID: record.PVETaskUPID, AgentUpgradeID: record.AgentUpgradeID,
-			Receipt: *record.Receipt,
+			Receipt: *record.Receipt, Action: record.Action, GuestType: record.GuestType, VMID: record.VMID,
+			SnippetDeletePhase: record.SnippetDeletePhase, SnippetStorageID: record.SnippetStorageID, SnippetVolumeSHA256: record.SnippetVolumeSHA256,
+			BindingID: record.BindingID, DeviceID: record.DeviceID, CredentialEpoch: record.CredentialEpoch, AssignmentRevision: record.AssignmentRevision,
+			AgentRef: record.AgentRef, ClusterRef: record.ClusterRef, ServiceRef: record.ServiceRef, InstanceUUID: record.InstanceUUID, Generation: record.Generation,
 		})
 	}
 	sort.Slice(result, func(i, k int) bool { return result[i].CommandID < result[k].CommandID })
@@ -708,7 +834,7 @@ func (j *Journal) RecoverIncomplete(now time.Time, mode string) ([]Receipt, erro
 		if err != nil {
 			return nil, err
 		}
-		if record.State != "received" || record.Receipt != nil || !record.Mutating {
+		if record.State != "received" || record.Receipt != nil || !record.Mutating || record.Action == "vm.cloud-init-snippet.delete" {
 			continue
 		}
 		id, err := protocol.NewID()
@@ -937,10 +1063,19 @@ func readJournal(filename string) (journalRecord, error) {
 		return journalRecord{}, err
 	}
 	var record journalRecord
-	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.SourceTemplateRef != "" && !nameRE.MatchString(record.SourceTemplateRef)) || record.SourceVMID < 0 || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) || !validOptionalJournalLineage(record) || !validJournalMigrationMarkers(record) {
+	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.SourceTemplateRef != "" && !nameRE.MatchString(record.SourceTemplateRef)) || record.SourceVMID < 0 || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) || !validOptionalJournalLineage(record) || !validJournalMigrationMarkers(record) || !validSnippetJournalRecord(record) {
 		return journalRecord{}, fmt.Errorf("control journal record is corrupt")
 	}
 	return record, nil
+}
+
+func validSnippetJournalRecord(record journalRecord) bool {
+	present := record.SnippetDeletePhase != "" || record.SnippetStorageID != "" || record.SnippetVolumeSHA256 != ""
+	if !present {
+		return true
+	}
+	return record.Action == "vm.cloud-init-snippet.delete" && validSnippetJournalPhase(record.SnippetDeletePhase) &&
+		storageRE.MatchString(record.SnippetStorageID) && bodyHashRE.MatchString(record.SnippetVolumeSHA256) && record.GuestType == "qemu"
 }
 
 func validOptionalJournalLineage(record journalRecord) bool {

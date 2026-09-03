@@ -1,0 +1,5 @@
+{
+  "volume": "local:snippets/example.yaml",
+  "attachment": "network",
+  "deleteUnreferenced": true
+}

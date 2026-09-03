@@ -310,7 +310,7 @@ sudo ag-pve template bootstrap \
 
 catalog 中的所有系统镜像必须使用上游官网不可变的日期/构建路径，不得使用 `latest` 或滚动 `release` 路径。每次下载都必须同时匹配 catalog 固定 SHA-256 和同一官网构建目录提供的 checksum；镜像站只能在内容通过该官网摘要链时作为传输加速，不能成为信任来源。
 
-helper 只调用本机 `pvesh/pvesm/qm/vzdump` 等固定程序，不读取官网凭据或 PVE API Token。manifest strict 固定 `networkRedirectPolicy` 为 HTTPS-only、`addressFamily=ipv4-only`、`hostPolicy=upstream-selected` 和 catalog/official-checksum 完整性链；实际 curl 固定 `--disable --ipv4`、最多五次 HTTPS redirect。上游可选择 redirect host，但下载内容仍必须通过 catalog SHA-256 与官方 checksum，不能把 redirect 当作任意 URL/代码执行入口。该模板 CLI 不进入 control 的 53 个远程动作，也不表示远程模板创建已经上线；远程 Agent 自升级是独立的 `agent.upgrade` 合同，不能调用此模板 helper，详见 `SELF-UPGRADE-V1.md`。远程 `vm.reinstall` 只接受 signed 固定 templateRef/version/VMID/config SHA 与完整交付合同，不接受本地 helper、ISO、URL、任意 storage volume 或 shell；实现合同见 `PROVISIONING-ACTIONS-V1.md`。安装与依赖检查已有自动化；发布前仍要在 PVE 8/9 非生产节点验收实际 plan/execute。
+helper 只调用本机 `pvesh/pvesm/qm/vzdump` 等固定程序，不读取官网凭据或 PVE API Token。manifest strict 固定 `networkRedirectPolicy` 为 HTTPS-only、`addressFamily=ipv4-only`、`hostPolicy=upstream-selected` 和 catalog/official-checksum 完整性链；实际 curl 固定 `--disable --ipv4`、最多五次 HTTPS redirect。上游可选择 redirect host，但下载内容仍必须通过 catalog SHA-256 与官方 checksum，不能把 redirect 当作任意 URL/代码执行入口。该模板 CLI 不进入 control 的 54 个远程动作，也不表示远程模板创建已经上线；远程 Agent 自升级是独立的 `agent.upgrade` 合同，不能调用此模板 helper，详见 `SELF-UPGRADE-V1.md`。远程 `vm.reinstall` 只接受 signed 固定 templateRef/version/VMID/config SHA 与完整交付合同，不接受本地 helper、ISO、URL、任意 storage volume 或 shell；实现合同见 `PROVISIONING-ACTIONS-V1.md`。安装与依赖检查已有自动化；发布前仍要在 PVE 8/9 非生产节点验收实际 plan/execute。
 
 ### 7.2 systemd watchdog 与重启补报
 

@@ -70,6 +70,10 @@ type Executor struct {
 	// PVE ticket and localhost details remain inside the Agent process and never
 	// enter a receipt, audit event, broker registration, log, or durable queue.
 	ConsoleSessions ConsoleSessionSink
+	// CloudInitSnippets persists only a phase, a storage identifier, and a
+	// SHA-256 projection of the exact volume. The raw volume/config never enters
+	// the command journal.
+	CloudInitSnippets CloudInitSnippetJournal
 }
 
 type InitialResourceAuthorizer interface {
@@ -84,6 +88,12 @@ type ConsoleSessionSink interface {
 	Publish(context.Context, ConsoleTunnelRegistration, ConsoleLocalEndpoint) (ConsoleSessionPublication, error)
 	Revoke(context.Context, ConsoleSessionRevoke) error
 	Invalidate()
+}
+
+type CloudInitSnippetJournal interface {
+	BeginCloudInitSnippetDelete(Command, string, string, time.Time) (CloudInitSnippetDeleteProgress, error)
+	AdvanceCloudInitSnippetDelete(Command, string, time.Time) error
+	RecordCloudInitSnippetDeleteSubmitted(Command, Receipt, string, time.Time) error
 }
 
 // UpgradeSubmitter stages an already verified agent.upgrade command for the
@@ -123,6 +133,9 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	}
 	if err := validateParameters(command); err != nil {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "rejected", "INVALID_PARAMETERS", e.Mode != "production" || !e.ProductionExecution, time.Now().UTC()
+		if command.Action == "vm.cloud-init-snippet.delete" {
+			r.Code = "CLOUD_INIT_SNIPPET_VOLUME_INVALID"
+		}
 		if errors.Is(err, ErrUnsupported) {
 			r.Code = "UNSUPPORTED"
 		}
@@ -309,6 +322,34 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		}
 		r.State, r.Code = "succeeded", "SUCCEEDED"
 		r.Result, _ = json.Marshal(result)
+		return finish(nil)
+	}
+	if command.Action == "vm.cloud-init-snippet.delete" {
+		if e.CloudInitSnippets == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "CLOUD_INIT_SNIPPET_JOURNAL_UNAVAILABLE", time.Now().UTC()
+			return finish(errors.New("Cloud-Init snippet journal is unavailable"))
+		}
+		result, upid, code, actionErr := executeCloudInitSnippetDelete(ctx, e.Client, e.CloudInitSnippets, command, now)
+		r.FinishedAt = time.Now().UTC()
+		if actionErr != nil {
+			r.State, r.Code = "failed", code
+			if code == "CLOUD_INIT_SNIPPET_DELETE_INDETERMINATE" {
+				r.State = "indeterminate"
+			}
+			return finish(actionErr)
+		}
+		if upid != "" {
+			r.State, r.Code = "submitted", "PVE_TASK_SUBMITTED"
+			if _, finishErr := finish(nil); finishErr != nil {
+				return r, finishErr
+			}
+			if journalErr := e.CloudInitSnippets.RecordCloudInitSnippetDeleteSubmitted(command, r, upid, r.FinishedAt); journalErr != nil {
+				r.State, r.Code = "indeterminate", "CLOUD_INIT_SNIPPET_DELETE_INDETERMINATE"
+				return finish(journalErr)
+			}
+			return finish(nil)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
 	if command.Action == "vm.set-initial-resources" {
@@ -802,6 +843,12 @@ func validateParameters(c Command) error {
 			return errors.New("invalid Cloud-Init parameters")
 		}
 		return nil
+	case "vm.cloud-init-snippet.delete":
+		var p cloudInitSnippetDeleteP
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || p.Attachment != "network" || p.DeleteUnreferenced == nil || !*p.DeleteUnreferenced || !validSnippetVolume(p.Volume) {
+			return errors.New("invalid Cloud-Init snippet delete parameters")
+		}
+		return nil
 	case "vm.set-timezone":
 		var p timezoneP
 		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !validTimezone(p.Timezone) {
@@ -1081,6 +1128,8 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		return setInitialResources(ctx, client, c, base)
 	case "vm.migrate-legacy-journal":
 		return "", nil, errors.New("legacy journal migration requires durable journal dispatch")
+	case "vm.cloud-init-snippet.delete":
+		return "", nil, errors.New("Cloud-Init snippet deletion requires durable journal dispatch")
 	case "vm.reinstall":
 		return reinstallGuest(ctx, client, c)
 	case "vm.console.create-session", "vm.console.revoke-session":

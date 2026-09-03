@@ -15,11 +15,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
+
+var storageSegmentRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 const (
 	defaultTimeout      = 15 * time.Second
@@ -147,6 +150,33 @@ func isLoopbackHost(host string) bool {
 // intentionally a low-level primitive: callers issuing writes must validate
 // their own command schema, authorisation, expiry and idempotency first.
 func (c *Client) Do(ctx context.Context, method, apiPath string, query url.Values, form url.Values, out any) error {
+	return c.do(ctx, method, apiPath, "", query, form, out)
+}
+
+// DeleteSnippetVolume deletes one already-validated PVE snippets volume. It is
+// deliberately narrower than Do: callers cannot supply an API path, URL, or
+// content type, and the volume is encoded as one opaque final path segment.
+func (c *Client) DeleteSnippetVolume(ctx context.Context, node, storage, volume string, out any) error {
+	if !storageSegmentRE.MatchString(node) || !storageSegmentRE.MatchString(storage) ||
+		!strings.HasPrefix(volume, storage+":snippets/") || strings.ContainsAny(volume, "\\\x00\r\n") {
+		return errors.New("invalid PVE snippet volume identity")
+	}
+	filename := strings.TrimPrefix(volume, storage+":snippets/")
+	if strings.Count(volume, ":") != 1 || filename == "" || filename == "." || filename == ".." || strings.ContainsAny(filename, "/%") || strings.HasPrefix(filename, ".") || strings.HasSuffix(filename, ".") || len(filename) > 255 {
+		return errors.New("invalid PVE snippet volume identity")
+	}
+	for _, r := range filename {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-') {
+			return errors.New("invalid PVE snippet volume identity")
+		}
+	}
+	decodedPath := "/nodes/" + node + "/storage/" + storage + "/content/" + volume
+	escapedVolume := strings.ReplaceAll(url.PathEscape(volume), ":", "%3A")
+	escapedPath := "/nodes/" + url.PathEscape(node) + "/storage/" + url.PathEscape(storage) + "/content/" + escapedVolume
+	return c.do(ctx, http.MethodDelete, decodedPath, escapedPath, nil, nil, out)
+}
+
+func (c *Client) do(ctx context.Context, method, apiPath, escapedAPIPath string, query url.Values, form url.Values, out any) error {
 	defer c.reportProgress()
 	if !strings.HasPrefix(apiPath, "/") || strings.Contains(apiPath, "..") {
 		return fmt.Errorf("unsafe pve API path %q", apiPath)
@@ -159,6 +189,9 @@ func (c *Client) Do(ctx context.Context, method, apiPath string, query url.Value
 	}
 	u := *c.baseURL
 	u.Path = path.Join(c.baseURL.Path, "/api2/json", apiPath)
+	if escapedAPIPath != "" {
+		u.RawPath = path.Join(c.baseURL.EscapedPath(), "/api2/json", escapedAPIPath)
+	}
 	u.RawQuery = query.Encode()
 	var requestBody io.Reader
 	if method != http.MethodGet && form != nil {

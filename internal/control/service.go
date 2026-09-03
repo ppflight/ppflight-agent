@@ -147,6 +147,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Executor.LegacyJournal == nil {
 		cfg.Executor.LegacyJournal = cfg.Journal
 	}
+	if cfg.Executor.CloudInitSnippets == nil {
+		cfg.Executor.CloudInitSnippets = cfg.Journal
+	}
 	cfg.Executor.Mode = cfg.Mode
 	service := &Service{
 		agentRef: cfg.AgentRef, clusterRef: cfg.ClusterRef, bindingID: cfg.BindingID, deviceID: cfg.DeviceID,
@@ -397,7 +400,11 @@ func (s *Service) ReconcileOnce(ctx context.Context) (int, error) {
 				return updated, errors.New("control task resolver is not configured")
 			}
 			result, resolveErr := s.taskResolver.ResolveTask(ctx, task.NodeRef, task.PVETaskUPID)
-			receipt, err = s.reconciledReceipt(task, result, resolveErr, now)
+			if task.Action == "vm.cloud-init-snippet.delete" {
+				receipt, err = s.reconciledSnippetDeleteReceipt(ctx, task, result, resolveErr, now)
+			} else {
+				receipt, err = s.reconciledReceipt(task, result, resolveErr, now)
+			}
 		}
 		if err != nil {
 			return updated, err
@@ -411,6 +418,67 @@ func (s *Service) ReconcileOnce(ctx context.Context) (int, error) {
 		updated++
 	}
 	return updated, nil
+}
+
+func (s *Service) reconciledSnippetDeleteReceipt(ctx context.Context, task SubmittedTask, result TaskResolution, resolveErr error, now time.Time) (Receipt, error) {
+	receipt, err := s.reconciledReceipt(task, result, resolveErr, now)
+	if err != nil {
+		return Receipt{}, err
+	}
+	currentRevision := s.assignmentRevision
+	if !s.dynamicAuthority && s.assignmentRevisionFn != nil {
+		currentRevision = s.assignmentRevisionFn()
+	}
+	authorityMatches := task.BindingID == s.bindingID && task.DeviceID == s.deviceID && uint64(task.CredentialEpoch) == s.credentialEpoch &&
+		uint64(task.AssignmentRevision) == currentRevision && task.AgentRef == s.agentRef && task.ClusterRef == s.clusterRef
+	if authorityMatches {
+		if s.assignments == nil {
+			authorityMatches = false
+		} else {
+			assignment, ok := s.assignments.Lookup(task.ClusterRef, task.GuestType, task.VMID)
+			authorityMatches = ok && assignment.ServiceRef == task.ServiceRef && assignment.InstanceUUID == task.InstanceUUID &&
+				assignment.Generation == uint64(task.Generation) && (assignment.NodeRef == "" || assignment.NodeRef == task.NodeRef)
+		}
+	}
+	if !authorityMatches {
+		receipt.State, receipt.Code, receipt.Result, receipt.PVETaskUPID = "indeterminate", "CLOUD_INIT_SNIPPET_DELETE_INDETERMINATE", nil, ""
+		ApplyReceiptCompatibility(&receipt)
+		return receipt, nil
+	}
+	if resolveErr != nil {
+		receipt.State, receipt.Code, receipt.PVETaskUPID = "waiting", "CLOUD_INIT_SNIPPET_DELETE_INDETERMINATE", ""
+		ApplyReceiptCompatibility(&receipt)
+		return receipt, nil
+	}
+	if strings.ToLower(strings.TrimSpace(result.Status)) != "stopped" {
+		receipt.PVETaskUPID = ""
+		ApplyReceiptCompatibility(&receipt)
+		return receipt, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(result.ExitStatus), "OK") {
+		receipt.State, receipt.Code, receipt.Result, receipt.PVETaskUPID = "failed", "CLOUD_INIT_SNIPPET_DELETE_FAILED", nil, ""
+		ApplyReceiptCompatibility(&receipt)
+		return receipt, nil
+	}
+	if s.executor.Client == nil || task.GuestType != "qemu" || task.VMID < 1 || !storageRE.MatchString(task.SnippetStorageID) || !bodyHashRE.MatchString(task.SnippetVolumeSHA256) {
+		return Receipt{}, errors.New("snippet delete recovery projection is invalid")
+	}
+	if err := s.journal.AdvanceSubmittedSnippetDelete(task, snippetPhaseDeleted, now); err != nil {
+		return Receipt{}, err
+	}
+	if err := verifySnippetAbsentByDigest(ctx, s.executor.Client, task.NodeRef, task.VMID, task.SnippetStorageID, task.SnippetVolumeSHA256); err != nil {
+		receipt.State, receipt.Code, receipt.Result, receipt.PVETaskUPID = "waiting", "CLOUD_INIT_SNIPPET_VERIFY_FAILED", nil, ""
+		ApplyReceiptCompatibility(&receipt)
+		return receipt, nil
+	}
+	if err := s.journal.AdvanceSubmittedSnippetDelete(task, snippetPhaseVerified, now); err != nil {
+		return Receipt{}, err
+	}
+	receipt.State, receipt.Code = "succeeded", "SUCCEEDED"
+	receipt.PVETaskUPID = ""
+	receipt.Result, _ = json.Marshal(CloudInitSnippetDeleteResult{Detached: true, Deleted: true, AlreadyAbsent: false})
+	ApplyReceiptCompatibility(&receipt)
+	return receipt, nil
 }
 
 func (s *Service) reconciledUpgradeReceipt(task SubmittedTask, result UpgradeResolution, resolveErr error, now time.Time) (Receipt, error) {
