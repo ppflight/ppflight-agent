@@ -66,6 +66,10 @@ type Executor struct {
 	// LegacyJournal performs one narrowly-scoped, signed VM lineage migration.
 	// It cannot enumerate, truncate, or otherwise clear the journal.
 	LegacyJournal LegacyJournalMigrator
+	// Delete501Journal performs the one-incident rc.4 DELETE-body recovery.
+	// It appends retirement evidence only after exact journal and live PVE
+	// read proofs have both succeeded.
+	Delete501Journal Delete501JournalReconciler
 	// ConsoleSessions starts a short-lived Agent-originated reverse WSS tunnel.
 	// PVE ticket and localhost details remain inside the Agent process and never
 	// enter a receipt, audit event, broker registration, log, or durable queue.
@@ -82,6 +86,10 @@ type InitialResourceAuthorizer interface {
 
 type LegacyJournalMigrator interface {
 	MigrateLegacyVMJournal(Command, legacyJournalMigrationP, time.Time) (LegacyJournalMigrationResult, error)
+}
+
+type Delete501JournalReconciler interface {
+	ReconcileDelete501(Command, delete501RecoveryP, string, string, time.Time) (Delete501RecoveryResult, error)
 }
 
 type ConsoleSessionSink interface {
@@ -298,11 +306,48 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.AgentUpgradeID = "submitted", "AGENT_UPGRADE_SUBMITTED", upgradeID
 		return finish(nil)
 	}
-	if e.Client == nil {
-		r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
-		return finish(errors.New("PVE control client is unavailable"))
-	}
 	if command.Action == "vm.migrate-legacy-journal" {
+		if parameters, ok := decodeDelete501Recovery(command); ok {
+			if e.Delete501Journal == nil {
+				r.State, r.Code, r.FinishedAt = "rejected", "DELETE_501_RECOVERY_UNAVAILABLE", time.Now().UTC()
+				return finish(errors.New("delete 501 recovery journal is unavailable"))
+			}
+			client := e.ReadClient
+			if client == nil {
+				client = e.Client
+			}
+			if client == nil {
+				r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+				return finish(errors.New("PVE read client is unavailable"))
+			}
+			version, versionErr := client.Version(ctx)
+			if versionErr != nil || version.Version != delete501ExpectedPVEVersion {
+				r.State, r.Code, r.FinishedAt = "rejected", "DELETE_501_RECOVERY_REJECTED", time.Now().UTC()
+				return finish(errors.New("delete 501 recovery requires the audited PVE version"))
+			}
+			if _, configErr := client.GuestConfig(ctx, "qemu", command.Identity.NodeRef, command.Identity.VMID); configErr != nil {
+				r.State, r.Code, r.FinishedAt = "rejected", "DELETE_501_RECOVERY_REJECTED", time.Now().UTC()
+				return finish(errors.New("delete 501 recovery requires the audited guest to exist"))
+			}
+			current, currentErr := client.GuestCurrent(ctx, "qemu", command.Identity.NodeRef, command.Identity.VMID)
+			if currentErr != nil || current.Status != "stopped" {
+				r.State, r.Code, r.FinishedAt = "rejected", "DELETE_501_RECOVERY_REJECTED", time.Now().UTC()
+				return finish(errors.New("delete 501 recovery requires the audited guest to be stopped"))
+			}
+			result, recoveryErr := e.Delete501Journal.ReconcileDelete501(command, parameters, version.Version, current.Status, now)
+			r.FinishedAt = time.Now().UTC()
+			if recoveryErr != nil {
+				r.State, r.Code = "rejected", "DELETE_501_RECOVERY_REJECTED"
+				return finish(recoveryErr)
+			}
+			r.State, r.Code = "succeeded", "SUCCEEDED"
+			r.Result, _ = json.Marshal(result)
+			return finish(nil)
+		}
+		if e.Client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE control client is unavailable"))
+		}
 		if e.LegacyJournal == nil {
 			r.State, r.Code, r.FinishedAt = "rejected", "LEGACY_JOURNAL_MIGRATION_UNAVAILABLE", time.Now().UTC()
 			return finish(errors.New("legacy journal migration is unavailable"))
@@ -332,6 +377,10 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code = "succeeded", "SUCCEEDED"
 		r.Result, _ = json.Marshal(result)
 		return finish(nil)
+	}
+	if e.Client == nil {
+		r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+		return finish(errors.New("PVE control client is unavailable"))
 	}
 	if command.Action == "vm.cloud-init-snippet.delete" {
 		if e.CloudInitSnippets == nil {
@@ -818,6 +867,9 @@ func validateParameters(c Command) error {
 		}
 		return nil
 	case "vm.migrate-legacy-journal":
+		if _, ok := decodeDelete501Recovery(c); ok {
+			return nil
+		}
 		var p legacyJournalMigrationP
 		if strictParameters(c.Parameters, &p) != nil || !validLegacyJournalMigration(c, p) {
 			return errors.New("invalid legacy journal migration parameters")

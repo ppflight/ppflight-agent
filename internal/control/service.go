@@ -147,6 +147,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Executor.LegacyJournal == nil {
 		cfg.Executor.LegacyJournal = cfg.Journal
 	}
+	if cfg.Executor.Delete501Journal == nil {
+		cfg.Executor.Delete501Journal = cfg.Journal
+	}
 	if cfg.Executor.CloudInitSnippets == nil {
 		cfg.Executor.CloudInitSnippets = cfg.Journal
 	}

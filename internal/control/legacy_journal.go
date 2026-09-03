@@ -318,11 +318,14 @@ func validJournalMigrationMarkers(record journalRecord) bool {
 		record.SourceVMID < 100 || !recordSucceeded(record)) {
 		return false
 	}
-	if record.RetiredByCommandID != "" && (record.Action == "vm.migrate-legacy-journal" || record.State != "indeterminate" ||
-		record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
-		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code) ||
-		record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "") {
-		return false
+	if record.RetiredByCommandID != "" {
+		validLegacyRetirement := record.Action != "vm.migrate-legacy-journal" && record.State == "indeterminate" &&
+			record.PVETaskUPID == "" && record.AgentUpgradeID == "" && record.Receipt != nil &&
+			record.Receipt.State == "indeterminate" && legacyIndeterminateReceiptCode(record.Receipt.Code) &&
+			record.Receipt.PVETaskUPID == "" && record.Receipt.AgentUpgradeID == ""
+		if !validLegacyRetirement && !knownDelete501RetirementShape(record) {
+			return false
+		}
 	}
 	if record.MigratedAt != nil && (record.MigratedAt.IsZero() || record.MigratedAt.Location() != time.UTC) {
 		return false

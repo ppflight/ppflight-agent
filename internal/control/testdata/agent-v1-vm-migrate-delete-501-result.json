@@ -1,0 +1,15 @@
+{
+  "reconciled": true,
+  "recoveryKind": "pve-delete-form-body-501-v1",
+  "failedCommandId": "c864ed6d-3d43-4fc9-b966-edaf7066cbb0",
+  "failedOperationId": "f967235b-a593-42fa-ae2d-f42219204d59",
+  "failedCommandDigest": "c1ed3db0b581f7891f3f917fbf9b42d2ffb86251d0cdf4b2a00cb0c6d48ab830",
+  "failedReceiptCode": "PVE_ACTION_INDETERMINATE",
+  "affectedAgentVersion": "0.1.1-rc.4",
+  "pveVersion": "8.4.0",
+  "guestType": "qemu",
+  "vmid": 100,
+  "generation": 1,
+  "guestPresent": true,
+  "guestStatus": "stopped"
+}

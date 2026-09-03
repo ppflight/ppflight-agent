@@ -265,11 +265,15 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	if mutating {
 		busy, err := j.resourceBusyLocked(resourceKey)
 		if command.Action == "vm.migrate-legacy-journal" {
-			var parameters legacyJournalMigrationP
-			if decodeErr := strictParameters(command.Parameters, &parameters); decodeErr != nil {
-				return Receipt{}, false, decodeErr
+			if parameters, ok := decodeDelete501Recovery(command); ok {
+				err = j.validateDelete501RecoveryClaimLocked(command, parameters)
+			} else {
+				var parameters legacyJournalMigrationP
+				if decodeErr := strictParameters(command.Parameters, &parameters); decodeErr != nil {
+					return Receipt{}, false, decodeErr
+				}
+				err = j.validateLegacyMigrationClaimLocked(command, parameters)
 			}
-			err = j.validateLegacyMigrationClaimLocked(command, parameters)
 			busy = false
 		}
 		if err != nil {
@@ -492,6 +496,17 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 		record.RetiredAt.After(migration.UpdatedAt) {
 		return false, nil
 	}
+	if knownDelete501RetirementShape(record) {
+		var result Delete501RecoveryResult
+		if !validDelete501RecoveryJournalResult(&migration, migration.Receipt.Result) ||
+			strictParameters(migration.Receipt.Result, &result) != nil ||
+			migration.AuditContext.WebsiteCommandKeyID != record.AuditContext.WebsiteCommandKeyID ||
+			migration.AuditContext.TargetRef != record.AuditContext.TargetRef {
+			return false, nil
+		}
+		return result.FailedCommandID == record.CommandID && result.FailedOperationID == record.OperationID &&
+			result.FailedCommandDigest == record.Digest, nil
+	}
 	var result LegacyJournalMigrationResult
 	if !validLegacyMigrationJournalResult(&migration, migration.Receipt.Result) ||
 		strictParameters(migration.Receipt.Result, &result) != nil {
@@ -662,7 +677,7 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	// which must survive a crash so an exact idempotent replay can return the
 	// first result without touching PVE again.
 	safeReplayResult := record.Action == "vm.set-initial-resources" && validInitialResourcesJournalResult(record, receipt.Result) ||
-		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(record, receipt.Result) ||
+		record.Action == "vm.migrate-legacy-journal" && (validLegacyMigrationJournalResult(record, receipt.Result) || validDelete501RecoveryJournalResult(record, receipt.Result)) ||
 		record.Action == "vm.cloud-init-snippet.delete" && validSnippetDeleteJournalResult(record, receipt.Result)
 	if receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !safeReplayResult {
 		journalReceipt.Result = nil

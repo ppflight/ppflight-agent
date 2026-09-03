@@ -13,7 +13,8 @@ WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 gue
 `0.1.1-rc.2` 开始；已由成功迁移完整退休的 indeterminate 记录从 `0.1.1-rc.3` 开始不再
 占用资源锁。释放锁前必须同时验证合法 `RetiredByCommandID/RetiredAt`、同资源同 authority
 的成功迁移 Journal，以及明确列出该旧 command 的严格迁移结果；部分标记或未完成迁移继续
-fail closed。协议版本仍为 `schemaVersion: 1`，这些 action
+fail closed。`0.1.1-rc.7` 增加固定到单条已审计生产事件的 DELETE-body 501 恢复变体。
+协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 
@@ -89,6 +90,53 @@ generation 逐项精确匹配。迁移资格不再以“必须缺字段”判断
 请求与结果 golden 分别为
 `internal/control/testdata/agent-v1-vm-migrate-legacy-journal.json` 和
 `internal/control/testdata/agent-v1-vm-migrate-legacy-journal-result.json`。
+
+### rc.4 DELETE-body 501 单事件恢复变体
+
+同一个 action 另有一个互斥的 exact parameters 变体：
+
+```json
+{
+  "recoveryKind": "pve-delete-form-body-501-v1",
+  "failedCommandId": "c864ed6d-3d43-4fc9-b966-edaf7066cbb0",
+  "failedOperationId": "f967235b-a593-42fa-ae2d-f42219204d59",
+  "failedCommandDigest": "c1ed3db0b581f7891f3f917fbf9b42d2ffb86251d0cdf4b2a00cb0c6d48ab830"
+}
+```
+
+它不是按错误码工作的通用恢复能力。Agent 常量同时锁定 `qemu/100/generation=1`、旧记录的
+`agentVersion=0.1.1-rc.4`、`state=indeterminate`、`code=PVE_ACTION_INDETERMINATE`、
+`accepted=false`、`asynchronous=false`、`mutationMayHaveSucceeded=true`，并要求 Journal/receipt/
+audit 的 command、operation、authority、target、signing key 与当前已验签恢复命令逐项一致。
+旧记录或 receipt 不得有 UPID/upgrade ID，且相同资源不能存在其他活动 mutation。
+
+执行阶段只使用 PVE GET：`/version` 必须精确返回 `8.4.0`，VM100 config 必须存在，current
+status 必须精确为 `stopped`。它不会在恢复动作内发送 DELETE 或其他 PVE mutation。成功时只向
+旧文件追加 `RetiredByCommandID/RetiredAt`，原 command、operation、digest、state、receipt、audit
+和 authority 原样保留；成功 typed result 为：
+
+```json
+{
+  "reconciled": true,
+  "recoveryKind": "pve-delete-form-body-501-v1",
+  "failedCommandId": "c864ed6d-3d43-4fc9-b966-edaf7066cbb0",
+  "failedOperationId": "f967235b-a593-42fa-ae2d-f42219204d59",
+  "failedCommandDigest": "c1ed3db0b581f7891f3f917fbf9b42d2ffb86251d0cdf4b2a00cb0c6d48ab830",
+  "failedReceiptCode": "PVE_ACTION_INDETERMINATE",
+  "affectedAgentVersion": "0.1.1-rc.4",
+  "pveVersion": "8.4.0",
+  "guestType": "qemu",
+  "vmid": 100,
+  "generation": 1,
+  "guestPresent": true,
+  "guestStatus": "stopped"
+}
+```
+
+只有恢复 Journal 已成功终态且保存的 typed result 与上述所有字段完全一致，旧 VM 锁才释放；
+部分 marker、结果缺失或字段不匹配继续 fail closed。随后删除必须使用新的 command/operation，
+由 rc.5+ 的无 body、query-only `vm.delete` 正常提交。请求与结果 golden 为
+`agent-v1-vm-migrate-delete-501.json` 和 `agent-v1-vm-migrate-delete-501-result.json`。
 
 ## 初次资源定型
 
