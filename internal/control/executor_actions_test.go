@@ -443,9 +443,9 @@ func TestGuestIPFilterVerificationIsReadOnlyAndWorksWhileGuestIsStopped(t *testi
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
-			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10","nomatch":0}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net1"):
-			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:db8::10/128","nomatch":0}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:0db8:0:0:0:0:0:10","nomatch":0}]}`))
 		default:
 			t.Fatalf("unexpected verification read: %s", r.URL.Path)
 		}
@@ -497,9 +497,9 @@ func TestGuestIPFilterSetPreconfigurationVerificationIsReadOnlyAndMultiNIC(t *te
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
-			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10","nomatch":0}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net1"):
-			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:db8::10/128","nomatch":0}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"2001:0db8:0:0:0:0:0:10","nomatch":0}]}`))
 		default:
 			t.Fatalf("unexpected preconfiguration read: %s", r.URL.Path)
 		}

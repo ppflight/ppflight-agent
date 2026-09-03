@@ -2235,17 +2235,44 @@ func verifyExpectedIPFilterSet(ctx context.Context, client *pve.Client, command 
 		if entry.NoMatch != nil && *entry.NoMatch != 0 {
 			return fmt.Errorf("guest IP filter %s contains a negative entry", name)
 		}
-		actual[entry.CIDR] = true
+		cidr, ok := canonicalFirewallCIDR(entry.CIDR)
+		if !ok || actual[cidr] {
+			return fmt.Errorf("guest IP filter %s contains an invalid or duplicate entry", name)
+		}
+		actual[cidr] = true
 	}
 	if len(actual) != len(expectedCIDRs) {
 		return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
 	}
-	for _, cidr := range expectedCIDRs {
-		if !actual[cidr] {
+	for _, expected := range expectedCIDRs {
+		cidr, ok := canonicalFirewallCIDR(expected)
+		if !ok || !actual[cidr] {
 			return fmt.Errorf("guest IP filter %s does not match assigned addresses", name)
 		}
 	}
 	return nil
+}
+
+// PVE accepts host CIDRs but may serialize an IPv4 /32 or IPv6 /128 entry
+// without its host prefix. Compare the semantic address while preserving the
+// exact signed host-only set and rejecting malformed or duplicate entries.
+func canonicalFirewallCIDR(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if ip, network, err := net.ParseCIDR(value); err == nil {
+		ones, bits := network.Mask.Size()
+		if ones < 0 || bits == 0 {
+			return "", false
+		}
+		return ip.String() + "/" + strconv.Itoa(ones), true
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return "", false
+	}
+	if ip.To4() != nil {
+		return ip.String() + "/32", true
+	}
+	return ip.String() + "/128", true
 }
 
 type IPFilterVerificationResult struct {
