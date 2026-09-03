@@ -10,7 +10,7 @@
 
 出现冲突时，以当前 Go 类型、协议测试和上述规范为准。尤其是：discovery `limit` 默认 20、最大 50；动作使用 `snapshot.*`、`backup.*`、`firewall.*`、`task.status` 等代码中的完整名称。
 
-control 当前 49 个 known actions 已用一致性测试锁住 registry/validator/executor。2026-09-02 起新增初次资源定型、固定模板重装、短时 console、只读 snapshot/backup、QEMU suspend/resume 与逐 NIC host-netdev 计量；当前合同见 `PROVISIONING-ACTIONS-V1.md`。`vm.reinstall` 不接受本地 template helper、任意 URL/ISO/storage volume 或 shell，只接受 signed 固定模板 identity/config SHA 与完整交付回读合同；真实 PVE 生产开放仍须由外部控制面完成 action allowlist/审批和验收。
+control 当前 53 个 known actions 已用一致性测试锁住 registry/validator/executor。2026-09-02 起新增初次资源定型、固定模板重装、短时 console、只读 snapshot/backup、QEMU suspend/resume 与逐 NIC host-netdev 计量；2026-09-03 又新增一次性 VM legacy Journal 恢复以及 guest firewall rules list/get/verify。当前合同见 `PROVISIONING-ACTIONS-V1.md`。`vm.reinstall` 不接受本地 template helper、任意 URL/ISO/storage volume 或 shell，只接受 signed 固定模板 identity/config SHA 与完整交付回读合同；真实 PVE 生产开放仍须由外部控制面完成 action allowlist/审批和验收。
 
 ## 仍然有效的审阅结论
 

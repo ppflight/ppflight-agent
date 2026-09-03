@@ -6,9 +6,62 @@ assignment revision、VM identity/generation、approval、resource lock、durabl
 HMAC receipt 和 monitoring audit 规则。JSON decoder 拒绝 unknown/duplicate/trailing 字段。
 
 首个包含这些 action 的 Agent 版本是 `0.1.0-rc.27`；clone lineage 修正与可用的反向
-WSS console 合同从 `0.1.0-rc.28` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
+WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 guest firewall rules
+严格回验从 `0.1.0-rc.29` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
+
+## VM 级 legacy Journal 恢复
+
+`vm.migrate-legacy-journal` 是 mutation，必须通过现有 command Ed25519、当前
+`bindingId/deviceId/credentialEpoch/assignmentRevision`、VM identity/generation、action
+allowlist、`approvalRef`、资源锁和 monitoring audit 门禁。它不是运维清理接口，也不能列举、
+删除或清空 Journal。
+
+exact parameters：
+
+```json
+{
+  "legacyCloneCommandId": "legacy-clone-command-01",
+  "legacyCloneOperationId": "legacy-clone-operation-01",
+  "legacyCloneDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
+  "sourceConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "retireIndeterminateCommandIds": ["legacy-indeterminate-command-01"]
+}
+```
+
+`retireIndeterminateCommandIds` 必须显式出现、按字典序严格递增、无重复，最多 64 项；可为
+空数组。目标 clone 必须是参数逐项引用的成功终态 `vm.clone`，保有相同 Agent、node、VM
+resource key、audit assignment/signing key/target，且任何已存在的 binding/device/epoch/
+assignment/VMID/generation 字段不得与当前命令冲突。RC.27 缺失的 authority 字段只能由当前
+已验签并获批的恢复命令补齐，不能由本地 CLI 或自报 payload 补齐。Agent 执行前还会重新读取
+`sourceVmid`，确认它仍是当前 node 上的同 guest type 模板，并重算 `sourceConfigSha256`。
+
+只允许把所列、同 VM generation、状态恰为
+`indeterminate/EXECUTION_INDETERMINATE` 且 Journal 与 receipt 都没有 UPID/upgrade ID 的旧记录
+标记为 retired。记录文件和审计证据保留；未列出的活动 mutation、带 UPID、身份冲突或损坏记录
+都会使整个动作 fail closed。clone 的 migration marker 使不同 command 无法二次消费；同一
+command/idempotency digest 可在进程崩溃后继续未完成的本地迁移，并在完成后只返回第一次结果。
+
+成功 result：
+
+```json
+{
+  "migrated": true,
+  "legacyCloneCommandId": "legacy-clone-command-01",
+  "legacyCloneOperationId": "legacy-clone-operation-01",
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
+  "sourceConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "retiredIndeterminateCommandIds": ["legacy-indeterminate-command-01"]
+}
+```
+
+请求与结果 golden 分别为
+`internal/control/testdata/agent-v1-vm-migrate-legacy-journal.json` 和
+`internal/control/testdata/agent-v1-vm-migrate-legacy-journal-result.json`。
 
 ## 初次资源定型
 
@@ -221,6 +274,53 @@ revoke parameters/result：
 broker revoke 固定 POST `/console-sessions/{sessionRef}/revoke`，request exact shape 为
 `schemaVersion/sessionRef/commandId/idempotencyKey/operationId/bindingId/deviceId/assignmentRevision/serviceRef/instanceUuid/generation/nodeRef/guestType/vmid`；
 成功可返回空 2xx body。broker 禁止 redirect；create response 必须是 strict JSON。
+
+## Guest firewall rules 严格回验
+
+以下三个 VM scope action 都是只读操作，不占用 mutation lock，也不需要审批；command 仍须
+通过 binding/device/epoch、assignment、VM identity/generation、Ed25519 和 action allowlist：
+
+- `firewall.guest.rules.list` parameters 固定为 `{}`。
+- `firewall.guest.rules.get` parameters 固定为 `{"position":0}`，position 范围 0..999。
+- `firewall.guest.rules.verify` parameters 固定为 `expectedDigest/rules`，rules 必须按 position
+  严格递增、无重复、最多 1000 条，且 SHA-256 必须等于 canonical JSON rules 的摘要。
+
+canonical rule 的 exact 字段为：
+
+```json
+{
+  "position": 0,
+  "type": "in",
+  "action": "ACCEPT",
+  "macro": "HTTPS",
+  "protocol": "tcp",
+  "icmpType": "echo-request",
+  "source": "192.0.2.0/24",
+  "destination": "198.51.100.10/32",
+  "sourcePort": "1024-65535",
+  "destinationPort": "443",
+  "interface": "net0",
+  "ipVersion": "4",
+  "logLevel": "info",
+  "enabled": true,
+  "comment": "managed rule"
+}
+```
+
+除 `position/type/action/enabled` 外的空字段省略。`type` 支持 PVE 官方返回的
+`in|out|group`；macro 和 security group 保持为受限 typed 名称。Agent 对 PVE 官方 rules
+返回字段执行 unknown-field fail-closed，拒绝重复位置、非法 enable/IP version、控制字符和
+不受支持的组合，然后按 position 排序再计算摘要。`verify` 同时比较摘要和 canonical JSON，
+所以新增、修改、删除、启用或关闭任一规则后都必须读取到完全一致状态才成功。
+
+list result 固定为 `{"rules":[...],"digest":"<64-lower-hex>"}`；get result 固定为
+`{"rule":{...},"digest":"<single-rule-64-lower-hex>"}`；verify result 固定为
+`{"verified":true,"rules":[...],"digest":"<64-lower-hex>"}`。上游 PVE 自带的共享 SHA-1
+digest 只用于验证返回格式，不进入本合同的 rule 字段或摘要算法。
+
+golden 位于
+`internal/control/testdata/agent-v1-firewall-guest-rules-list-result.json` 和
+`internal/control/testdata/agent-v1-firewall-guest-rules-verify.json`。
 
 ## 只读 snapshot / backup
 

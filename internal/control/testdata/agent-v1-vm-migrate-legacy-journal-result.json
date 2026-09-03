@@ -1,0 +1,11 @@
+{
+  "migrated": true,
+  "legacyCloneCommandId": "legacy-clone-command-01",
+  "legacyCloneOperationId": "legacy-clone-operation-01",
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
+  "sourceConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "retiredIndeterminateCommandIds": [
+    "legacy-indeterminate-command-01"
+  ]
+}

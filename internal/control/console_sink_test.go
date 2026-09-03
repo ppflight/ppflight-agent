@@ -96,7 +96,7 @@ func startFakeVNC(t *testing.T, ticket []byte, payload []byte) (int, <-chan erro
 
 func TestConsoleReverseTunnelAuthenticatesLocallyAndForwardsBytes(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
-	now := time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC)
+	now := time.Now().UTC().Truncate(time.Second)
 	registration := consoleRegistration(now)
 	ticket := []byte("ephemeral-pve-ticket")
 	port, pveDone, closePVE := startFakeVNC(t, ticket, []byte("SERVER"))

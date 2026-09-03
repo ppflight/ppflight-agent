@@ -1,0 +1,11 @@
+{
+  "legacyCloneCommandId": "legacy-clone-command-01",
+  "legacyCloneOperationId": "legacy-clone-operation-01",
+  "legacyCloneDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "templateRef": "ubuntu-24.04",
+  "sourceVmid": 9001,
+  "sourceConfigSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "retireIndeterminateCommandIds": [
+    "legacy-indeterminate-command-01"
+  ]
+}

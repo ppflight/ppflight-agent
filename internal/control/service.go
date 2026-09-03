@@ -144,6 +144,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Executor.InitialResources == nil {
 		cfg.Executor.InitialResources = cfg.Journal
 	}
+	if cfg.Executor.LegacyJournal == nil {
+		cfg.Executor.LegacyJournal = cfg.Journal
+	}
 	cfg.Executor.Mode = cfg.Mode
 	service := &Service{
 		agentRef: cfg.AgentRef, clusterRef: cfg.ClusterRef, bindingID: cfg.BindingID, deviceID: cfg.DeviceID,

@@ -421,6 +421,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.clone` | `sourceVmid`, `templateRef`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256，Journal 固化 templateRef/sourceVmid 供后续 lineage 使用。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |
 | vm | `vm.set-initial-resources` | 仅新 clone 首次定型；精确 `cores/sockets/memoryMiB` 加 `cloneOperationId/templateRef/sourceVmid/vmGeneration/templateConfigSha256`，其中 `vmGeneration` 是十进制字符串。当前命令使用独立 operationId，`cloneOperationId` 引用此前成功终态的 clone；本机 durable journal 精确核对 authority、VM identity、generation、template identity 与 SHA，并证明目标从未启动/交付/重装或进入其他代次。PVE 当前须为 stopped non-template；允许低于模板基线，但不构成存量降级入口。等待 UPID 并精确回读。 |
+| vm | `vm.migrate-legacy-journal` | 修改类、必须签名审批、每个 clone lineage 仅能消费一次的本地恢复动作。只接受一个精确 legacy clone command/operation/digest、固定 templateRef/sourceVmid/source config SHA，以及显式排序的无 UPID indeterminate command ID 列表；命令 envelope 锁定当前 binding/device/epoch/assignment/VMID/generation，旧记录的 Agent/audit target/signing key/assignment/resource key 及任何已存在 authority 字段必须一致。重新读取当前模板摘要后才补齐 legacy clone identity，并只标记退休列出的无 UPID 记录；绝不删除文件，不存在枚举/清空 Journal 参数。 |
 | vm | `vm.reinstall` | Linux QEMU only；固定 template identity/version/VMID/config SHA-256、独占 temporary VMID、完整最终资源/磁盘 IO/网络/IPFilter/Cloud-Init/OS identity 合同。先建本机完整补偿 clone，再替换并逐项回读；失败恢复或进入 indeterminate。禁止 URL/ISO/shell/任意 guest-exec 参数。 |
 | vm | `vm.resize` | `disk`，以及互斥的 grow-only `size`（例如 `+20G`）或绝对 `targetGiB`；绝对目标会先回读当前 `size=`，相等幂等成功、缩容拒绝。 |
 | vm | `vm.set-disk-io` | QEMU only；`disk` 与 `limits`。limits 的 10 个 IOPS/MBPS base/max/burst length 键必须全部出现，值为 typed 整数或 null；null 会移除对应受管键，保留 volume/size/cache 等其余配置并使用 PVE digest。 |
@@ -442,6 +443,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `firewall.guest.set-options` | `enable` 必填；可选 `policyIn`/`policyOut`（`ACCEPT`/`DROP`/`REJECT`）与 `macFilter`。旧 `{enable}` payload 保持兼容，未知字段仍拒绝。 |
 | vm | `firewall.guest.verify-ipfilter` | 只读；精确回验 cluster、目标 node 与 guest firewall 已启用、cluster 未显式关闭 PVE 8 二层 `ebtables`、guest 策略为 `ACCEPT/ACCEPT`、MACFilter 有效、目标 `netN firewall=1`，并且每个 `ipfilter-netN` 仅包含签名命令声明的正向 `/32`、`/128` host CIDR。`networks[].macAddress` 可选以兼容旧调用；新流程必须提供规范大写、非零单播 MAC，Agent 会同时证明 PVE 当前 QEMU `virtio=<MAC>` 或 LXC `hwaddr=<MAC>` 与签名分配一致。成功结果显式返回 `guestFirewallEnabled`、`policyIn`、`policyOut`、`macFilterEnabled`，以及每张网卡的 `macAddress`、`firewallEnabled`、`ipFilterEnabled`、`ipSet`、`ipFilterCidrs`。可在 guest 停机时执行。 |
 | vm | `firewall.guest.verify-ipfilter-sets` | 只读；创建/重装的中间预配置阶段精确回验 guest firewall 与目标全部 `netN firewall` 均关闭，按新请求同时证明每张 `netN` 的规范 MAC，并确认每个 `ipfilter-netN` 仅含签名命令声明的正向 `/32`、`/128` host CIDR。成功结果固定返回 `enforcementState=preconfigured-not-enforcing`，不得解释为防冒用已生效，也不得作为创建/重装最终成功条件。 |
+| vm | `firewall.guest.rules.list`, `firewall.guest.rules.get`, `firewall.guest.rules.verify` | 只读。list 仅接受 `{}`；get 接受 `position=0..999`；verify 接受按 position 严格递增的完整 canonical rules 和对应 SHA-256。返回 PVE position/type/action/macro/protocol/ICMP/source/destination/ports/interface/IP version/log/enabled/comment 字段与确定性摘要；未知上游字段、重复位置或摘要/内容不一致均 fail closed。 |
 | vm | `firewall.rule.create`, `firewall.rule.update`, `firewall.rule.delete` | typed direction/action/protocol/source/destination/port/position 等；不接受规则文本。 |
 | vm | `firewall.ipset.create`, `firewall.ipset.update`, `firewall.ipset.delete` | `name` 与可选 `comment`。 |
 | vm | `firewall.ipset.entry.create` | `name`, `cidr`、必填 bool `noSubnet`，可选 `comment`。 |
@@ -458,7 +460,7 @@ POST /internal/v1/monitoring/audit-events/batches
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
 锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
 
-当前共有 49 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 的 exact JSON shape、回执及服务端接入边界见 `PROVISIONING-ACTIONS-V1.md`。
+当前共有 53 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 的 exact JSON shape、回执及服务端接入边界见 `PROVISIONING-ACTIONS-V1.md`。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
@@ -559,7 +561,7 @@ payment_authorized
 | 操作线程/UPID | command/receipt 含 `operationId`；journal 保存 submitted/waiting UPID，runtime 在 command cycle 前后调用 reconcile 并查询原 UPID。 | Agent 与官网端到端恢复矩阵通过前不得称生产就绪。 |
 | watchdog/previousExit | systemd notify/watchdog、请求级采集 progress deadline、自动重启所需 unit 设置、`lifecycle-state.json` 和按 destination 启用的 website/monitoring 不可淘汰 lifecycle outbox 已实现并有 Linux/重启测试；未启用域保持 pending。 | 这是本地恢复与补报原语，不是远端 SLA；官网/监控接收、展示/告警以及真实故障演练仍需验收。 |
 | Agent 离线命令 | Agent 主动 poll、领取后的 journal/UPID/receipt durable recovery 已实现。 | 官网持久离线命令队列与 command `wait` 尚待实现/联调；任何离线场景都禁止自动回退官网直连 PVE。 |
-| 固定动作 Executor | 第 7 节 49 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console 等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
+| 固定动作 Executor | 第 7 节 53 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console 等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching 与 signed netN/MAC/generation 到宿主 tap/veth counter 的逐公网 NIC 计量已实现；private NIC 不计费。 | 官网向导/assignment 签发与账本消费仍待远端合并；多 NIC guest aggregate 永远不能 active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |

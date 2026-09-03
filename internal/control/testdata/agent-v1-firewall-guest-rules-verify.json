@@ -1,0 +1,23 @@
+{
+  "expectedDigest": "c40a551703a38ae432b11f41f91e6347fc6e9a78c05618b19a3ed431343b82ab",
+  "rules": [
+    {
+      "position": 0,
+      "type": "in",
+      "action": "ACCEPT",
+      "protocol": "tcp",
+      "source": "192.0.2.0/24",
+      "destinationPort": "22",
+      "interface": "net0",
+      "ipVersion": "4",
+      "enabled": true,
+      "comment": "SSH"
+    },
+    {
+      "position": 1,
+      "type": "out",
+      "action": "DROP",
+      "enabled": false
+    }
+  ]
+}

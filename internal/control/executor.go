@@ -63,6 +63,9 @@ type Executor struct {
 	// grow-only resource policy from durable clone lineage. Production never
 	// trusts a caller-provided "new VM" boolean.
 	InitialResources InitialResourceAuthorizer
+	// LegacyJournal performs one narrowly-scoped, signed VM lineage migration.
+	// It cannot enumerate, truncate, or otherwise clear the journal.
+	LegacyJournal LegacyJournalMigrator
 	// ConsoleSessions starts a short-lived Agent-originated reverse WSS tunnel.
 	// PVE ticket and localhost details remain inside the Agent process and never
 	// enter a receipt, audit event, broker registration, log, or durable queue.
@@ -71,6 +74,10 @@ type Executor struct {
 
 type InitialResourceAuthorizer interface {
 	AuthorizeInitialResources(Command, string, string, int, string) error
+}
+
+type LegacyJournalMigrator interface {
+	MigrateLegacyVMJournal(Command, legacyJournalMigrationP, time.Time) (LegacyJournalMigrationResult, error)
 }
 
 type ConsoleSessionSink interface {
@@ -237,6 +244,29 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "firewall.guest.rules.list" || command.Action == "firewall.guest.rules.get" || command.Action == "firewall.guest.rules.verify" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		base := fmt.Sprintf("/nodes/%s/%s/%d", command.Identity.NodeRef, command.Identity.GuestType, command.Identity.VMID)
+		result, readErr := executeGuestFirewallRules(ctx, client, command, base)
+		r.FinishedAt = time.Now().UTC()
+		if readErr != nil {
+			r.State, r.Code = "failed", "GUEST_FIREWALL_RULES_NOT_READY"
+			return finish(readErr)
+		}
+		if len(result) > maxControlResultBytes {
+			r.State, r.Code = "failed", "RESULT_TOO_LARGE"
+			return finish(ErrResultTooLarge)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if e.Mode != "production" || !e.ProductionExecution {
 		r.State, r.Code, r.DryRun, r.FinishedAt = "dry_run", "DRY_RUN", true, time.Now().UTC()
 		return finish(nil)
@@ -258,6 +288,28 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	if e.Client == nil {
 		r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
 		return finish(errors.New("PVE control client is unavailable"))
+	}
+	if command.Action == "vm.migrate-legacy-journal" {
+		if e.LegacyJournal == nil {
+			r.State, r.Code, r.FinishedAt = "rejected", "LEGACY_JOURNAL_MIGRATION_UNAVAILABLE", time.Now().UTC()
+			return finish(errors.New("legacy journal migration is unavailable"))
+		}
+		var parameters legacyJournalMigrationP
+		_ = strictParameters(command.Parameters, &parameters)
+		full := true
+		if sourceErr := verifyCloneSource(ctx, e.Client, command, cloneP{SourceVMID: parameters.SourceVMID, TemplateRef: parameters.TemplateRef, Name: "legacy-lineage-proof", Target: command.Identity.NodeRef, Storage: "local", Full: &full, SourceConfigSHA256: parameters.SourceConfigSHA256}); sourceErr != nil {
+			r.State, r.Code, r.FinishedAt = "rejected", "LEGACY_JOURNAL_SOURCE_REJECTED", time.Now().UTC()
+			return finish(sourceErr)
+		}
+		result, migrationErr := e.LegacyJournal.MigrateLegacyVMJournal(command, parameters, now)
+		r.FinishedAt = time.Now().UTC()
+		if migrationErr != nil {
+			r.State, r.Code = "rejected", "LEGACY_JOURNAL_MIGRATION_REJECTED"
+			return finish(migrationErr)
+		}
+		r.State, r.Code = "succeeded", "SUCCEEDED"
+		r.Result, _ = json.Marshal(result)
+		return finish(nil)
 	}
 	if command.Action == "vm.set-initial-resources" {
 		if e.InitialResources == nil {
@@ -703,6 +755,12 @@ func validateParameters(c Command) error {
 			return errors.New("invalid initial resource parameters")
 		}
 		return nil
+	case "vm.migrate-legacy-journal":
+		var p legacyJournalMigrationP
+		if strictParameters(c.Parameters, &p) != nil || !validLegacyJournalMigration(c, p) {
+			return errors.New("invalid legacy journal migration parameters")
+		}
+		return nil
 	case "vm.reinstall":
 		var p reinstallP
 		if strictParameters(c.Parameters, &p) != nil || !exactReinstallKeys(c.Parameters) || !validReinstall(c, p) {
@@ -766,6 +824,24 @@ func validateParameters(c Command) error {
 		var p ipFilterVerifyP
 		if strictParameters(c.Parameters, &p) != nil || !validIPFilterVerification(p) {
 			return errors.New("invalid guest IP filter set verification parameters")
+		}
+		return nil
+	case "firewall.guest.rules.list":
+		return requireEmptyObject(c.Parameters)
+	case "firewall.guest.rules.get":
+		var p guestFirewallRulesGetP
+		if strictParameters(c.Parameters, &p) != nil || p.Position < 0 || p.Position > 999 {
+			return errors.New("invalid guest firewall rule position")
+		}
+		return nil
+	case "firewall.guest.rules.verify":
+		var p guestFirewallRulesVerifyP
+		if strictParameters(c.Parameters, &p) != nil {
+			return errors.New("invalid expected guest firewall rules")
+		}
+		digest, err := guestFirewallRulesDigest(p.Rules)
+		if err != nil || !bodyHashRE.MatchString(p.ExpectedDigest) || digest != p.ExpectedDigest {
+			return errors.New("invalid expected guest firewall rules")
 		}
 		return nil
 	case "vm.delete":
@@ -1003,6 +1079,8 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		return setResources(ctx, client, c, base)
 	case "vm.set-initial-resources":
 		return setInitialResources(ctx, client, c, base)
+	case "vm.migrate-legacy-journal":
+		return "", nil, errors.New("legacy journal migration requires durable journal dispatch")
 	case "vm.reinstall":
 		return reinstallGuest(ctx, client, c)
 	case "vm.console.create-session", "vm.console.revoke-session":

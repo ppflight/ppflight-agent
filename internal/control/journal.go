@@ -58,22 +58,26 @@ type journalRecord struct {
 	Generation         protocol.Counter `json:"generation,omitempty"`
 	// SourceConfigSHA256 is safe clone-lineage metadata. It is the reviewed
 	// template configuration digest, never a command body or credential.
-	SourceConfigSHA256 string          `json:"sourceConfigSha256,omitempty"`
-	SourceTemplateRef  string          `json:"sourceTemplateRef,omitempty"`
-	SourceVMID         int             `json:"sourceVmid,omitempty"`
-	Mutating           bool            `json:"mutating"`
-	Digest             string          `json:"digest"`
-	ResourceKey        string          `json:"resourceKey"`
-	NodeRef            string          `json:"nodeRef,omitempty"`
-	PVETaskUPID        string          `json:"pveTaskUpid,omitempty"`
-	AgentUpgradeID     string          `json:"agentUpgradeId,omitempty"`
-	State              string          `json:"state"`
-	ReceiptPending     bool            `json:"receiptPending,omitempty"`
-	CreatedAt          time.Time       `json:"createdAt"`
-	UpdatedAt          time.Time       `json:"updatedAt"`
-	Receipt            *Receipt        `json:"receipt,omitempty"`
-	AuditContext       *auditContext   `json:"auditContext,omitempty"`
-	AuditPending       *auditlog.Event `json:"auditPending,omitempty"`
+	SourceConfigSHA256  string          `json:"sourceConfigSha256,omitempty"`
+	SourceTemplateRef   string          `json:"sourceTemplateRef,omitempty"`
+	SourceVMID          int             `json:"sourceVmid,omitempty"`
+	MigratedByCommandID string          `json:"migratedByCommandId,omitempty"`
+	MigratedAt          *time.Time      `json:"migratedAt,omitempty"`
+	RetiredByCommandID  string          `json:"retiredByCommandId,omitempty"`
+	RetiredAt           *time.Time      `json:"retiredAt,omitempty"`
+	Mutating            bool            `json:"mutating"`
+	Digest              string          `json:"digest"`
+	ResourceKey         string          `json:"resourceKey"`
+	NodeRef             string          `json:"nodeRef,omitempty"`
+	PVETaskUPID         string          `json:"pveTaskUpid,omitempty"`
+	AgentUpgradeID      string          `json:"agentUpgradeId,omitempty"`
+	State               string          `json:"state"`
+	ReceiptPending      bool            `json:"receiptPending,omitempty"`
+	CreatedAt           time.Time       `json:"createdAt"`
+	UpdatedAt           time.Time       `json:"updatedAt"`
+	Receipt             *Receipt        `json:"receipt,omitempty"`
+	AuditContext        *auditContext   `json:"auditContext,omitempty"`
+	AuditPending        *auditlog.Event `json:"auditPending,omitempty"`
 }
 
 // auditContext is the safe, immutable command projection needed to rebuild a
@@ -182,6 +186,16 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 		if existing.Receipt != nil {
 			return *existing.Receipt, true, nil
 		}
+		if existing.Action == "vm.migrate-legacy-journal" {
+			// This action only applies a deterministic local metadata transaction.
+			// The exact signed command may safely finish a crash-interrupted partial
+			// migration, while a different command is rejected by one-time markers.
+			existing.UpdatedAt = now.UTC()
+			if writeErr := writeJournal(filename, existing); writeErr != nil {
+				return Receipt{}, false, writeErr
+			}
+			return Receipt{}, false, nil
+		}
 		if !existing.Mutating {
 			// A read can be repeated safely after a crash. Keep the same durable
 			// claim and let the redelivered command execute again.
@@ -224,6 +238,13 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	mutating := requiresApproval(command.Action)
 	if mutating {
 		busy, err := j.resourceBusyLocked(resourceKey)
+		if command.Action == "vm.migrate-legacy-journal" {
+			var parameters legacyJournalMigrationP
+			if decodeErr := strictParameters(command.Parameters, &parameters); decodeErr != nil {
+				return Receipt{}, false, decodeErr
+			}
+			busy, err = j.resourceBusyForLegacyMigrationLocked(command, parameters)
+		}
 		if err != nil {
 			return Receipt{}, false, err
 		}
@@ -382,6 +403,9 @@ func recordSucceeded(record journalRecord) bool {
 }
 
 func recordMutationMayHaveHappened(record journalRecord) bool {
+	if record.RetiredByCommandID != "" {
+		return false
+	}
 	if record.Receipt == nil {
 		return record.State == "received" || record.State == "submitted" || record.State == "waiting" || record.State == "indeterminate"
 	}
@@ -453,7 +477,9 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	// exception is the strictly typed, secret-free initial-resource result,
 	// which must survive a crash so an exact idempotent replay can return the
 	// first result without touching PVE again.
-	if record.Action != "vm.set-initial-resources" || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !validInitialResourcesJournalResult(record, receipt.Result) {
+	safeReplayResult := record.Action == "vm.set-initial-resources" && validInitialResourcesJournalResult(record, receipt.Result) ||
+		record.Action == "vm.migrate-legacy-journal" && validLegacyMigrationJournalResult(receipt.Result)
+	if receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !safeReplayResult {
 		journalReceipt.Result = nil
 	}
 	record.State, record.UpdatedAt, record.Receipt, record.ReceiptPending = receipt.State, receipt.FinishedAt.UTC(), &journalReceipt, true
@@ -471,6 +497,27 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 		record.AuditPending = &event
 	}
 	return writeJournal(filename, *record)
+}
+
+func validLegacyMigrationJournalResult(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var result LegacyJournalMigrationResult
+	if strictParameters(raw, &result) != nil || !result.Migrated || !commandIDRE.MatchString(result.LegacyCloneCommandID) ||
+		!commandIDRE.MatchString(result.LegacyCloneOperationID) || !nameRE.MatchString(result.TemplateRef) ||
+		result.SourceVMID < 100 || result.SourceVMID > 999999999 || !bodyHashRE.MatchString(result.SourceConfigSHA256) ||
+		result.RetiredIndeterminateCommandIDs == nil || len(result.RetiredIndeterminateCommandIDs) > maxLegacyJournalRetirements {
+		return false
+	}
+	previous := ""
+	for _, commandID := range result.RetiredIndeterminateCommandIDs {
+		if !commandIDRE.MatchString(commandID) || previous != "" && commandID <= previous {
+			return false
+		}
+		previous = commandID
+	}
+	return true
 }
 
 func validInitialResourcesJournalResult(record *journalRecord, raw json.RawMessage) bool {
@@ -888,7 +935,7 @@ func readJournal(filename string) (journalRecord, error) {
 		return journalRecord{}, err
 	}
 	var record journalRecord
-	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.SourceTemplateRef != "" && !nameRE.MatchString(record.SourceTemplateRef)) || record.SourceVMID < 0 || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) || !validOptionalJournalLineage(record) {
+	if err := json.Unmarshal(raw, &record); err != nil || record.Version != SchemaVersion || !commandIDRE.MatchString(record.CommandID) || record.Digest == "" || record.ResourceKey == "" || !validJournalScope(record.Scope, record.NodeRef) || (record.Action != "" && !actionRE.MatchString(record.Action)) || (record.SourceConfigSHA256 != "" && !bodyHashRE.MatchString(record.SourceConfigSHA256)) || (record.SourceTemplateRef != "" && !nameRE.MatchString(record.SourceTemplateRef)) || record.SourceVMID < 0 || (record.PVETaskUPID != "" && !upidRE.MatchString(record.PVETaskUPID)) || (record.AuditContext != nil && record.AuditContext.validate() != nil) || (record.AuditPending != nil && record.AuditPending.Validate() != nil) || !validOptionalJournalLineage(record) || !validJournalMigrationMarkers(record) {
 		return journalRecord{}, fmt.Errorf("control journal record is corrupt")
 	}
 	return record, nil
