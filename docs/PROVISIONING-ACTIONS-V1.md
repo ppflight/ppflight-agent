@@ -10,7 +10,10 @@ WSS console 合同从 `0.1.0-rc.28` 开始；VM 级 legacy Journal 恢复和 gue
 严格回验从 `0.1.0-rc.29` 开始；跨 assignment revision 的精确 legacy 恢复合同从
 `0.1.0-rc.30` 开始；旧版 `PVE_RESULT_INDETERMINATE` 精确恢复兼容从 `0.1.0-rc.31`
 开始；旧生产 Journal 缺失 record-level action 与 clone source identity 的签名审计恢复从
-`0.1.1-rc.2` 开始。协议版本仍为 `schemaVersion: 1`，这些 action
+`0.1.1-rc.2` 开始；已由成功迁移完整退休的 indeterminate 记录从 `0.1.1-rc.3` 开始不再
+占用资源锁。释放锁前必须同时验证合法 `RetiredByCommandID/RetiredAt`、同资源同 authority
+的成功迁移 Journal，以及明确列出该旧 command 的严格迁移结果；部分标记或未完成迁移继续
+fail closed。协议版本仍为 `schemaVersion: 1`，这些 action
 是 additive 扩展。密码、SSH key、PVE
 ticket/certificate、完整 parameters 和原始 PVE response 不进入 receipt、audit 或日志。
 

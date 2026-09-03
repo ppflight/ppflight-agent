@@ -87,6 +87,22 @@ func legacyMigrationFixture(t *testing.T) (*Journal, Command, Command, legacyJou
 	return journal, clone, migration, parameters, now
 }
 
+func legacyInitialResourcesCommand(t *testing.T, clone, migration Command, parameters legacyJournalMigrationP, commandID, operationID string) Command {
+	t.Helper()
+	raw, err := json.Marshal(initialResourcesP{
+		Cores: 1, Sockets: 1, MemoryMiB: 1024, CloneOperationID: clone.OperationID,
+		TemplateRef: parameters.TemplateRef, SourceVMID: parameters.SourceVMID,
+		VMGeneration: protocol.Counter(migration.Identity.Generation), TemplateConfigSHA256: parameters.SourceConfigSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := legacyAuthorityCommand("vm.set-initial-resources", string(raw), commandID, operationID)
+	initial.AssignmentRevision = migration.AssignmentRevision
+	initial.Identity = migration.Identity
+	return initial
+}
+
 func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *testing.T) {
 	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
 	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.0-rc.31"); err != nil || duplicate {
@@ -115,6 +131,13 @@ func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *
 	if err := journal.Complete(migration, receipt); err != nil {
 		t.Fatal(err)
 	}
+	initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "initial-command", "initial-operation")
+	if _, duplicate, err := journal.ClaimWithAudit(initial, now.Add(4*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+		t.Fatalf("initial claim remained resource-busy after completed migration: duplicate=%t err=%v", duplicate, err)
+	}
+	if err := journal.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
+		t.Fatalf("migrated lineage not authorized: %v", err)
+	}
 	reopened, err := OpenJournal(journal.directory)
 	if err != nil {
 		t.Fatal(err)
@@ -123,10 +146,108 @@ func TestLegacyJournalMigrationBackfillsCloneRetiresNoUPIDAndSurvivesRestart(t *
 	if err != nil || !duplicate || replayed.State != "succeeded" || !bytes.Equal(replayed.Result, resultRaw) {
 		t.Fatalf("replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
 	}
-	initial := legacyAuthorityCommand("vm.set-initial-resources", initialResourcesFixture, "initial-command", "initial-operation")
-	initial.AssignmentRevision = migration.AssignmentRevision
 	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
 		t.Fatalf("migrated lineage not authorized after restart: %v", err)
+	}
+}
+
+func TestRetirementDoesNotReleaseResourceLockBeforeMigrationCompletion(t *testing.T) {
+	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+		t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	if _, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "incomplete-initial-command", "incomplete-initial-operation")
+	if _, _, err := journal.ClaimWithAudit(initial, now.Add(4*time.Second), "0.1.1-rc.3"); !errors.Is(err, ErrResourceBusy) {
+		t.Fatalf("uncommitted migration released resource lock: %v", err)
+	}
+}
+
+func TestMalformedOrPartialRetirementMarkersRemainFailClosed(t *testing.T) {
+	tests := map[string]func(*journalRecord, Command, time.Time){
+		"command only": func(record *journalRecord, migration Command, _ time.Time) {
+			record.RetiredByCommandID = migration.CommandID
+		},
+		"time only": func(record *journalRecord, _ Command, now time.Time) {
+			record.RetiredAt = &now
+		},
+		"malformed command": func(record *journalRecord, _ Command, now time.Time) {
+			record.RetiredByCommandID = "bad command id"
+			record.RetiredAt = &now
+		},
+		"missing migration": func(record *journalRecord, _ Command, now time.Time) {
+			record.RetiredByCommandID = "missing-migration-command"
+			record.RetiredAt = &now
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+			retiredPath := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+			record, err := readJournal(retiredPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&record, migration, now.Add(3*time.Second))
+			if err := writeJournal(retiredPath, record); err != nil {
+				t.Fatal(err)
+			}
+			initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "malformed-initial-command", "malformed-initial-operation")
+			if _, _, err := journal.ClaimWithAudit(initial, now.Add(4*time.Second), "0.1.1-rc.3"); err == nil {
+				t.Fatal("malformed retirement released resource lock")
+			}
+			if _, err := os.Stat(retiredPath); err != nil {
+				t.Fatalf("legacy journal file changed or disappeared: %v", err)
+			}
+		})
+	}
+}
+
+func TestRetiredRecordAuthorityMismatchStillHoldsResourceLock(t *testing.T) {
+	mutations := map[string]func(*journalRecord){
+		"binding":    func(record *journalRecord) { record.BindingID = "22222222-2222-4222-8222-222222222222" },
+		"device":     func(record *journalRecord) { record.DeviceID = "device-2" },
+		"epoch":      func(record *journalRecord) { record.CredentialEpoch++ },
+		"revision":   func(record *journalRecord) { record.AssignmentRevision++ },
+		"vmid":       func(record *journalRecord) { record.VMID++ },
+		"generation": func(record *journalRecord) { record.Generation++ },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+			if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+				t.Fatalf("migration claim duplicate=%t err=%v", duplicate, err)
+			}
+			result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resultRaw, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := Receipt{SchemaVersion: 1, ReceiptID: "77777777-7777-4777-8777-777777777777", CommandID: migration.CommandID,
+				OperationID: migration.OperationID, AgentRef: migration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+				ExecutionMode: "production", StartedAt: now.Add(2 * time.Second), FinishedAt: now.Add(3 * time.Second), Result: resultRaw}
+			if err := journal.Complete(migration, receipt); err != nil {
+				t.Fatal(err)
+			}
+			retiredPath := journal.path(parameters.RetireIndeterminateCommandIDs[0])
+			retired, err := readJournal(retiredPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(&retired)
+			if err := writeJournal(retiredPath, retired); err != nil {
+				t.Fatal(err)
+			}
+			initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "mismatch-initial-command", "mismatch-initial-operation")
+			if _, _, err := journal.ClaimWithAudit(initial, now.Add(4*time.Second), "0.1.1-rc.3"); !errors.Is(err, ErrResourceBusy) {
+				t.Fatalf("retired %s mismatch released resource lock: %v", name, err)
+			}
+		})
 	}
 }
 
@@ -377,9 +498,10 @@ func TestLegacyJournalMigrationAcceptsCompleteHistoricalAuthorityProductionShape
 		t.Fatalf("restart replay=%#v duplicate=%t err=%v", replayed, duplicate, err)
 	}
 
-	initial := legacyAuthorityCommand("vm.set-initial-resources", initialResourcesFixture, "production-initial-command", "production-initial-operation")
-	initial.AssignmentRevision = migration.AssignmentRevision
-	initial.Identity.VMID = 100
+	initial := legacyInitialResourcesCommand(t, clone, migration, parameters, "production-initial-command", "production-initial-operation")
+	if _, duplicate, err := reopened.ClaimWithAudit(initial, now.Add(5*time.Second), "0.1.1-rc.3"); err != nil || duplicate {
+		t.Fatalf("production initial claim duplicate=%t err=%v", duplicate, err)
+	}
 	if err := reopened.AuthorizeInitialResources(initial, clone.OperationID, parameters.TemplateRef, parameters.SourceVMID, parameters.SourceConfigSHA256); err != nil {
 		t.Fatalf("initial resources remained blocked after migration: %v", err)
 	}

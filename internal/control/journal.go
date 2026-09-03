@@ -384,15 +384,19 @@ func (j *Journal) AuthorizeInitialResources(command Command, cloneOperationID, t
 		return errors.New("completed clone lineage was not found")
 	}
 	for _, record := range records {
+		mutationMayHaveHappened, mutationErr := j.recordMutationMayHaveHappenedLocked(record)
+		if mutationErr != nil {
+			return mutationErr
+		}
 		if record.ResourceKey == resourceKey {
-			if record.Action == "vm.set-initial-resources" && record.CommandID != command.CommandID && recordMutationMayHaveHappened(record) {
+			if record.Action == "vm.set-initial-resources" && record.CommandID != command.CommandID && mutationMayHaveHappened {
 				return errors.New("VM generation already consumed its initial resource authorization")
 			}
-			if (record.Action == "vm.start" || record.Action == "vm.verify-delivery" || record.Action == "vm.reinstall") && recordMutationMayHaveHappened(record) {
+			if (record.Action == "vm.start" || record.Action == "vm.verify-delivery" || record.Action == "vm.reinstall") && mutationMayHaveHappened {
 				return errors.New("VM generation has already been finalized, delivered, or started")
 			}
 		}
-		if sameLineageVM(record, command) && uint64(record.Generation) != command.Identity.Generation && !record.CreatedAt.Before(clone.CreatedAt) && recordMutationMayHaveHappened(record) {
+		if sameLineageVM(record, command) && uint64(record.Generation) != command.Identity.Generation && !record.CreatedAt.Before(clone.CreatedAt) && mutationMayHaveHappened {
 			return errors.New("VM identity has advanced to another generation")
 		}
 	}
@@ -430,7 +434,7 @@ func recordSucceeded(record journalRecord) bool {
 }
 
 func recordMutationMayHaveHappened(record journalRecord) bool {
-	if record.RetiredByCommandID != "" {
+	if recordHasCompleteRetirementMarkers(record) {
 		return false
 	}
 	if record.Receipt == nil {
@@ -442,6 +446,63 @@ func recordMutationMayHaveHappened(record journalRecord) bool {
 	default:
 		return false
 	}
+}
+
+func recordHasCompleteRetirementMarkers(record journalRecord) bool {
+	return record.RetiredByCommandID != "" && commandIDRE.MatchString(record.RetiredByCommandID) &&
+		record.RetiredAt != nil && !record.RetiredAt.IsZero() && record.RetiredAt.Location() == time.UTC &&
+		validJournalMigrationMarkers(record)
+}
+
+// recordMutationMayHaveHappenedLocked additionally proves that complete-looking
+// retirement markers were committed by a successful, same-authority migration
+// whose durable result explicitly lists this record. This prevents a crash
+// between marker writes and migration completion from releasing the VM lock.
+func (j *Journal) recordMutationMayHaveHappenedLocked(record journalRecord) (bool, error) {
+	if recordHasCompleteRetirementMarkers(record) {
+		retired, err := j.retirementCommittedLocked(record)
+		if err != nil {
+			return true, err
+		}
+		return !retired, nil
+	}
+	return recordMutationMayHaveHappened(record), nil
+}
+
+func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) {
+	if !recordHasCompleteRetirementMarkers(record) {
+		return false, nil
+	}
+	migration, err := readJournal(j.path(record.RetiredByCommandID))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if migration.CommandID != record.RetiredByCommandID || migration.Action != "vm.migrate-legacy-journal" ||
+		migration.ResourceKey != record.ResourceKey || !recordSucceeded(migration) || migration.AuditContext == nil ||
+		migration.AuditContext.Action != migration.Action || migration.AuditContext.ApprovalRef == "" ||
+		migration.BindingID != record.BindingID || migration.DeviceID != record.DeviceID ||
+		migration.CredentialEpoch != record.CredentialEpoch || migration.AssignmentRevision != record.AssignmentRevision ||
+		migration.AgentRef != record.AgentRef || migration.ClusterRef != record.ClusterRef || migration.NodeRef != record.NodeRef ||
+		migration.ServiceRef != record.ServiceRef || migration.InstanceUUID != record.InstanceUUID || migration.GuestType != record.GuestType ||
+		migration.VMID != record.VMID || migration.Generation != record.Generation || migration.Receipt == nil ||
+		migration.CreatedAt.IsZero() || migration.UpdatedAt.IsZero() || record.RetiredAt.Before(migration.CreatedAt) ||
+		record.RetiredAt.After(migration.UpdatedAt) {
+		return false, nil
+	}
+	var result LegacyJournalMigrationResult
+	if !validLegacyMigrationJournalResult(&migration, migration.Receipt.Result) ||
+		strictParameters(migration.Receipt.Result, &result) != nil {
+		return false, nil
+	}
+	for _, commandID := range result.RetiredIndeterminateCommandIDs {
+		if commandID == record.CommandID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (j *Journal) Complete(command Command, receipt Receipt) error {
@@ -886,7 +947,13 @@ func (j *Journal) resourceBusyLocked(resourceKey string) (bool, error) {
 			return false, err
 		}
 		if record.Mutating && record.ResourceKey == resourceKey && (record.State == "received" || record.State == "submitted" || record.State == "waiting" || record.State == "indeterminate") {
-			return true, nil
+			retired, retireErr := j.retirementCommittedLocked(record)
+			if retireErr != nil {
+				return false, retireErr
+			}
+			if !retired {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
