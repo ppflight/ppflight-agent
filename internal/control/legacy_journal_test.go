@@ -779,6 +779,62 @@ func TestLegacyJournalMigrationClaimReturnsSpecificConflictClasses(t *testing.T)
 	})
 }
 
+func TestLegacyJournalMigrationRetiresNewIndeterminateOnAlreadyMigratedLineage(t *testing.T) {
+	journal, clone, migration, parameters, now := legacyMigrationFixture(t)
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(2*time.Second), "0.1.1-rc.21"); err != nil || duplicate {
+		t.Fatalf("first migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	firstResult, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRaw, _ := json.Marshal(firstResult)
+	firstReceipt := Receipt{SchemaVersion: 1, ReceiptID: "66666666-6666-4666-8666-666666666666", CommandID: migration.CommandID,
+		OperationID: migration.OperationID, AgentRef: migration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(2 * time.Second), FinishedAt: now.Add(3 * time.Second), Result: firstRaw}
+	if err := journal.Complete(migration, firstReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	indeterminate := legacyAuthorityCommand("vm.set-timezone", `{"timezone":"UTC"}`, "followup-indeterminate-command", "followup-indeterminate-operation")
+	indeterminate.AssignmentRevision = migration.AssignmentRevision
+	indeterminate.Identity = migration.Identity
+	if _, duplicate, err := journal.ClaimWithAudit(indeterminate, now.Add(4*time.Second), "0.1.1-rc.21"); err != nil || duplicate {
+		t.Fatalf("follow-up mutation claim duplicate=%t err=%v", duplicate, err)
+	}
+	indeterminateReceipt := Receipt{SchemaVersion: 1, ReceiptID: "77777777-7777-4777-8777-777777777777", CommandID: indeterminate.CommandID,
+		OperationID: indeterminate.OperationID, AgentRef: indeterminate.AgentRef, State: "indeterminate", Code: "PVE_RESULT_INDETERMINATE",
+		ExecutionMode: "production", StartedAt: now.Add(4 * time.Second), FinishedAt: now.Add(4 * time.Second)}
+	if err := journal.Complete(indeterminate, indeterminateReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	parameters.LegacyAssignmentRevision = migration.AssignmentRevision
+	parameters.RetireIndeterminateCommandIDs = []string{indeterminate.CommandID}
+	parametersRaw, _ := json.Marshal(parameters)
+	second := migration
+	second.CommandID = "followup-migration-command"
+	second.OperationID = "followup-migration-operation"
+	second.IdempotencyKey = "followup-migration-idempotency"
+	second.AssignmentRevision++
+	second.Parameters = parametersRaw
+	if _, duplicate, err := journal.ClaimWithAudit(second, now.Add(5*time.Second), "0.1.1-rc.22"); err != nil || duplicate {
+		t.Fatalf("follow-up migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	secondResult, err := journal.MigrateLegacyVMJournal(second, parameters, now.Add(6*time.Second))
+	if err != nil || !secondResult.Migrated || len(secondResult.RetiredIndeterminateCommandIDs) != 1 {
+		t.Fatalf("follow-up migration result=%#v err=%v", secondResult, err)
+	}
+	cloneRecord, err := readJournal(journal.path(clone.CommandID))
+	if err != nil || cloneRecord.MigratedByCommandID != migration.CommandID || cloneRecord.AssignmentRevision != migration.AssignmentRevision {
+		t.Fatalf("original clone migration marker changed: record=%#v err=%v", cloneRecord, err)
+	}
+	retired, err := readJournal(journal.path(indeterminate.CommandID))
+	if err != nil || retired.RetiredByCommandID != second.CommandID || retired.AssignmentRevision != second.AssignmentRevision {
+		t.Fatalf("follow-up record was not retired: record=%#v err=%v", retired, err)
+	}
+}
+
 func TestLegacyJournalMigrationConflictReceiptCodesAreStableAndRedacted(t *testing.T) {
 	tests := []struct {
 		err  error

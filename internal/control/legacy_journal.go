@@ -97,14 +97,20 @@ func (j *Journal) MigrateLegacyVMJournal(command Command, parameters legacyJourn
 		}{path: filename, record: record})
 	}
 	migratedAt := now.UTC()
-	backfillLegacyAuthority(&clone, command)
-	clone.SourceConfigSHA256 = parameters.SourceConfigSHA256
-	clone.SourceTemplateRef = parameters.TemplateRef
-	clone.SourceVMID = parameters.SourceVMID
-	clone.MigratedByCommandID = command.CommandID
-	clone.MigratedAt = &migratedAt
-	if err := writeJournal(clonePath, clone); err != nil {
-		return result, err
+	// A later Agent fix may need to retire a new no-UPID indeterminate
+	// mutation on a lineage that an earlier migration already established.
+	// Preserve the first immutable clone migration marker and authority; the
+	// follow-up command can touch only its explicitly listed record.
+	if clone.MigratedByCommandID == "" {
+		backfillLegacyAuthority(&clone, command)
+		clone.SourceConfigSHA256 = parameters.SourceConfigSHA256
+		clone.SourceTemplateRef = parameters.TemplateRef
+		clone.SourceVMID = parameters.SourceVMID
+		clone.MigratedByCommandID = command.CommandID
+		clone.MigratedAt = &migratedAt
+		if err := writeJournal(clonePath, clone); err != nil {
+			return result, err
+		}
 	}
 	for index := range retirements {
 		record := &retirements[index].record
@@ -198,6 +204,12 @@ func legacyCloneEligibilityError(record journalRecord, command Command, paramete
 			record.SourceVMID == parameters.SourceVMID && recordAuthorityEquals(record, command) {
 			return nil
 		}
+		if record.SourceConfigSHA256 == parameters.SourceConfigSHA256 &&
+			record.SourceTemplateRef == parameters.TemplateRef &&
+			record.SourceVMID == parameters.SourceVMID &&
+			migratedCloneAuthorityMatches(record, command, parameters.LegacyAssignmentRevision) {
+			return nil
+		}
 		return ErrCloneAlreadyMigrated
 	}
 	if !legacySourceIdentityMatches(record, parameters) {
@@ -207,6 +219,17 @@ func legacyCloneEligibilityError(record journalRecord, command Command, paramete
 		return ErrCloneLegacyAuthorityMismatch
 	}
 	return nil
+}
+
+func migratedCloneAuthorityMatches(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter) bool {
+	return record.MigratedAt != nil && !record.MigratedAt.IsZero() &&
+		record.AssignmentRevision == legacyAssignmentRevision && legacyAssignmentRevision < command.AssignmentRevision &&
+		record.BindingID == command.BindingID && record.DeviceID == command.DeviceID &&
+		record.CredentialEpoch == command.CredentialEpoch && record.AgentRef == command.AgentRef &&
+		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&
+		record.ServiceRef == command.Identity.ServiceRef && record.InstanceUUID == command.Identity.InstanceUUID &&
+		record.GuestType == command.Identity.GuestType && record.VMID == command.Identity.VMID &&
+		uint64(record.Generation) == command.Identity.Generation
 }
 
 func legacyIndeterminateEligible(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter, resourceKey, commandID string) bool {
