@@ -309,13 +309,15 @@ GET  /internal/v1/agents/{agentRef}/assignments?afterRevision=...&wait=25
 
 官网为一次向导、VPS 操作、IP 切换或升级创建持久 `operationId`。其中每个不可分步骤有自己的 `commandId`；同一 command 的重试保留 command ID 和 canonical body。Agent 只有在所有回执已进入持久队列后才推进 cursor。同一 ID 配不同 body 返回 `COMMAND_ID_CONFLICT`。
 
-实际回执状态是 `dry_run`、`submitted`、`waiting`、`succeeded`、`failed`、`indeterminate`、`rejected`。PVE 返回 UPID 时只生成 `submitted/PVE_TASK_SUBMITTED`，不代表成功。Agent 必须把 UPID 写入 journal；后续通过 node scope 的 `task.status` 或内部等价 resolver 读取：
+实际回执状态是 `dry_run`、`running`、`submitted`、`waiting`、`succeeded`、`failed`、`indeterminate`、`rejected`。生产修改命令在 durable journal claim 完成后、第一次 PVE mutation 之前，必须先把 `running/COMMAND_STARTED` 写入官网 receipt queue；官网收到后清除 delivery lease 并进入 `RUNNING`，长任务不得因尚无终态回执而被重复下发。PVE 返回 UPID 时只生成 `submitted/PVE_TASK_SUBMITTED`，不代表成功。Agent 必须把 UPID 写入 journal；后续通过 node scope 的 `task.status` 或内部等价 resolver 读取：
 
 ```text
 GET /api2/json/nodes/{node}/tasks/{UPID}/status
 ```
 
 `queued/running` 对应 `waiting/PVE_TASK_WAITING`；终态 `exitstatus=OK` 对应 `succeeded`，其他终态对应 `failed/PVE_TASK_FAILED`。Agent 重启后继续查询同一 UPID，绝不能重新提交原 mutation。若崩溃发生在 durable claim 之后、UPID 持久化之前，只能返回 `indeterminate/EXECUTION_INDETERMINATE`，不得猜测失败后重试。
+
+失败、拒绝或结果不确定的官网回执可以携带严格受限的 `error`：必填 `source=pve|qga|agent`、安全阶段 `stage` 与单行 `reason`，PVE 或经 PVE 代理的 QGA HTTP 失败另可包含固定方法 `method`、无 query 的 API `path` 和 `httpStatus`。PVE reason 只取响应顶层 `message`，否则退化为固定 HTTP 文本；长度受限且禁止控制字符。请求体、响应 body、参数、密码、Token、Authorization、任意 shell 输出及本地日志均不得进入回执。该诊断只进入官网 receipt/operation 日志，不进入 monitoring audit payload。
 
 `vm.cloud-init-snippet.delete` 在通用 command state 之外保存严格单调的安全阶段：`validated`、`reference_proven`、`detached`、`delete_submitted`、`deleted`、`verified`、`succeeded`。记录只含签名 identity、storage identifier 和 exact volume 的 SHA-256；原始 volume、`cicustom`、路径与 PVE response 不可表示。detach 后重启可凭同一 command digest、先前 reference proof 与当前 absent 回读继续；delete UPID 在返回 submitted receipt 前先落盘。UPID `stopped/OK` 之后仍必须读取 target config 和 `content=snippets` 清单并按 volume digest 证明两处 absent，才从 `deleted` 推进到 `verified/succeeded`。状态读取失败保留 waiting/indeterminate，非 OK 终态失败，均不得重新提交 DELETE。最终网站 receipt 不公开原始 UPID。
 

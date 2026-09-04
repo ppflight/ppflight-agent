@@ -33,6 +33,64 @@ var (
 )
 
 const maxControlResultBytes = 1 << 20
+
+type failureStageProvider interface {
+	FailureStage() string
+}
+
+func executionError(action string, err error) *ExecutionError {
+	if err == nil {
+		return nil
+	}
+	stage := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(action)), " ", "-")
+	var staged failureStageProvider
+	if errors.As(err, &staged) && errorStageRE.MatchString(staged.FailureStage()) {
+		stage = staged.FailureStage()
+	}
+	if !errorStageRE.MatchString(stage) {
+		stage = "agent"
+	}
+
+	source := "agent"
+	reason := err.Error()
+	httpStatus := 0
+	method := ""
+	apiPath := ""
+	var httpErr *pve.HTTPError
+	if errors.As(err, &httpErr) {
+		source = "pve"
+		if strings.Contains(httpErr.Path, "/agent/") {
+			source = "qga"
+		}
+		httpStatus = httpErr.StatusCode
+		method = httpErr.Method
+		apiPath = httpErr.Path
+		if strings.TrimSpace(httpErr.Reason) != "" {
+			reason = httpErr.Reason
+		} else {
+			reason = fmt.Sprintf("PVE API returned HTTP %d", httpErr.StatusCode)
+		}
+	} else {
+		lower := strings.ToLower(reason)
+		if strings.Contains(lower, "qga") || strings.Contains(lower, "guest agent") || strings.Contains(lower, "guest-exec") {
+			source = "qga"
+		}
+	}
+
+	// Collapse whitespace/control characters and cap the diagnostic before it
+	// enters a signed receipt. Request bodies, credentials and raw response
+	// bodies are never selected above for typed PVE failures.
+	reason = strings.Join(strings.Fields(reason), " ")
+	runes := []rune(reason)
+	if len(runes) > 512 {
+		reason = string(runes[:512])
+	}
+	if reason == "" {
+		reason = "Agent operation failed"
+	}
+	return &ExecutionError{Source: source, Stage: stage, Method: method, Path: apiPath, HTTPStatus: httpStatus, Reason: reason}
+}
+
 const maxJSONDepth = 64
 
 const (
@@ -154,6 +212,9 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	finish := func(receiptErr error) (Receipt, error) {
 		if r.FinishedAt.IsZero() || r.FinishedAt.Before(r.StartedAt) {
 			r.FinishedAt = r.StartedAt
+		}
+		if receiptErr != nil && (r.State == "failed" || r.State == "indeterminate" || r.State == "rejected") {
+			r.Error = executionError(command.Action, receiptErr)
 		}
 		ApplyReceiptCompatibility(&r)
 		return r, receiptErr
@@ -489,6 +550,7 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	upid, result, err := executePVEWithOptions(ctx, e.Client, command, pveExecutionOptions{
 		reinstallReadyWait:    e.ReinstallReadyWait,
 		reinstallPollInterval: e.ReinstallPollInterval,
+		readClient:            e.ReadClient,
 	})
 	r.PVETaskUPID, r.FinishedAt = upid, time.Now().UTC()
 	if err != nil {
@@ -1229,6 +1291,7 @@ func validDiscoveryPhase(phase string) bool {
 type pveExecutionOptions struct {
 	reinstallReadyWait    time.Duration
 	reinstallPollInterval time.Duration
+	readClient            *pve.Client
 }
 
 type pveExecutionOptionsContextKey struct{}
@@ -1283,7 +1346,11 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	case "vm.cloud-init-snippet.delete":
 		return "", nil, errors.New("Cloud-Init snippet deletion requires durable journal dispatch")
 	case "vm.reinstall":
-		return reinstallGuest(ctx, client, c, options.reinstallReadyWait, options.reinstallPollInterval)
+		readClient := options.readClient
+		if readClient == nil {
+			readClient = client
+		}
+		return reinstallGuest(ctx, client, readClient, c, options.reinstallReadyWait, options.reinstallPollInterval)
 	case "vm.console.create-session", "vm.console.revoke-session":
 		// Executor.Execute dispatches these through the ephemeral broker so
 		// console secrets can never enter the ordinary PVE result path.

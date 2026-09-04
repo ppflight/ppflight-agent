@@ -277,6 +277,58 @@ func TestProductionServiceReportsBoundedPreAuthenticationRejectionCodes(t *testi
 	}
 }
 
+func TestProductionServiceQueuesRunningReceiptBeforeMutationResult(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	command, assignments := signedCommand(t, now)
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	command.SigningKeyID = "website-key-1"
+	command.Signature, _ = SignCommandEd25519(command, privateKey)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api2/json/nodes/pve-1/qemu/101/status/start" {
+			t.Fatalf("unexpected mutation %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":"UPID:pve-1:1:2:3:qmstart:101:root@pam:"}`))
+	}))
+	defer server.Close()
+	directory := t.TempDir()
+	journal, err := OpenJournal(directory + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := &memoryReceiptQueue{}
+	service, err := NewService(ServiceConfig{
+		AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "production",
+		BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: uint64(command.CredentialEpoch),
+		AssignmentRevision:  func() uint64 { return uint64(command.AssignmentRevision) },
+		CommandSigningKeyID: "website-key-1", CommandPublicKey: publicKey,
+		AllowedActions: []string{command.Action}, Assignments: assignments,
+		Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
+		Journal: journal, Executor: Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true},
+		ReceiptQueue: queue, AuditSink: &memoryAuditSink{}, AgentVersion: "test-version",
+		CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, pollErr := service.PollOnce(context.Background()); pollErr != nil || processed != 1 {
+		t.Fatalf("processed=%d err=%v", processed, pollErr)
+	}
+	if len(queue.payloads) != 2 {
+		t.Fatalf("receipt count=%d", len(queue.payloads))
+	}
+	var running, terminal Receipt
+	if err := json.Unmarshal(queue.payloads[0], &running); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(queue.payloads[1], &terminal); err != nil {
+		t.Fatal(err)
+	}
+	if running.State != "running" || running.Code != "COMMAND_STARTED" || !running.Accepted || !running.Asynchronous || terminal.State != "submitted" || terminal.Code != "PVE_TASK_SUBMITTED" {
+		t.Fatalf("running=%#v terminal=%#v", running, terminal)
+	}
+}
+
 func TestProductionServiceStartsAtRevisionZeroForFirstSignedRefresh(t *testing.T) {
 	_, assignments := signedCommand(t, time.Now().UTC())
 	directory := t.TempDir()

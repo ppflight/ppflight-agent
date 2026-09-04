@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -31,10 +32,11 @@ const (
 )
 
 var (
-	commandIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-	uuidRE      = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	actionRE    = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
-	bodyHashRE  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	commandIDRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	uuidRE       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	actionRE     = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
+	errorStageRE = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,127}$`)
+	bodyHashRE   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // ErrCommandAuthorityMismatch identifies a correctly signed command which is
@@ -220,6 +222,20 @@ type Receipt struct {
 	MutationMayHaveSucceeded bool            `json:"mutationMayHaveSucceeded,omitempty"`
 	OperatorRef              string          `json:"operatorRef,omitempty"`
 	Result                   json.RawMessage `json:"result,omitempty"`
+	Error                    *ExecutionError `json:"error,omitempty"`
+}
+
+// ExecutionError is the bounded, structured diagnostic returned to the
+// website for a failed command. It contains enough provider context to avoid
+// requiring root SSH logs, but cannot contain credentials, request bodies or
+// arbitrary command output.
+type ExecutionError struct {
+	Source     string `json:"source"`
+	Stage      string `json:"stage"`
+	Method     string `json:"method,omitempty"`
+	Path       string `json:"path,omitempty"`
+	HTTPStatus int    `json:"httpStatus,omitempty"`
+	Reason     string `json:"reason"`
 }
 
 type VerifyConfig struct {
@@ -538,7 +554,7 @@ func ApplyReceiptCompatibility(r *Receipt) {
 	r.Asynchronous = false
 	r.MutationMayHaveSucceeded = r.State == "indeterminate"
 	switch r.State {
-	case "submitted", "waiting":
+	case "running", "submitted", "waiting":
 		r.Accepted = true
 		r.Asynchronous = true
 	case "succeeded":
@@ -567,6 +583,20 @@ func (r Receipt) Validate() error {
 	if r.ExecutionMode != "test" && r.ExecutionMode != "production" || r.FinishedAt.Before(r.StartedAt) {
 		return fmt.Errorf("invalid control receipt timing or mode")
 	}
+	if r.Error != nil {
+		if r.State != "failed" && r.State != "indeterminate" && r.State != "rejected" {
+			return fmt.Errorf("successful control receipt cannot contain an execution error")
+		}
+		if r.Error.Source != "pve" && r.Error.Source != "qga" && r.Error.Source != "agent" ||
+			!errorStageRE.MatchString(r.Error.Stage) ||
+			r.Error.Method != "" && r.Error.Method != http.MethodGet && r.Error.Method != http.MethodPost && r.Error.Method != http.MethodPut && r.Error.Method != http.MethodDelete ||
+			r.Error.Path != "" && (len(r.Error.Path) > 512 || !strings.HasPrefix(r.Error.Path, "/") || strings.ContainsAny(r.Error.Path, "\x00\r\n?#")) ||
+			r.Error.HTTPStatus != 0 && (r.Error.HTTPStatus < 100 || r.Error.HTTPStatus > 599) ||
+			strings.TrimSpace(r.Error.Reason) == "" || len(r.Error.Reason) > 1024 ||
+			strings.ContainsAny(r.Error.Reason, "\x00\r\n") {
+			return fmt.Errorf("invalid control receipt execution error")
+		}
+	}
 	switch r.State {
 	case "dry_run":
 		if !r.DryRun {
@@ -575,6 +605,10 @@ func (r Receipt) Validate() error {
 	case "submitted", "waiting":
 		if (r.PVETaskUPID == "") == (r.AgentUpgradeID == "") {
 			return fmt.Errorf("asynchronous receipt must identify exactly one task")
+		}
+	case "running":
+		if !r.Accepted || !r.Asynchronous || r.DryRun || r.PVETaskUPID != "" || r.AgentUpgradeID != "" || r.Error != nil {
+			return fmt.Errorf("invalid running control receipt")
 		}
 	case "succeeded", "failed", "indeterminate", "rejected":
 	default:

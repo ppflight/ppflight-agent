@@ -314,11 +314,23 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			journaled = true
 			err = nil
 		default:
+			// Persist a running receipt before any production mutation begins. This
+			// advances the website out of its command-lease state while long, fully
+			// synchronous workflows (notably reinstall) are still executing.
+			if s.mode == "production" && s.executor.ProductionExecution && auditable {
+				started, startedErr := s.runningReceipt(command, now)
+				if startedErr != nil {
+					return processed, startedErr
+				}
+				if startedErr = s.enqueue(started); startedErr != nil {
+					return processed, startedErr
+				}
+			}
 			receipt, err = s.executor.Execute(ctx, command, now)
 			receipt.OperationID = command.OperationID
 			ApplyReceiptCompatibility(&receipt)
-			// The public receipt carries only bounded safe codes. The underlying
-			// PVE error is intentionally not serialized or returned to the API.
+			// Only bounded structured provider diagnostics are exposed; raw response
+			// bodies, request bodies and credentials remain local to the Agent.
 			if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
 				return processed, completeErr
 			}
@@ -627,6 +639,18 @@ func (s *Service) rejection(command Command, code string, now time.Time) (Receip
 		AgentRef: s.agentRef, State: "rejected", Code: code, ExecutionMode: s.mode,
 		DryRun:    s.mode != "production" || !s.executor.ProductionExecution,
 		StartedAt: now, FinishedAt: now, OperatorRef: command.OperatorRef,
+	}, nil
+}
+
+func (s *Service) runningReceipt(command Command, now time.Time) (Receipt, error) {
+	id, err := protocol.NewID()
+	if err != nil {
+		return Receipt{}, err
+	}
+	return Receipt{
+		SchemaVersion: SchemaVersion, ReceiptID: id, CommandID: command.CommandID, OperationID: command.OperationID,
+		AgentRef: s.agentRef, State: "running", Code: "COMMAND_STARTED", ExecutionMode: s.mode,
+		Accepted: true, Asynchronous: true, StartedAt: now, FinishedAt: now, OperatorRef: command.OperatorRef,
 	}, nil
 }
 

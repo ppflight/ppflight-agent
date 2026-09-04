@@ -161,6 +161,35 @@ func TestVMDeleteMissingConfigRequiresExactSignedGuestIdentity(t *testing.T) {
 	}
 }
 
+func TestExecutorReturnsBoundedStructuredPVEFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"data":null,"message":"permission check failed"}`))
+	}))
+	defer server.Close()
+	command := controlCommand("vm.delete", "qemu", `{"purge":true,"destroyUnreferencedDisks":true}`)
+	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.Error == nil {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+	wantPath := "/nodes/pve1/qemu/101"
+	if receipt.Error.Source != "pve" || receipt.Error.Stage != "vm.delete" || receipt.Error.Method != http.MethodDelete || receipt.Error.Path != wantPath || receipt.Error.HTTPStatus != http.StatusForbidden || receipt.Error.Reason != "permission check failed" {
+		t.Fatalf("structured error=%#v", receipt.Error)
+	}
+}
+
+func TestExecutionErrorClassifiesPVEProxiedGuestAgentFailure(t *testing.T) {
+	diagnostic := executionError("vm.set-timezone", &pve.HTTPError{
+		StatusCode: http.StatusInternalServerError,
+		Reason:     "QEMU guest agent is not running",
+		Method:     http.MethodPost,
+		Path:       "/nodes/pve1/qemu/101/agent/exec",
+	})
+	if diagnostic == nil || diagnostic.Source != "qga" || diagnostic.HTTPStatus != http.StatusInternalServerError || diagnostic.Path != "/nodes/pve1/qemu/101/agent/exec" {
+		t.Fatalf("diagnostic=%#v", diagnostic)
+	}
+}
+
 func TestExecutorResourceAndNetworkUseConfigDigest(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

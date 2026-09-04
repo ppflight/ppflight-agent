@@ -27,6 +27,43 @@ var (
 	ErrReinstallPreflight     = errors.New("reinstall preflight rejected before mutation")
 )
 
+// reinstallExecutionError keeps the exact failed stage and underlying
+// provider/QGA error after compensation. Older code returned only the
+// ErrReinstallRolledBack sentinel, which made the website unable to explain a
+// real failure even though the original VM had been restored safely.
+type reinstallExecutionError struct {
+	Stage string
+	Cause error
+}
+
+func (e *reinstallExecutionError) Error() string {
+	if e == nil || e.Cause == nil {
+		return ErrReinstallRolledBack.Error()
+	}
+	return fmt.Sprintf("%s at %s: %v", ErrReinstallRolledBack, e.Stage, e.Cause)
+}
+
+func (e *reinstallExecutionError) Unwrap() []error {
+	if e == nil || e.Cause == nil {
+		return []error{ErrReinstallRolledBack}
+	}
+	return []error{ErrReinstallRolledBack, e.Cause}
+}
+
+func (e *reinstallExecutionError) FailureStage() string {
+	if e == nil {
+		return "reinstall"
+	}
+	return e.Stage
+}
+
+func reinstallRolledBack(stage string, cause error) error {
+	if strings.TrimSpace(stage) == "" {
+		stage = "reinstall"
+	}
+	return &reinstallExecutionError{Stage: stage, Cause: cause}
+}
+
 type reinstallP struct {
 	TemplateRef          string           `json:"templateRef"`
 	TemplateVersion      string           `json:"templateVersion"`
@@ -563,7 +600,7 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	return json.Marshal(publication)
 }
 
-func reinstallGuest(ctx context.Context, client *pve.Client, command Command, readyWait, pollInterval time.Duration) (string, json.RawMessage, error) {
+func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command Command, readyWait, pollInterval time.Duration) (string, json.RawMessage, error) {
 	var parameters reinstallP
 	_ = strictParameters(command.Parameters, &parameters)
 	resources, err := client.ClusterResources(ctx)
@@ -635,28 +672,28 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command, re
 		}
 		return waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef)
 	}
-	rollbackBeforeTargetDelete := func() error {
+	rollbackBeforeTargetDelete := func(stage string, cause error) error {
 		if cleanupErr := cleanupTemporary(); cleanupErr != nil {
 			return fmt.Errorf("%w: compensation clone cleanup failed", ErrReinstallIndeterminate)
 		}
 		if powerErr := restorePower(); powerErr != nil {
 			return fmt.Errorf("%w: original VM power restoration failed", ErrReinstallIndeterminate)
 		}
-		return ErrReinstallRolledBack
+		return reinstallRolledBack(stage, cause)
 	}
 	if originalRunning {
 		if err := waitMutation(http.MethodPost, targetBase+"/status/shutdown", nil, command.Identity.NodeRef); err != nil {
 			if powerErr := restorePower(); powerErr != nil {
 				return "", nil, fmt.Errorf("%w: shutdown failed and original VM power could not be verified", ErrReinstallIndeterminate)
 			}
-			return "", nil, ErrReinstallRolledBack
+			return "", nil, reinstallRolledBack("shutdown_original", err)
 		}
 	}
 	// A full clone of the current stopped VM is the compensation boundary.
 	if err := waitMutation(http.MethodPost, targetBase+"/clone", url.Values{"newid": {strconv.Itoa(parameters.TemporaryVMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}, "name": {"ppflight-reinstall-rollback-" + strconv.Itoa(command.Identity.VMID)}}, command.Identity.NodeRef); err != nil {
-		return "", nil, rollbackBeforeTargetDelete()
+		return "", nil, rollbackBeforeTargetDelete("create_compensation_clone", err)
 	}
-	compensate := func(_ error) error {
+	compensate := func(stage string, cause error) error {
 		targetExists, inventoryErr := resourceExists(command.Identity.VMID)
 		if inventoryErr != nil {
 			return fmt.Errorf("%w: replacement state could not be inspected", ErrReinstallIndeterminate)
@@ -677,7 +714,7 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command, re
 		if cleanupErr := waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef); cleanupErr != nil {
 			return fmt.Errorf("%w: original VM restored but compensation clone cleanup failed", ErrReinstallIndeterminate)
 		}
-		return ErrReinstallRolledBack
+		return reinstallRolledBack(stage, cause)
 	}
 	if err := waitMutation(http.MethodDelete, targetBase, url.Values{"purge": {"0"}, "destroy-unreferenced-disks": {"0"}}, command.Identity.NodeRef); err != nil {
 		targetExists, inventoryErr := resourceExists(command.Identity.VMID)
@@ -685,48 +722,48 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command, re
 			return "", nil, fmt.Errorf("%w: target delete result could not be inspected", ErrReinstallIndeterminate)
 		}
 		if targetExists {
-			return "", nil, rollbackBeforeTargetDelete()
+			return "", nil, rollbackBeforeTargetDelete("delete_original", err)
 		}
-		return "", nil, compensate(err)
+		return "", nil, compensate("delete_original", err)
 	}
 	if err := waitMutation(http.MethodPost, templateBase+"/clone", url.Values{"newid": {strconv.Itoa(command.Identity.VMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}}, command.Identity.NodeRef); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("clone_replacement", err)
 	}
 	resourceCommand := command
 	resourceCommand.Parameters, _ = json.Marshal(initialResourcesP{Cores: parameters.Expected.Cores, Sockets: parameters.Expected.Sockets, MemoryMiB: parameters.Expected.MemoryMiB, CloneOperationID: command.OperationID, TemplateRef: parameters.TemplateRef, SourceVMID: parameters.TemplateVMID, VMGeneration: protocol.Counter(command.Identity.Generation), TemplateConfigSHA256: parameters.TemplateConfigSHA256})
 	if _, _, err := setInitialResources(ctx, client, resourceCommand, targetBase); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("set_resources", err)
 	}
 	for _, network := range parameters.Networks {
 		networkCommand := command
 		networkCommand.Parameters, _ = json.Marshal(network)
 		if _, _, err := setNetwork(ctx, client, networkCommand, targetBase); err != nil {
-			return "", nil, compensate(err)
+			return "", nil, compensate("set_network", err)
 		}
 	}
 	if err := restoreReinstallFirewall(ctx, client, command, parameters.Expected.Networks, waitMutation); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("restore_firewall", err)
 	}
 	cloudCommand := command
 	cloudCommand.Parameters, _ = json.Marshal(parameters.CloudInit)
 	if _, _, err := setCloudInit(ctx, client, cloudCommand, targetBase); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("set_cloud_init", err)
 	}
 	resizeCommand := command
 	resizeCommand.Parameters, _ = json.Marshal(resizeP{Disk: parameters.Expected.Disk.Interface, TargetGiB: &parameters.Expected.Disk.MinimumGiB})
 	if _, _, err := resizeDisk(ctx, client, resizeCommand, targetBase); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("resize_disk", err)
 	}
 	ioCommand := command
 	ioCommand.Parameters, _ = json.Marshal(diskIOP{Disk: parameters.Expected.Disk.Interface, Limits: parameters.Expected.Disk.Limits})
 	if _, _, err := setDiskLimits(ctx, client, ioCommand, targetBase); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("set_disk_io", err)
 	}
 	if err := waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef); err != nil {
-		return "", nil, compensate(err)
+		return "", nil, compensate("start_replacement", err)
 	}
-	if err := waitForReinstallReadiness(ctx, client, command, targetBase, parameters, readyWait, pollInterval); err != nil {
-		return "", nil, compensate(err)
+	if err := waitForReinstallReadiness(ctx, client, readClient, command, targetBase, parameters, readyWait, pollInterval); err != nil {
+		return "", nil, compensate("verify_replacement", err)
 	}
 	if err := waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef); err != nil {
 		return "", nil, fmt.Errorf("%w: replacement verified but compensation clone cleanup failed", ErrReinstallIndeterminate)
@@ -735,7 +772,7 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command, re
 	return "", result, nil
 }
 
-func waitForReinstallReadiness(ctx context.Context, client *pve.Client, command Command, targetBase string, parameters reinstallP, readyWait, pollInterval time.Duration) error {
+func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Client, command Command, targetBase string, parameters reinstallP, readyWait, pollInterval time.Duration) error {
 	if readyWait == 0 {
 		readyWait = defaultReinstallReadyWait
 	}
@@ -754,10 +791,10 @@ func waitForReinstallReadiness(ctx context.Context, client *pve.Client, command 
 			}
 			timezoneVerified = true
 		}
-		if _, err := verifyDelivery(ctx, client, verifyCommand); err != nil {
+		if _, err := verifyDelivery(ctx, readClient, verifyCommand); err != nil {
 			return err
 		}
-		return verifyReinstallOS(ctx, client, command, parameters.ExpectedOS)
+		return verifyReinstallOS(ctx, readClient, command, parameters.ExpectedOS)
 	}
 	lastErr := verify()
 	if lastErr == nil || readyWait < 0 || !reinstallReadinessRetryable(lastErr) {

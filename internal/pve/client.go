@@ -229,6 +229,8 @@ func (c *Client) do(ctx context.Context, method, apiPath, escapedAPIPath string,
 			StatusCode: resp.StatusCode,
 			Body:       boundedText(responseBody, 1024),
 			Reason:     boundedPVEErrorReason(responseBody, 512),
+			Method:     method,
+			Path:       "/" + strings.TrimPrefix(apiPath, "/"),
 		}
 	}
 	var envelope struct {
@@ -287,6 +289,8 @@ type HTTPError struct {
 	StatusCode int
 	Body       string
 	Reason     string
+	Method     string
+	Path       string
 }
 
 func (e *HTTPError) Error() string {

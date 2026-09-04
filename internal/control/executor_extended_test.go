@@ -435,7 +435,8 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	mutations := []string{}
 	targetStatus := "running"
 	timezoneAttempts := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	readFirewallVerified := false
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			mutations = append(mutations, r.Method+" "+r.URL.Path)
 			if strings.HasSuffix(r.URL.Path, "/101/status/shutdown") {
@@ -478,6 +479,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 		case "/api2/json/nodes/pve1/qemu/101/agent/exec-status":
 			_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
 		case "/api2/json/cluster/firewall/options":
+			readFirewallVerified = true
 			_, _ = w.Write([]byte(`{"data":{"enable":1,"ebtables":1}}`))
 		case "/api2/json/nodes/pve1/firewall/options":
 			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
@@ -490,8 +492,17 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 		default:
 			t.Fatalf("unexpected GET %s", r.URL.Path)
 		}
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/api2/json/cluster/firewall/options" {
+			http.Error(w, `{"data":null,"message":"control token cannot audit cluster firewall"}`, http.StatusForbidden)
+			return
+		}
+		handler.ServeHTTP(w, r)
 	}))
 	defer server.Close()
+	readServer := httptest.NewServer(handler)
+	defer readServer.Close()
 	enabled := true
 	qga := true
 	start := true
@@ -521,12 +532,15 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	exact["networks"].([]any)[0].(map[string]any)["vlan"] = nil
 	raw, _ = json.Marshal(exact)
 	command := controlCommand("vm.reinstall", "qemu", string(raw))
-	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true, ReinstallReadyWait: 100 * time.Millisecond, ReinstallPollInterval: time.Millisecond}).Execute(context.Background(), command, time.Now())
+	receipt, err := (Executor{Client: controlTestClient(t, server), ReadClient: controlTestClient(t, readServer), Mode: "production", ProductionExecution: true, ReinstallReadyWait: 100 * time.Millisecond, ReinstallPollInterval: time.Millisecond}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"reinstalled":true`) || strings.Contains(string(receipt.Result), "fixture-secret") {
 		t.Fatalf("receipt=%#v mutations=%v err=%v", receipt, mutations, err)
 	}
 	if timezoneAttempts != 3 {
 		t.Fatalf("post-boot QGA was not retried: attempts=%d", timezoneAttempts)
+	}
+	if !readFirewallVerified {
+		t.Fatal("reinstall readiness did not use the independent read client")
 	}
 	wanted := []string{"POST /api2/json/nodes/pve1/qemu/101/status/shutdown", "POST /api2/json/nodes/pve1/qemu/101/clone", "DELETE /api2/json/nodes/pve1/qemu/101", "POST /api2/json/nodes/pve1/qemu/9001/clone", "DELETE /api2/json/nodes/pve1/qemu/800101"}
 	for _, expected := range wanted {

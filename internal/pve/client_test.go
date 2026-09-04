@@ -94,7 +94,7 @@ func TestHTTPErrorExtractsOnlyBoundedTopLevelPVEMessage(t *testing.T) {
 	if !errors.As(err, &httpErr) {
 		t.Fatalf("error=%v", err)
 	}
-	if httpErr.StatusCode != http.StatusInternalServerError || httpErr.Reason != "Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist" {
+	if httpErr.StatusCode != http.StatusInternalServerError || httpErr.Reason != "Configuration file 'nodes/pve1/qemu-server/101.conf' does not exist" || httpErr.Method != http.MethodDelete || httpErr.Path != "/nodes/pve1/qemu/101" {
 		t.Fatalf("HTTP error=%#v", httpErr)
 	}
 	if !strings.Contains(httpErr.Body, `"nested value"`) {
