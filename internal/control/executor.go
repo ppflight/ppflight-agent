@@ -1652,11 +1652,11 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 		return "", nil, err
 	}
 	var pid int
-	if json.Unmarshal(raw, &pid) != nil {
+	if decodeQGACommandResult(raw, &pid) != nil {
 		var result struct {
 			PID int `json:"pid"`
 		}
-		if json.Unmarshal(raw, &result) != nil || result.PID < 1 {
+		if decodeQGACommandResult(raw, &result) != nil || result.PID < 1 {
 			return "", nil, errors.New("QGA guest-exec returned an invalid pid")
 		}
 		pid = result.PID
@@ -1667,12 +1667,16 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		var rawStatus json.RawMessage
 		var status struct {
 			Exited   json.RawMessage `json:"exited"`
 			ExitCode int             `json:"exitcode"`
 		}
-		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &status); err != nil {
+		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &rawStatus); err != nil {
 			return "", nil, err
+		}
+		if err := decodeQGACommandResult(rawStatus, &status); err != nil {
+			return "", nil, errors.New("QGA guest-exec returned an invalid status")
 		}
 		exited, valid := boolish(status.Exited)
 		if !valid {
@@ -1696,6 +1700,24 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 		}
 	}
 }
+
+// PVE's guest-agent proxy has returned both direct command results and a
+// nested {"result": ...} QMP envelope across supported PVE/QGA versions.
+// Decode only that single documented wrapper and never infer success from an
+// unknown response shape.
+func decodeQGACommandResult(raw json.RawMessage, out any) error {
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Result) > 0 {
+		if string(envelope.Result) == "null" {
+			return errors.New("QGA command result is null")
+		}
+		raw = envelope.Result
+	}
+	return json.Unmarshal(raw, out)
+}
+
 func boolish(raw json.RawMessage) (bool, bool) {
 	var boolean bool
 	if json.Unmarshal(raw, &boolean) == nil {

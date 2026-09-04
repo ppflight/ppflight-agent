@@ -353,6 +353,31 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		}
 	})
 
+	t.Run("timezone decodes nested QGA command result envelopes", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"pid":11}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				if r.URL.Query().Get("pid") != "11" {
+					t.Fatalf("pid query: %v", r.URL.Query())
+				}
+				_, _ = w.Write([]byte(`{"data":{"result":{"exited":true,"exitcode":0}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"America/Los_Angeles","offset":-25200}}}`))
+			default:
+				t.Fatalf("unexpected request: %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"America/Los_Angeles"}`), time.Now())
+		if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !strings.Contains(string(receipt.Result), `"verified":true`) {
+			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+	})
+
 	t.Run("timezone waits for QGA to become available after guest boot", func(t *testing.T) {
 		infoReads := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
