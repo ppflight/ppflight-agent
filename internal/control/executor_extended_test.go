@@ -433,9 +433,16 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	canonical, _ := json.Marshal(baseline)
 	templateHash := fmt.Sprintf("%x", sha256.Sum256(canonical))
 	mutations := []string{}
+	targetStatus := "running"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			mutations = append(mutations, r.Method+" "+r.URL.Path)
+			if strings.HasSuffix(r.URL.Path, "/101/status/shutdown") {
+				targetStatus = "stopped"
+			}
+			if strings.HasSuffix(r.URL.Path, "/101/status/start") {
+				targetStatus = "running"
+			}
 			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
 				_, _ = w.Write([]byte(`{"data":17}`))
 				return
@@ -445,7 +452,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/api2/json/cluster/resources":
-			_, _ = w.Write([]byte(`{"data":[{"type":"qemu","node":"pve1","vmid":101,"template":0,"status":"stopped"},{"type":"qemu","node":"pve1","vmid":9001,"template":1,"status":"stopped"}]}`))
+			_, _ = fmt.Fprintf(w, `{"data":[{"type":"qemu","node":"pve1","vmid":101,"template":0,"status":%q},{"type":"qemu","node":"pve1","vmid":9001,"template":1,"status":"stopped"}]}`, targetStatus)
 		case "/api2/json/nodes/pve1/qemu/9001/config":
 			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-zfs:vm-9001-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=02:00:00:00:00:01,bridge=vmbr0,firewall=0","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`))
 		case "/api2/json/nodes/pve1/qemu/9001/firewall/rules", "/api2/json/nodes/pve1/qemu/9001/firewall/ipset":
@@ -512,11 +519,14 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"reinstalled":true`) || strings.Contains(string(receipt.Result), "fixture-secret") {
 		t.Fatalf("receipt=%#v mutations=%v err=%v", receipt, mutations, err)
 	}
-	wanted := []string{"POST /api2/json/nodes/pve1/qemu/101/clone", "DELETE /api2/json/nodes/pve1/qemu/101", "POST /api2/json/nodes/pve1/qemu/9001/clone", "DELETE /api2/json/nodes/pve1/qemu/800101"}
+	wanted := []string{"POST /api2/json/nodes/pve1/qemu/101/status/shutdown", "POST /api2/json/nodes/pve1/qemu/101/clone", "DELETE /api2/json/nodes/pve1/qemu/101", "POST /api2/json/nodes/pve1/qemu/9001/clone", "DELETE /api2/json/nodes/pve1/qemu/800101"}
 	for _, expected := range wanted {
 		if !containsString(mutations, expected) {
 			t.Fatalf("missing %s in %v", expected, mutations)
 		}
+	}
+	if mutationIndex(mutations, wanted[0]) > mutationIndex(mutations, wanted[1]) {
+		t.Fatalf("running VM was cloned before shutdown: %v", mutations)
 	}
 }
 
@@ -527,6 +537,29 @@ func containsString(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+func mutationIndex(values []string, wanted string) int {
+	for index, value := range values {
+		if value == wanted {
+			return index
+		}
+	}
+	return -1
+}
+
+func TestReinstallMissingTargetIsDeterministicPreflightFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/cluster/resources" {
+			t.Fatalf("preflight reached unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
+	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.reinstall", "qemu", reinstallFixture()), time.Now())
+	if err == nil || !errors.Is(err, ErrReinstallPreflight) || receipt.State != "failed" || receipt.Code != "REINSTALL_PREFLIGHT_REJECTED" || receipt.Accepted || receipt.MutationMayHaveSucceeded {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
 }
 
 func TestSuspendResumeUseFixedStatusEndpoints(t *testing.T) {

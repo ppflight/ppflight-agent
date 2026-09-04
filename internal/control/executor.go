@@ -483,7 +483,9 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 	r.PVETaskUPID, r.FinishedAt = upid, time.Now().UTC()
 	if err != nil {
 		var httpErr *pve.HTTPError
-		if errors.Is(err, ErrReinstallRolledBack) {
+		if errors.Is(err, ErrReinstallPreflight) {
+			r.State, r.Code = "failed", "REINSTALL_PREFLIGHT_REJECTED"
+		} else if errors.Is(err, ErrReinstallRolledBack) {
 			r.State, r.Code = "failed", "REINSTALL_ROLLED_BACK"
 		} else if errors.Is(err, ErrReinstallIndeterminate) {
 			r.State, r.Code = "indeterminate", "REINSTALL_INDETERMINATE"

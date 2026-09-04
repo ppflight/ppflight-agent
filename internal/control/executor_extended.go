@@ -24,6 +24,7 @@ import (
 var (
 	ErrReinstallRolledBack    = errors.New("reinstall failed and the original VM was restored")
 	ErrReinstallIndeterminate = errors.New("reinstall state is indeterminate and requires intervention")
+	ErrReinstallPreflight     = errors.New("reinstall preflight rejected before mutation")
 )
 
 type reinstallP struct {
@@ -565,21 +566,25 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (string, json.RawMessage, error) {
 	var parameters reinstallP
 	_ = strictParameters(command.Parameters, &parameters)
-	if err := requireStoppedNonTemplate(ctx, client, command); err != nil {
-		return "", nil, err
-	}
-	template, err := client.TemplateInfo(ctx, parameters.TemplateGuestType, parameters.TemplateNode, parameters.TemplateVMID, parameters.TemplateRef)
-	if err != nil || !strings.EqualFold(template.ConfigSHA256, parameters.TemplateConfigSHA256) {
-		return "", nil, errors.New("reinstall template identity or configuration changed")
-	}
 	resources, err := client.ClusterResources(ctx)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: assigned VM inventory unavailable: %v", ErrReinstallPreflight, err)
+	}
+	originalRunning, err := reinstallTargetPowerState(resources, command)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrReinstallPreflight, err)
 	}
 	for _, resource := range resources {
 		if resource.VMID == parameters.TemporaryVMID {
-			return "", nil, errors.New("reinstall compensation VMID is already in use")
+			return "", nil, fmt.Errorf("%w: compensation VMID is already in use", ErrReinstallPreflight)
 		}
+	}
+	template, err := client.TemplateInfo(ctx, parameters.TemplateGuestType, parameters.TemplateNode, parameters.TemplateVMID, parameters.TemplateRef)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: template inspection failed: %v", ErrReinstallPreflight, err)
+	}
+	if !strings.EqualFold(template.ConfigSHA256, parameters.TemplateConfigSHA256) {
+		return "", nil, fmt.Errorf("%w: template identity or configuration changed", ErrReinstallPreflight)
 	}
 	targetBase := fmt.Sprintf("/nodes/%s/qemu/%d", command.Identity.NodeRef, command.Identity.VMID)
 	temporaryBase := fmt.Sprintf("/nodes/%s/qemu/%d", command.Identity.NodeRef, parameters.TemporaryVMID)
@@ -594,19 +599,80 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 		}
 		return nil
 	}
+	resourceExists := func(vmid int) (bool, error) {
+		current, inventoryErr := client.ClusterResources(ctx)
+		if inventoryErr != nil {
+			return false, inventoryErr
+		}
+		for _, resource := range current {
+			if resource.VMID == vmid {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	restorePower := func() error {
+		current, currentErr := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+		if currentErr != nil {
+			return currentErr
+		}
+		running := strings.EqualFold(strings.TrimSpace(current.Status), "running")
+		if originalRunning && !running {
+			return waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef)
+		}
+		if !originalRunning && running {
+			return waitMutation(http.MethodPost, targetBase+"/status/stop", nil, command.Identity.NodeRef)
+		}
+		return nil
+	}
+	cleanupTemporary := func() error {
+		exists, inventoryErr := resourceExists(parameters.TemporaryVMID)
+		if inventoryErr != nil {
+			return inventoryErr
+		}
+		if !exists {
+			return nil
+		}
+		return waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef)
+	}
+	rollbackBeforeTargetDelete := func() error {
+		if cleanupErr := cleanupTemporary(); cleanupErr != nil {
+			return fmt.Errorf("%w: compensation clone cleanup failed", ErrReinstallIndeterminate)
+		}
+		if powerErr := restorePower(); powerErr != nil {
+			return fmt.Errorf("%w: original VM power restoration failed", ErrReinstallIndeterminate)
+		}
+		return ErrReinstallRolledBack
+	}
+	if originalRunning {
+		if err := waitMutation(http.MethodPost, targetBase+"/status/shutdown", nil, command.Identity.NodeRef); err != nil {
+			if powerErr := restorePower(); powerErr != nil {
+				return "", nil, fmt.Errorf("%w: shutdown failed and original VM power could not be verified", ErrReinstallIndeterminate)
+			}
+			return "", nil, ErrReinstallRolledBack
+		}
+	}
 	// A full clone of the current stopped VM is the compensation boundary.
 	if err := waitMutation(http.MethodPost, targetBase+"/clone", url.Values{"newid": {strconv.Itoa(parameters.TemporaryVMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}, "name": {"ppflight-reinstall-rollback-" + strconv.Itoa(command.Identity.VMID)}}, command.Identity.NodeRef); err != nil {
-		return "", nil, err
+		return "", nil, rollbackBeforeTargetDelete()
 	}
-	replacementCreated := false
 	compensate := func(_ error) error {
-		if replacementCreated {
+		targetExists, inventoryErr := resourceExists(command.Identity.VMID)
+		if inventoryErr != nil {
+			return fmt.Errorf("%w: replacement state could not be inspected", ErrReinstallIndeterminate)
+		}
+		if targetExists {
 			_ = waitMutation(http.MethodPost, targetBase+"/status/stop", nil, command.Identity.NodeRef)
-			_ = waitMutation(http.MethodDelete, targetBase, url.Values{"purge": {"0"}, "destroy-unreferenced-disks": {"0"}}, command.Identity.NodeRef)
+			if deleteErr := waitMutation(http.MethodDelete, targetBase, url.Values{"purge": {"0"}, "destroy-unreferenced-disks": {"0"}}, command.Identity.NodeRef); deleteErr != nil {
+				return fmt.Errorf("%w: replacement cleanup failed", ErrReinstallIndeterminate)
+			}
 		}
 		restoreErr := waitMutation(http.MethodPost, temporaryBase+"/clone", url.Values{"newid": {strconv.Itoa(command.Identity.VMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}}, command.Identity.NodeRef)
 		if restoreErr != nil {
 			return fmt.Errorf("%w: replacement error and compensation error", ErrReinstallIndeterminate)
+		}
+		if powerErr := restorePower(); powerErr != nil {
+			return fmt.Errorf("%w: original VM restored but power restoration failed", ErrReinstallIndeterminate)
 		}
 		if cleanupErr := waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef); cleanupErr != nil {
 			return fmt.Errorf("%w: original VM restored but compensation clone cleanup failed", ErrReinstallIndeterminate)
@@ -614,13 +680,18 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 		return ErrReinstallRolledBack
 	}
 	if err := waitMutation(http.MethodDelete, targetBase, url.Values{"purge": {"0"}, "destroy-unreferenced-disks": {"0"}}, command.Identity.NodeRef); err != nil {
-		_ = waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef)
-		return "", nil, err
+		targetExists, inventoryErr := resourceExists(command.Identity.VMID)
+		if inventoryErr != nil {
+			return "", nil, fmt.Errorf("%w: target delete result could not be inspected", ErrReinstallIndeterminate)
+		}
+		if targetExists {
+			return "", nil, rollbackBeforeTargetDelete()
+		}
+		return "", nil, compensate(err)
 	}
 	if err := waitMutation(http.MethodPost, templateBase+"/clone", url.Values{"newid": {strconv.Itoa(command.Identity.VMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}}, command.Identity.NodeRef); err != nil {
 		return "", nil, compensate(err)
 	}
-	replacementCreated = true
 	resourceCommand := command
 	resourceCommand.Parameters, _ = json.Marshal(initialResourcesP{Cores: parameters.Expected.Cores, Sockets: parameters.Expected.Sockets, MemoryMiB: parameters.Expected.MemoryMiB, CloneOperationID: command.OperationID, TemplateRef: parameters.TemplateRef, SourceVMID: parameters.TemplateVMID, VMGeneration: protocol.Counter(command.Identity.Generation), TemplateConfigSHA256: parameters.TemplateConfigSHA256})
 	if _, _, err := setInitialResources(ctx, client, resourceCommand, targetBase); err != nil {
@@ -672,6 +743,26 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 	}
 	result, _ := json.Marshal(map[string]any{"reinstalled": true, "verified": true, "templateRef": parameters.TemplateRef, "templateVersion": parameters.TemplateVersion, "templateConfigSha256": parameters.TemplateConfigSHA256, "vmGeneration": protocol.Counter(parameters.VMGeneration)})
 	return "", result, nil
+}
+
+func reinstallTargetPowerState(resources []pve.Resource, command Command) (bool, error) {
+	for _, resource := range resources {
+		if resource.Node != command.Identity.NodeRef || resource.Type != command.Identity.GuestType || resource.VMID != command.Identity.VMID {
+			continue
+		}
+		if resource.Template != 0 {
+			return false, errors.New("assigned VM is a template")
+		}
+		switch strings.ToLower(strings.TrimSpace(resource.Status)) {
+		case "running":
+			return true, nil
+		case "stopped":
+			return false, nil
+		default:
+			return false, errors.New("assigned VM power state is unknown")
+		}
+	}
+	return false, errors.New("assigned VM was not found")
 }
 
 func restoreReinstallFirewall(ctx context.Context, client *pve.Client, command Command, networks []deliveryNetwork, waitMutation func(string, string, url.Values, string) error) error {
