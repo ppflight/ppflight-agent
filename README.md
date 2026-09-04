@@ -98,7 +98,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.38` 把首次 `cloud-init status --wait` 也纳入同一个 10 分钟 reinstall readiness 总时限；guest 内 cloud-init 异常时必须向官网返回超时失败，不得在首次 QGA guest-exec 中无限占用任务。
 
-`0.1.1-rc.39` 按 cloud-init 23.4+ 官方返回码语义接受退出码 0（成功）和 2（已完成但有可恢复错误），退出码 1（崩溃）仍失败回滚。接受退出码 2 后仍必须通过时区、OS、QGA、资源、网络和防火墙的全部签名交付回验。
+`0.1.1-rc.40` 将 cloud-init 的退出状态只作为“初始化已结束”信号：退出码 0、1、2 都会进入后续严格交付证明，其他异常退出码仍拒绝。即使 cloud-init 返回 1，替换实例也必须逐项通过时区、OS、QGA、CPU/内存/磁盘、双网卡地址和防火墙的全部签名回验，否则安全回滚原实例。Agent 会记录不含 guest 输出和密钥的重装验证阶段、cloud-init 退出码及最终真实失败原因。
 
 ## NIC 角色、IP、网络与防盗用
 

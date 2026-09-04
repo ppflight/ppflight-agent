@@ -620,7 +620,7 @@ func TestReinstallReadinessDeadlineBoundsBlockingCloudInit(t *testing.T) {
 	}
 }
 
-func TestCloudInitReadinessAcceptsRecoverableCompletionButRejectsCrash(t *testing.T) {
+func TestCloudInitCommandReportsExactTerminalExitCode(t *testing.T) {
 	for _, fixture := range []struct {
 		name     string
 		exitCode int
@@ -628,7 +628,7 @@ func TestCloudInitReadinessAcceptsRecoverableCompletionButRejectsCrash(t *testin
 	}{
 		{name: "success", exitCode: 0},
 		{name: "recoverable completion", exitCode: 2},
-		{name: "crash", exitCode: 1, wantErr: true},
+		{name: "unrecoverable completion", exitCode: 1, wantErr: true},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -651,7 +651,29 @@ func TestCloudInitReadinessAcceptsRecoverableCompletionButRejectsCrash(t *testin
 			if (err != nil) != fixture.wantErr {
 				t.Fatalf("exit code %d: err=%v wantErr=%t", fixture.exitCode, err, fixture.wantErr)
 			}
+			if fixture.wantErr && !strings.Contains(err.Error(), fmt.Sprintf("exit code %d", fixture.exitCode)) {
+				t.Fatalf("terminal exit code was not preserved: %v", err)
+			}
 		})
+	}
+}
+
+func TestCloudInitTerminalStatusContinuesOnlyDocumentedSettledStates(t *testing.T) {
+	for _, fixture := range []struct {
+		exitCode int
+		hadError bool
+		wantErr  bool
+	}{
+		{exitCode: 0},
+		{exitCode: 1, hadError: true},
+		{exitCode: 2},
+		{exitCode: 3, wantErr: true},
+		{exitCode: 127, wantErr: true},
+	} {
+		hadError, err := cloudInitTerminalStatus(fixture.exitCode)
+		if hadError != fixture.hadError || (err != nil) != fixture.wantErr {
+			t.Fatalf("exit=%d hadError=%t err=%v", fixture.exitCode, hadError, err)
+		}
 	}
 }
 

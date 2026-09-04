@@ -1769,9 +1769,23 @@ func runGuestCommand(ctx context.Context, c *pve.Client, base, label string, arg
 // terminal states use more than the conventional zero success code. The
 // caller must still use fixed argv and an explicit, compile-time allowlist.
 func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, label string, allowedExitCodes map[int]struct{}, argv ...string) error {
-	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": argv})
+	exitCode, err := runGuestCommandExitCode(ctx, c, base, argv...)
 	if err != nil {
 		return err
+	}
+	if _, allowed := allowedExitCodes[exitCode]; !allowed {
+		return fmt.Errorf("guest %s command failed with exit code %d", label, exitCode)
+	}
+	return nil
+}
+
+// runGuestCommandExitCode returns only QGA's numeric terminal status. Guest
+// stdout/stderr remains private to the node and is never copied into logs or
+// signed receipts.
+func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, argv ...string) (int, error) {
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": argv})
+	if err != nil {
+		return 0, err
 	}
 	var pid int
 	if decodeQGACommandResult(raw, &pid) != nil {
@@ -1779,12 +1793,12 @@ func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, labe
 			PID int `json:"pid"`
 		}
 		if decodeQGACommandResult(raw, &result) != nil || result.PID < 1 {
-			return errors.New("QGA guest-exec returned an invalid pid")
+			return 0, errors.New("QGA guest-exec returned an invalid pid")
 		}
 		pid = result.PID
 	}
 	if pid < 1 {
-		return errors.New("QGA guest-exec returned an invalid pid")
+		return 0, errors.New("QGA guest-exec returned an invalid pid")
 	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -1795,24 +1809,21 @@ func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, labe
 			ExitCode int             `json:"exitcode"`
 		}
 		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &rawStatus); err != nil {
-			return err
+			return 0, err
 		}
 		if err := decodeQGACommandResult(rawStatus, &status); err != nil {
-			return errors.New("QGA guest-exec returned an invalid status")
+			return 0, errors.New("QGA guest-exec returned an invalid status")
 		}
 		exited, valid := boolish(status.Exited)
 		if !valid {
-			return errors.New("QGA guest-exec returned an invalid status")
+			return 0, errors.New("QGA guest-exec returned an invalid status")
 		}
 		if exited {
-			if _, allowed := allowedExitCodes[status.ExitCode]; !allowed {
-				return fmt.Errorf("guest %s command failed", label)
-			}
-			return nil
+			return status.ExitCode, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		case <-ticker.C:
 		}
 	}

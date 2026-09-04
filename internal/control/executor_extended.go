@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -858,6 +859,12 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 		readinessCtx, cancelReadiness = context.WithTimeout(ctx, readyWait)
 	}
 	defer cancelReadiness()
+	slog.Info("reinstall replacement verification started",
+		"operationId", command.OperationID,
+		"node", command.Identity.NodeRef,
+		"vmid", command.Identity.VMID,
+		"readinessBudgetMs", max(readyWait.Milliseconds(), 0),
+	)
 	timezoneCommand := command
 	timezoneCommand.Parameters, _ = json.Marshal(timezoneP{Timezone: parameters.Expected.Timezone})
 	verifyCommand := command
@@ -870,11 +877,35 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 		// setting the signed timezone; otherwise cloud-init may overwrite a
 		// successfully verified timedatectl change moments later.
 		if !cloudInitReady {
-			// cloud-init 23.4+ documents exit 2 as a completed terminal state
-			// with recoverable errors. Subsequent signed delivery checks remain
-			// authoritative, while exit 1 (crash) still fails closed.
-			if err := runGuestCommandWithExitCodes(readinessCtx, client, targetBase, "cloud-init readiness", map[int]struct{}{0: {}, 2: {}}, "/usr/bin/cloud-init", "status", "--wait"); err != nil {
+			// cloud-init documents 0 as clean completion, 2 as completion with
+			// recoverable errors, and 1 as completion with an unrecoverable
+			// cloud-init error. Exit 1 still means the boot process settled, so
+			// continue only into the full signed delivery proof below. That proof
+			// fails closed on every required resource, QGA, network, firewall,
+			// timezone and OS fact instead of treating cloud-init's aggregate
+			// status as a substitute for the actual delivery contract.
+			exitCode, err := runGuestCommandExitCode(readinessCtx, client, targetBase, "/usr/bin/cloud-init", "status", "--wait")
+			if err != nil {
 				return err
+			}
+			cloudInitHadError, statusErr := cloudInitTerminalStatus(exitCode)
+			if statusErr != nil {
+				return statusErr
+			}
+			if cloudInitHadError {
+				slog.Warn("cloud-init settled with an error; continuing strict replacement verification",
+					"operationId", command.OperationID,
+					"node", command.Identity.NodeRef,
+					"vmid", command.Identity.VMID,
+					"exitCode", exitCode,
+				)
+			} else {
+				slog.Info("cloud-init settled",
+					"operationId", command.OperationID,
+					"node", command.Identity.NodeRef,
+					"vmid", command.Identity.VMID,
+					"exitCode", exitCode,
+				)
 			}
 			cloudInitReady = true
 		}
@@ -883,11 +914,24 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 				return err
 			}
 			timezoneVerified = true
+			slog.Info("reinstall replacement timezone verified",
+				"operationId", command.OperationID,
+				"node", command.Identity.NodeRef,
+				"vmid", command.Identity.VMID,
+			)
 		}
 		if _, err := verifyDelivery(readinessCtx, readClient, verifyCommand); err != nil {
 			return err
 		}
-		return verifyReinstallOS(readinessCtx, readClient, command, parameters.ExpectedOS)
+		if err := verifyReinstallOS(readinessCtx, readClient, command, parameters.ExpectedOS); err != nil {
+			return err
+		}
+		slog.Info("reinstall replacement delivery verified",
+			"operationId", command.OperationID,
+			"node", command.Identity.NodeRef,
+			"vmid", command.Identity.VMID,
+		)
+		return nil
 	}
 	lastErr := verify()
 	if lastErr == nil || readyWait < 0 || !reinstallReadinessRetryable(lastErr) {
@@ -914,6 +958,20 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 				return lastErr
 			}
 		}
+	}
+}
+
+// cloudInitTerminalStatus distinguishes a settled cloud-init run from an
+// invalid guest-exec result. A cloud-init exit 1 is not itself delivery
+// success; it merely permits the stronger signed replacement proof to run.
+func cloudInitTerminalStatus(exitCode int) (hadError bool, err error) {
+	switch exitCode {
+	case 0, 2:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("guest cloud-init readiness command failed with exit code %d", exitCode)
 	}
 }
 
