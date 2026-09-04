@@ -95,20 +95,21 @@ type journalRecord struct {
 // receipt audit event after a crash. It intentionally cannot represent
 // Parameters, credentials, secrets, or a complete result.
 type auditContext struct {
-	AssignmentRevision  protocol.Counter `json:"assignmentRevision"`
-	CommandID           string           `json:"commandId"`
-	IdempotencyKey      string           `json:"idempotencyKey"`
-	OperationID         string           `json:"operationId"`
-	Action              string           `json:"action"`
-	Scope               string           `json:"scope"`
-	TargetRef           string           `json:"targetRef"`
-	WebsiteCommandKeyID string           `json:"websiteCommandKeyId"`
-	ReceivedAt          time.Time        `json:"receivedAt"`
-	AcceptedAt          time.Time        `json:"acceptedAt"`
-	ApprovalRef         string           `json:"approvalRef,omitempty"`
-	RequestedByRef      string           `json:"requestedByRef"`
-	PayloadDigest       string           `json:"payloadDigest"`
-	AgentVersion        string           `json:"agentVersion"`
+	AssignmentRevision  protocol.Counter      `json:"assignmentRevision"`
+	CommandID           string                `json:"commandId"`
+	IdempotencyKey      string                `json:"idempotencyKey"`
+	OperationID         string                `json:"operationId"`
+	Action              string                `json:"action"`
+	Scope               string                `json:"scope"`
+	TargetRef           string                `json:"targetRef"`
+	Target              *auditlog.EventTarget `json:"target,omitempty"`
+	WebsiteCommandKeyID string                `json:"websiteCommandKeyId"`
+	ReceivedAt          time.Time             `json:"receivedAt"`
+	AcceptedAt          time.Time             `json:"acceptedAt"`
+	ApprovalRef         string                `json:"approvalRef,omitempty"`
+	RequestedByRef      string                `json:"requestedByRef"`
+	PayloadDigest       string                `json:"payloadDigest"`
+	AgentVersion        string                `json:"agentVersion"`
 }
 
 // SubmittedTask is the safe recovery view of an asynchronous command.
@@ -1027,6 +1028,14 @@ func newAuditContext(command Command, now time.Time, agentVersion string) (audit
 		RequestedByRef: command.OperatorRef, PayloadDigest: "sha256:" + command.BodySHA256,
 		AgentVersion: agentVersion,
 	}
+	if command.Scope == ScopeVM {
+		result.Target = &auditlog.EventTarget{
+			ClusterRef: command.Identity.ClusterRef,
+			NodeRef:    command.Identity.NodeRef,
+			GuestType:  command.Identity.GuestType,
+			VMID:       command.Identity.VMID,
+		}
+	}
 	if err := result.validate(); err != nil {
 		return auditContext{}, err
 	}
@@ -1045,6 +1054,19 @@ func (c auditContext) validate() error {
 	}
 	if !strings.HasPrefix(c.PayloadDigest, "sha256:") || !bodyHashRE.MatchString(strings.TrimPrefix(c.PayloadDigest, "sha256:")) || !validAuditText(c.AgentVersion, 128) {
 		return errors.New("journal audit context digest or version is invalid")
+	}
+	if c.Target != nil {
+		probe := auditlog.Event{
+			EventID: "11111111-1111-4111-8111-111111111111", AssignmentRevision: c.AssignmentRevision,
+			CommandID: c.CommandID, OperationID: c.OperationID, IdempotencyKey: c.IdempotencyKey,
+			Action: c.Action, Scope: c.Scope, TargetRef: c.TargetRef, Target: c.Target,
+			WebsiteCommandKeyID: c.WebsiteCommandKeyID, ReceivedAt: c.ReceivedAt,
+			Outcome: "succeeded", PayloadDigest: c.PayloadDigest, PolicyDecision: "allowed",
+			AgentVersion: c.AgentVersion,
+		}
+		if err := probe.Validate(); err != nil {
+			return errors.New("journal audit context target is invalid")
+		}
 	}
 	return nil
 }
@@ -1089,14 +1111,28 @@ func auditEventFromReceipt(context auditContext, receipt Receipt) (auditlog.Even
 	}
 	event := auditlog.Event{
 		EventID: receipt.ReceiptID, AssignmentRevision: context.AssignmentRevision,
-		CommandID: context.CommandID, IdempotencyKey: context.IdempotencyKey,
-		Action: context.Action, Scope: context.Scope, TargetRef: context.TargetRef,
+		CommandID: context.CommandID, OperationID: context.OperationID, IdempotencyKey: context.IdempotencyKey,
+		Action: context.Action, Scope: context.Scope, TargetRef: context.TargetRef, Target: context.Target,
 		WebsiteCommandKeyID: context.WebsiteCommandKeyID, ReceivedAt: context.ReceivedAt.UTC(),
 		AcceptedAt: &acceptedAt, StartedAt: startedAt, FinishedAt: finishedAt,
 		Outcome: outcome, ErrorCode: receipt.Code, UPID: upidDigest,
 		ApprovalRef: context.ApprovalRef, RequestedByRef: context.RequestedByRef,
 		PayloadDigest: context.PayloadDigest, ResultDigest: resultDigest,
 		PolicyDecision: policy, AgentVersion: context.AgentVersion,
+	}
+	switch {
+	case policy == "denied":
+		event.FailureStage = "policy"
+	case receipt.State == "failed" || outcome == "rolled_back":
+		event.FailureStage = "execution"
+	case receipt.State == "indeterminate":
+		event.FailureStage = "receipt"
+	}
+	if receipt.Error != nil {
+		event.Error = &auditlog.ExecutionError{
+			Source: receipt.Error.Source, Stage: receipt.Error.Stage, Method: receipt.Error.Method,
+			Path: receipt.Error.Path, HTTPStatus: receipt.Error.HTTPStatus, Reason: receipt.Error.Reason,
+		}
 	}
 	if err := event.Validate(); err != nil {
 		return auditlog.Event{}, err

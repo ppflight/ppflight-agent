@@ -680,6 +680,13 @@ func (s *Service) reconciledReceipt(task SubmittedTask, result TaskResolution, r
 				receipt.State, receipt.Code = "succeeded", "SUCCEEDED"
 			} else {
 				receipt.State, receipt.Code = "failed", "PVE_TASK_FAILED"
+				reason := strings.TrimSpace(result.ExitStatus)
+				if reason == "" {
+					reason = "PVE task finished without a successful exit status"
+				} else {
+					reason = "PVE task failed: " + reason
+				}
+				receipt.Error = &ExecutionError{Source: "pve", Stage: "task_result", Reason: reason}
 			}
 		default:
 			receipt.State, receipt.Code = "waiting", "PVE_TASK_STATUS_INDETERMINATE"

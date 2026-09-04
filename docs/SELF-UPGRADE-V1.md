@@ -2,7 +2,7 @@
 
 `agent.upgrade` 是 node scope、需要审批的写操作。它沿用官网控制通道已有的 Ed25519、`bindingId`、`deviceId`、`credentialEpoch`、`assignmentRevision`、`idempotencyKey`、目标身份、有效期、本地 `allowedActions` 和独立监控审计门禁。官网不得从浏览器接收或透传下载 URL、大小或 SHA。
 
-从 `0.1.1-rc.30` 起，命令接收、策略拒绝、执行开始、终态、耗时和自升级各复验阶段都会写入结构化 journal 日志。从 `0.1.1-rc.31` 起，root helper 的失败阶段与原因也会持久化并进入官网签名回执，且发布打包器生成的每个文件都会由自动测试逐项通过 helper 白名单。从 `0.1.1-rc.32` 起，特权 helper 与主 Agent 统一使用 JSON journal 格式。日志与回执只包含合同允许的 `source/stage/method/path/httpStatus/reason`，不记录参数、凭据、请求体、PVE 原始响应或 guest 输出。
+从 `0.1.1-rc.30` 起，命令接收、策略拒绝、执行开始、终态、耗时和自升级各复验阶段都会写入结构化 journal 日志。从 `0.1.1-rc.31` 起，root helper 的失败阶段与原因也会持久化并进入官网签名回执，且发布打包器生成的每个文件都会由自动测试逐项通过 helper 白名单。从 `0.1.1-rc.32` 起，特权 helper 与主 Agent 统一使用 JSON journal 格式。从 `0.1.1-rc.33` 起，同一受限诊断也进入 monitoring audit，并附带 `operationId` 与可读 VM 目标供监控端聚合。日志与回执只包含合同允许的 `source/stage/method/path/httpStatus/reason`，不记录参数、凭据、请求体、PVE 原始响应或 guest 输出。
 
 严格参数如下，未知字段拒绝：
 

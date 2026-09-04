@@ -86,7 +86,7 @@ func TestAuditFailureLeavesReceiptPendingAndReconcileAfterRestart(t *testing.T) 
 	if len(audit.events) != 1 || len(receipts.payloads) != 1 {
 		t.Fatalf("audit=%d receipts=%d", len(audit.events), len(receipts.payloads))
 	}
-	if event := audit.events[0]; event.EventID != pendingReceipts[0].Receipt.ReceiptID || event.TargetRef != "vm:cluster-1:qemu:instance-1:2" || event.PolicyDecision != "allowed" || !strings.HasPrefix(event.PayloadDigest, "sha256:") || !strings.HasPrefix(event.ResultDigest, "sha256:") {
+	if event := audit.events[0]; event.EventID != pendingReceipts[0].Receipt.ReceiptID || event.OperationID != command.OperationID || event.TargetRef != "vm:cluster-1:qemu:instance-1:2" || event.Target == nil || event.Target.VMID != 101 || event.Target.GuestType != "qemu" || event.PolicyDecision != "allowed" || !strings.HasPrefix(event.PayloadDigest, "sha256:") || !strings.HasPrefix(event.ResultDigest, "sha256:") {
 		t.Fatalf("audit event=%#v", event)
 	}
 	if pending, err := reopened.PendingAudits(); err != nil || len(pending) != 0 {
@@ -101,6 +101,30 @@ func TestAuditFailureLeavesReceiptPendingAndReconcileAfterRestart(t *testing.T) 
 	}
 	if strings.Contains(string(raw), "parameters") || strings.Contains(string(raw), "secret") || strings.Contains(string(raw), `"result"`) {
 		t.Fatalf("journal persisted forbidden audit data: %s", raw)
+	}
+}
+
+func TestAuditEventIncludesOnlyBoundedStructuredReceiptError(t *testing.T) {
+	now := time.Date(2026, 9, 4, 1, 2, 3, 0, time.UTC)
+	command, _ := signedCommand(t, now)
+	context, err := newAuditContext(command, now, "0.1.1-rc.33")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := Receipt{
+		SchemaVersion: 1, ReceiptID: "33333333-3333-4333-8333-333333333333",
+		CommandID: command.CommandID, OperationID: command.OperationID, AgentRef: command.AgentRef,
+		State: "failed", Code: "PVE_TASK_FAILED", ExecutionMode: "production",
+		StartedAt: now, FinishedAt: now.Add(time.Second),
+		Error: &ExecutionError{Source: "pve", Stage: "task_result", Reason: "PVE task failed: storage is unavailable"},
+	}
+	event, err := auditEventFromReceipt(context, receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.FailureStage != "execution" || event.Error == nil || event.Error.Source != "pve" ||
+		event.Error.Stage != "task_result" || event.Error.Reason != receipt.Error.Reason {
+		t.Fatalf("audit diagnostic=%#v", event)
 	}
 }
 

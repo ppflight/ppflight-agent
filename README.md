@@ -94,7 +94,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 生产修改命令在真正调用 PVE 前先持久排队 `running/COMMAND_STARTED` 回执，避免重装等长流程被官网租约误重发。失败终态另返回严格受限的结构化诊断（来源、执行阶段及可选 PVE 方法/路径/HTTP 状态和顶层原因）；不会返回请求体、原始响应、凭据或任意系统日志。重装的修改步骤使用 control client，最终 QGA/OS/网络/防火墙交付回验固定使用独立 read client。
 
-所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；只允许冻结的 command/action/scope/typed target/outcome 元数据和 SHA-256 digest，严禁 secret、root 密码、Token、完整 command parameters/result 或原始 UPID。monitoring audit schema 不含 `operationId`/`executionMode`；精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；监控服务端存储和可查询 UI 仍由另一任务交付。官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
+所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；允许 `operationId` 关联同一任务的多个进度事件，VM 目标额外携带 `clusterRef/nodeRef/guestType/vmid`。失败时可携带与官网 receipt 相同的受限 `error`（来源、阶段、固定 HTTP 方法、无 query API 路径、状态码和单行原因）。严禁 secret、root 密码、Token、完整 command parameters/result、原始响应或原始 UPID。精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
 
 ## NIC 角色、IP、网络与防盗用
 

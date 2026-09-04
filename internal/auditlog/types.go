@@ -30,6 +30,7 @@ var (
 	targetPartRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	actionRE     = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*)+$`)
 	errorCodeRE  = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
+	errorStageRE = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,127}$`)
 	digestRE     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
@@ -50,10 +51,12 @@ type Event struct {
 	EventID             string           `json:"eventId"`
 	AssignmentRevision  protocol.Counter `json:"assignmentRevision"`
 	CommandID           string           `json:"commandId"`
+	OperationID         string           `json:"operationId,omitempty"`
 	IdempotencyKey      string           `json:"idempotencyKey"`
 	Action              string           `json:"action"`
 	Scope               string           `json:"scope"`
 	TargetRef           string           `json:"targetRef"`
+	Target              *EventTarget     `json:"target,omitempty"`
 	WebsiteCommandKeyID string           `json:"websiteCommandKeyId"`
 	ReceivedAt          time.Time        `json:"receivedAt"`
 	AcceptedAt          *time.Time       `json:"acceptedAt,omitempty"`
@@ -61,6 +64,8 @@ type Event struct {
 	FinishedAt          *time.Time       `json:"finishedAt,omitempty"`
 	Outcome             string           `json:"outcome"`
 	ErrorCode           string           `json:"errorCode,omitempty"`
+	FailureStage        string           `json:"failureStage,omitempty"`
+	Error               *ExecutionError  `json:"error,omitempty"`
 	UPID                string           `json:"upid,omitempty"`
 	ApprovalRef         string           `json:"approvalRef,omitempty"`
 	RequestedByRef      string           `json:"requestedByRef,omitempty"`
@@ -68,6 +73,27 @@ type Event struct {
 	ResultDigest        string           `json:"resultDigest,omitempty"`
 	PolicyDecision      string           `json:"policyDecision"`
 	AgentVersion        string           `json:"agentVersion"`
+}
+
+// EventTarget is a human-readable VM identity projection. InstanceUUID and
+// generation remain in TargetRef; this projection intentionally adds only the
+// operator-safe fields needed to identify a guest in the monitoring UI.
+type EventTarget struct {
+	ClusterRef string `json:"clusterRef"`
+	NodeRef    string `json:"nodeRef"`
+	GuestType  string `json:"guestType"`
+	VMID       int    `json:"vmid"`
+}
+
+// ExecutionError mirrors the receipt's already-redacted diagnostic. It never
+// carries request bodies, response bodies, credentials, or arbitrary output.
+type ExecutionError struct {
+	Source     string `json:"source"`
+	Stage      string `json:"stage"`
+	Method     string `json:"method,omitempty"`
+	Path       string `json:"path,omitempty"`
+	HTTPStatus int    `json:"httpStatus,omitempty"`
+	Reason     string `json:"reason"`
 }
 
 // Batch is sent only to POST /internal/v1/monitoring/audit-events/batches.
@@ -110,10 +136,11 @@ func (e Event) Validate() error {
 	}
 	for label, value := range map[string]string{
 		"commandId": e.CommandID, "idempotencyKey": e.IdempotencyKey,
+		"operationId":         e.OperationID,
 		"websiteCommandKeyId": e.WebsiteCommandKeyID,
 		"approvalRef":         e.ApprovalRef, "requestedByRef": e.RequestedByRef,
 	} {
-		if value == "" && (label == "approvalRef" || label == "requestedByRef") {
+		if value == "" && (label == "approvalRef" || label == "requestedByRef" || label == "operationId") {
 			continue
 		}
 		if !safeRefRE.MatchString(value) {
@@ -125,6 +152,17 @@ func (e Event) Validate() error {
 	}
 	if !actionRE.MatchString(e.Action) || !validTargetRef(e.Scope, e.TargetRef) {
 		return errors.New("audit event action, scope, or targetRef is invalid")
+	}
+	if e.Target != nil {
+		if e.Scope != "vm" || !targetPartRE.MatchString(e.Target.ClusterRef) ||
+			!targetPartRE.MatchString(e.Target.NodeRef) ||
+			(e.Target.GuestType != "qemu" && e.Target.GuestType != "lxc") || e.Target.VMID < 1 {
+			return errors.New("audit event target is invalid")
+		}
+		parts := strings.Split(e.TargetRef, ":")
+		if len(parts) != 5 || parts[1] != e.Target.ClusterRef || parts[2] != e.Target.GuestType {
+			return errors.New("audit event target does not match targetRef")
+		}
 	}
 	if !validUTCTime(e.ReceivedAt) {
 		return errors.New("audit event timing is invalid")
@@ -140,6 +178,22 @@ func (e Event) Validate() error {
 	}
 	if !validOutcome(e.Outcome) || e.ErrorCode != "" && !errorCodeRE.MatchString(e.ErrorCode) {
 		return errors.New("audit event outcome or errorCode is invalid")
+	}
+	if e.FailureStage != "" && e.FailureStage != "admission" && e.FailureStage != "policy" && e.FailureStage != "execution" && e.FailureStage != "receipt" {
+		return errors.New("audit event failureStage is invalid")
+	}
+	if e.Error != nil {
+		if e.Outcome != "failed" && e.Outcome != "rolled_back" && e.Outcome != "indeterminate" && e.Outcome != "rejected" {
+			return errors.New("successful audit event cannot contain an execution error")
+		}
+		if e.Error.Source != "pve" && e.Error.Source != "qga" && e.Error.Source != "agent" ||
+			!errorStageRE.MatchString(e.Error.Stage) ||
+			e.Error.Method != "" && e.Error.Method != "GET" && e.Error.Method != "POST" && e.Error.Method != "PUT" && e.Error.Method != "DELETE" ||
+			e.Error.Path != "" && (len(e.Error.Path) > 512 || !strings.HasPrefix(e.Error.Path, "/") || strings.ContainsAny(e.Error.Path, "\x00\r\n?#")) ||
+			e.Error.HTTPStatus != 0 && (e.Error.HTTPStatus < 100 || e.Error.HTTPStatus > 599) ||
+			!validBoundedText(e.Error.Reason, 1024, false) {
+			return errors.New("audit event execution error is invalid")
+		}
 	}
 	if e.UPID != "" && !digestRE.MatchString(e.UPID) {
 		return errors.New("audit event UPID must be a SHA-256 digest")

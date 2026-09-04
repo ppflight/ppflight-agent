@@ -17,7 +17,8 @@ func validEvent() Event {
 	return Event{
 		EventID: "11111111-1111-4111-8111-111111111111", AssignmentRevision: 7,
 		CommandID: "command-1", IdempotencyKey: "idempotency-1", Action: "vm.start", Scope: "vm",
-		TargetRef: "vm:cluster-1:qemu:instance-1:2", WebsiteCommandKeyID: "website-key-1",
+		OperationID: "operation-1", TargetRef: "vm:cluster-1:qemu:instance-1:2",
+		Target: &EventTarget{ClusterRef: "cluster-1", NodeRef: "pve-1", GuestType: "qemu", VMID: 101}, WebsiteCommandKeyID: "website-key-1",
 		ReceivedAt: received, AcceptedAt: &received, StartedAt: &started, FinishedAt: &finished,
 		Outcome: "succeeded", ErrorCode: "SUCCEEDED", UPID: "sha256:" + strings.Repeat("c", 64),
 		ApprovalRef: "approval-1", RequestedByRef: "operator-1",
@@ -39,7 +40,7 @@ func TestBatchGoldenJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"schemaVersion":1,"batchId":"11111111-1111-4111-8111-111111111111","monitoringAgentRef":"monitor-agent-1","deviceId":"device-1","credentialEpoch":"4","sequence":"9","bootId":"22222222-2222-4222-8222-222222222222","observedAt":"2026-08-30T01:02:05Z","sentAt":"2026-08-30T01:02:06Z","deliveryState":{"pendingItems":"2","pendingBytes":"4096","lastDeliveryError":"","authBlocked":false},"events":[{"eventId":"11111111-1111-4111-8111-111111111111","assignmentRevision":"7","commandId":"command-1","idempotencyKey":"idempotency-1","action":"vm.start","scope":"vm","targetRef":"vm:cluster-1:qemu:instance-1:2","websiteCommandKeyId":"website-key-1","receivedAt":"2026-08-30T01:02:03Z","acceptedAt":"2026-08-30T01:02:03Z","startedAt":"2026-08-30T01:02:04Z","finishedAt":"2026-08-30T01:02:05Z","outcome":"succeeded","errorCode":"SUCCEEDED","upid":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","approvalRef":"approval-1","requestedByRef":"operator-1","payloadDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resultDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policyDecision":"allowed","agentVersion":"1.2.3"}]}`
+	want := `{"schemaVersion":1,"batchId":"11111111-1111-4111-8111-111111111111","monitoringAgentRef":"monitor-agent-1","deviceId":"device-1","credentialEpoch":"4","sequence":"9","bootId":"22222222-2222-4222-8222-222222222222","observedAt":"2026-08-30T01:02:05Z","sentAt":"2026-08-30T01:02:06Z","deliveryState":{"pendingItems":"2","pendingBytes":"4096","lastDeliveryError":"","authBlocked":false},"events":[{"eventId":"11111111-1111-4111-8111-111111111111","assignmentRevision":"7","commandId":"command-1","operationId":"operation-1","idempotencyKey":"idempotency-1","action":"vm.start","scope":"vm","targetRef":"vm:cluster-1:qemu:instance-1:2","target":{"clusterRef":"cluster-1","nodeRef":"pve-1","guestType":"qemu","vmid":101},"websiteCommandKeyId":"website-key-1","receivedAt":"2026-08-30T01:02:03Z","acceptedAt":"2026-08-30T01:02:03Z","startedAt":"2026-08-30T01:02:04Z","finishedAt":"2026-08-30T01:02:05Z","outcome":"succeeded","errorCode":"SUCCEEDED","upid":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","approvalRef":"approval-1","requestedByRef":"operator-1","payloadDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","resultDigest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policyDecision":"allowed","agentVersion":"1.2.3"}]}`
 	if string(raw) != want {
 		t.Fatalf("golden mismatch\n got: %s\nwant: %s", raw, want)
 	}
