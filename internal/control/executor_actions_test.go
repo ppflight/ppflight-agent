@@ -301,6 +301,28 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		}
 	})
 
+	t.Run("Cloud-Init omits an empty SSH key list", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if requests == 1 {
+				_, _ = w.Write([]byte(`{"data":{"digest":"cloud-digest"}}`))
+				return
+			}
+			_ = r.ParseForm()
+			if _, present := r.Form["sshkeys"]; present {
+				t.Fatalf("empty sshkeys must be omitted: %v", r.Form)
+			}
+			_, _ = w.Write([]byte(`{"data":null}`))
+		}))
+		defer server.Close()
+		command := controlCommand("vm.set-cloud-init", "qemu", `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":[],"qgaEnabled":true}`)
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
+		if err != nil || receipt.State != "succeeded" || requests != 2 {
+			t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+		}
+	})
+
 	t.Run("timezone waits for QGA command completion", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {

@@ -1619,7 +1619,14 @@ func setCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) 
 	if err != nil {
 		return "", nil, err
 	}
-	form := url.Values{"ciuser": {p.Username}, "cipassword": {p.Password}, "sshkeys": {url.QueryEscape(strings.Join(p.SSHAuthorizedKeys, "\n"))}, "name": {p.Hostname}, "agent": {"enabled=1"}}
+	form := url.Values{"ciuser": {p.Username}, "cipassword": {p.Password}, "name": {p.Hostname}, "agent": {"enabled=1"}}
+	// PVE treats an explicitly present empty sshkeys value as an invalid
+	// URL-encoded key list. Omit the property when the caller supplied no keys;
+	// this preserves the cloned template's empty/default state without asking
+	// PVE to parse a value that has no key material.
+	if len(p.SSHAuthorizedKeys) > 0 {
+		form.Set("sshkeys", url.QueryEscape(strings.Join(p.SSHAuthorizedKeys, "\n")))
+	}
 	if current.Digest != "" {
 		form.Set("digest", current.Digest)
 	}
