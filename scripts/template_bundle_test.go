@@ -94,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "e9a560007671a5f328d5b5b07cb6de88b1307309809ef6cc49b668eb0984648c"
+	const expectedManifestSHA256 = "2ccec7dbf66c44a84ca95cbb525745e9e4b044914b2c966488986288689ee743"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -134,9 +134,10 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 		`rpm -q --quiet qemu-guest-agent`,
 		`systemctl is-enabled qemu-guest-agent.service`,
 		`ppflight-qga-preinstalled`,
-		`require_host_cpu_flags "$name" x86-64-v2`,
-		`require_host_cpu_flags "$name" x86-64-v3`,
+		`report_host_cpu_compatibility "$name" x86-64-v2`,
+		`report_host_cpu_compatibility "$name" x86-64-v3`,
 		`avx avx2 bmi1 bmi2 f16c fma abm movbe xsave`,
+		`[[ "$existing_name" == "$expected_name" ]]`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("template builder is missing the frozen socket baseline check %q", required)

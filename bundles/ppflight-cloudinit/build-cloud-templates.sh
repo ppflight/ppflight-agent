@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.3.0"
+readonly SCRIPT_VERSION="3.3.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -264,17 +264,27 @@ validate_integer() {
   [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
 }
 
-require_host_cpu_flags() {
+report_host_cpu_compatibility() {
   local template_name="$1" level="$2"
   shift 2
-  local flags flag
-  [[ "$CPU_TYPE" == "host" ]] || die "$template_name requires $level; CPU_TYPE must be host so the required host features reach the guest"
+  local flags flag missing=""
+  if [[ "$CPU_TYPE" != "host" ]]; then
+    log "CPU compatibility note: $template_name targets $level; continuing with configured CPU_TYPE=$CPU_TYPE"
+    return 0
+  fi
   flags=" $(awk -F: '/^flags[[:space:]]*:/ {print $2; exit}' /proc/cpuinfo) "
-  [[ "$flags" != "  " ]] || die "cannot read host CPU flags required by $template_name"
+  if [[ "$flags" == "  " ]]; then
+    log "CPU compatibility note: host flags are unavailable for $template_name ($level); continuing template build"
+    return 0
+  fi
   for flag in "$@"; do
-    [[ "$flags" == *" $flag "* ]] || die "$template_name requires $level but host CPU flag '$flag' is missing"
+    [[ "$flags" == *" $flag "* ]] || missing="${missing}${missing:+,}$flag"
   done
-  log "Host CPU satisfies $level for $template_name"
+  if [[ -n "$missing" ]]; then
+    log "CPU compatibility note: $template_name targets $level and host lacks [$missing]; continuing template build"
+  else
+    log "Host CPU satisfies $level for $template_name"
+  fi
 }
 
 preflight_selected_cpu_levels() {
@@ -284,11 +294,11 @@ preflight_selected_cpu_levels() {
     case "$name" in
       centos-stream-9)
         # Linux reports SSE3 as pni on x86_64.
-        require_host_cpu_flags "$name" x86-64-v2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2
+        report_host_cpu_compatibility "$name" x86-64-v2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2
         ;;
       centos-stream-10)
         # Linux reports LZCNT as abm on x86_64.
-        require_host_cpu_flags "$name" x86-64-v3 \
+        report_host_cpu_compatibility "$name" x86-64-v3 \
           cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 \
           avx avx2 bmi1 bmi2 f16c fma abm movbe xsave
         ;;
@@ -690,9 +700,10 @@ check_existing_vmids() {
       config="$(qm config "$vmid")"
       grep -qx 'template: 1' <<< "$config" || die "VMID $vmid exists and is not a template"
       [[ "$REPLACE_EXISTING" == "1" ]] || die "template $vmid already exists; rerun with --replace"
+      existing_name="$(awk '$1 == "name:" {print $2; exit}' <<< "$config")"
+      [[ "$existing_name" == "$name" ]] || die "template $vmid has name '$existing_name', expected '$name'; refusing to replace it"
       if ! grep -Eq '^tags: .*ppflight-cloudinit([;,]|$)' <<< "$config"; then
-        existing_name="$(awk '$1 == "name:" {print $2; exit}' <<< "$config")"
-        [[ "$FORCE_REPLACE_UNMANAGED" == "1" && "$existing_name" == "$name" ]] ||
+        [[ "$FORCE_REPLACE_UNMANAGED" == "1" ]] ||
           die "template $vmid is not tagged ppflight-cloudinit; refusing to replace it"
       fi
     fi
@@ -706,8 +717,10 @@ destroy_existing_template() {
     config="$(qm config "$vmid")"
     grep -qx 'template: 1' <<< "$config" || die "VMID $vmid changed and is no longer a template"
     existing_name="$(awk '$1 == "name:" {print $2; exit}' <<< "$config")"
+    [[ "$existing_name" == "$expected_name" ]] ||
+      die "template $vmid changed name to '$existing_name'; refusing to destroy it"
     if ! grep -Eq '^tags: .*ppflight-cloudinit([;,]|$)' <<< "$config"; then
-      [[ "$FORCE_REPLACE_UNMANAGED" == "1" && "$existing_name" == "$expected_name" ]] ||
+      [[ "$FORCE_REPLACE_UNMANAGED" == "1" ]] ||
         die "template $vmid is unmanaged or changed; refusing to destroy it"
     fi
     log "Replacing existing template $vmid"
