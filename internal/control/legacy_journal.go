@@ -223,7 +223,8 @@ func legacyCloneEligibilityError(record journalRecord, command Command, paramete
 
 func migratedCloneAuthorityMatches(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter) bool {
 	return record.MigratedAt != nil && !record.MigratedAt.IsZero() &&
-		record.AssignmentRevision == legacyAssignmentRevision && legacyAssignmentRevision < command.AssignmentRevision &&
+		record.AssignmentRevision > 0 && record.AssignmentRevision <= legacyAssignmentRevision &&
+		legacyAssignmentRevision < command.AssignmentRevision &&
 		record.BindingID == command.BindingID && record.DeviceID == command.DeviceID &&
 		record.CredentialEpoch == command.CredentialEpoch && record.AgentRef == command.AgentRef &&
 		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&

@@ -73,7 +73,7 @@ func TestWebsiteTelemetryCarriesObservedAndSentTimes(t *testing.T) {
 func TestWebsiteTelemetryForAgentCarriesRunningVersion(t *testing.T) {
 	now := time.Date(2026, 9, 4, 9, 20, 0, 0, time.UTC)
 	snapshot := observation.Snapshot{Mode: "production", AgentRef: "agent", CollectorRef: "collector", ClusterRef: "cluster", ObservedAt: now}
-	batch, err := BuildWebsiteTelemetryAtForAgent(snapshot, nil, "source", "0.1.1-rc.23", 8, now)
+	batch, err := BuildWebsiteTelemetryAtForAgent(snapshot, nil, "source", "0.1.1-rc.24", 8, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func TestWebsiteTelemetryForAgentCarriesRunningVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch.AgentVersion != "0.1.1-rc.23" || !bytes.Contains(raw, []byte(`"agentVersion":"0.1.1-rc.23"`)) {
+	if batch.AgentVersion != "0.1.1-rc.24" || !bytes.Contains(raw, []byte(`"agentVersion":"0.1.1-rc.24"`)) {
 		t.Fatalf("running Agent version missing from website telemetry: %s", raw)
 	}
 }

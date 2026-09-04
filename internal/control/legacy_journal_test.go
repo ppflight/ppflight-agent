@@ -825,6 +825,13 @@ func TestLegacyJournalMigrationRetiresNewIndeterminateOnAlreadyMigratedLineage(t
 	if err != nil || !secondResult.Migrated || len(secondResult.RetiredIndeterminateCommandIDs) != 1 {
 		t.Fatalf("follow-up migration result=%#v err=%v", secondResult, err)
 	}
+	secondRaw, _ := json.Marshal(secondResult)
+	secondReceipt := Receipt{SchemaVersion: 1, ReceiptID: "99999999-9999-4999-8999-999999999999", CommandID: second.CommandID,
+		OperationID: second.OperationID, AgentRef: second.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(5 * time.Second), FinishedAt: now.Add(6 * time.Second), Result: secondRaw}
+	if err := journal.Complete(second, secondReceipt); err != nil {
+		t.Fatal(err)
+	}
 	cloneRecord, err := readJournal(journal.path(clone.CommandID))
 	if err != nil || cloneRecord.MigratedByCommandID != migration.CommandID || cloneRecord.AssignmentRevision != migration.AssignmentRevision {
 		t.Fatalf("original clone migration marker changed: record=%#v err=%v", cloneRecord, err)
@@ -832,6 +839,48 @@ func TestLegacyJournalMigrationRetiresNewIndeterminateOnAlreadyMigratedLineage(t
 	retired, err := readJournal(journal.path(indeterminate.CommandID))
 	if err != nil || retired.RetiredByCommandID != second.CommandID || retired.AssignmentRevision != second.AssignmentRevision {
 		t.Fatalf("follow-up record was not retired: record=%#v err=%v", retired, err)
+	}
+
+	// A later recovery may need another read-only assignment revision between
+	// the indeterminate mutation and its migration. The immutable clone marker
+	// remains on the first migration authority, while the explicitly named new
+	// record belongs to a later revision on the same binding and VM lineage.
+	thirdIndeterminate := legacyAuthorityCommand("vm.set-timezone", `{"timezone":"America/Los_Angeles"}`, "third-indeterminate-command", "third-indeterminate-operation")
+	thirdIndeterminate.AssignmentRevision = second.AssignmentRevision + 1
+	thirdIndeterminate.Identity = migration.Identity
+	if _, duplicate, err := journal.ClaimWithAudit(thirdIndeterminate, now.Add(7*time.Second), "0.1.1-rc.23"); err != nil || duplicate {
+		t.Fatalf("third mutation claim duplicate=%t err=%v", duplicate, err)
+	}
+	thirdReceipt := Receipt{SchemaVersion: 1, ReceiptID: "88888888-8888-4888-8888-888888888888", CommandID: thirdIndeterminate.CommandID,
+		OperationID: thirdIndeterminate.OperationID, AgentRef: thirdIndeterminate.AgentRef, State: "indeterminate", Code: "PVE_RESULT_INDETERMINATE",
+		ExecutionMode: "production", StartedAt: now.Add(7 * time.Second), FinishedAt: now.Add(7 * time.Second)}
+	if err := journal.Complete(thirdIndeterminate, thirdReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	parameters.LegacyAssignmentRevision = thirdIndeterminate.AssignmentRevision
+	parameters.RetireIndeterminateCommandIDs = []string{thirdIndeterminate.CommandID}
+	thirdParametersRaw, _ := json.Marshal(parameters)
+	third := second
+	third.CommandID = "third-migration-command"
+	third.OperationID = "third-migration-operation"
+	third.IdempotencyKey = "third-migration-idempotency"
+	third.AssignmentRevision = thirdIndeterminate.AssignmentRevision + 2
+	third.Parameters = thirdParametersRaw
+	if _, duplicate, err := journal.ClaimWithAudit(third, now.Add(8*time.Second), "0.1.1-rc.24"); err != nil || duplicate {
+		t.Fatalf("third migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	thirdResult, err := journal.MigrateLegacyVMJournal(third, parameters, now.Add(9*time.Second))
+	if err != nil || !thirdResult.Migrated || len(thirdResult.RetiredIndeterminateCommandIDs) != 1 {
+		t.Fatalf("third migration result=%#v err=%v", thirdResult, err)
+	}
+	thirdRetired, err := readJournal(journal.path(thirdIndeterminate.CommandID))
+	if err != nil || thirdRetired.RetiredByCommandID != third.CommandID || thirdRetired.AssignmentRevision != third.AssignmentRevision {
+		t.Fatalf("third follow-up record was not retired: record=%#v err=%v", thirdRetired, err)
+	}
+	cloneRecord, err = readJournal(journal.path(clone.CommandID))
+	if err != nil || cloneRecord.MigratedByCommandID != migration.CommandID || cloneRecord.AssignmentRevision != migration.AssignmentRevision {
+		t.Fatalf("clone migration marker changed after repeated follow-up: record=%#v err=%v", cloneRecord, err)
 	}
 }
 
