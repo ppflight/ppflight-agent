@@ -245,12 +245,22 @@ download_verified() {
     || die "$label SHA-256 校验失败"
 }
 
-install_smartmontools() {
+install_host_dependencies() {
+  local -a missing_packages=()
   if [[ -x /usr/sbin/smartctl ]]; then
     printf '复用本机已有 smartctl。\n'
+  else
+    missing_packages+=(smartmontools)
+  fi
+  if command -v virt-customize >/dev/null 2>&1; then
+    printf '复用本机已有 virt-customize。\n'
+  else
+    missing_packages+=(libguestfs-tools)
+  fi
+  if [[ ${#missing_packages[@]} -eq 0 ]]; then
     return
   fi
-  command -v apt-get >/dev/null 2>&1 || die '缺少 /usr/sbin/smartctl，且本机没有 apt-get'
+  command -v apt-get >/dev/null 2>&1 || die '缺少模板/监控工作流依赖，且本机没有 apt-get'
   command -v pveversion >/dev/null 2>&1 || die '无法识别本机 PVE 版本'
   local pve_major suite sources_file
   pve_major="$(pveversion | sed -n 's/^pve-manager\/\([0-9]\+\).*/\1/p')"
@@ -259,7 +269,7 @@ install_smartmontools() {
     9) suite='trixie' ;;
     *) die "不支持的 PVE 主版本: ${pve_major:-unknown}" ;;
   esac
-  sources_file="$INSTALL_TEMP_DIR/debian-smartmontools.list"
+  sources_file="$INSTALL_TEMP_DIR/debian-host-dependencies.list"
   printf '%s\n' \
     "deb https://deb.debian.org/debian $suite main" \
     "deb https://deb.debian.org/debian $suite-updates main" \
@@ -273,20 +283,21 @@ install_smartmontools() {
     -o 'Acquire::ForceIPv4=true'
     -o 'Acquire::Retries=3'
   )
-  printf '本机缺少 smartctl；仅使用 Debian 官方 %s 固定源安装 smartmontools...\n' "$suite"
+  printf '本机缺少必需依赖；仅使用 Debian 官方 %s 固定源安装: %s\n' "$suite" "${missing_packages[*]}"
   DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" update
-  DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends smartmontools
+  DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}" install -y --no-install-recommends "${missing_packages[@]}"
   [[ -x /usr/sbin/smartctl ]] || die 'Debian 官方 smartmontools 安装完成后仍未找到 /usr/sbin/smartctl'
+  command -v virt-customize >/dev/null 2>&1 || die 'Debian 官方 libguestfs-tools 安装完成后仍未找到 virt-customize'
 }
 
 readonly NODE_EXPORTER_PATH="$INSTALL_TEMP_DIR/$NODE_EXPORTER_ARCHIVE"
 readonly SMARTCTL_EXPORTER_PATH="$INSTALL_TEMP_DIR/$SMARTCTL_EXPORTER_ARCHIVE"
+install_host_dependencies
 printf '正在下载固定版本 node_exporter %s 和 smartctl_exporter %s...\n' "$NODE_EXPORTER_VERSION" "$SMARTCTL_EXPORTER_VERSION"
 download_verified "$NODE_EXPORTER_BASE/$NODE_EXPORTER_ARCHIVE" "$NODE_EXPORTER_PATH" "$NODE_EXPORTER_SHA256" 'node_exporter'
 download_verified "$SMARTCTL_EXPORTER_BASE/$SMARTCTL_EXPORTER_ARCHIVE" "$SMARTCTL_EXPORTER_PATH" "$SMARTCTL_EXPORTER_SHA256" 'smartctl_exporter'
 
 binary_sha256="$(cut -d ' ' -f 1 ppflight-agent.sha256)"
-install_smartmontools
 scripts/install.sh \
   --binary ./ppflight-agent \
   --binary-sha256 "$binary_sha256" \

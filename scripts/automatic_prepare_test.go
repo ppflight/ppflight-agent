@@ -12,7 +12,7 @@ import (
 
 func TestQuickInstallPinsRepositoryVersionAndPublishedAssetDigests(t *testing.T) {
 	const (
-		repositoryVersion = "0.1.1-rc.16"
+		repositoryVersion = "0.1.1-rc.17"
 		nodeAMD64         = "b51d8a76aa2a9156a55d501aca6276fae09e262259a5e4e831d2c2222f084e63"
 		nodeARM64         = "ad35b605f9954b9f1ffddf5ba054bdc5a98d790b9eae5291e1eeb83f1ecbd0e7"
 		smartAMD64        = "875983cd27affc5a682401930e5a8eea3f06c325fe6d6a7228c5547d882685b3"
@@ -110,6 +110,9 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 		"Dir::Etc::sourceparts=-",
 		"Acquire::ForceIPv4=true",
 		`apt-get "${apt_options[@]}" update`,
+		`missing_packages+=(libguestfs-tools)`,
+		`apt-get "${apt_options[@]}" install -y --no-install-recommends "${missing_packages[@]}"`,
+		`command -v virt-customize >/dev/null 2>&1 || die 'Debian 官方 libguestfs-tools 安装完成后仍未找到 virt-customize'`,
 	} {
 		if !strings.Contains(quickInstall, required) {
 			t.Fatalf("quick installer is missing isolated official smartmontools source contract %q", required)
@@ -163,7 +166,7 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 func TestQuickInstallFreshOnlyHostFirewallTransactionOrder(t *testing.T) {
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	classify := strings.Index(quickInstall, `INSTALL_MODE="$(./ppflight-agent host-firewall classify)"`)
-	aptMutation := strings.LastIndex(quickInstall, "install_smartmontools")
+	aptMutation := strings.LastIndex(quickInstall, "install_host_dependencies")
 	installMutation := strings.Index(quickInstall, "\nscripts/install.sh \\")
 	prepare := strings.Index(quickInstall, "/usr/local/bin/ag-pve pve prepare --local-only")
 	lastServiceCheck := strings.LastIndex(quickInstall, "systemctl is-active --quiet ppflight-smartctl-exporter.service")
@@ -318,6 +321,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "pveversion"), "#!/usr/bin/env bash\nprintf 'pve-manager/8.4.0/fixture\\n'\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "apt-get"), "#!/usr/bin/env bash\nprintf 'apt-get:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "virt-customize"), "#!/usr/bin/env bash\nexit 0\n")
 
 	raw := readDeploymentFile(t, "quick-install.sh")
 	const rootCheck = "[[ ${EUID:-$(id -u)} -eq 0 ]] || die '请在 PVE root 终端执行'"
