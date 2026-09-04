@@ -1055,16 +1055,17 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 	}
 }
 
-func TestFirewallIPSetEntryDeleteUsesEscapedCIDRAndRequiresAbsenceReadback(t *testing.T) {
+func TestFirewallIPSetEntryDeleteUsesProviderCIDRAndRequiresAbsenceReadback(t *testing.T) {
 	for _, tt := range []struct {
 		name         string
 		deleteStatus int
+		before       string
 		entries      string
 		wantError    bool
 	}{
-		{name: "deleted and absent", deleteStatus: http.StatusOK, entries: `[]`},
-		{name: "already absent is convergent", deleteStatus: http.StatusInternalServerError, entries: `[{"cidr":"10.0.0.1/32"}]`},
-		{name: "false success is rejected", deleteStatus: http.StatusOK, entries: `[{"cidr":"10.0.0.0/24"}]`, wantError: true},
+		{name: "provider host spelling is deleted and absent", deleteStatus: http.StatusOK, before: `[{"cidr":"10.0.0.1","digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`, entries: `[]`},
+		{name: "already absent is convergent", before: `[{"cidr":"10.0.0.2/32"}]`, entries: `[{"cidr":"10.0.0.2/32"}]`},
+		{name: "false success is rejected", deleteStatus: http.StatusOK, before: `[{"cidr":"10.0.0.1/32"}]`, entries: `[{"cidr":"10.0.0.1/32"}]`, wantError: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			deletes, reads := 0, 0
@@ -1072,10 +1073,15 @@ func TestFirewallIPSetEntryDeleteUsesEscapedCIDRAndRequiresAbsenceReadback(t *te
 				switch r.Method {
 				case http.MethodDelete:
 					deletes++
-					if r.URL.Path != "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted/10.0.0.0/24" ||
-						!strings.Contains(r.URL.EscapedPath(), "10.0.0.0%2F24") ||
-						!strings.Contains(r.RequestURI, "10.0.0.0%2F24") {
+					wantPath := "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted/10.0.0.1"
+					if strings.Contains(tt.before, `10.0.0.1/32`) {
+						wantPath += "/32"
+					}
+					if r.URL.Path != wantPath || strings.Contains(r.RequestURI, "%2F") {
 						t.Fatalf("unsafe delete URI: path=%q escaped=%q requestURI=%q", r.URL.Path, r.URL.EscapedPath(), r.RequestURI)
+					}
+					if strings.Contains(tt.before, `"digest"`) && r.URL.Query().Get("digest") != strings.Repeat("a", 40) {
+						t.Fatalf("missing provider digest: %q", r.URL.RawQuery)
 					}
 					w.WriteHeader(tt.deleteStatus)
 					if tt.deleteStatus == http.StatusOK {
@@ -1088,7 +1094,11 @@ func TestFirewallIPSetEntryDeleteUsesEscapedCIDRAndRequiresAbsenceReadback(t *te
 					if r.URL.Path != "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted" {
 						t.Fatalf("unexpected readback path: %s", r.URL.Path)
 					}
-					_, _ = w.Write([]byte(`{"data":` + tt.entries + `}`))
+					body := tt.entries
+					if reads == 1 {
+						body = tt.before
+					}
+					_, _ = w.Write([]byte(`{"data":` + body + `}`))
 				default:
 					t.Fatalf("unexpected method: %s", r.Method)
 				}
@@ -1098,12 +1108,16 @@ func TestFirewallIPSetEntryDeleteUsesEscapedCIDRAndRequiresAbsenceReadback(t *te
 			_, _, err := executePVE(
 				context.Background(),
 				controlTestClient(t, server),
-				controlCommand("firewall.ipset.entry.delete", "qemu", `{"name":"trusted","cidr":"10.0.0.0/24"}`),
+				controlCommand("firewall.ipset.entry.delete", "qemu", `{"name":"trusted","cidr":"10.0.0.1/32"}`),
 			)
 			if (err != nil) != tt.wantError {
 				t.Fatalf("err=%v wantError=%t", err, tt.wantError)
 			}
-			if deletes != 1 || reads != 1 {
+			wantDeletes, wantReads := 1, 2
+			if tt.name == "already absent is convergent" {
+				wantDeletes, wantReads = 0, 1
+			}
+			if deletes != wantDeletes || reads != wantReads {
 				t.Fatalf("deletes=%d reads=%d", deletes, reads)
 			}
 		})

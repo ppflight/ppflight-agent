@@ -1501,8 +1501,30 @@ func deleteFirewallIPSetEntry(ctx context.Context, client *pve.Client, command C
 		Kind: command.Identity.GuestType,
 		VMID: command.Identity.VMID,
 	}
+	expected, ok := canonicalFirewallCIDR(parameters.CIDR)
+	if !ok {
+		return "", nil, errors.New("invalid firewall IP-set deletion target")
+	}
+	entries, err := client.FirewallIPSetEntries(ctx, ref, parameters.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	var target *pve.FirewallIPSetEntry
+	for i := range entries {
+		actual, valid := canonicalFirewallCIDR(entries[i].CIDR)
+		if !valid || actual != expected {
+			continue
+		}
+		if target != nil {
+			return "", nil, errors.New("firewall IP-set deletion target is ambiguous")
+		}
+		target = &entries[i]
+	}
+	if target == nil {
+		return "", json.RawMessage(`{"deleted":true,"alreadyAbsent":true}`), nil
+	}
 	var result json.RawMessage
-	deleteErr := client.DeleteFirewallIPSetEntry(ctx, ref, parameters.Name, parameters.CIDR, &result)
+	deleteErr := client.DeleteFirewallIPSetEntry(ctx, ref, parameters.Name, target.CIDR, target.Digest, &result)
 	absent, readErr := firewallIPSetEntryAbsent(ctx, client, ref, parameters.Name, parameters.CIDR)
 	if readErr != nil {
 		if deleteErr != nil {

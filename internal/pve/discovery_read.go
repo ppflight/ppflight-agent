@@ -397,6 +397,7 @@ type FirewallIPSet struct {
 type FirewallIPSetEntry struct {
 	CIDR    string `json:"cidr"`
 	NoMatch *int   `json:"nomatch,omitempty"`
+	Digest  string `json:"digest,omitempty"`
 }
 
 func (c *Client) FirewallOptions(ctx context.Context, ref FirewallRef) (FirewallOptions, error) {
@@ -470,12 +471,11 @@ func (c *Client) FirewallIPSetEntries(ctx context.Context, ref FirewallRef, name
 	return result, err
 }
 
-// DeleteFirewallIPSetEntry deletes one validated CIDR as a single escaped PVE
-// path segment. A CIDR contains '/', so routing it through the generic Do
-// method would turn the prefix into another URL segment and can reach a
-// different API route while still returning a syntactically successful JSON
-// envelope.
-func (c *Client) DeleteFirewallIPSetEntry(ctx context.Context, ref FirewallRef, name, cidr string, out any) error {
+// DeleteFirewallIPSetEntry deletes one entry using the exact CIDR spelling
+// returned by PVE. PVE deliberately registers this endpoint with an empty
+// fragment delimiter because CIDRs contain '/', so the slash must remain in
+// the request path instead of being escaped as an opaque URL segment.
+func (c *Client) DeleteFirewallIPSetEntry(ctx context.Context, ref FirewallRef, name, cidr, digest string, out any) error {
 	base, err := firewallBase(ref)
 	if err != nil {
 		return err
@@ -487,14 +487,29 @@ func (c *Client) DeleteFirewallIPSetEntry(ctx context.Context, ref FirewallRef, 
 	if strings.TrimSpace(cidr) != cidr || strings.ContainsAny(cidr, "%\\\x00\r\n") {
 		return errors.New("invalid firewall IP-set CIDR")
 	}
-	ip, network, err := net.ParseCIDR(cidr)
-	if err != nil || ip == nil || network == nil {
-		return errors.New("invalid firewall IP-set CIDR")
+	ip := net.ParseIP(cidr)
+	if ip == nil {
+		parsedIP, network, parseErr := net.ParseCIDR(cidr)
+		if parseErr != nil || parsedIP == nil || network == nil {
+			return errors.New("invalid firewall IP-set CIDR")
+		}
+	}
+	if digest != "" && !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(digest) {
+		return errors.New("invalid firewall IP-set digest")
+	}
+	query := url.Values{}
+	if digest != "" {
+		query.Set("digest", digest)
+	}
+	if len(query) == 0 {
+		query = nil
 	}
 	decodedPath := base + "/ipset/" + part + "/" + cidr
-	escapedPath := base + "/ipset/" + url.PathEscape(part) + "/" + url.PathEscape(cidr)
+	if strings.Contains(decodedPath, "..") {
+		return errors.New("invalid firewall IP-set CIDR")
+	}
 
-	return c.do(ctx, http.MethodDelete, decodedPath, escapedPath, nil, nil, out)
+	return c.do(ctx, http.MethodDelete, decodedPath, "", query, nil, out)
 }
 
 func firewallBase(ref FirewallRef) (string, error) {
