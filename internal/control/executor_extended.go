@@ -852,6 +852,12 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 	if pollInterval <= 0 {
 		pollInterval = defaultReinstallPollInterval
 	}
+	readinessCtx := ctx
+	cancelReadiness := func() {}
+	if readyWait > 0 {
+		readinessCtx, cancelReadiness = context.WithTimeout(ctx, readyWait)
+	}
+	defer cancelReadiness()
 	timezoneCommand := command
 	timezoneCommand.Parameters, _ = json.Marshal(timezoneP{Timezone: parameters.Expected.Timezone})
 	verifyCommand := command
@@ -864,35 +870,40 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 		// setting the signed timezone; otherwise cloud-init may overwrite a
 		// successfully verified timedatectl change moments later.
 		if !cloudInitReady {
-			if err := runGuestCommand(ctx, client, targetBase, "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err != nil {
+			if err := runGuestCommand(readinessCtx, client, targetBase, "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err != nil {
 				return err
 			}
 			cloudInitReady = true
 		}
 		if !timezoneVerified {
-			if _, _, err := setGuestTimezone(ctx, client, timezoneCommand, targetBase); err != nil {
+			if _, _, err := setGuestTimezone(readinessCtx, client, timezoneCommand, targetBase); err != nil {
 				return err
 			}
 			timezoneVerified = true
 		}
-		if _, err := verifyDelivery(ctx, readClient, verifyCommand); err != nil {
+		if _, err := verifyDelivery(readinessCtx, readClient, verifyCommand); err != nil {
 			return err
 		}
-		return verifyReinstallOS(ctx, readClient, command, parameters.ExpectedOS)
+		return verifyReinstallOS(readinessCtx, readClient, command, parameters.ExpectedOS)
 	}
 	lastErr := verify()
 	if lastErr == nil || readyWait < 0 || !reinstallReadinessRetryable(lastErr) {
 		return lastErr
 	}
-	timer := time.NewTimer(readyWait)
-	defer timer.Stop()
+	if readinessCtx.Err() != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("reinstall readiness deadline exceeded: %w", lastErr)
+	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+		case <-readinessCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("reinstall readiness deadline exceeded: %w", lastErr)
 		case <-ticker.C:
 			lastErr = verify()

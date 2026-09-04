@@ -96,6 +96,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；允许 `operationId` 关联同一任务的多个进度事件，VM 目标额外携带 `clusterRef/nodeRef/guestType/vmid`。失败时可携带与官网 receipt 相同的受限 `error`（来源、阶段、固定 HTTP 方法、无 query API 路径、状态码和单行原因）。严禁 secret、root 密码、Token、完整 command parameters/result、原始响应或原始 UPID。精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
 
+`0.1.1-rc.38` 把首次 `cloud-init status --wait` 也纳入同一个 10 分钟 reinstall readiness 总时限；guest 内 cloud-init 异常时必须向官网返回超时失败，不得在首次 QGA guest-exec 中无限占用任务。
+
 ## NIC 角色、IP、网络与防盗用
 
 `vm.set-network` 只更新既有 `net0`..`net31`，支持固定 MAC、bridge、VLAN tag、MTU、NIC firewall、rate、IPv4/IPv6 和 gateway。QEMU 的 IP 字段写入对应 `ipconfigN`；LXC 写入 `netN`。QEMU Cloud-Init 配置写入不等于客户系统已经实时换 IP，官网必须在同一 `operationId` 中完成状态等待和回读后再提交 IPAM。

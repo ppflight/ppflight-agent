@@ -589,6 +589,37 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	}
 }
 
+func TestReinstallReadinessDeadlineBoundsBlockingCloudInit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/agent/exec"):
+			_, _ = w.Write([]byte(`{"data":41}`))
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+			_, _ = w.Write([]byte(`{"data":{"exited":0,"exitcode":0}}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := controlTestClient(t, server)
+	command := controlCommand("vm.reinstall", "qemu", reinstallFixture())
+	started := time.Now()
+	err := waitForReinstallReadiness(
+		context.Background(), client, client, command,
+		"/nodes/pve1/qemu/101",
+		reinstallP{Expected: deliveryExpected{Timezone: "UTC"}},
+		40*time.Millisecond,
+		time.Millisecond,
+	)
+	if err == nil || !strings.Contains(err.Error(), "reinstall readiness deadline exceeded") {
+		t.Fatalf("blocking cloud-init did not return the bounded readiness error: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("blocking cloud-init exceeded its readiness budget: %v", elapsed)
+	}
+}
+
 func TestReinstallCompensationRestoresCloneRandomizedNetworkIdentity(t *testing.T) {
 	enabled := true
 	mtu := 1500
