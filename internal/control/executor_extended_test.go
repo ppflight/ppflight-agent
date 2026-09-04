@@ -347,7 +347,7 @@ func TestConsoleTicketNeverEntersReceipt(t *testing.T) {
 			command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
 			command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
 			receipt, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: sink, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
-			if err != nil || sink.local.Port != 5901 || len(sink.local.Ticket) == 0 || sink.registration.Transport != "agent-reverse-wss-v1" || receipt.State != "succeeded" {
+			if err != nil || sink.local.Port != 5901 || len(sink.local.Ticket) == 0 || sink.registration.Transport != "agent-reverse-wss-v1" || sink.registration.ExpiresAt.Nanosecond() != 0 || receipt.State != "succeeded" {
 				t.Fatalf("receipt=%#v endpoint=%#v registration=%#v err=%v", receipt, sink.local, sink.registration, err)
 			}
 			raw, _ := json.Marshal(receipt)

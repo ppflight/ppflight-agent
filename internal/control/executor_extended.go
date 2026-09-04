@@ -617,7 +617,11 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	if err != nil {
 		return nil, err
 	}
-	expiresAt := now.UTC().Add(time.Duration(parameters.TTLSeconds) * time.Second)
+	// The website console registration contract uses canonical RFC3339 UTC
+	// seconds. time.Time would otherwise preserve the executor clock's
+	// fractional nanoseconds and PVE would succeed only for the broker to reject
+	// the registration as a non-canonical timestamp.
+	expiresAt := now.UTC().Truncate(time.Second).Add(time.Duration(parameters.TTLSeconds) * time.Second)
 	registration := ConsoleTunnelRegistration{SchemaVersion: 1, Transport: "agent-reverse-wss-v1", SessionRef: sessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: command.CredentialEpoch, AssignmentRevision: command.AssignmentRevision, AgentRef: command.AgentRef, ClusterRef: command.Identity.ClusterRef, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, ExpiresAt: expiresAt, OneTime: true}
 	port := int(response.Port)
 	response.Port = 0

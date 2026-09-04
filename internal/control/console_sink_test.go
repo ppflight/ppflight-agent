@@ -252,6 +252,36 @@ func TestConsoleWebsiteFailureClosesAuthenticatedLocalSocket(t *testing.T) {
 	}
 }
 
+func TestConsoleBrokerRejectionReturnsOnlyBoundedHTTPAndErrorCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"error":{"code":"invalid_request","message":"secret provider detail"}}`))
+	}))
+	defer server.Close()
+	sink := &HTTPSConsoleSessionSink{client: server.Client(), keyID: "key-1", secret: []byte("0123456789abcdef"), now: func() time.Time { return time.Now().UTC() }}
+	err := sink.do(context.Background(), http.MethodPost, server.URL, "idempotency-1", map[string]any{"schemaVersion": 1}, nil)
+	if err == nil || err.Error() != "console broker rejected request: HTTP 422 (invalid_request)" {
+		t.Fatalf("unexpected broker rejection: %v", err)
+	}
+	if strings.Contains(err.Error(), "secret provider detail") {
+		t.Fatal("broker rejection reflected a free-form response message")
+	}
+}
+
+func TestConsoleBrokerRejectionDropsUnsafeErrorCode(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"unsafe code: credential=secret"}}`))
+	}))
+	defer server.Close()
+	sink := &HTTPSConsoleSessionSink{client: server.Client(), keyID: "key-1", secret: []byte("0123456789abcdef"), now: func() time.Time { return time.Now().UTC() }}
+	err := sink.do(context.Background(), http.MethodPost, server.URL, "idempotency-1", map[string]any{"schemaVersion": 1}, nil)
+	if err == nil || err.Error() != "console broker rejected request: HTTP 409" {
+		t.Fatalf("unsafe broker error code was retained: %v", err)
+	}
+}
+
 func TestConsoleSessionExpiryClosesLocalPVEAndWSS(t *testing.T) {
 	now := time.Now().UTC()
 	registration := consoleRegistration(now)

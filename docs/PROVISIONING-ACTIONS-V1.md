@@ -339,6 +339,8 @@ binding/credential 重载或 Agent 退出都会关闭本地 PVE socket 与 WSS�
 PVE 8/9 的 `vncproxy` 成功响应可能把端口编码为 JSON 数字或十进制字符串；
 `0.1.1-rc.35` 对这两种受限编码作等价解析，并继续拒绝空值、布尔值、小数、符号、
 非十进制文本与 1–65535 之外的端口。
+`0.1.1-rc.36` 把注册 `expiresAt` 规范为 UTC 整秒；broker 非 2xx 响应只回传 HTTP 状态和
+最多 64 字节的安全协议错误码，绝不回传自由文本 message 或原始响应。
 
 revoke parameters/result：
 

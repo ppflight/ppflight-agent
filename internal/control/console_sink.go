@@ -422,7 +422,11 @@ func (s *HTTPSConsoleSessionSink) do(ctx context.Context, method, endpoint, idem
 		return errors.New("console broker response is invalid")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return errors.New("console broker rejected request")
+		code := safeConsoleBrokerErrorCode(responseBody)
+		if code == "" {
+			return fmt.Errorf("console broker rejected request: HTTP %d", response.StatusCode)
+		}
+		return fmt.Errorf("console broker rejected request: HTTP %d (%s)", response.StatusCode, code)
 	}
 	if output == nil {
 		return nil
@@ -440,4 +444,26 @@ func (s *HTTPSConsoleSessionSink) do(ctx context.Context, method, endpoint, idem
 		return errors.New("console broker response contract is invalid")
 	}
 	return nil
+}
+
+// safeConsoleBrokerErrorCode returns only the bounded protocol identifier from
+// an error envelope. It deliberately excludes the free-form message and raw
+// response so a broker cannot reflect secrets or arbitrary text into receipts,
+// audit events, telemetry, or logs.
+func safeConsoleBrokerErrorCode(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil || envelope.Error.Code == "" || len(envelope.Error.Code) > 64 {
+		return ""
+	}
+	for _, character := range envelope.Error.Code {
+		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '.' || character == '-') {
+			return ""
+		}
+	}
+	return envelope.Error.Code
 }
