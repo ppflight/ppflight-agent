@@ -240,6 +240,23 @@ func TestSetNetworkRemovesEmptyQEMUIPConfigFields(t *testing.T) {
 }
 
 func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
+	t.Run("semantically identical disk IO policy is not rewritten", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+				t.Fatalf("redundant disk policy mutation: %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`{"data":{"digest":"d1","scsi0":"local-zfs:vm-101-disk-0,discard=on,iops_rd=5000,iops_rd_max=8000,iops_rd_max_length=30,iops_wr=3500,iops_wr_max=6000,iops_wr_max_length=30,iothread=1,mbps_rd=200,mbps_rd_max=350,mbps_wr=150,mbps_wr_max=300,size=20G,ssd=1"}}`))
+		}))
+		defer server.Close()
+		limits := `{"iopsRead":5000,"iopsWrite":3500,"iopsReadMax":8000,"iopsWriteMax":6000,"iopsReadMaxLength":30,"iopsWriteMaxLength":30,"mbpsRead":200,"mbpsWrite":150,"mbpsReadMax":350,"mbpsWriteMax":300}`
+		_, result, err := executePVE(context.Background(), controlTestClient(t, server), controlCommand("vm.set-disk-io", "qemu", `{"disk":"scsi0","limits":`+limits+`}`))
+		if err != nil || requests != 1 || !strings.Contains(string(result), `"changed":false`) || !strings.Contains(string(result), `"verified":true`) {
+			t.Fatalf("requests=%d result=%s err=%v", requests, result, err)
+		}
+	})
+
 	t.Run("absolute disk growth and IO policy", func(t *testing.T) {
 		requests := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

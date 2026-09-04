@@ -1579,6 +1579,15 @@ func setDiskLimits(ctx context.Context, c *pve.Client, cmd Command, base string)
 	if !ok {
 		return "", nil, errors.New("target disk does not exist")
 	}
+	// PVE does not preserve disk-option ordering. Re-serialising an already
+	// matching policy can therefore turn a semantic no-op into a config write;
+	// on ZFS-backed full clones PVE 8.4 may reject that redundant drive rewrite
+	// even though every requested limit is already present. Compare the typed
+	// policy first and avoid touching the drive when its effective limits match.
+	if diskLimitsMatch(drive, p.Limits) {
+		result, _ := json.Marshal(map[string]any{"changed": false, "disk": p.Disk, "verified": true})
+		return "", result, nil
+	}
 	updated, err := mergeDiskLimits(drive, p)
 	if err != nil {
 		return "", nil, err
