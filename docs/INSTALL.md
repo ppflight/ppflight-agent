@@ -58,7 +58,7 @@ sudo scripts/install.sh \
 
 监控 `telemetry-v1` 的可选 `telemetry.host.disks[]` 使用严格结构 `{device,readBytes?,writtenBytes?,readsCompleted?,writesCompleted?,ioTimeSeconds?}`。每个累计值均为 `{decimal:"..."}`，保留 exporter 原始十进制文本，不能经过 JavaScript `number` 舍入；服务端以相邻样本和观察时间计算速率，首样本、计数器重置或乱序样本不能伪造磁盘吞吐。
 
-cloud-init helper 不是安装时另行下载的插件：同一 Agent 发布/安装包必须携带仓内 `bundles/ppflight-cloudinit`、manifest 和 verifier。安装器在安装二进制前先验证 bundle 精确文件集、摘要、依赖和 IPv4/HTTPS redirect policy；缺失、混装或校验失败会中止整次安装。当前自动化已覆盖打包/安装合同，但发布物仍须在 PVE 8/9 非生产节点完成会创建模板/备份的真实 plan/execute 破坏性验收。
+cloud-init helper 不是安装时另行下载的插件：同一 Agent 发布/安装包必须携带仓内 `bundles/ppflight-cloudinit`、manifest 和 verifier。安装器在安装二进制前先验证 bundle 精确文件集、摘要、依赖和 IPv4/HTTPS redirect policy；缺失、混装或校验失败会中止整次安装。模板构建额外要求 PVE 8 主机具备 `libguestfs-tools` 提供的 `virt-customize`：它在模板磁盘导入前安装并离线核验 `qemu-guest-agent` 的包数据库、二进制和有效 systemd 激活路径（enable-able unit，或 Debian/Ubuntu static unit 的已验证 virtio-port udev 规则）；PVE 的 `agent=enabled=1` 仅是设备开关，不构成 QGA 安装证明。当前自动化已覆盖打包/安装合同，但发布物仍须在 PVE 8/9 非生产节点完成会创建模板/备份的真实 plan/execute 破坏性验收。
 
 installer 也支持 `--release-url HTTPS_URL --release-sha256 HEX` 只下载 Agent 二进制；该下载固定 IPv4、HTTPS/TLS 1.2+，并在安装前校验 SHA-256。它不会下载缺失的 scripts/config/cloud-init bundle，所以仍必须从已经解压并校验的完整发布包内运行；`--release-url` 不是远程脚本或整包 bootstrap。
 

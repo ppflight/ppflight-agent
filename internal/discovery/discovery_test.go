@@ -48,7 +48,7 @@ func TestDiscoverTemplatesIsBoundedAndPageable(t *testing.T) {
 			}
 			fmt.Fprint(w, `{"data":[{"id":"qemu/101","type":"qemu","node":"pve1","vmid":101,"name":"golden","template":1},{"id":"lxc/102","type":"lxc","node":"pve1","vmid":102,"template":0},{"id":"qemu/103","type":"qemu","node":"pve1","vmid":103,"template":0}]}`)
 		case "/api2/json/nodes/pve1/qemu/101/config":
-			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"fast:vm-101-disk-0,size=8G","ide2":"fast:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","agent":"enabled=1"}}`)
+			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"fast:vm-101-disk-0,size=8G","ide2":"fast:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`)
 		case "/api2/json/nodes/pve1/qemu/101/firewall/rules", "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
 			fmt.Fprint(w, `{"data":[]}`)
 		default:
@@ -61,7 +61,7 @@ func TestDiscoverTemplatesIsBoundedAndPageable(t *testing.T) {
 	if result.ErrorCode != "" || result.Complete || result.NextCursor != "2" {
 		t.Fatalf("page result %#v", result)
 	}
-	if len(result.Data.Templates) != 1 || !result.Data.Templates[0].CloudInit || result.Data.Templates[0].NetworkCount != 1 || result.Data.Templates[0].ConfigSHA256 == "" || !result.Data.Templates[0].Baseline.GuestFirewallEmpty {
+	if len(result.Data.Templates) != 1 || !result.Data.Templates[0].CloudInit || result.Data.Templates[0].NetworkCount != 1 || result.Data.Templates[0].ConfigSHA256 == "" || !result.Data.Templates[0].Baseline.QGAPackagePreinstalled || !result.Data.Templates[0].Baseline.GuestFirewallEmpty {
 		t.Fatalf("templates %#v", result.Data.Templates)
 	}
 }
@@ -92,7 +92,7 @@ func TestDiscoverTemplateUsesPVEDefaultSingleSocketWhenOmitted(t *testing.T) {
 		case "/api2/json/cluster/resources":
 			fmt.Fprint(w, `{"data":[{"id":"qemu/9000","type":"qemu","node":"pve","vmid":9000,"name":"ubuntu-2204","template":1}]}`)
 		case "/api2/json/nodes/pve/qemu/9000/config":
-			fmt.Fprint(w, `{"data":{"cores":2,"memory":2048,"scsi0":"local-zfs:base-9000-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1","agent":"enabled=1"}}`)
+			fmt.Fprint(w, `{"data":{"cores":2,"memory":2048,"scsi0":"local-zfs:base-9000-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`)
 		case "/api2/json/nodes/pve/qemu/9000/firewall/rules", "/api2/json/nodes/pve/qemu/9000/firewall/ipset":
 			fmt.Fprint(w, `{"data":[]}`)
 		default:

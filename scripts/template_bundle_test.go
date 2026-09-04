@@ -94,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "8baf95b6d4816feb3294d5f60ee7fe587a8267bee9cfb97089db1a0ec4b55580"
+	const expectedManifestSHA256 = "ed29cc12d98e3dd813ae84f75ab7e5e38394c8eac4189352f4700085380ec2f8"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -118,7 +118,7 @@ func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
 	}
 }
 
-func TestTemplateBuilderPinsAndVerifiesSingleSocketBaseline(t *testing.T) {
+func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "bundles", "ppflight-cloudinit", "build-cloud-templates.sh"))
 	if err != nil {
 		t.Fatal(err)
@@ -127,9 +127,24 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketBaseline(t *testing.T) {
 	for _, required := range []string{
 		`--sockets 1 \`,
 		`grep -qx 'sockets: 1' <<< "$config"`,
+		`virt-customize --format qcow2 --network -a "$prepared"`,
+		`--install "$QGA_PACKAGE"`,
+		`virt-customize --format qcow2 --no-network -a "$prepared"`,
+		`dpkg-query -W -f='${db:Status-Status}' qemu-guest-agent`,
+		`rpm -q --quiet qemu-guest-agent`,
+		`systemctl is-enabled qemu-guest-agent.service`,
+		`ppflight-qga-preinstalled`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("template builder is missing the frozen socket baseline check %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		"  - qemu-guest-agent\n",
+		"[systemctl, enable, --now, qemu-guest-agent]",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("template builder must not defer QGA installation to first-boot Cloud-Init: %q", forbidden)
 		}
 	}
 }

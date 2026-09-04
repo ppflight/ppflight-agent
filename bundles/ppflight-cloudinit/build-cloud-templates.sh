@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.1.0"
+readonly SCRIPT_VERSION="3.2.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -34,6 +34,15 @@ BACKUP_STORAGE="${BACKUP_STORAGE:-}"
 EXPECTED_CATALOG_REVISION="${EXPECTED_CATALOG_REVISION:-}"
 EXPECTED_CATALOG_SHA256="${EXPECTED_CATALOG_SHA256:-}"
 
+# QGA must be part of the immutable guest disk, rather than being first
+# installed by the customer-facing Cloud-Init boot.  PVE's `agent=enabled=1`
+# switch merely exposes the virtio serial device; it does not prove that a
+# guest has the qemu-guest-agent package or an enabled service.
+readonly QGA_PACKAGE="qemu-guest-agent"
+readonly QGA_SERVICE="qemu-guest-agent.service"
+readonly QGA_MARKER_PATH="/etc/ppflight/qga-preinstalled-v1"
+readonly QGA_MARKER_VALUE="qemu-guest-agent=preinstalled-and-activation-verified"
+
 QOS_MBPS_RD="${QOS_MBPS_RD:-200}"
 QOS_MBPS_WR="${QOS_MBPS_WR:-150}"
 QOS_MBPS_RD_MAX="${QOS_MBPS_RD_MAX:-350}"
@@ -47,6 +56,7 @@ QOS_IOPS_WR_MAX_LENGTH="${QOS_IOPS_WR_MAX_LENGTH:-30}"
 
 CURRENT_VMID=""
 CURRENT_NAME=""
+CURRENT_PREPARED_IMAGE=""
 DEBIAN_SNIPPET=""
 RHEL_SNIPPET=""
 CREATED_VMIDS=()
@@ -54,6 +64,7 @@ SELECTED_ROWS=()
 TEMPLATE_ROWS=()
 CATALOG_REVISION=""
 CATALOG_SHA256=""
+declare -A PREPARED_IMAGES=()
 
 log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
@@ -199,8 +210,14 @@ load_config() {
 }
 
 on_exit() {
-  local rc=$?
+  local rc=$? prepared
   trap - EXIT
+  if [[ -n "$CURRENT_PREPARED_IMAGE" && -e "$CURRENT_PREPARED_IMAGE" ]]; then
+    rm -f -- "$CURRENT_PREPARED_IMAGE" || true
+  fi
+  for prepared in "${PREPARED_IMAGES[@]}"; do
+    [[ -z "$prepared" || "$prepared" == "$CURRENT_PREPARED_IMAGE" ]] || rm -f -- "$prepared" || true
+  done
   if [[ -n "$CURRENT_VMID" && "$CLEANUP_FAILED_VM" == "1" ]]; then
     if qm status "$CURRENT_VMID" >/dev/null 2>&1 &&
        qm config "$CURRENT_VMID" | grep -qx "name: $CURRENT_NAME" &&
@@ -344,7 +361,7 @@ select_templates() {
 
 preflight() {
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "run this script as root on a Proxmox VE node"
-  for cmd in qm pvesm pvesh pveversion qemu-img curl sha256sum sha512sum awk grep sed stat ip findmnt df dirname flock perl python3; do
+  for cmd in qm pvesm pvesh pveversion qemu-img virt-customize curl sha256sum sha512sum awk grep sed stat ip findmnt df dirname flock perl python3 mktemp; do
     require_command "$cmd"
   done
   perl -MJSON::PP -e 'exit 0' >/dev/null 2>&1 || die "required Perl module not found: JSON::PP"
@@ -402,6 +419,7 @@ preflight() {
     ((QOS_IOPS_WR_MAX >= QOS_IOPS_WR)) || die "write IOPS burst must be >= sustained write IOPS"
   fi
 
+  virt-customize --version >/dev/null 2>&1 || die "virt-customize is unavailable; install the PVE 8 package libguestfs-tools before building templates"
   log "PVE: $(pveversion)"
   log "Selected final disk storage: $IMAGE_STORAGE; file storage: $FILE_STORAGE; external bridge: $BRIDGE; internal bridge: ${INTERNAL_BRIDGE:-disabled}"
 }
@@ -440,7 +458,6 @@ growpart:
 resize_rootfs: true
 package_update: true
 packages:
-  - qemu-guest-agent
   - vim
   - curl
   - net-tools
@@ -470,7 +487,6 @@ runcmd:
   - [sysctl, --system]
   - [systemctl, enable, --now, ssh]
   - [systemctl, restart, ssh]
-  - [systemctl, enable, --now, qemu-guest-agent]
   - [systemctl, enable, serial-getty@ttyS0.service]
 YAML
 
@@ -499,7 +515,6 @@ growpart:
 resize_rootfs: true
 package_update: true
 packages:
-  - qemu-guest-agent
   - chrony
   - vim-enhanced
   - curl
@@ -531,7 +546,6 @@ runcmd:
   - [systemctl, enable, --now, sshd]
   - [systemctl, restart, sshd]
   - [systemctl, enable, --now, chronyd]
-  - [systemctl, enable, --now, qemu-guest-agent]
   - [systemctl, enable, serial-getty@ttyS0.service]
 YAML
 
@@ -676,16 +690,124 @@ disk_qos_suffix() {
   fi
 }
 
+qga_verify_command() {
+  # This command is executed inside the offline guest image by
+  # virt-customize. It intentionally checks the package database, executable,
+  # valid systemd activation path, and PPFlight build marker independently. A PVE VM
+  # config line (`agent: enabled=1`) cannot satisfy any of these checks.
+  cat <<'SH'
+set -eu
+if command -v dpkg-query >/dev/null 2>&1; then
+  test "$(dpkg-query -W -f='${db:Status-Status}' qemu-guest-agent)" = installed
+elif command -v rpm >/dev/null 2>&1; then
+  rpm -q --quiet qemu-guest-agent
+else
+  echo "unsupported package database" >&2
+  exit 64
+fi
+
+test -x /usr/sbin/qemu-ga || test -x /usr/bin/qemu-ga
+state="$(systemctl is-enabled qemu-guest-agent.service 2>/dev/null || true)"
+case "$state" in
+  enabled|enabled-runtime) ;;
+  static)
+    static_rule_verified=0
+    for rule in /usr/lib/udev/rules.d/60-qemu-guest-agent.rules /lib/udev/rules.d/60-qemu-guest-agent.rules; do
+      if test -r "$rule" && grep -Fq 'SYSTEMD_WANTS}="qemu-guest-agent.service"' "$rule"; then
+        static_rule_verified=1
+        break
+      fi
+    done
+    test "$static_rule_verified" = 1
+    ;;
+  *)
+    echo "qemu-guest-agent service activation is invalid: $state" >&2
+    exit 65
+    ;;
+esac
+test "$(cat /etc/ppflight/qga-preinstalled-v1)" = qemu-guest-agent=preinstalled-and-activation-verified
+SH
+}
+
+qga_activate_service_command() {
+  # Debian-family packages may intentionally ship a static unit and use the
+  # qemu virtio-port udev rule to start it as soon as PVE exposes the device.
+  # RHEL-family packages normally have an enable-able unit. Both are valid,
+  # but a static unit without the matching udev activation rule is rejected.
+  cat <<'SH'
+set -eu
+state="$(systemctl is-enabled qemu-guest-agent.service 2>/dev/null || true)"
+case "$state" in
+  static)
+    for rule in /usr/lib/udev/rules.d/60-qemu-guest-agent.rules /lib/udev/rules.d/60-qemu-guest-agent.rules; do
+      if test -r "$rule" && grep -Fq 'SYSTEMD_WANTS}="qemu-guest-agent.service"' "$rule"; then
+        exit 0
+      fi
+    done
+    echo "static qemu-guest-agent unit has no virtio-port udev activation rule" >&2
+    exit 65
+    ;;
+  *)
+    systemctl enable qemu-guest-agent.service
+    ;;
+esac
+SH
+}
+
+prepare_image_with_qga() {
+  local source="$1" vmid="$2" prepared
+  [[ -s "$source" ]] || die "source image is missing before QGA preparation: $source"
+  prepared="$(mktemp "$CACHE_DIR/.ppflight-qga-${vmid}.XXXXXX.qcow2")"
+  # mktemp creates the path securely, while qemu-img requires a non-existent
+  # output. The parent cache directory is protected by the root-only builder
+  # lock and the template source image is never modified in place.
+  rm -f -- "$prepared"
+  CURRENT_PREPARED_IMAGE="$prepared"
+
+  log "Preparing immutable QGA image copy for template $vmid"
+  qemu-img convert -p -f qcow2 -O qcow2 "$source" "$prepared"
+  qemu-img check "$prepared" >/dev/null || die "prepared QGA image is invalid for template $vmid"
+
+  # --network is necessary only for the distribution package manager. The
+  # catalog covers Ubuntu/Debian and RHEL-family GenericCloud images, whose
+  # package name and systemd unit are intentionally the same.
+  virt-customize --format qcow2 --network -a "$prepared" \
+    --install "$QGA_PACKAGE" \
+    --run-command "$(qga_activate_service_command)" \
+    --run-command "install -d -m 0755 /etc/ppflight && printf '%s\\n' '$QGA_MARKER_VALUE' > '$QGA_MARKER_PATH'" \
+    || die "failed to preinstall $QGA_PACKAGE in template $vmid"
+
+  # Reopen the modified disk without a network, so successful eligibility is
+  # based on the actual immutable filesystem state and not on a deferred
+  # cloud-init package task or a PVE-side agent device setting.
+  virt-customize --format qcow2 --no-network -a "$prepared" \
+    --run-command "$(qga_verify_command)" \
+    || die "QGA package/service verification failed for template $vmid"
+
+  PREPARED_IMAGES["$vmid"]="$prepared"
+  log "QGA package and enabled service verified in template $vmid image"
+}
+
+prepare_selected_images_with_qga() {
+  local row vmid _name image
+  for row in "${SELECTED_ROWS[@]}"; do
+    IFS='|' read -r vmid _name image _ <<< "$row"
+    prepare_image_with_qga "$CACHE_DIR/$image" "$vmid"
+  done
+}
+
 create_template() {
   local row="$1" vmid name image _url _checksum_url _algorithm _upstream_expected _source_sha256 _minimum_bytes family placeholder_ip description _version _aliases
-  local imported_volume snippet qos description_full
+  local imported_volume snippet qos description_full prepared_image
   local -a network_args
   IFS='|' read -r vmid name image _url _checksum_url _algorithm _upstream_expected _source_sha256 _minimum_bytes family placeholder_ip description _version _aliases <<< "$row"
   snippet="$DEBIAN_SNIPPET"
   [[ "$family" == "rhel" ]] && snippet="$RHEL_SNIPPET"
   [[ -n "$snippet" ]] || die "Cloud-Init profile was not generated for $family"
   qos="$(disk_qos_suffix)"
-  description_full="$description; built by ppflight-cloudinit v$SCRIPT_VERSION on $(date -u '+%F')"
+  prepared_image="${PREPARED_IMAGES[$vmid]:-}"
+  [[ -n "$prepared_image" && -s "$prepared_image" ]] || die "QGA-prepared image is missing for template $vmid"
+  description_full="$description; qemu-guest-agent preinstalled and activation verified; built by ppflight-cloudinit v$SCRIPT_VERSION on $(date -u '+%F')"
   network_args=(--net0 "virtio,bridge=$BRIDGE,firewall=$FIREWALL")
   if [[ -n "$INTERNAL_BRIDGE" ]]; then
     network_args+=(--net1 "virtio,bridge=$INTERNAL_BRIDGE,firewall=$FIREWALL")
@@ -707,12 +829,15 @@ create_template() {
     --serial0 socket \
     --vga std \
     --agent enabled=1,fstrim_cloned_disks=1 \
-    --tags ppflight-cloudinit-build \
+    --tags 'ppflight-cloudinit-build;ppflight-qga-preinstalled' \
     --onboot 0
   CURRENT_VMID="$vmid"
   CURRENT_NAME="$name"
 
-  qm disk import "$vmid" "$CACHE_DIR/$image" "$IMAGE_STORAGE"
+  qm disk import "$vmid" "$prepared_image" "$IMAGE_STORAGE"
+  rm -f -- "$prepared_image"
+  unset 'PREPARED_IMAGES[$vmid]'
+  CURRENT_PREPARED_IMAGE=""
   imported_volume="$(qm config "$vmid" | awk -F': ' '/^unused[0-9]+:/ {print $2; exit}')"
   [[ -n "$imported_volume" ]] || die "imported disk not found for VMID $vmid"
 
@@ -728,7 +853,7 @@ create_template() {
   qm resize "$vmid" scsi0 "$DISK_SIZE"
   qm cloudinit update "$vmid"
   qm template "$vmid"
-  qm set "$vmid" --tags ppflight-cloudinit
+  qm set "$vmid" --tags 'ppflight-cloudinit;ppflight-qga-preinstalled'
   CREATED_VMIDS+=("$vmid")
   CURRENT_VMID=""
   CURRENT_NAME=""
@@ -743,6 +868,7 @@ verify_template() {
   grep -qx 'template: 1' <<< "$config" || die "$vmid is not a template"
   grep -qx "name: $name" <<< "$config" || die "$vmid has unexpected name"
   grep -Eq '^tags: .*ppflight-cloudinit([;,]|$)' <<< "$config" || die "$vmid is missing the project tag"
+  grep -Eq '^tags: .*ppflight-qga-preinstalled([;,]|$)' <<< "$config" || die "$vmid is missing the QGA-preinstalled build attestation tag"
   grep -q '^agent: enabled=1' <<< "$config" || die "$vmid does not have QEMU Agent enabled"
   grep -qx 'sockets: 1' <<< "$config" || die "$vmid does not have the required single CPU socket"
   grep -q '^serial0: socket' <<< "$config" || die "$vmid does not have serial0"
@@ -793,7 +919,7 @@ write_manifest() {
     printf 'pve_version=%s\n' "$(pveversion)"
     printf 'image_storage=%s\nfile_storage=%s\nexternal_bridge=%s\ninternal_bridge=%s\n' "$IMAGE_STORAGE" "$FILE_STORAGE" "$BRIDGE" "${INTERNAL_BRIDGE:-disabled}"
     printf 'backup_storage=%s\nbackup_policy=%s\n' "${BACKUP_STORAGE:-disabled}" "$backup_policy"
-    printf 'debian_snippet=%s\nrhel_snippet=%s\n' "$DEBIAN_SNIPPET" "$RHEL_SNIPPET"
+    printf 'debian_snippet=%s\nrhel_snippet=%s\nqga_package=%s\nqga_service=%s\nqga_build_attestation=preinstalled-and-activation-verified\n' "$DEBIAN_SNIPPET" "$RHEL_SNIPPET" "$QGA_PACKAGE" "$QGA_SERVICE"
     printf 'disk_size=%s\ndisk_ssd=%s\nmemory_mb=%s\ncores=%s\ncpu_type=%s\nqos_enabled=%s\n' "$DISK_SIZE" "$DISK_SSD" "$MEMORY_MB" "$CORES" "$CPU_TYPE" "$ENABLE_QOS"
     for row in "${SELECTED_ROWS[@]}"; do
       IFS='|' read -r vmid name image _ <<< "$row"
@@ -831,6 +957,9 @@ main() {
     IFS='|' read -r vmid name image url checksum_url algorithm upstream_expected source_sha256 minimum_bytes _family _ip _description _version _aliases <<< "$row"
     download_image "$image" "$url" "$checksum_url" "$algorithm" "$upstream_expected" "$source_sha256" "$minimum_bytes"
   done
+
+  log "Preparing and offline-verifying QGA packages before replacing any template VMID"
+  prepare_selected_images_with_qga
 
   write_snippets
 

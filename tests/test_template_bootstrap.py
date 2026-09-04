@@ -178,6 +178,50 @@ class OfficialImagePinningTest(unittest.TestCase):
                 )
 
 
+class TemplateQGAEligibilityTest(unittest.TestCase):
+    class ConfigRunner:
+        def __init__(self, config: str):
+            self.config = config
+
+        def run(self, argv, check=True, timeout=120):
+            del check, timeout
+            if tuple(argv) == ("qm", "config", "9000"):
+                return subprocess.CompletedProcess(tuple(argv), 0, self.config, "")
+            raise AssertionError(f"unexpected command: {argv!r}")
+
+    def test_template_volume_requires_qga_package_build_attestation(self):
+        runner = self.ConfigRunner(
+            "template: 1\n"
+            "tags: ppflight-cloudinit\n"
+            "agent: enabled=1\n"
+            "scsi0: local-lvm:vm-9000-disk-0\n"
+        )
+
+        self.assertIsNone(BOOTSTRAP._template_volume(runner, 9000))
+
+    def test_template_volume_requires_pve_agent_device_too(self):
+        runner = self.ConfigRunner(
+            "template: 1\n"
+            "tags: ppflight-cloudinit;ppflight-qga-preinstalled\n"
+            "scsi0: local-lvm:vm-9000-disk-0\n"
+        )
+
+        self.assertIsNone(BOOTSTRAP._template_volume(runner, 9000))
+
+    def test_template_volume_accepts_qga_preinstalled_template(self):
+        runner = self.ConfigRunner(
+            "template: 1\n"
+            "tags: ppflight-cloudinit;ppflight-qga-preinstalled\n"
+            "agent: enabled=1,fstrim_cloned_disks=1\n"
+            "scsi0: local-lvm:vm-9000-disk-0,discard=on\n"
+        )
+
+        self.assertEqual(
+            BOOTSTRAP._template_volume(runner, 9000),
+            "local-lvm:vm-9000-disk-0",
+        )
+
+
 class DualBridgeRequestTest(unittest.TestCase):
     def _arguments(self, **overrides):
         values = {

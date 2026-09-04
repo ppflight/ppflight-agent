@@ -113,14 +113,15 @@ type TemplateInfo struct {
 }
 
 type TemplateBaseline struct {
-	Cores              int               `json:"cores"`
-	Sockets            int               `json:"sockets"`
-	MemoryMiB          int               `json:"memoryMiB"`
-	BootDisk           TemplateBootDisk  `json:"bootDisk"`
-	Networks           []TemplateNetwork `json:"networks"`
-	CloudInitDrive     bool              `json:"cloudInitDrive"`
-	QGADeviceEnabled   bool              `json:"qgaDeviceEnabled"`
-	GuestFirewallEmpty bool              `json:"guestFirewallEmpty"`
+	Cores                  int               `json:"cores"`
+	Sockets                int               `json:"sockets"`
+	MemoryMiB              int               `json:"memoryMiB"`
+	BootDisk               TemplateBootDisk  `json:"bootDisk"`
+	Networks               []TemplateNetwork `json:"networks"`
+	CloudInitDrive         bool              `json:"cloudInitDrive"`
+	QGADeviceEnabled       bool              `json:"qgaDeviceEnabled"`
+	QGAPackagePreinstalled bool              `json:"qgaPackagePreinstalled"`
+	GuestFirewallEmpty     bool              `json:"guestFirewallEmpty"`
 }
 type TemplateBootDisk struct {
 	Interface string `json:"interface"`
@@ -253,7 +254,26 @@ func templateBaseline(raw map[string]json.RawMessage) (TemplateBaseline, error) 
 	if !baseline.QGADeviceEnabled {
 		return TemplateBaseline{}, errors.New("template QGA device is not enabled")
 	}
+	tags, tagsPresent := templateConfigString(raw, "tags")
+	baseline.QGAPackagePreinstalled = tagsPresent && templateHasTag(tags, "ppflight-qga-preinstalled")
+	if !baseline.QGAPackagePreinstalled {
+		// A stopped template cannot answer a QGA command. The attestation tag is
+		// added only after the local builder has installed the package and
+		// verified its package database, daemon binary and service activation
+		// path in the guest filesystem before import. PVE root is the trust
+		// boundary for both template disks and their configuration tags.
+		return TemplateBaseline{}, errors.New("template QGA package attestation is missing")
+	}
 	return baseline, nil
+}
+
+func templateHasTag(value, wanted string) bool {
+	for _, tag := range strings.FieldsFunc(value, func(r rune) bool { return r == ';' || r == ',' }) {
+		if strings.TrimSpace(tag) == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func templateConfigString(raw map[string]json.RawMessage, key string) (string, bool) {

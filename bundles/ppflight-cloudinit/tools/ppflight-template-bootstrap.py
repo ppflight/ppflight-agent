@@ -965,6 +965,14 @@ def _template_volume(runner: CommandRunner, vmid: int) -> Optional[str]:
     tags = re.split(r"[;,]", tag_line[len("tags: ") :]) if tag_line else []
     if "ppflight-cloudinit" not in tags:
         return None
+    # The builder writes this tag only after virt-customize has installed the
+    # package and an offline guest filesystem check has verified its package
+    # database, daemon binary and enabled systemd unit.  PVE's agent device
+    # flag alone is deliberately insufficient for template eligibility.
+    if "ppflight-qga-preinstalled" not in tags:
+        return None
+    if not any(line.startswith("agent: enabled=1") for line in lines):
+        return None
     for line in lines:
         if line.startswith("scsi0: "):
             return line[len("scsi0: ") :].split(",", 1)[0]

@@ -428,7 +428,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 		Cores: 2, Sockets: 1, MemoryMiB: 1024,
 		BootDisk:       pve.TemplateBootDisk{Interface: "scsi0", SizeGiB: 8},
 		Networks:       []pve.TemplateNetwork{{Interface: "net0", Bridge: "vmbr0", Model: "virtio"}},
-		CloudInitDrive: true, QGADeviceEnabled: true, GuestFirewallEmpty: true,
+		CloudInitDrive: true, QGADeviceEnabled: true, QGAPackagePreinstalled: true, GuestFirewallEmpty: true,
 	}
 	canonical, _ := json.Marshal(baseline)
 	templateHash := fmt.Sprintf("%x", sha256.Sum256(canonical))
@@ -447,7 +447,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 		case "/api2/json/cluster/resources":
 			_, _ = w.Write([]byte(`{"data":[{"type":"qemu","node":"pve1","vmid":101,"template":0,"status":"stopped"},{"type":"qemu","node":"pve1","vmid":9001,"template":1,"status":"stopped"}]}`))
 		case "/api2/json/nodes/pve1/qemu/9001/config":
-			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-zfs:vm-9001-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=02:00:00:00:00:01,bridge=vmbr0,firewall=0","agent":"enabled=1"}}`))
+			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-zfs:vm-9001-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=02:00:00:00:00:01,bridge=vmbr0,firewall=0","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`))
 		case "/api2/json/nodes/pve1/qemu/9001/firewall/rules", "/api2/json/nodes/pve1/qemu/9001/firewall/ipset":
 			_, _ = w.Write([]byte(`{"data":[]}`))
 		case "/api2/json/nodes/pve1/qemu/101/config":

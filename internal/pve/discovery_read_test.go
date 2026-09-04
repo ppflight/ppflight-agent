@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -22,7 +23,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 		case "/api2/json/cluster/sdn/vnets":
 			fmt.Fprint(w, `{"data":[{"vnet":"blue","zone":"public"}]}`)
 		case "/api2/json/nodes/pve1/qemu/101/config":
-			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=8G","ide2":"local:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","agent":"enabled=1"}}`)
+			fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=8G","ide2":"local:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`)
 		case "/api2/json/cluster/resources":
 			if r.URL.Query().Get("type") != "vm" || r.URL.Query().Has("start") || r.URL.Query().Has("limit") {
 				t.Errorf("unexpected page query %s", r.URL.RawQuery)
@@ -50,7 +51,7 @@ func TestDiscoveryReadMethodsUseOnlyFixedGETPaths(t *testing.T) {
 	if got, err := c.ClusterSDN(ctx); err != nil || len(got) != 1 || got[0].Type != "vnet" || got[0].VNet != "blue" || got[0].Zone != "public" {
 		t.Fatalf("sdn %#v: %v", got, err)
 	}
-	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 || got.Baseline == nil || got.Baseline.BootDisk.SizeGiB != 8 || got.ConfigSHA256 == "" {
+	if got, err := c.TemplateInfo(ctx, "qemu", "pve1", 101, "golden"); err != nil || !got.CloudInit || got.NetworkCount != 1 || got.Baseline == nil || !got.Baseline.QGAPackagePreinstalled || got.Baseline.BootDisk.SizeGiB != 8 || got.ConfigSHA256 == "" {
 		t.Fatalf("template %#v: %v", got, err)
 	}
 	if got, err := c.ClusterResourcesPage(ctx, 1, 1); err != nil || len(got) != 1 || got[0].VMID != 101 {
@@ -88,6 +89,23 @@ func TestNodeFirewallIPSetsAreNotAnAPICollection(t *testing.T) {
 	}
 	if requested {
 		t.Fatal("node firewall IPSet lookup reached the PVE API")
+	}
+}
+
+func TestTemplateInfoRejectsQGADeviceWithoutPackageAttestation(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api2/json/nodes/pve1/qemu/9000/config" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:base-9000-disk-0,size=8G","ide2":"local:cloudinit,media=cdrom","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1","agent":"enabled=1","tags":"ppflight-cloudinit"}}`)
+	}))
+	defer server.Close()
+
+	_, err := c.TemplateInfo(context.Background(), "qemu", "pve1", 9000, "ubuntu-2204")
+	if err == nil || !strings.Contains(err.Error(), "QGA package attestation") {
+		t.Fatalf("template without QGA package attestation err=%v", err)
 	}
 }
 

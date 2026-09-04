@@ -1,18 +1,18 @@
 {
   "schemaVersion": "ppflight.agent-vendor-manifest/v1",
-  "bundleVersion": "3.1.2",
+  "bundleVersion": "3.2.0",
   "catalogRevision": "2026-09-02.2",
   "catalogSha256": "a28236be654c53f2a309358764fe67fc61b167f9ea658b1bde3f8b06521a1944",
   "entrypoint": "tools/ppflight-template-bootstrap.py",
   "files": [
     {
       "path": "build-cloud-templates.sh",
-      "sha256": "25458a7f7333c34b8e488ab5ce0f041aebfab1d23c3c0333e696d0ed4361be82",
+      "sha256": "99f6be74dd01969dcc02bb7de08fb9b47038c85372b9bf4a3600c90f700829aa",
       "requiredAtRuntime": true
     },
     {
       "path": "tools/ppflight-template-bootstrap.py",
-      "sha256": "2a367d8a02fba46951acdb71e79e88f25a91f4f34c27281bbeb51a72541b29fc",
+      "sha256": "f419edcfd5ac4db32008670e1c7860a9c569c3652e960b2a606108e34d395e9e",
       "requiredAtRuntime": true
     },
     {
@@ -64,6 +64,7 @@
       "id",
       "install",
       "ip",
+      "mktemp",
       "mv",
       "perl",
       "pvecm",
@@ -78,6 +79,7 @@
       "sha256sum",
       "sha512sum",
       "stat",
+      "virt-customize",
       "vzdump"
     ],
     "perlModules": ["JSON::PP"]
