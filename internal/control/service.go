@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -256,6 +257,15 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 	processed := 0
 	for _, command := range response.Commands {
 		now := s.now().UTC()
+		slog.Info("control command received",
+			"operationId", command.OperationID,
+			"commandId", command.CommandID,
+			"action", command.Action,
+			"scope", command.Scope,
+			"targetNode", command.Identity.NodeRef,
+			"targetVMID", command.Identity.VMID,
+			"assignmentRevision", command.AssignmentRevision,
+		)
 		assignmentRevision := s.assignmentRevisionFn
 		if s.dynamicAuthority {
 			assignmentRevision = func() uint64 { return s.assignmentRevision }
@@ -272,6 +282,12 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			if errors.Is(verifyErr, ErrAuthenticatedPolicy) && requiresApproval(command.Action) && s.auditSink == nil {
 				code = "AUDIT_UNAVAILABLE"
 			}
+			slog.Warn("control command rejected",
+				"operationId", command.OperationID,
+				"commandId", command.CommandID,
+				"action", command.Action,
+				"code", code,
+			)
 			receipt, receiptErr := s.rejection(command, code, now)
 			if receiptErr != nil {
 				return processed, receiptErr
@@ -288,6 +304,11 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		}
 		auditable := requiresApproval(command.Action)
 		if auditable && s.auditSink == nil {
+			slog.Error("control command audit unavailable",
+				"operationId", command.OperationID,
+				"commandId", command.CommandID,
+				"action", command.Action,
+			)
 			receipt, receiptErr := s.rejection(command, "AUDIT_UNAVAILABLE", now)
 			if receiptErr != nil {
 				return processed, receiptErr
@@ -326,6 +347,12 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 					return processed, startedErr
 				}
 			}
+			slog.Info("control command execution started",
+				"operationId", command.OperationID,
+				"commandId", command.CommandID,
+				"action", command.Action,
+				"scope", command.Scope,
+			)
 			receipt, err = s.executor.Execute(ctx, command, now)
 			receipt.OperationID = command.OperationID
 			ApplyReceiptCompatibility(&receipt)
@@ -336,6 +363,7 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			}
 			journaled = true
 		}
+		logCommandReceipt(command, receipt)
 		if err != nil && receipt.ReceiptID == "" {
 			return processed, err
 		}
@@ -355,6 +383,35 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		return processed, err
 	}
 	return processed, nil
+}
+
+// logCommandReceipt emits only bounded identifiers and the same sanitized
+// provider diagnostic accepted by the signed receipt contract. Parameters,
+// credentials, response bodies and guest output are deliberately excluded.
+func logCommandReceipt(command Command, receipt Receipt) {
+	attributes := []any{
+		"operationId", command.OperationID,
+		"commandId", command.CommandID,
+		"action", command.Action,
+		"state", receipt.State,
+		"code", receipt.Code,
+		"durationMs", max(receipt.FinishedAt.Sub(receipt.StartedAt).Milliseconds(), 0),
+		"pveTask", receipt.PVETaskUPID != "",
+		"agentUpgrade", receipt.AgentUpgradeID != "",
+	}
+	if receipt.Error != nil {
+		attributes = append(attributes,
+			"errorSource", receipt.Error.Source,
+			"errorStage", receipt.Error.Stage,
+			"httpMethod", receipt.Error.Method,
+			"httpPath", receipt.Error.Path,
+			"httpStatus", receipt.Error.HTTPStatus,
+			"reason", receipt.Error.Reason,
+		)
+		slog.Error("control command completed", attributes...)
+		return
+	}
+	slog.Info("control command completed", attributes...)
 }
 
 // verificationRejectionCode exposes only a fixed authentication or policy

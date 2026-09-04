@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -89,6 +90,12 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 	if err != nil {
 		return "", err
 	}
+	slog.Info("agent upgrade preparation started",
+		"operationId", command.OperationID,
+		"commandId", command.CommandID,
+		"releaseTag", parameters.ReleaseTag,
+		"architecture", parameters.Artifact.Architecture,
+	)
 	manifestURL := ""
 	if c.cfg.TestOnlyAllowHTTP {
 		manifestURL = testHTTPOrigin(c.cfg.WebsiteEndpoint) + upgradecontract.CurrentManifestPath
@@ -109,6 +116,11 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 	if err := manifest.Match(parameters); err != nil {
 		return "", err
 	}
+	slog.Info("agent upgrade manifest verified",
+		"operationId", command.OperationID,
+		"releaseTag", parameters.ReleaseTag,
+		"agentCommitSha", parameters.AgentCommitSHA,
+	)
 	if !c.cfg.TestOnlyAllowHTTP {
 		if err := upgradecontract.SameOrigin(c.cfg.WebsiteEndpoint, parameters.Artifact.DownloadURL); err != nil {
 			return "", err
@@ -130,6 +142,13 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 	if err := c.downloadArtifact(ctx, downloadURL, artifactPath, parameters.Artifact); err != nil {
 		return "", err
 	}
+	slog.Info("agent upgrade artifact verified",
+		"operationId", command.OperationID,
+		"releaseTag", parameters.ReleaseTag,
+		"architecture", parameters.Artifact.Architecture,
+		"sizeBytes", parameters.Artifact.SizeBytes,
+		"sha256", parameters.Artifact.SHA256,
+	)
 	request := Request{
 		SchemaVersion: requestSchema, UpgradeID: upgradeID, PreparedAt: c.cfg.Now().UTC(), CurrentVersion: c.cfg.CurrentVersion,
 		ArtifactFile: filepath.Base(artifactPath), ArtifactSHA256: parameters.Artifact.SHA256, ArtifactBytes: parameters.Artifact.SizeBytes, Command: command,
@@ -143,6 +162,11 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 		_ = os.Remove(artifactPath)
 		return "", err
 	}
+	slog.Info("agent upgrade handed to root helper",
+		"operationId", command.OperationID,
+		"upgradeId", upgradeID,
+		"releaseTag", parameters.ReleaseTag,
+	)
 	return upgradeID, nil
 }
 

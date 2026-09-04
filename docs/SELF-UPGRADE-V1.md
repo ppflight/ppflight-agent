@@ -2,6 +2,8 @@
 
 `agent.upgrade` 是 node scope、需要审批的写操作。它沿用官网控制通道已有的 Ed25519、`bindingId`、`deviceId`、`credentialEpoch`、`assignmentRevision`、`idempotencyKey`、目标身份、有效期、本地 `allowedActions` 和独立监控审计门禁。官网不得从浏览器接收或透传下载 URL、大小或 SHA。
 
+从 `0.1.1-rc.30` 起，命令接收、策略拒绝、执行开始、终态、耗时和自升级各复验阶段都会写入结构化 journal 日志。失败日志只包含回执合同允许的 `source/stage/method/path/httpStatus/reason`，不记录参数、凭据、请求体、PVE 原始响应或 guest 输出。
+
 严格参数如下，未知字段拒绝：
 
 ```json

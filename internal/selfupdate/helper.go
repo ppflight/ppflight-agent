@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -83,6 +84,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	if err != nil {
 		return err
 	}
+	slog.Info("agent upgrade root helper started", "upgradeId", request.UpgradeID, "operationId", request.Command.OperationID)
 	result := Result{SchemaVersion: requestSchema, UpgradeID: request.UpgradeID, Status: "failed", Code: "UPGRADE_HELPER_FAILED", FinishedAt: cfg.Now().UTC()}
 	writeResult := func() {
 		result.FinishedAt = cfg.Now().UTC()
@@ -96,6 +98,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		}
 	}
 	if err := validateHelperRequest(requestPath, request, cfg); err != nil {
+		slog.Error("agent upgrade root helper rejected request", "upgradeId", request.UpgradeID, "stage", "validate_request", "reason", safeHelperText([]byte(err.Error())))
 		writeResult()
 		return err
 	}
@@ -115,6 +118,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		writeResult()
 		return err
 	}
+	slog.Info("agent upgrade root helper reverified authority", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	if err := upgradecontract.SameOrigin(cfg.WebsiteEndpoint, parameters.Artifact.DownloadURL); err != nil {
 		writeResult()
 		return err
@@ -125,12 +129,15 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		writeResult()
 		return err
 	}
+	slog.Info("agent upgrade root helper verified archive", "upgradeId", request.UpgradeID, "sha256", parameters.Artifact.SHA256)
 	backupPath, err := installCandidate(cfg.BinaryPath, cfg.StateDirectory, request.UpgradeID, binary)
 	if err != nil {
 		writeResult()
 		return err
 	}
+	slog.Info("agent upgrade candidate installed atomically", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	rollback := func(cause error) error {
+		slog.Error("agent upgrade health check failed; rollback started", "upgradeId", request.UpgradeID, "reason", safeHelperText([]byte(cause.Error())))
 		rollbackErr := restoreBackup(cfg.BinaryPath, backupPath)
 		if rollbackErr == nil {
 			rollbackErr = cfg.RunSystemctl(ctx, "restart", cfg.ServiceName)
@@ -140,6 +147,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		}
 		result.Status, result.Code = "rolled_back", "AGENT_UPGRADE_ROLLED_BACK"
 		writeResult()
+		slog.Warn("agent upgrade rollback completed", "upgradeId", request.UpgradeID, "rollbackSucceeded", rollbackErr == nil)
 		if rollbackErr != nil {
 			return fmt.Errorf("upgrade failed (%v) and rollback failed (%v)", cause, rollbackErr)
 		}
@@ -152,6 +160,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	if err := waitForStatus(ctx, cfg, targetVersion); err != nil {
 		return rollback(err)
 	}
+	slog.Info("agent upgrade health check passed", "upgradeId", request.UpgradeID, "version", targetVersion)
 	result.Status, result.Code, result.Version = "succeeded", "AGENT_UPGRADE_SUCCEEDED", targetVersion
 	result.FinishedAt = cfg.Now().UTC()
 	if err := saveResult(cfg.StateDirectory, result); err != nil {
@@ -159,6 +168,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	}
 	_ = os.Remove(filepath.Join(filepath.Dir(requestPath), request.ArtifactFile))
 	_ = os.Remove(requestPath)
+	slog.Info("agent upgrade completed", "upgradeId", request.UpgradeID, "version", targetVersion)
 	return nil
 }
 
