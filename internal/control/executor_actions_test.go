@@ -329,6 +329,57 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 			t.Fatalf("receipt=%#v err=%v", receipt, err)
 		}
 	})
+
+	t.Run("timezone waits for QGA to become available after guest boot", func(t *testing.T) {
+		infoReads := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				infoReads++
+				if infoReads < 3 {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"data":null}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_, _ = w.Write([]byte(`{"data":{"pid":7}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+				_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
+			default:
+				t.Fatalf("unexpected request: %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		executor := Executor{
+			Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true,
+			QGABootWait: 100 * time.Millisecond, QGAPollInterval: time.Millisecond,
+		}
+		receipt, err := executor.Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"UTC"}`), time.Now())
+		if err != nil || receipt.State != "succeeded" || infoReads != 3 {
+			t.Fatalf("receipt=%#v err=%v infoReads=%d", receipt, err, infoReads)
+		}
+	})
+
+	t.Run("timezone rejects after its bounded QGA startup grace", func(t *testing.T) {
+		infoReads := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			infoReads++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"data":null}`))
+		}))
+		defer server.Close()
+		executor := Executor{
+			Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true,
+			QGABootWait: 5 * time.Millisecond, QGAPollInterval: time.Millisecond,
+		}
+		receipt, err := executor.Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"UTC"}`), time.Now())
+		if err == nil || receipt.State != "rejected" || receipt.Code != "QGA_UNAVAILABLE" || infoReads < 2 {
+			t.Fatalf("receipt=%#v err=%v infoReads=%d", receipt, err, infoReads)
+		}
+	})
 }
 
 func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {

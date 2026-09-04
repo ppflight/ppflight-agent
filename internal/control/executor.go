@@ -35,6 +35,11 @@ var (
 const maxControlResultBytes = 1 << 20
 const maxJSONDepth = 64
 
+const (
+	defaultQGABootWait     = 60 * time.Second
+	defaultQGAPollInterval = 2 * time.Second
+)
+
 var (
 	nodeRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	netRE         = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
@@ -53,9 +58,16 @@ type Executor struct {
 	Client *pve.Client
 	// ReadClient uses the least-privilege collection token for task status and
 	// QGA capability preflight. It never becomes a mutation fallback.
-	ReadClient          *pve.Client
-	Discovery           *discovery.Service
-	Capabilities        GuestCapabilityChecker
+	ReadClient   *pve.Client
+	Discovery    *discovery.Service
+	Capabilities GuestCapabilityChecker
+	// QGABootWait and QGAPollInterval bound the startup grace period used only
+	// by vm.set-timezone. A newly started QEMU guest commonly reports QGA as
+	// unavailable for a short period even though the device and package are
+	// correctly configured. Other interactive QGA actions still fail closed
+	// immediately when the capability is unavailable.
+	QGABootWait         time.Duration
+	QGAPollInterval     time.Duration
 	Mode                string
 	ProductionExecution bool
 	UpgradeSubmitter    UpgradeSubmitter
@@ -442,6 +454,9 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 			wanted = "guest-exec"
 		}
 		capability, capabilityErr := e.guestAgentCommand(ctx, command, wanted)
+		if command.Action == "vm.set-timezone" && capability == GuestCapabilityUnavailable {
+			capability, capabilityErr = e.waitForGuestAgentCommand(ctx, command, wanted)
+		}
 		r.FinishedAt = time.Now().UTC()
 		switch {
 		case capabilityErr != nil, capability == GuestCapabilityUnavailable:
@@ -503,6 +518,39 @@ func (e Executor) guestAgentCommand(ctx context.Context, command Command, name s
 		checker = pveGuestCapabilityChecker{client: client}
 	}
 	return checker.GuestAgentCommand(ctx, command.Identity.NodeRef, command.Identity.VMID, name)
+}
+
+func (e Executor) waitForGuestAgentCommand(ctx context.Context, command Command, name string) (GuestCapability, error) {
+	wait := e.QGABootWait
+	if wait == 0 {
+		wait = defaultQGABootWait
+	}
+	if wait < 0 {
+		return e.guestAgentCommand(ctx, command, name)
+	}
+	poll := e.QGAPollInterval
+	if poll <= 0 {
+		poll = defaultQGAPollInterval
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		select {
+		case <-ctx.Done():
+			return GuestCapabilityUnavailable, ctx.Err()
+		case <-deadline.C:
+			return GuestCapabilityUnavailable, lastErr
+		case <-ticker.C:
+			capability, err := e.guestAgentCommand(ctx, command, name)
+			if capability != GuestCapabilityUnavailable {
+				return capability, err
+			}
+			lastErr = err
+		}
+	}
 }
 
 type pveGuestCapabilityChecker struct{ client *pve.Client }

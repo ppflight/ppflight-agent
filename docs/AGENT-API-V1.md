@@ -547,7 +547,7 @@ Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处
 
 Agent telemetry 已区分 `qga.availability.available`、`observedAt`、`freshUntil` 和 `unavailableReason`，并列出各 QGA read capability。APP 必须展示 availability 和 freshness，不能只显示最后一次成功结果，也不能把“已安装但已停止”和新鲜可用混为一谈。
 
-QEMU 的 `vm.reset-password`、`vm.set-timezone`、`vm.verify-delivery` 与重装最终回验依赖 QGA。QGA 被卸载、停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable；不得继续排队后再把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。LXC root password 使用 PVE 固定 config password 字段，不经过 QGA；Windows 和 QEMU 非 root 账户仍走 typed QGA password API。
+QEMU 的 `vm.reset-password`、`vm.set-timezone`、`vm.verify-delivery` 与重装最终回验依赖 QGA。新启动来宾的 `vm.set-timezone` 在首次 capability unavailable 后有固定 60 秒、每 2 秒一次的有界启动宽限期，并为 90 秒命令租约保留回执余量；宽限期结束仍不可用、QGA 被卸载/停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable，不得把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。LXC root password 使用 PVE 固定 config password 字段，不经过 QGA；Windows 和 QEMU 非 root 账户仍走 typed QGA password API。
 
 website guest telemetry 已携带 QGA availability/freshness，并输出 `capabilities.lifecycle/rootPasswordReset/guestNetworkVerify/metering`。QGA 缺失或过期会让依赖 capability unavailable，lifecycle 保持 available；capability 带 `observedAt/freshUntil/reason/executionPreflight`。Executor 已在 `vm.reset-password` 提交前只读查询 PVE QGA `agent/info` 并检查 `guest-set-user-password`；APP 消费/展示和 operation 中的 guest-network verify 仍属于远端待合并项。
 
