@@ -336,6 +336,10 @@ WSS 连接只允许系统 CA、正确 Host/SNI、IPv4，transport 明确禁用�
 binding/credential 重载或 Agent 退出都会关闭本地 PVE socket 与 WSS。所有帧、ticket 和临时
 连接元数据均不写 journal、receipt、audit、telemetry 或日志。
 
+PVE 8/9 的 `vncproxy` 成功响应可能把端口编码为 JSON 数字或十进制字符串；
+`0.1.1-rc.35` 对这两种受限编码作等价解析，并继续拒绝空值、布尔值、小数、符号、
+非十进制文本与 1–65535 之外的端口。
+
 revoke parameters/result：
 
 ```json

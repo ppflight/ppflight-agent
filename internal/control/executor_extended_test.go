@@ -327,24 +327,50 @@ func TestSnapshotAndBackupInventoryAreTypedAndBounded(t *testing.T) {
 }
 
 func TestConsoleTicketNeverEntersReceipt(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/vncproxy") || r.Form.Get("websocket") != "1" {
-			t.Fatalf("unexpected vncproxy request: %s %s %v", r.Method, r.URL.Path, r.Form)
-		}
-		_, _ = w.Write([]byte(`{"data":{"user":"root@pam","ticket":"PVE:super-secret-ticket","cert":"-----BEGIN CERTIFICATE-----safe-----END CERTIFICATE-----","port":5901}}`))
-	}))
-	defer server.Close()
-	sink := &memoryConsoleSink{}
-	command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
-	command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
-	receipt, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: sink, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
-	if err != nil || len(sink.local.Ticket) == 0 || sink.registration.Transport != "agent-reverse-wss-v1" || receipt.State != "succeeded" {
-		t.Fatalf("receipt=%#v registration=%#v err=%v", receipt, sink.registration, err)
+	for _, test := range []struct {
+		name string
+		port string
+	}{
+		{name: "PVE numeric port", port: `5901`},
+		{name: "PVE string port", port: `"5901"`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/vncproxy") || r.Form.Get("websocket") != "1" {
+					t.Fatalf("unexpected vncproxy request: %s %s %v", r.Method, r.URL.Path, r.Form)
+				}
+				_, _ = w.Write([]byte(`{"data":{"user":"root@pam","ticket":"PVE:super-secret-ticket","cert":"-----BEGIN CERTIFICATE-----safe-----END CERTIFICATE-----","port":` + test.port + `}}`))
+			}))
+			defer server.Close()
+			sink := &memoryConsoleSink{}
+			command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
+			command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
+			receipt, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: sink, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
+			if err != nil || sink.local.Port != 5901 || len(sink.local.Ticket) == 0 || sink.registration.Transport != "agent-reverse-wss-v1" || receipt.State != "succeeded" {
+				t.Fatalf("receipt=%#v endpoint=%#v registration=%#v err=%v", receipt, sink.local, sink.registration, err)
+			}
+			raw, _ := json.Marshal(receipt)
+			if strings.Contains(string(raw), "super-secret-ticket") || strings.Contains(string(raw), "BEGIN CERTIFICATE") || strings.Contains(string(raw), "root@pam") {
+				t.Fatalf("console secret leaked in receipt: %s", raw)
+			}
+		})
 	}
-	raw, _ := json.Marshal(receipt)
-	if strings.Contains(string(raw), "super-secret-ticket") || strings.Contains(string(raw), "BEGIN CERTIFICATE") || strings.Contains(string(raw), "root@pam") {
-		t.Fatalf("console secret leaked in receipt: %s", raw)
+}
+
+func TestConsoleRejectsMalformedPVEPort(t *testing.T) {
+	for _, port := range []string{`null`, `true`, `5901.5`, `"5901.5"`, `"+5901"`, `0`, `65536`} {
+		t.Run(port, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"data":{"ticket":"PVE:ticket","port":` + port + `}}`))
+			}))
+			defer server.Close()
+			command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
+			command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
+			if _, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: &memoryConsoleSink{}, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now()); err == nil {
+				t.Fatal("malformed PVE console port was accepted")
+			}
+		})
 	}
 }
 

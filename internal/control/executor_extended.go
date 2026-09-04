@@ -169,6 +169,37 @@ type ConsoleLocalEndpoint struct {
 	Ticket []byte
 }
 
+// pveConsolePort accepts both encodings emitted by supported PVE releases.
+// PVE 8 may serialize the vncproxy port as a JSON string while other versions
+// return a JSON number. Keep this compatibility local to the typed console
+// response instead of weakening decoding for any other provider field.
+type pveConsolePort int
+
+func (p *pveConsolePort) UnmarshalJSON(raw []byte) error {
+	value := strings.TrimSpace(string(raw))
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		var decoded string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return errors.New("invalid PVE console port")
+		}
+		value = decoded
+	}
+	if value == "" || len(value) > 5 {
+		return errors.New("invalid PVE console port")
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return errors.New("invalid PVE console port")
+		}
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("invalid PVE console port")
+	}
+	*p = pveConsolePort(port)
+	return nil
+}
+
 type ConsoleSessionPublication struct {
 	SessionRef  string    `json:"sessionRef"`
 	State       string    `json:"state"`
@@ -565,8 +596,8 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	var parameters consoleCreateP
 	_ = strictParameters(command.Parameters, &parameters)
 	var response struct {
-		Ticket string `json:"ticket"`
-		Port   int    `json:"port"`
+		Ticket string         `json:"ticket"`
+		Port   pveConsolePort `json:"port"`
 	}
 	base := fmt.Sprintf("/nodes/%s/%s/%d/vncproxy", command.Identity.NodeRef, command.Identity.GuestType, command.Identity.VMID)
 	if err := client.Do(ctx, http.MethodPost, base, nil, url.Values{"websocket": {"1"}}, &response); err != nil {
@@ -588,7 +619,7 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	}
 	expiresAt := now.UTC().Add(time.Duration(parameters.TTLSeconds) * time.Second)
 	registration := ConsoleTunnelRegistration{SchemaVersion: 1, Transport: "agent-reverse-wss-v1", SessionRef: sessionRef, CommandID: command.CommandID, IdempotencyKey: command.IdempotencyKey, OperationID: command.OperationID, BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: command.CredentialEpoch, AssignmentRevision: command.AssignmentRevision, AgentRef: command.AgentRef, ClusterRef: command.Identity.ClusterRef, ServiceRef: command.Identity.ServiceRef, InstanceUUID: command.Identity.InstanceUUID, Generation: protocol.Counter(command.Identity.Generation), NodeRef: command.Identity.NodeRef, GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, ExpiresAt: expiresAt, OneTime: true}
-	port := response.Port
+	port := int(response.Port)
 	response.Port = 0
 	publication, err := sink.Publish(ctx, registration, ConsoleLocalEndpoint{Port: port, Ticket: ticket})
 	if err != nil {
