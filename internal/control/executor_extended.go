@@ -708,6 +708,16 @@ func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command
 		if restoreErr != nil {
 			return fmt.Errorf("%w: replacement error and compensation error", ErrReinstallIndeterminate)
 		}
+		// PVE deliberately assigns fresh MAC addresses to every QEMU clone.  A
+		// compensation clone is therefore not the original signed VM identity
+		// until every website-owned network is replayed and read back.  Restoring
+		// power or deleting the compensation source before this proof would turn
+		// a recoverable replacement failure into a live VM whose NICs no longer
+		// match the signed assignment (and would also disable safe metering and
+		// IP-filter verification).
+		if networkErr := restoreReinstallCompensationNetworks(ctx, client, readClient, command, targetBase, parameters); networkErr != nil {
+			return fmt.Errorf("%w: %v", ErrReinstallIndeterminate, networkErr)
+		}
 		if powerErr := restorePower(); powerErr != nil {
 			return fmt.Errorf("%w: original VM restored but power restoration failed", ErrReinstallIndeterminate)
 		}
@@ -770,6 +780,34 @@ func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command
 	}
 	result, _ := json.Marshal(map[string]any{"reinstalled": true, "verified": true, "templateRef": parameters.TemplateRef, "templateVersion": parameters.TemplateVersion, "templateConfigSha256": parameters.TemplateConfigSHA256, "vmGeneration": protocol.Counter(parameters.VMGeneration)})
 	return "", result, nil
+}
+
+func restoreReinstallCompensationNetworks(ctx context.Context, client, readClient *pve.Client, command Command, targetBase string, parameters reinstallP) error {
+	for _, network := range parameters.Networks {
+		networkCommand := command
+		networkCommand.Parameters, _ = json.Marshal(network)
+		if _, _, err := setNetwork(ctx, client, networkCommand, targetBase); err != nil {
+			return fmt.Errorf("restored VM signed network %s could not be reapplied: %v", network.Interface, err)
+		}
+	}
+	config, err := readClient.GuestConfig(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return fmt.Errorf("restored VM signed network readback failed: %v", err)
+	}
+	for _, expected := range parameters.Expected.Networks {
+		value, exists := configString(config.Raw, expected.Interface)
+		if !exists || !networkMatches(config.Raw, value, expected) {
+			return fmt.Errorf("restored VM signed network %s does not match", expected.Interface)
+		}
+		if *expected.Firewall {
+			if err := verifyExpectedIPFilter(ctx, readClient, command, expected.Interface, expected.IPFilterCIDRs); err != nil {
+				return fmt.Errorf("restored VM signed network %s firewall proof failed: %v", expected.Interface, err)
+			}
+		} else if err := verifyGuestFirewallDisabled(ctx, readClient, command); err != nil {
+			return fmt.Errorf("restored VM firewall proof failed: %v", err)
+		}
+	}
+	return nil
 }
 
 func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Client, command Command, targetBase string, parameters reinstallP, readyWait, pollInterval time.Duration) error {

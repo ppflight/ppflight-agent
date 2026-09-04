@@ -553,6 +553,300 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	}
 }
 
+func TestReinstallCompensationRestoresCloneRandomizedNetworkIdentity(t *testing.T) {
+	enabled := true
+	mtu := 1500
+	publicBridge, privateBridge := "vmbr0", "vmbr1"
+	publicMAC, privateMAC := "02:BF:18:70:3A:2B", "02:F7:12:C5:75:8A"
+	publicRate, privateRate := "22.5", "0"
+	publicIP, privateIP, noIPv6 := "74.91.18.93/32", "10.0.1.12/32", ""
+	publicGateway, privateGateway, noGateway6 := "74.91.18.89", "10.0.1.1", ""
+	parameters := reinstallP{
+		Networks: []networkP{
+			{Interface: "net0", Bridge: &publicBridge, MAC: &publicMAC, MTU: &mtu, Firewall: &enabled, RateMbps: &publicRate, IPv4: &publicIP, IPv6: &noIPv6, Gateway4: &publicGateway, Gateway6: &noGateway6},
+			{Interface: "net1", Bridge: &privateBridge, MAC: &privateMAC, MTU: &mtu, Firewall: &enabled, RateMbps: &privateRate, IPv4: &privateIP, IPv6: &noIPv6, Gateway4: &privateGateway, Gateway6: &noGateway6},
+		},
+		Expected: deliveryExpected{Networks: []deliveryNetwork{
+			{Interface: "net0", Bridge: publicBridge, MAC: publicMAC, MTU: mtu, Firewall: &enabled, RateMbps: publicRate, IPv4: publicIP, IPv6: noIPv6, IPFilterCIDRs: []string{"74.91.18.93/32"}},
+			{Interface: "net1", Bridge: privateBridge, MAC: privateMAC, MTU: mtu, Firewall: &enabled, RateMbps: privateRate, IPv4: privateIP, IPv6: noIPv6, IPFilterCIDRs: []string{"10.0.1.12/32"}},
+		}},
+	}
+	config := map[string]string{
+		"digest":    "clone-randomized",
+		"net0":      "virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5",
+		"net1":      "virtio=BC:24:11:9A:0A:8E,bridge=vmbr1,firewall=1,mtu=1500",
+		"ipconfig0": "ip=74.91.18.93/32,gw=74.91.18.89",
+		"ipconfig1": "ip=10.0.1.12/32,gw=10.0.1.1",
+	}
+	putOrder := []string{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/config":
+			_ = r.ParseForm()
+			for _, interfaceRef := range []string{"net0", "net1"} {
+				if value := r.Form.Get(interfaceRef); value != "" {
+					config[interfaceRef] = value
+					config["ipconfig"+strings.TrimPrefix(interfaceRef, "net")] = r.Form.Get("ipconfig" + strings.TrimPrefix(interfaceRef, "net"))
+					putOrder = append(putOrder, interfaceRef)
+				}
+			}
+			_, _ = w.Write([]byte(`{"data":null}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/config":
+			body, _ := json.Marshal(map[string]any{"data": config})
+			_, _ = w.Write(body)
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/cluster/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":1,"ebtables":1}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/firewall/options":
+			_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
+			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/firewall/ipset/ipfilter-net0":
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"74.91.18.93/32","nomatch":0}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/firewall/ipset/ipfilter-net1":
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"10.0.1.12/32","nomatch":0}]}`))
+		default:
+			t.Fatalf("unexpected compensation request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	command := controlCommand("vm.reinstall", "qemu", `{}`)
+	if err := restoreReinstallCompensationNetworks(context.Background(), controlTestClient(t, server), controlTestClient(t, server), command, "/nodes/pve1/qemu/101", parameters); err != nil {
+		t.Fatalf("compensation network restoration failed: %v", err)
+	}
+	if strings.Join(putOrder, ",") != "net0,net1" {
+		t.Fatalf("signed networks were not replayed in order: %v", putOrder)
+	}
+	for _, expected := range parameters.Expected.Networks {
+		if !networkMatches(rawConfig(config), config[expected.Interface], expected) {
+			t.Fatalf("restored %s did not match signed identity: %s", expected.Interface, config[expected.Interface])
+		}
+	}
+}
+
+func TestReinstallCompensationRejectsStaleIndependentNetworkReadback(t *testing.T) {
+	enabled := true
+	mtu := 1500
+	bridge, mac, rate, ipv4, ipv6, gateway4, gateway6 := "vmbr0", "02:BF:18:70:3A:2B", "22.5", "74.91.18.93/32", "", "74.91.18.89", ""
+	parameters := reinstallP{
+		Networks: []networkP{{Interface: "net0", Bridge: &bridge, MAC: &mac, MTU: &mtu, Firewall: &enabled, RateMbps: &rate, IPv4: &ipv4, IPv6: &ipv6, Gateway4: &gateway4, Gateway6: &gateway6}},
+		Expected: deliveryExpected{Networks: []deliveryNetwork{{Interface: "net0", Bridge: bridge, MAC: mac, MTU: mtu, Firewall: &enabled, RateMbps: rate, IPv4: ipv4, IPv6: ipv6, IPFilterCIDRs: []string{"74.91.18.93/32"}}}},
+	}
+	controlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+			t.Fatalf("unexpected control request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"data":{"digest":"random","net0":"virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5","ipconfig0":"ip=74.91.18.93/32,gw=74.91.18.89"}}`))
+			return
+		}
+		if r.Method != http.MethodPut {
+			t.Fatalf("unexpected control method: %s", r.Method)
+		}
+		_, _ = w.Write([]byte(`{"data":null}`))
+	}))
+	defer controlServer.Close()
+	readServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+			t.Fatalf("unexpected readback request: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"net0":"virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5","ipconfig0":"ip=74.91.18.93/32,gw=74.91.18.89"}}`))
+	}))
+	defer readServer.Close()
+	command := controlCommand("vm.reinstall", "qemu", `{}`)
+	err := restoreReinstallCompensationNetworks(context.Background(), controlTestClient(t, controlServer), controlTestClient(t, readServer), command, "/nodes/pve1/qemu/101", parameters)
+	if err == nil || !strings.Contains(err.Error(), "signed network net0 does not match") {
+		t.Fatalf("stale independent readback was accepted: %v", err)
+	}
+}
+
+func TestReinstallFailureRestoresSignedCloneIdentityBeforeCleanup(t *testing.T) {
+	t.Run("verified rollback cleans compensation source", func(t *testing.T) {
+		runReinstallFailureCompensation(t, false)
+	})
+	t.Run("stale rollback readback keeps compensation source", func(t *testing.T) {
+		runReinstallFailureCompensation(t, true)
+	})
+}
+
+func runReinstallFailureCompensation(t *testing.T, staleReadback bool) {
+	baseline := pve.TemplateBaseline{
+		Cores: 2, Sockets: 1, MemoryMiB: 1024,
+		BootDisk:       pve.TemplateBootDisk{Interface: "scsi0", SizeGiB: 8},
+		Networks:       []pve.TemplateNetwork{{Interface: "net0", Bridge: "vmbr0", Model: "virtio"}},
+		CloudInitDrive: true, QGADeviceEnabled: true, QGAPackagePreinstalled: true, GuestFirewallEmpty: true,
+	}
+	canonical, _ := json.Marshal(baseline)
+	templateHash := fmt.Sprintf("%x", sha256.Sum256(canonical))
+	enabled, start := true, true
+	mtu := 1500
+	publicBridge, privateBridge := "vmbr0", "vmbr1"
+	publicMAC, privateMAC := "02:BF:18:70:3A:2B", "02:F7:12:C5:75:8A"
+	publicRate, privateRate := "22.5", "0"
+	publicIP, privateIP, noIPv6 := "74.91.18.93/32", "10.0.1.12/32", ""
+	publicGateway, privateGateway, noGateway6 := "74.91.18.89", "10.0.1.1", ""
+	iops := int64(1000)
+	parameters := reinstallP{
+		TemplateRef: "ubuntu-24.04", TemplateVersion: "24.04", TemplateNode: "pve1", TemplateGuestType: "qemu", TemplateVMID: 9001, TemplateConfigSHA256: templateHash,
+		VMGeneration: 1, TemporaryVMID: 800101, Storage: "local-zfs", NotBefore: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), Start: &start,
+		Expected: deliveryExpected{Cores: 2, Sockets: 1, MemoryMiB: 1024, Disk: deliveryDisk{Interface: "scsi0", MinimumGiB: 20, Limits: diskIOLimits{IOPSRead: &iops}}, Networks: []deliveryNetwork{
+			{Interface: "net0", Bridge: publicBridge, MAC: publicMAC, MTU: mtu, Firewall: &enabled, RateMbps: publicRate, IPv4: publicIP, IPv6: noIPv6, IPFilterCIDRs: []string{"74.91.18.93/32"}},
+			{Interface: "net1", Bridge: privateBridge, MAC: privateMAC, MTU: mtu, Firewall: &enabled, RateMbps: privateRate, IPv4: privateIP, IPv6: noIPv6, IPFilterCIDRs: []string{"10.0.1.12/32"}},
+		}, Timezone: "UTC"},
+		ExpectedOS: reinstallOS{Family: "linux", Name: "ubuntu", VersionID: "24.04"},
+		Networks: []networkP{
+			{Interface: "net0", Bridge: &publicBridge, MAC: &publicMAC, MTU: &mtu, Firewall: &enabled, RateMbps: &publicRate, IPv4: &publicIP, IPv6: &noIPv6, Gateway4: &publicGateway, Gateway6: &noGateway6},
+			{Interface: "net1", Bridge: &privateBridge, MAC: &privateMAC, MTU: &mtu, Firewall: &enabled, RateMbps: &privateRate, IPv4: &privateIP, IPv6: &noIPv6, Gateway4: &privateGateway, Gateway6: &noGateway6},
+		},
+		CloudInit: cloudInitP{Hostname: "vm101", Username: "root", Password: "fixture-secret", PasswordFormat: "plain", SSHAuthorizedKeys: []string{}, QGAEnabled: &enabled},
+	}
+	targetExists, temporaryExists := true, false
+	targetStatus := "stopped"
+	resourceWriteFailed := false
+	config := map[string]string{
+		"digest": "clone-randomized", "cores": "2", "sockets": "1", "memory": "1024",
+		"scsi0":     "local-zfs:vm-101-disk-0,size=20G,iops_rd=1000",
+		"net0":      "virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5",
+		"net1":      "virtio=BC:24:11:9A:0A:8E,bridge=vmbr1,firewall=1,mtu=1500",
+		"ipconfig0": "ip=74.91.18.93/32,gw=74.91.18.89",
+		"ipconfig1": "ip=10.0.1.12/32,gw=10.0.1.1",
+	}
+	mutations := []string{}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			switch r.URL.Path {
+			case "/api2/json/cluster/resources":
+				resources := []map[string]any{{"type": "qemu", "node": "pve1", "vmid": 9001, "template": 1, "status": "stopped"}}
+				if targetExists {
+					resources = append(resources, map[string]any{"type": "qemu", "node": "pve1", "vmid": 101, "template": 0, "status": targetStatus})
+				}
+				if temporaryExists {
+					resources = append(resources, map[string]any{"type": "qemu", "node": "pve1", "vmid": 800101, "template": 0, "status": "stopped"})
+				}
+				body, _ := json.Marshal(map[string]any{"data": resources})
+				_, _ = w.Write(body)
+			case "/api2/json/nodes/pve1/qemu/9001/config":
+				_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-zfs:vm-9001-disk-0,size=8G","ide2":"local-zfs:cloudinit,media=cdrom","net0":"virtio=02:00:00:00:00:01,bridge=vmbr0,firewall=0","agent":"enabled=1","tags":"ppflight-cloudinit;ppflight-qga-preinstalled"}}`))
+			case "/api2/json/nodes/pve1/qemu/9001/firewall/rules", "/api2/json/nodes/pve1/qemu/9001/firewall/ipset":
+				_, _ = w.Write([]byte(`{"data":[]}`))
+			case "/api2/json/nodes/pve1/qemu/101/config":
+				body, _ := json.Marshal(map[string]any{"data": config})
+				_, _ = w.Write(body)
+			case "/api2/json/nodes/pve1/qemu/101/status/current":
+				_, _ = fmt.Fprintf(w, `{"data":{"status":%q,"qmpstatus":%q}}`, targetStatus, targetStatus)
+			case "/api2/json/cluster/firewall/options":
+				_, _ = w.Write([]byte(`{"data":{"enable":1,"ebtables":1}}`))
+			case "/api2/json/nodes/pve1/firewall/options":
+				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
+			case "/api2/json/nodes/pve1/qemu/101/firewall/options":
+				_, _ = w.Write([]byte(`{"data":{"enable":1,"policy_in":"ACCEPT","policy_out":"ACCEPT","macfilter":1}}`))
+			case "/api2/json/nodes/pve1/qemu/101/firewall/ipset":
+				_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"},{"name":"ipfilter-net1"}]}`))
+			case "/api2/json/nodes/pve1/qemu/101/firewall/ipset/ipfilter-net0":
+				_, _ = w.Write([]byte(`{"data":[{"cidr":"74.91.18.93/32","nomatch":0}]}`))
+			case "/api2/json/nodes/pve1/qemu/101/firewall/ipset/ipfilter-net1":
+				_, _ = w.Write([]byte(`{"data":[{"cidr":"10.0.1.12/32","nomatch":0}]}`))
+			default:
+				t.Fatalf("unexpected reinstall GET: %s", r.URL.Path)
+			}
+			return
+		}
+
+		_ = r.ParseForm()
+		mutations = append(mutations, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/clone":
+			temporaryExists = true
+		case r.Method == http.MethodDelete && r.URL.Path == "/api2/json/nodes/pve1/qemu/101":
+			targetExists = false
+		case r.Method == http.MethodPost && (r.URL.Path == "/api2/json/nodes/pve1/qemu/9001/clone" || r.URL.Path == "/api2/json/nodes/pve1/qemu/800101/clone"):
+			targetExists, targetStatus = true, "stopped"
+			config["net0"] = "virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5"
+			config["net1"] = "virtio=BC:24:11:9A:0A:8E,bridge=vmbr1,firewall=1,mtu=1500"
+		case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/status/stop":
+			targetStatus = "stopped"
+		case r.Method == http.MethodDelete && r.URL.Path == "/api2/json/nodes/pve1/qemu/800101":
+			temporaryExists = false
+		case r.Method == http.MethodPut && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/config":
+			if r.Form.Get("cores") != "" && !resourceWriteFailed {
+				resourceWriteFailed = true
+				http.Error(w, `{"data":null,"message":"injected resource failure"}`, http.StatusBadRequest)
+				return
+			}
+			for _, interfaceRef := range []string{"net0", "net1"} {
+				if value := r.Form.Get(interfaceRef); value != "" {
+					config[interfaceRef] = value
+					config["ipconfig"+strings.TrimPrefix(interfaceRef, "net")] = r.Form.Get("ipconfig" + strings.TrimPrefix(interfaceRef, "net"))
+				}
+			}
+		default:
+			t.Fatalf("unexpected reinstall mutation: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":null}`))
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	readServer := server
+	if staleReadback {
+		readServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/config" {
+				_, _ = w.Write([]byte(`{"data":{"net0":"virtio=BC:24:11:FC:46:CE,bridge=vmbr0,firewall=1,mtu=1500,rate=22.5","net1":"virtio=BC:24:11:9A:0A:8E,bridge=vmbr1,firewall=1,mtu=1500","ipconfig0":"ip=74.91.18.93/32,gw=74.91.18.89","ipconfig1":"ip=10.0.1.12/32,gw=10.0.1.1"}}`))
+				return
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		defer readServer.Close()
+	}
+	raw, _ := json.Marshal(parameters)
+	command := controlCommand("vm.reinstall", "qemu", string(raw))
+	_, _, err := reinstallGuest(context.Background(), controlTestClient(t, server), controlTestClient(t, readServer), command, -1, time.Millisecond)
+	if staleReadback {
+		if err == nil || !errors.Is(err, ErrReinstallIndeterminate) || errors.Is(err, ErrReinstallRolledBack) {
+			t.Fatalf("stale signed-network readback did not remain indeterminate: %v", err)
+		}
+		if !resourceWriteFailed || !targetExists || !temporaryExists || targetStatus != "stopped" {
+			t.Fatalf("unsafe indeterminate state: resourceFailure=%t target=%t temporary=%t status=%s", resourceWriteFailed, targetExists, temporaryExists, targetStatus)
+		}
+		if mutationIndex(mutations, "DELETE /api2/json/nodes/pve1/qemu/800101") >= 0 {
+			t.Fatalf("compensation source was deleted before signed-network proof: %v", mutations)
+		}
+		return
+	}
+	if err == nil || !errors.Is(err, ErrReinstallRolledBack) || errors.Is(err, ErrReinstallIndeterminate) {
+		t.Fatalf("replacement failure was not safely rolled back: %v", err)
+	}
+	if !resourceWriteFailed || targetExists != true || temporaryExists != false || targetStatus != "stopped" {
+		t.Fatalf("unexpected compensation state: resourceFailure=%t target=%t temporary=%t status=%s", resourceWriteFailed, targetExists, temporaryExists, targetStatus)
+	}
+	for _, expected := range parameters.Expected.Networks {
+		if !networkMatches(rawConfig(config), config[expected.Interface], expected) {
+			t.Fatalf("clone-back retained randomized identity for %s: %s", expected.Interface, config[expected.Interface])
+		}
+	}
+	restoreClone := mutationIndex(mutations, "POST /api2/json/nodes/pve1/qemu/800101/clone")
+	cleanup := mutationIndex(mutations, "DELETE /api2/json/nodes/pve1/qemu/800101")
+	lastNetworkWrite := -1
+	for index, mutation := range mutations {
+		if mutation == "PUT /api2/json/nodes/pve1/qemu/101/config" && index > lastNetworkWrite {
+			lastNetworkWrite = index
+		}
+	}
+	if restoreClone < 0 || lastNetworkWrite <= restoreClone || cleanup <= lastNetworkWrite {
+		t.Fatalf("compensation cleanup preceded signed network restoration: %v", mutations)
+	}
+}
+
+func rawConfig(values map[string]string) map[string]json.RawMessage {
+	raw := make(map[string]json.RawMessage, len(values))
+	for key, value := range values {
+		encoded, _ := json.Marshal(value)
+		raw[key] = encoded
+	}
+	return raw
+}
+
 func containsString(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {

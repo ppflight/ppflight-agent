@@ -92,7 +92,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 当前 54 个 known actions 已由一致性测试锁住 registry、strict validator 和 Executor 分派。动作存在也不代表官网已批准生产路由；production 仍受签名、assignment、allowlist、审批、资源锁、产品 rollout 和 `productionExecution` 共同限制。`agent.upgrade` 仅接受官网固定 manifest 制品并由独立 root helper 复验、原子替换、回验和回滚，完整合同见[安全自升级合同](docs/SELF-UPGRADE-V1.md)。新增初次定型、固定模板重装、短时控制台、VM 级 legacy Journal 恢复、防火墙规则严格回验与安全 snippet 删除合同见[Agent API v1](docs/AGENT-API-V1.md)。
 
-生产修改命令在真正调用 PVE 前先持久排队 `running/COMMAND_STARTED` 回执，避免重装等长流程被官网租约误重发。失败终态另返回严格受限的结构化诊断（来源、执行阶段及可选 PVE 方法/路径/HTTP 状态和顶层原因）；不会返回请求体、原始响应、凭据或任意系统日志。重装的修改步骤使用 control client，最终 QGA/OS/网络/防火墙交付回验固定使用独立 read client。
+生产修改命令在真正调用 PVE 前先持久排队 `running/COMMAND_STARTED` 回执，避免重装等长流程被官网租约误重发。失败终态另返回严格受限的结构化诊断（来源、执行阶段及可选 PVE 方法/路径/HTTP 状态和顶层原因）；不会返回请求体、原始响应、凭据或任意系统日志。重装的修改步骤使用 control client，最终 QGA/OS/网络/防火墙交付回验固定使用独立 read client。从 `0.1.1-rc.34` 起，失败重装把补偿 clone 恢复到原 VMID 后必须重新写入全部签名 NIC，并通过独立 read client 严格回验网络配置与 IPFilter；证明完成前不得恢复电源或删除补偿 clone。
 
 所有已验签的官网修改类 command（包括 dry-run、策略拒绝和终态）还必须生成脱敏审计事件，使用监控站独立绑定的 HMAC 上传到 `/internal/v1/monitoring/audit-events/batches`。审计使用独立 durable outbox、幂等 event ID、跨重启单调 sequence、`observedAt/sentAt`；允许 `operationId` 关联同一任务的多个进度事件，VM 目标额外携带 `clusterRef/nodeRef/guestType/vmid`。失败时可携带与官网 receipt 相同的受限 `error`（来源、阶段、固定 HTTP 方法、无 query API 路径、状态码和单行原因）。严禁 secret、root 密码、Token、完整 command parameters/result、原始响应或原始 UPID。精确字段见目标契约。Agent wire/journal/outbox、runtime sink 和 monitoring HMAC uploader 已接线；官网不得向未具备 audit route 的 Agent 下发修改命令，完成端到端验收前 production 修改动作不得开放。
 
