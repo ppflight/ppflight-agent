@@ -327,7 +327,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
-				_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_ = r.ParseForm()
 				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl|set-timezone|Asia/Shanghai" {
@@ -340,7 +340,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-				_, _ = w.Write([]byte(`{"data":{"zone":"Asia/Shanghai","offset":28800}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"Asia/Shanghai","offset":28800}}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -363,13 +363,13 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 					_, _ = w.Write([]byte(`{"data":null}`))
 					return
 				}
-				_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_, _ = w.Write([]byte(`{"data":{"pid":7}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
 				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-				_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"UTC","offset":0}}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -412,11 +412,11 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/config"):
 			_, _ = w.Write([]byte(`{"data":{"cores":2,"sockets":1,"memory":1024,"scsi0":"local-lvm:vm-101-disk-0,size=20G,iops_rd=1000,mbps_rd=100","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=1,rate=100","ipconfig0":"ip=192.0.2.10/24,ip6=2001:db8::10/64"}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/info"):
-			_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-network-get-interfaces","enabled":true}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-network-get-interfaces","enabled":true}]}}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
-			_, _ = w.Write([]byte(`{"data":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"},{"ip-address":"2001:db8::10","prefix":64,"ip-address-type":"ipv6"}]}]}`))
+			_, _ = w.Write([]byte(`{"data":{"result":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"},{"ip-address":"2001:db8::10","prefix":64,"ip-address-type":"ipv6"}]}]}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-			_, _ = w.Write([]byte(`{"data":{"zone":"UTC","offset":0}}`))
+			_, _ = w.Write([]byte(`{"data":{"result":{"zone":"UTC","offset":0}}}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
 			if r.URL.Path == "/api2/json/cluster/firewall/options" {
 				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
@@ -1078,7 +1078,7 @@ func TestNetworkUpdateNeverChangesMACImplicitly(t *testing.T) {
 func TestExecutorPasswordReceiptDoesNotExposePassword(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/agent/info") {
-			_, _ = w.Write([]byte(`{"data":{"version":"9.0","supported_commands":[{"name":"guest-set-user-password","enabled":true}]}}`))
+			_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-set-user-password","enabled":true}]}}}`))
 			return
 		}
 		_ = r.ParseForm()
@@ -1086,7 +1086,7 @@ func TestExecutorPasswordReceiptDoesNotExposePassword(t *testing.T) {
 			t.Fatal("password did not reach PVE form")
 		}
 		// Even a surprising upstream echo must never reach a receipt or journal.
-		_, _ = w.Write([]byte(`{"data":{"password":"secret-value"}}`))
+		_, _ = w.Write([]byte(`{"data":{"result":{"password":"secret-value"}}}`))
 	}))
 	defer server.Close()
 	r, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.reset-password", "qemu", `{"username":"root","password":"secret-value","crypted":false}`), time.Now())

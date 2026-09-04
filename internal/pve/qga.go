@@ -117,8 +117,10 @@ func (c *Client) ProbeGuestAgent(ctx context.Context, node string, vmid int) (Gu
 }
 
 // GuestAgentInfo reads the QGA command inventory through PVE's documented
-// agent endpoint. PVE wraps every guest-agent command result inside
-// {"result": ...} within its ordinary {"data": ...} API envelope.
+// forwarded command endpoint. These forwarded read commands wrap their value
+// inside {"result": ...} within PVE's ordinary {"data": ...} API envelope.
+// The separately registered exec and exec-status endpoints are direct-value
+// exceptions and intentionally do not use this helper.
 func (c *Client) GuestAgentInfo(ctx context.Context, node string, vmid int) (GuestAgentInfo, error) {
 	base, err := guestPath("qemu", node, vmid)
 	if err != nil {

@@ -252,6 +252,26 @@ func TestReadGuestTimezoneDecodesPVECommandResultEnvelope(t *testing.T) {
 	}
 }
 
+func TestGuestAgentResultEnvelopeRejectsNullAndWrongTypes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "null result", body: `{"data":{"result":null}}`},
+		{name: "wrong result type", body: `{"data":{"result":[]}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, tt.body)
+			}))
+			defer server.Close()
+			if _, err := c.GuestAgentInfo(context.Background(), "pve1", 100); err == nil {
+				t.Fatal("invalid PVE guest-agent result was accepted")
+			}
+		})
+	}
+}
+
 func TestClientRejectsRemotePlainHTTP(t *testing.T) {
 	if _, err := NewClient(Config{Endpoint: "http://pve.example.test:8006", TokenID: "x", TokenSecret: "x"}); err == nil {
 		t.Fatal("expected error")
