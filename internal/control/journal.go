@@ -266,7 +266,9 @@ func (j *Journal) claim(command Command, now time.Time, audit *auditContext) (Re
 	if mutating {
 		busy, err := j.resourceBusyLocked(resourceKey)
 		if command.Action == "vm.migrate-legacy-journal" {
-			if parameters, ok := decodeDelete501Recovery(command); ok {
+			if parameters, ok := decodeIPFilterDeleteRecovery(command); ok {
+				err = j.validateIPFilterDeleteRecoveryClaimLocked(command, parameters)
+			} else if parameters, ok := decodeDelete501Recovery(command); ok {
 				err = j.validateDelete501RecoveryClaimLocked(command, parameters)
 			} else {
 				var parameters legacyJournalMigrationP
@@ -485,14 +487,24 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 		}
 		return false, err
 	}
+	var ipFilterResult IPFilterDeleteRecoveryResult
+	var migrationResult json.RawMessage
+	if migration.Receipt != nil {
+		migrationResult = migration.Receipt.Result
+	}
+	isIPFilterRecovery := strictParameters(migrationResult, &ipFilterResult) == nil && ipFilterResult.RecoveryKind == ipFilterDeleteRecoveryKind
+	authorityMatches := migration.BindingID == record.BindingID && migration.DeviceID == record.DeviceID &&
+		migration.CredentialEpoch == record.CredentialEpoch && migration.AgentRef == record.AgentRef &&
+		migration.ClusterRef == record.ClusterRef && migration.NodeRef == record.NodeRef && migration.ServiceRef == record.ServiceRef &&
+		migration.InstanceUUID == record.InstanceUUID && migration.GuestType == record.GuestType && migration.VMID == record.VMID &&
+		migration.Generation == record.Generation &&
+		(migration.AssignmentRevision == record.AssignmentRevision ||
+			(isIPFilterRecovery && record.AuditContext != nil && ipFilterResult.LegacyAssignmentRevision == record.AuditContext.AssignmentRevision &&
+				record.AssignmentRevision == ipFilterResult.LegacyAssignmentRevision && migration.AssignmentRevision > record.AssignmentRevision))
 	if migration.CommandID != record.RetiredByCommandID || migration.Action != "vm.migrate-legacy-journal" ||
 		migration.ResourceKey != record.ResourceKey || !recordSucceeded(migration) || migration.AuditContext == nil ||
 		migration.AuditContext.Action != migration.Action || migration.AuditContext.ApprovalRef == "" ||
-		migration.BindingID != record.BindingID || migration.DeviceID != record.DeviceID ||
-		migration.CredentialEpoch != record.CredentialEpoch || migration.AssignmentRevision != record.AssignmentRevision ||
-		migration.AgentRef != record.AgentRef || migration.ClusterRef != record.ClusterRef || migration.NodeRef != record.NodeRef ||
-		migration.ServiceRef != record.ServiceRef || migration.InstanceUUID != record.InstanceUUID || migration.GuestType != record.GuestType ||
-		migration.VMID != record.VMID || migration.Generation != record.Generation || migration.Receipt == nil ||
+		!authorityMatches || migration.Receipt == nil ||
 		migration.CreatedAt.IsZero() || migration.UpdatedAt.IsZero() || record.RetiredAt.Before(migration.CreatedAt) ||
 		record.RetiredAt.After(migration.UpdatedAt) {
 		return false, nil
@@ -507,6 +519,13 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 		}
 		return result.FailedCommandID == record.CommandID && result.FailedOperationID == record.OperationID &&
 			result.FailedCommandDigest == record.Digest, nil
+	}
+	if strictParameters(migration.Receipt.Result, &ipFilterResult) == nil && ipFilterResult.RecoveryKind == ipFilterDeleteRecoveryKind {
+		return validIPFilterDeleteRecoveryJournalResult(&migration, migration.Receipt.Result) &&
+			ipFilterResult.LegacyAssignmentRevision == record.AuditContext.AssignmentRevision &&
+			ipFilterResult.FailedCommandID == record.CommandID && ipFilterResult.FailedOperationID == record.OperationID &&
+			ipFilterResult.FailedCommandDigest == record.Digest &&
+			record.AuditContext.PayloadDigest == "sha256:"+ipFilterResult.FailedPayloadSHA256, nil
 	}
 	var result LegacyJournalMigrationResult
 	if !validLegacyMigrationJournalResult(&migration, migration.Receipt.Result) ||
@@ -678,7 +697,7 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	// which must survive a crash so an exact idempotent replay can return the
 	// first result without touching PVE again.
 	safeReplayResult := record.Action == "vm.set-initial-resources" && validInitialResourcesJournalResult(record, receipt.Result) ||
-		record.Action == "vm.migrate-legacy-journal" && (validLegacyMigrationJournalResult(record, receipt.Result) || validDelete501RecoveryJournalResult(record, receipt.Result)) ||
+		record.Action == "vm.migrate-legacy-journal" && (validLegacyMigrationJournalResult(record, receipt.Result) || validDelete501RecoveryJournalResult(record, receipt.Result) || validIPFilterDeleteRecoveryJournalResult(record, receipt.Result)) ||
 		record.Action == "vm.cloud-init-snippet.delete" && validSnippetDeleteJournalResult(record, receipt.Result)
 	if receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !safeReplayResult {
 		journalReceipt.Result = nil

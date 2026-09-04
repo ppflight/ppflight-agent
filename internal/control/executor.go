@@ -147,6 +147,9 @@ type Executor struct {
 	// It appends retirement evidence only after exact journal and live PVE
 	// read proofs have both succeeded.
 	Delete501Journal Delete501JournalReconciler
+	// IPFilterDeleteJournal retires one exact no-UPID indeterminate IPFilter
+	// deletion only after a fresh provider read has proved its current state.
+	IPFilterDeleteJournal IPFilterDeleteJournalReconciler
 	// ConsoleSessions starts a short-lived Agent-originated reverse WSS tunnel.
 	// PVE ticket and localhost details remain inside the Agent process and never
 	// enter a receipt, audit event, broker registration, log, or durable queue.
@@ -167,6 +170,10 @@ type LegacyJournalMigrator interface {
 
 type Delete501JournalReconciler interface {
 	ReconcileDelete501(Command, delete501RecoveryP, string, string, time.Time) (Delete501RecoveryResult, error)
+}
+
+type IPFilterDeleteJournalReconciler interface {
+	ReconcileIPFilterDelete(Command, ipFilterDeleteRecoveryP, bool, string, time.Time) (IPFilterDeleteRecoveryResult, error)
 }
 
 type ConsoleSessionSink interface {
@@ -396,6 +403,51 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		return finish(nil)
 	}
 	if command.Action == "vm.migrate-legacy-journal" {
+		if parameters, ok := decodeIPFilterDeleteRecovery(command); ok {
+			if e.IPFilterDeleteJournal == nil {
+				r.State, r.Code, r.FinishedAt = "rejected", "IPFILTER_DELETE_RECOVERY_UNAVAILABLE", time.Now().UTC()
+				return finish(errors.New("IPFilter delete recovery journal is unavailable"))
+			}
+			client := e.ReadClient
+			if client == nil {
+				client = e.Client
+			}
+			if client == nil {
+				r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+				return finish(errors.New("PVE read client is unavailable"))
+			}
+			ref := pve.FirewallRef{Node: command.Identity.NodeRef, Kind: command.Identity.GuestType, VMID: command.Identity.VMID}
+			entries, readErr := client.FirewallIPSetEntries(ctx, ref, parameters.Name)
+			if readErr != nil {
+				r.State, r.Code, r.FinishedAt = "failed", "IPFILTER_DELETE_RECOVERY_READ_FAILED", time.Now().UTC()
+				return finish(readErr)
+			}
+			expected, expectedOK := canonicalFirewallCIDR(parameters.CIDR)
+			matches := make([]string, 0, 1)
+			for _, entry := range entries {
+				actual, valid := canonicalFirewallCIDR(entry.CIDR)
+				if valid && expectedOK && actual == expected {
+					matches = append(matches, entry.CIDR)
+				}
+			}
+			if !expectedOK || len(matches) > 1 {
+				r.State, r.Code, r.FinishedAt = "rejected", "IPFILTER_DELETE_RECOVERY_REJECTED", time.Now().UTC()
+				return finish(errors.New("IPFilter delete recovery provider state is ambiguous"))
+			}
+			observedCIDR := ""
+			if len(matches) == 1 {
+				observedCIDR = matches[0]
+			}
+			result, recoveryErr := e.IPFilterDeleteJournal.ReconcileIPFilterDelete(command, parameters, len(matches) == 1, observedCIDR, now)
+			r.FinishedAt = time.Now().UTC()
+			if recoveryErr != nil {
+				r.State, r.Code = "rejected", "IPFILTER_DELETE_RECOVERY_REJECTED"
+				return finish(recoveryErr)
+			}
+			r.State, r.Code = "succeeded", "SUCCEEDED"
+			r.Result, _ = json.Marshal(result)
+			return finish(nil)
+		}
 		if parameters, ok := decodeDelete501Recovery(command); ok {
 			if e.Delete501Journal == nil {
 				r.State, r.Code, r.FinishedAt = "rejected", "DELETE_501_RECOVERY_UNAVAILABLE", time.Now().UTC()
@@ -996,6 +1048,9 @@ func validateParameters(c Command) error {
 		}
 		return nil
 	case "vm.migrate-legacy-journal":
+		if _, ok := decodeIPFilterDeleteRecovery(c); ok {
+			return nil
+		}
 		if _, ok := decodeDelete501Recovery(c); ok {
 			return nil
 		}

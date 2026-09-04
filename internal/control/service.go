@@ -152,6 +152,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Executor.Delete501Journal == nil {
 		cfg.Executor.Delete501Journal = cfg.Journal
 	}
+	if cfg.Executor.IPFilterDeleteJournal == nil {
+		cfg.Executor.IPFilterDeleteJournal = cfg.Journal
+	}
 	if cfg.Executor.CloudInitSnippets == nil {
 		cfg.Executor.CloudInitSnippets = cfg.Journal
 	}
