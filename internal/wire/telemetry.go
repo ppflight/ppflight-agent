@@ -17,15 +17,20 @@ import (
 )
 
 type WebsiteTelemetryBatch struct {
-	SchemaVersion int              `json:"schemaVersion"`
-	BatchID       string           `json:"batchId"`
-	AgentRef      string           `json:"agentRef"`
-	CollectorRef  string           `json:"collectorRef"`
-	SourceRef     string           `json:"sourceRef"`
-	ClusterRef    string           `json:"clusterRef"`
-	Mode          string           `json:"mode"`
-	Sequence      protocol.Counter `json:"sequence"`
-	ObservedAt    time.Time        `json:"observedAt"`
+	SchemaVersion int    `json:"schemaVersion"`
+	BatchID       string `json:"batchId"`
+	AgentRef      string `json:"agentRef"`
+	// AgentVersion is an authenticated observation used by the website to
+	// keep the installation record current after an in-place upgrade. Older
+	// agents omit it, so the website accepts the field as optional during the
+	// rolling transition.
+	AgentVersion string           `json:"agentVersion,omitempty"`
+	CollectorRef string           `json:"collectorRef"`
+	SourceRef    string           `json:"sourceRef"`
+	ClusterRef   string           `json:"clusterRef"`
+	Mode         string           `json:"mode"`
+	Sequence     protocol.Counter `json:"sequence"`
+	ObservedAt   time.Time        `json:"observedAt"`
 	// SentAt is fixed when the durable payload is created. The receiver adds
 	// receivedAt; retries keep the same body and batch ID.
 	SentAt     time.Time                           `json:"sentAt"`
@@ -98,6 +103,27 @@ type WebsitePVEGuestView struct {
 
 func BuildWebsiteTelemetry(snapshot observation.Snapshot, assignments *inventory.Store, sourceRef string, sequence uint64) (WebsiteTelemetryBatch, error) {
 	return BuildWebsiteTelemetryAt(snapshot, assignments, sourceRef, sequence, time.Now().UTC())
+}
+
+// BuildWebsiteTelemetryForAgent adds the running binary version to the signed
+// website payload. Keeping the original builder preserves fixtures and makes
+// omission by older agents explicit during a rolling upgrade.
+func BuildWebsiteTelemetryForAgent(snapshot observation.Snapshot, assignments *inventory.Store, sourceRef, agentVersion string, sequence uint64) (WebsiteTelemetryBatch, error) {
+	batch, err := BuildWebsiteTelemetry(snapshot, assignments, sourceRef, sequence)
+	if err != nil {
+		return WebsiteTelemetryBatch{}, err
+	}
+	batch.AgentVersion = agentVersion
+	return batch, nil
+}
+
+func BuildWebsiteTelemetryAtForAgent(snapshot observation.Snapshot, assignments *inventory.Store, sourceRef, agentVersion string, sequence uint64, sentAt time.Time) (WebsiteTelemetryBatch, error) {
+	batch, err := BuildWebsiteTelemetryAt(snapshot, assignments, sourceRef, sequence, sentAt)
+	if err != nil {
+		return WebsiteTelemetryBatch{}, err
+	}
+	batch.AgentVersion = agentVersion
+	return batch, nil
 }
 
 // BuildWebsiteTelemetryAt is the deterministic form used when the caller has

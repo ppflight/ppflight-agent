@@ -795,7 +795,7 @@ func (a *App) enqueueLifecycleTelemetry(snapshot observation.Snapshot, now time.
 		sequence, err := a.runstate.NextWebsite()
 		if err == nil {
 			var batch wire.WebsiteTelemetryBatch
-			batch, err = wire.BuildWebsiteTelemetryAt(lifecycleSnapshot(snapshot, incidents), a.assignments, a.cfg.Identity.SourceRef, sequence, now)
+			batch, err = wire.BuildWebsiteTelemetryAtForAgent(lifecycleSnapshot(snapshot, incidents), a.assignments, a.cfg.Identity.SourceRef, a.version, sequence, now)
 			if err == nil {
 				var raw []byte
 				raw, err = json.Marshal(batch)
@@ -882,7 +882,7 @@ func (a *App) sample(ctx context.Context, now time.Time) error {
 		sequence, err := a.runstate.NextWebsite()
 		if err == nil {
 			var batch wire.WebsiteTelemetryBatch
-			batch, err = wire.BuildWebsiteTelemetry(snapshot, a.assignments, a.cfg.Identity.SourceRef, sequence)
+			batch, err = wire.BuildWebsiteTelemetryForAgent(snapshot, a.assignments, a.cfg.Identity.SourceRef, a.version, sequence)
 			if err == nil {
 				var raw []byte
 				raw, err = json.Marshal(batch)
