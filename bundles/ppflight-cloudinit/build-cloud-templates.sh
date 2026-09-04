@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.3.1"
+readonly SCRIPT_VERSION="3.3.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -817,8 +817,13 @@ prepare_image_with_qga() {
 
   # --network is necessary only for the distribution package manager. The
   # catalog covers Ubuntu/Debian and RHEL-family GenericCloud images, whose
-  # package name and systemd unit are intentionally the same.
-  virt-customize --format qcow2 --network -a "$prepared" \
+  # package name and systemd unit are intentionally the same. Always force the
+  # libguestfs appliance through QEMU TCG: unlike KVM's `-cpu host`, TCG uses an
+  # emulated maximum CPU and can therefore execute x86-64-v2/v3 guest package
+  # tools even when the physical PVE test host lacks SSSE3/AVX2. This is slower
+  # but makes all seven immutable-image builds independent of host CPU flags.
+  LIBGUESTFS_BACKEND_SETTINGS=force_tcg \
+    virt-customize --format qcow2 --network -a "$prepared" \
     --install "$QGA_PACKAGE" \
     --run-command "$(qga_activate_service_command)" \
     --run-command "install -d -m 0755 /etc/ppflight && printf '%s\\n' '$QGA_MARKER_VALUE' > '$QGA_MARKER_PATH'" \
@@ -827,7 +832,8 @@ prepare_image_with_qga() {
   # Reopen the modified disk without a network, so successful eligibility is
   # based on the actual immutable filesystem state and not on a deferred
   # cloud-init package task or a PVE-side agent device setting.
-  virt-customize --format qcow2 --no-network -a "$prepared" \
+  LIBGUESTFS_BACKEND_SETTINGS=force_tcg \
+    virt-customize --format qcow2 --no-network -a "$prepared" \
     --run-command "$(qga_verify_command)" \
     || die "QGA package/service verification failed for template $vmid"
 

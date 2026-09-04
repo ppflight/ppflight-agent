@@ -94,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "2ccec7dbf66c44a84ca95cbb525745e9e4b044914b2c966488986288689ee743"
+	const expectedManifestSHA256 = "27557eeb4498b718ce23a1a3de3c8d1500a7a04283e44bf58845534f6eeb52e0"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -127,6 +127,7 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 	for _, required := range []string{
 		`--sockets 1 \`,
 		`grep -qx 'sockets: 1' <<< "$config"`,
+		`LIBGUESTFS_BACKEND_SETTINGS=force_tcg`,
 		`virt-customize --format qcow2 --network -a "$prepared"`,
 		`--install "$QGA_PACKAGE"`,
 		`virt-customize --format qcow2 --no-network -a "$prepared"`,
@@ -142,6 +143,9 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 		if !strings.Contains(script, required) {
 			t.Fatalf("template builder is missing the frozen socket baseline check %q", required)
 		}
+	}
+	if count := strings.Count(script, `LIBGUESTFS_BACKEND_SETTINGS=force_tcg`); count != 2 {
+		t.Fatalf("template builder must force TCG for both QGA installation and verification, got %d invocations", count)
 	}
 	for _, forbidden := range []string{
 		"  - qemu-guest-agent\n",
