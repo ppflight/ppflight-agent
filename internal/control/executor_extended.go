@@ -870,7 +870,10 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 		// setting the signed timezone; otherwise cloud-init may overwrite a
 		// successfully verified timedatectl change moments later.
 		if !cloudInitReady {
-			if err := runGuestCommand(readinessCtx, client, targetBase, "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err != nil {
+			// cloud-init 23.4+ documents exit 2 as a completed terminal state
+			// with recoverable errors. Subsequent signed delivery checks remain
+			// authoritative, while exit 1 (crash) still fails closed.
+			if err := runGuestCommandWithExitCodes(readinessCtx, client, targetBase, "cloud-init readiness", map[int]struct{}{0: {}, 2: {}}, "/usr/bin/cloud-init", "status", "--wait"); err != nil {
 				return err
 			}
 			cloudInitReady = true

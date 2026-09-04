@@ -1762,6 +1762,13 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 // terminal exit status. Callers choose only compile-time command paths and
 // labels; no shell is involved and guest output is never reflected.
 func runGuestCommand(ctx context.Context, c *pve.Client, base, label string, argv ...string) error {
+	return runGuestCommandWithExitCodes(ctx, c, base, label, map[int]struct{}{0: {}}, argv...)
+}
+
+// runGuestCommandWithExitCodes is reserved for commands whose documented
+// terminal states use more than the conventional zero success code. The
+// caller must still use fixed argv and an explicit, compile-time allowlist.
+func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, label string, allowedExitCodes map[int]struct{}, argv ...string) error {
 	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": argv})
 	if err != nil {
 		return err
@@ -1798,7 +1805,7 @@ func runGuestCommand(ctx context.Context, c *pve.Client, base, label string, arg
 			return errors.New("QGA guest-exec returned an invalid status")
 		}
 		if exited {
-			if status.ExitCode != 0 {
+			if _, allowed := allowedExitCodes[status.ExitCode]; !allowed {
 				return fmt.Errorf("guest %s command failed", label)
 			}
 			return nil

@@ -620,6 +620,41 @@ func TestReinstallReadinessDeadlineBoundsBlockingCloudInit(t *testing.T) {
 	}
 }
 
+func TestCloudInitReadinessAcceptsRecoverableCompletionButRejectsCrash(t *testing.T) {
+	for _, fixture := range []struct {
+		name     string
+		exitCode int
+		wantErr  bool
+	}{
+		{name: "success", exitCode: 0},
+		{name: "recoverable completion", exitCode: 2},
+		{name: "crash", exitCode: 1, wantErr: true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/agent/exec"):
+					_, _ = w.Write([]byte(`{"data":42}`))
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+					_, _ = fmt.Fprintf(w, `{"data":{"exited":1,"exitcode":%d}}`, fixture.exitCode)
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			err := runGuestCommandWithExitCodes(
+				context.Background(), controlTestClient(t, server), "/nodes/pve1/qemu/101",
+				"cloud-init readiness", map[int]struct{}{0: {}, 2: {}},
+				"/usr/bin/cloud-init", "status", "--wait",
+			)
+			if (err != nil) != fixture.wantErr {
+				t.Fatalf("exit code %d: err=%v wantErr=%t", fixture.exitCode, err, fixture.wantErr)
+			}
+		})
+	}
+}
+
 func TestReinstallCompensationRestoresCloneRandomizedNetworkIdentity(t *testing.T) {
 	enabled := true
 	mtu := 1500
