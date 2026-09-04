@@ -856,8 +856,19 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 	timezoneCommand.Parameters, _ = json.Marshal(timezoneP{Timezone: parameters.Expected.Timezone})
 	verifyCommand := command
 	verifyCommand.Parameters, _ = json.Marshal(deliveryP{NotBefore: parameters.NotBefore, Expected: parameters.Expected})
+	cloudInitReady := false
 	timezoneVerified := false
 	verify := func() error {
+		// QGA can become available while cloud-init is still applying the
+		// template defaults. Wait for cloud-init's durable final state before
+		// setting the signed timezone; otherwise cloud-init may overwrite a
+		// successfully verified timedatectl change moments later.
+		if !cloudInitReady {
+			if err := runGuestCommand(ctx, client, targetBase, "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err != nil {
+				return err
+			}
+			cloudInitReady = true
+		}
 		if !timezoneVerified {
 			if _, _, err := setGuestTimezone(ctx, client, timezoneCommand, targetBase); err != nil {
 				return err

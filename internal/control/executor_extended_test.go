@@ -460,7 +460,9 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	templateHash := fmt.Sprintf("%x", sha256.Sum256(canonical))
 	mutations := []string{}
 	targetStatus := "running"
+	cloudInitAttempts := 0
 	timezoneAttempts := 0
+	guestCommands := []string{}
 	readFirewallVerified := false
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -472,6 +474,14 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 				targetStatus = "running"
 			}
 			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
+				_ = r.ParseForm()
+				guestCommand := strings.Join(r.Form["command"], "|")
+				guestCommands = append(guestCommands, guestCommand)
+				if guestCommand == "/usr/bin/cloud-init|status|--wait" {
+					cloudInitAttempts++
+					_, _ = w.Write([]byte(`{"data":16}`))
+					return
+				}
 				timezoneAttempts++
 				if timezoneAttempts < 3 {
 					http.Error(w, "QGA is not running yet", http.StatusInternalServerError)
@@ -562,8 +572,8 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"reinstalled":true`) || strings.Contains(string(receipt.Result), "fixture-secret") {
 		t.Fatalf("receipt=%#v mutations=%v err=%v", receipt, mutations, err)
 	}
-	if timezoneAttempts != 3 {
-		t.Fatalf("post-boot QGA was not retried: attempts=%d", timezoneAttempts)
+	if cloudInitAttempts != 1 || timezoneAttempts != 3 || len(guestCommands) != 4 || guestCommands[0] != "/usr/bin/cloud-init|status|--wait" {
+		t.Fatalf("post-boot cloud-init/timezone ordering was not enforced: cloud-init=%d timezone=%d commands=%v", cloudInitAttempts, timezoneAttempts, guestCommands)
 	}
 	if !readFirewallVerified {
 		t.Fatal("reinstall readiness did not use the independent read client")

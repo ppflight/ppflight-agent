@@ -1747,9 +1747,24 @@ func setCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) 
 func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p timezoneP
 	_ = strictParameters(cmd.Parameters, &p)
-	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": {"/usr/bin/timedatectl", "set-timezone", p.Timezone}})
-	if err != nil {
+	if err := runGuestCommand(ctx, c, base, "timezone", "/usr/bin/timedatectl", "set-timezone", p.Timezone); err != nil {
 		return "", nil, err
+	}
+	observed, readErr := c.ReadGuestTimezone(ctx, cmd.Identity.NodeRef, cmd.Identity.VMID)
+	if readErr != nil || !guestTimezoneMatches(observed, p.Timezone, time.Now().UTC()) {
+		return "", nil, errors.New("guest timezone readback does not match")
+	}
+	result, _ := json.Marshal(map[string]any{"configured": true, "verified": true})
+	return "", result, nil
+}
+
+// runGuestCommand executes one fixed argv through QGA and waits for its exact
+// terminal exit status. Callers choose only compile-time command paths and
+// labels; no shell is involved and guest output is never reflected.
+func runGuestCommand(ctx context.Context, c *pve.Client, base, label string, argv ...string) error {
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": argv})
+	if err != nil {
+		return err
 	}
 	var pid int
 	if decodeQGACommandResult(raw, &pid) != nil {
@@ -1757,12 +1772,12 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 			PID int `json:"pid"`
 		}
 		if decodeQGACommandResult(raw, &result) != nil || result.PID < 1 {
-			return "", nil, errors.New("QGA guest-exec returned an invalid pid")
+			return errors.New("QGA guest-exec returned an invalid pid")
 		}
 		pid = result.PID
 	}
 	if pid < 1 {
-		return "", nil, errors.New("QGA guest-exec returned an invalid pid")
+		return errors.New("QGA guest-exec returned an invalid pid")
 	}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -1773,29 +1788,24 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 			ExitCode int             `json:"exitcode"`
 		}
 		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &rawStatus); err != nil {
-			return "", nil, err
+			return err
 		}
 		if err := decodeQGACommandResult(rawStatus, &status); err != nil {
-			return "", nil, errors.New("QGA guest-exec returned an invalid status")
+			return errors.New("QGA guest-exec returned an invalid status")
 		}
 		exited, valid := boolish(status.Exited)
 		if !valid {
-			return "", nil, errors.New("QGA guest-exec returned an invalid status")
+			return errors.New("QGA guest-exec returned an invalid status")
 		}
 		if exited {
 			if status.ExitCode != 0 {
-				return "", nil, errors.New("guest timezone command failed")
+				return fmt.Errorf("guest %s command failed", label)
 			}
-			observed, readErr := c.ReadGuestTimezone(ctx, cmd.Identity.NodeRef, cmd.Identity.VMID)
-			if readErr != nil || !guestTimezoneMatches(observed, p.Timezone, time.Now().UTC()) {
-				return "", nil, errors.New("guest timezone readback does not match")
-			}
-			result, _ := json.Marshal(map[string]any{"configured": true, "verified": true})
-			return "", result, nil
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return "", nil, ctx.Err()
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
