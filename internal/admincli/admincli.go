@@ -3444,10 +3444,7 @@ func (c *cli) chooseTemplateStorage(ctx context.Context, reader *bufio.Reader, s
 	fmt.Fprintln(c.out, "  说明：只增加上述能力，不删除当前已有内容或数据。")
 	fmt.Fprintf(c.out, "  底层命令：%s %s %s\n", remediation.Command.Argv[0], remediation.Command.Argv[1], remediation.Command.Argv[2])
 	fmt.Fprintf(c.out, "            %s %s\n", remediation.Command.Argv[3], remediation.Command.Argv[4])
-	confirmed, err := c.promptYesNo(reader, "确认配置 storage content 并继续？", false)
-	if err != nil || !confirmed {
-		return "", storages, errors.New("未确认 storage content 配置，未执行任何变更")
-	}
+	fmt.Fprintln(c.out, "  已通过安全校验，正在自动追加 storage content 并回读确认（无需人工确认）。")
 	if err := c.applyTemplateRemediation(ctx, choice.Storage, remediation); err != nil {
 		return "", storages, err
 	}

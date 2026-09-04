@@ -731,14 +731,14 @@ func TestChooseTemplateStorageAppliesExactContentAndRediscovers(t *testing.T) {
 			return templatebootstrap.Result{ExitCode: 0, Stdout: discoveryRaw}, nil
 		},
 	}
-	selected, storages, err := instance.chooseTemplateStorage(context.Background(), bufio.NewReader(strings.NewReader("1\ny\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
+	selected, storages, err := instance.chooseTemplateStorage(context.Background(), bufio.NewReader(strings.NewReader("1\n")), []templateStorage{storage}, "image", "选择镜像缓存存储")
 	if err != nil || selected != "local" || len(storages) != 1 || !storages[0].RoleEligibility.Image.Allowed {
 		t.Fatalf("selected=%q storages=%#v err=%v", selected, storages, err)
 	}
 	if gotStorage != "local" || gotContent != "backup,iso,snippets,vztmpl" {
 		t.Fatalf("pvesm set got storage=%q content=%q", gotStorage, gotContent)
 	}
-	for _, expected := range []string{"[y/n]（回车默认：n）", "当前能力：备份 (backup)", "需要新增：Cloud-Init 配置 (snippets)", "pvesm set local", "--content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
+	for _, expected := range []string{"无需人工确认", "当前能力：备份 (backup)", "需要新增：Cloud-Init 配置 (snippets)", "pvesm set local", "--content backup,iso,snippets,vztmpl", "已配置并通过重新检测"} {
 		if !strings.Contains(output.String(), expected) {
 			t.Fatalf("output missing %q: %s", expected, output.String())
 		}
@@ -777,7 +777,7 @@ func TestTemplateInitAllSelectsImageTemplateAndBackupStorages(t *testing.T) {
 	var bootstrapArgs []string
 	var output, stderr bytes.Buffer
 	instance := &cli{
-		in: strings.NewReader("\n1\ny\n1\ny\n1\nvmbr0\ny\nvmbr0\nvmbr1\nn\n"), out: &output, errOut: &stderr, version: "test",
+		in: strings.NewReader("\n1\n1\ny\n1\nvmbr0\ny\nvmbr0\nvmbr1\nn\n"), out: &output, errOut: &stderr, version: "test",
 		templateBridges: &fakeTemplateBridgeManager{inspect: []templateBridgeState{safeCreatedBridgeState()}},
 		pvesmSetContent: func(_ context.Context, storageID, content string) error {
 			if storageID != "local" || content != "backup,iso,snippets,vztmpl" {

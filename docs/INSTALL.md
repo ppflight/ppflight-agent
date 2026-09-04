@@ -289,7 +289,7 @@ sudo ag-pve template init
 
 向导会读取本地 catalog 和 PVE storage discovery，让管理员依次选择模板、镜像缓存 storage、模板磁盘 storage、显式 `required|disabled` 备份策略、备份 storage（required 时）、外网桥和可选内网桥；添加内网 `net1` 默认 `y`，模板备份默认 `n`。外网桥用于 `net0`，启用内网时另建 `net1`，二者必须不同。若所选内网桥已存在，向导只在它严格回读为已启用、无物理端口、无 IPv4/IPv6 地址、无默认网关的 PVE Linux bridge 时原样复用，绝不修改已有接口；若不存在，向导会单独列出 `autostart=1`、`bridge-ports none`、PVE Linux bridge 的 `STP off/bridge-fd 0` 安全默认值及无 IP/网关的创建配置，并且只有管理员输入 `y` 才创建。创建前若存在 `/etc/network/interfaces.new`，向导拒绝把管理员尚未应用的网络变更一并 reload；新配置及 root-owned 非软链 pending 文件必须保持不变，并在 PVE reload task `stopped/OK`、PVE 配置和内核 `bridge+UP` 严格回读后才进入模板 plan。取消、创建失败或回读失败均不会进入模板 plan/execute。直接调用 `template bootstrap` 仍只接受已存在的网桥，不会隐式创建。选择 `all` 也不会跳过任一 storage 或网络选择。它先输出无副作用 plan；执行确认默认 `y`，核对 VMID/storage/摘要/备份策略/网络角色后直接回车或输入 `y` 会执行，输入 `n` 才取消。
 
-若 discovery 返回 storage content remediation，`ag` 只会在 `program=pvesm` 且 argv、storage ID、current/required/proposed content 全部严格匹配，存储 active/enabled，且该角色没有其他阻断原因时把它列为“选择后新增”的候选项。选中后会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定命令；只有输入 `y` 才以固定绝对路径执行，不经 shell，并立即重新 discovery。取消、命令失败或重新检测仍不合格都会停止向导，不会进入模板 plan/execute。
+若 discovery 返回 storage content remediation，`ag` 只会在 `program=pvesm` 且 argv、storage ID、current/required/proposed content 全部严格匹配，存储 active/enabled，且该角色没有其他阻断原因时把它列为“选择后新增”的候选项。选中后会用中文分块显示当前能力、需要新增的能力、完成后的能力和固定命令，随后自动以固定绝对路径追加所需 content，不经 shell且不再询问一次 `y/n`，并立即重新 discovery。命令失败或重新检测仍不合格都会停止向导，不会进入模板 plan/execute。
 
 自动化可调用以下固定子命令；不能传 URL、catalog 路径、cache 路径、shell 片段或 replace 选项：
 
