@@ -142,6 +142,10 @@ func runUpgradeHelper(args []string) int {
 		fmt.Fprintln(os.Stderr, "upgrade helper configuration invalid")
 		return 1
 	}
+	// The privileged helper uses the same structured JSON journal format as
+	// the long-running Agent. It never logs config values, credentials,
+	// command parameters, provider bodies, or guest output.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
 	if err := admincli.ValidateInstalledWriteTarget(*configFile, cfg); err != nil {
 		fmt.Fprintln(os.Stderr, "upgrade helper configuration or state path is unsafe")
 		return 1
