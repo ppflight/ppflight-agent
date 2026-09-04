@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -40,6 +42,44 @@ func TestReleaseAllowlistIncludesCredentialRemovalHelper(t *testing.T) {
 	}
 	if allowedReleaseEntry("ppflight-agent/scripts/remove-arbitrary-pve-data.sh", false) {
 		t.Fatal("release allowlist accepted an unapproved removal helper")
+	}
+}
+
+func TestRootHelperAcceptsEveryEntryProducedByReleasePackager(t *testing.T) {
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := t.TempDir()
+	command := exec.Command("/usr/bin/bash", "../../scripts/package-release.sh",
+		"--binary", binary, "--version", "0.1.1-rc.999", "--arch", runtime.GOARCH, "--output-dir", output)
+	if combined, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("package release: %v: %s", err, combined)
+	}
+	archive := filepath.Join(output, "ppflight-agent-0.1.1-rc.999-linux-"+runtime.GOARCH+".tar.gz")
+	file, err := os.Open(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	reader := tar.NewReader(gz)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		directory := header.Typeflag == tar.TypeDir
+		if !allowedReleaseEntry(header.Name, directory) {
+			t.Fatalf("release packager emitted entry rejected by root helper: %s", header.Name)
+		}
 	}
 }
 

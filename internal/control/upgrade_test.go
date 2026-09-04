@@ -48,6 +48,25 @@ func TestAgentUpgradePrepareFailureIsTerminalAndDoesNotClaimPVEUPID(t *testing.T
 	}
 }
 
+func TestReconciledUpgradeFailureCarriesBoundedHelperDiagnostic(t *testing.T) {
+	now := time.Now().UTC()
+	diagnostic := &ExecutionError{Source: "agent", Stage: "verify_archive", Reason: "release archive contains an unreviewed entry"}
+	receipt, err := (&Service{}).reconciledUpgradeReceipt(SubmittedTask{
+		AgentUpgradeID: "upgrade-01",
+		OperationID:    "operation-01",
+		Receipt: Receipt{
+			SchemaVersion: 1, ReceiptID: "receipt-01", CommandID: "command-01", AgentRef: "agent-01",
+			State: "submitted", Code: "AGENT_UPGRADE_SUBMITTED", ExecutionMode: "production", StartedAt: now,
+		},
+	}, UpgradeResolution{Status: "failed", Code: "UPGRADE_HELPER_FAILED", Error: diagnostic}, nil, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.State != "failed" || receipt.Code != "AGENT_UPGRADE_FAILED" || receipt.Error != diagnostic {
+		t.Fatalf("receipt=%#v", receipt)
+	}
+}
+
 func TestJournalAuthorizesOnlyExactSubmittedUpgrade(t *testing.T) {
 	journal, err := OpenJournal(t.TempDir())
 	if err != nil {

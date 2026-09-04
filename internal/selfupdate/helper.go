@@ -97,43 +97,41 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 			}
 		}
 	}
-	if err := validateHelperRequest(requestPath, request, cfg); err != nil {
-		slog.Error("agent upgrade root helper rejected request", "upgradeId", request.UpgradeID, "stage", "validate_request", "reason", safeHelperText([]byte(err.Error())))
+	fail := func(stage string, cause error) error {
+		result.Error = &control.ExecutionError{Source: "agent", Stage: stage, Reason: safeHelperText([]byte(cause.Error()))}
+		slog.Error("agent upgrade root helper failed", "upgradeId", request.UpgradeID, "stage", stage, "reason", result.Error.Reason)
 		writeResult()
-		return err
+		return cause
+	}
+	if err := validateHelperRequest(requestPath, request, cfg); err != nil {
+		return fail("validate_request", err)
 	}
 	parameters, _ := upgradecontract.DecodeParameters(request.Command.Parameters)
 	manifestURL, _ := upgradecontract.ManifestURL(cfg.WebsiteEndpoint)
 	body, err := coordinator.getExact(ctx, manifestURL, 1<<20)
 	if err != nil {
-		writeResult()
-		return err
+		return fail("fetch_manifest", err)
 	}
 	manifest, err := upgradecontract.DecodeManifest(body)
 	if err != nil {
-		writeResult()
-		return err
+		return fail("decode_manifest", err)
 	}
 	if err := manifest.Match(parameters); err != nil {
-		writeResult()
-		return err
+		return fail("match_manifest", err)
 	}
 	slog.Info("agent upgrade root helper reverified authority", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	if err := upgradecontract.SameOrigin(cfg.WebsiteEndpoint, parameters.Artifact.DownloadURL); err != nil {
-		writeResult()
-		return err
+		return fail("verify_origin", err)
 	}
 	archivePath := filepath.Join(filepath.Dir(requestPath), request.ArtifactFile)
 	binary, err := verifiedBinary(archivePath, parameters)
 	if err != nil {
-		writeResult()
-		return err
+		return fail("verify_archive", err)
 	}
 	slog.Info("agent upgrade root helper verified archive", "upgradeId", request.UpgradeID, "sha256", parameters.Artifact.SHA256)
 	backupPath, err := installCandidate(cfg.BinaryPath, cfg.StateDirectory, request.UpgradeID, binary)
 	if err != nil {
-		writeResult()
-		return err
+		return fail("install_candidate", err)
 	}
 	slog.Info("agent upgrade candidate installed atomically", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	rollback := func(cause error) error {
@@ -146,6 +144,11 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 			rollbackErr = waitForStatus(ctx, cfg, cfg.CurrentVersion)
 		}
 		result.Status, result.Code = "rolled_back", "AGENT_UPGRADE_ROLLED_BACK"
+		result.Error = &control.ExecutionError{Source: "agent", Stage: "restart_health_check", Reason: safeHelperText([]byte(cause.Error()))}
+		if rollbackErr != nil {
+			result.Error.Stage = "rollback"
+			result.Error.Reason = safeHelperText([]byte(fmt.Sprintf("upgrade failed (%v); rollback failed (%v)", cause, rollbackErr)))
+		}
 		writeResult()
 		slog.Warn("agent upgrade rollback completed", "upgradeId", request.UpgradeID, "rollbackSucceeded", rollbackErr == nil)
 		if rollbackErr != nil {
@@ -333,9 +336,11 @@ var releaseFileAllowlist = map[string]bool{
 	"ppflight-agent": true, "ppflight-agent.sha256": true, "VERSION": true, "README.md": true,
 	"config/README.md": true, "config/agent.env.example": true, "config/agent.example.yaml": true, "config/assignments.example.yaml": true,
 	"docs/AGENT-API-V1.md": true, "docs/API.md": true, "docs/CONTRACT-REVIEW.md": true, "docs/INSTALL.md": true, "docs/SELF-UPGRADE-V1.md": true,
+	"docs/MONITORING-NETWORK-PROJECTION-V1.md": true,
 	"packaging/systemd/ppflight-agent.service": true, "packaging/systemd/ppflight-agent-upgrade.path": true, "packaging/systemd/ppflight-agent-upgrade.service": true,
+	"packaging/systemd/ppflight-host-firewall.service": true,
 	"packaging/systemd/ppflight-node-exporter.service": true, "packaging/systemd/ppflight-smartctl-exporter.service": true, "packaging/tmpfiles.d/ppflight-agent.conf": true,
-	"scripts/install.sh": true, "scripts/uninstall.sh": true, "scripts/create-pve-tokens.sh": true, "scripts/remove-pve-credentials.sh": true, "scripts/verify-template-bundle.py": true,
+	"scripts/install.sh": true, "scripts/quick-install.sh": true, "scripts/uninstall.sh": true, "scripts/create-pve-tokens.sh": true, "scripts/remove-pve-credentials.sh": true, "scripts/verify-template-bundle.py": true,
 	"bundles/ppflight-cloudinit/agent-vendor-manifest.v1.json": true, "bundles/ppflight-cloudinit/build-cloud-templates.sh": true,
 	"bundles/ppflight-cloudinit/tools/ppflight-template-bootstrap.py": true,
 	"bundles/ppflight-cloudinit/catalog/template-catalog.v1.json":     true, "bundles/ppflight-cloudinit/catalog/template-catalog.schema.json": true,

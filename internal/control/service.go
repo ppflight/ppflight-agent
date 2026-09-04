@@ -41,6 +41,7 @@ type UpgradeResolution struct {
 	Status  string
 	Version string
 	Code    string
+	Error   *ExecutionError
 }
 
 // TaskResolution is intentionally a small PVE-neutral task view. Status is
@@ -638,8 +639,10 @@ func (s *Service) reconciledUpgradeReceipt(task SubmittedTask, result UpgradeRes
 			receipt.State, receipt.Code = "succeeded", "AGENT_UPGRADE_SUCCEEDED"
 		case "rolled_back":
 			receipt.State, receipt.Code = "failed", "AGENT_UPGRADE_ROLLED_BACK"
+			receipt.Error = result.Error
 		case "failed":
 			receipt.State, receipt.Code = "failed", "AGENT_UPGRADE_FAILED"
+			receipt.Error = result.Error
 		default:
 			receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_STATUS_INDETERMINATE"
 		}

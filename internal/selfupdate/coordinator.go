@@ -3,6 +3,7 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -16,7 +17,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/control"
@@ -27,6 +30,8 @@ import (
 )
 
 const requestSchema = 1
+
+var resultErrorStageRE = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,127}$`)
 
 type Config struct {
 	StateDirectory  string
@@ -53,12 +58,13 @@ type Request struct {
 }
 
 type Result struct {
-	SchemaVersion int       `json:"schemaVersion"`
-	UpgradeID     string    `json:"upgradeId"`
-	Status        string    `json:"status"`
-	Version       string    `json:"version,omitempty"`
-	Code          string    `json:"code"`
-	FinishedAt    time.Time `json:"finishedAt"`
+	SchemaVersion int                     `json:"schemaVersion"`
+	UpgradeID     string                  `json:"upgradeId"`
+	Status        string                  `json:"status"`
+	Version       string                  `json:"version,omitempty"`
+	Code          string                  `json:"code"`
+	Error         *control.ExecutionError `json:"error,omitempty"`
+	FinishedAt    time.Time               `json:"finishedAt"`
 }
 
 func New(cfg Config) (*Coordinator, error) {
@@ -183,7 +189,9 @@ func (c *Coordinator) ResolveUpgrade(_ context.Context, upgradeID string) (contr
 		return control.UpgradeResolution{}, errors.New("upgrade result is unavailable")
 	}
 	var result Result
-	if err := json.Unmarshal(body, &result); err != nil || result.SchemaVersion != requestSchema || result.UpgradeID != upgradeID || result.FinishedAt.IsZero() {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&result); err != nil || decoder.Decode(&struct{}{}) != io.EOF || result.SchemaVersion != requestSchema || result.UpgradeID != upgradeID || result.FinishedAt.IsZero() || !validResultError(result.Error) {
 		return control.UpgradeResolution{}, errors.New("upgrade result is invalid")
 	}
 	switch result.Status {
@@ -191,7 +199,16 @@ func (c *Coordinator) ResolveUpgrade(_ context.Context, upgradeID string) (contr
 	default:
 		return control.UpgradeResolution{}, errors.New("upgrade result status is invalid")
 	}
-	return control.UpgradeResolution{Status: result.Status, Version: result.Version, Code: result.Code}, nil
+	return control.UpgradeResolution{Status: result.Status, Version: result.Version, Code: result.Code, Error: result.Error}, nil
+}
+
+func validResultError(value *control.ExecutionError) bool {
+	if value == nil {
+		return true
+	}
+	return value.Source == "agent" && resultErrorStageRE.MatchString(value.Stage) && value.Method == "" && value.Path == "" && value.HTTPStatus == 0 &&
+		strings.TrimSpace(value.Reason) == value.Reason && value.Reason != "" && len(value.Reason) <= 512 &&
+		!strings.ContainsAny(value.Reason, "\x00\r\n")
 }
 
 func (c *Coordinator) getExact(ctx context.Context, endpoint string, limit int64) ([]byte, error) {
