@@ -1149,7 +1149,7 @@ func TestExecutorFreezesPasswordResetWhenQGAUnavailableOrUnsupported(t *testing.
 		status           int
 	}{
 		{name: "agent stopped", status: http.StatusInternalServerError, info: `{"data":null}`, code: "QGA_UNAVAILABLE"},
-		{name: "command unsupported", status: http.StatusOK, info: `{"data":{"version":"9.0","supported_commands":[]}}`, code: "QGA_COMMAND_UNSUPPORTED"},
+		{name: "command unsupported", status: http.StatusOK, info: `{"data":{"result":{"version":"9.0","supported_commands":[]}}}`, code: "QGA_COMMAND_UNSUPPORTED"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			reads, writes := 0, 0

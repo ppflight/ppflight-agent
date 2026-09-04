@@ -175,13 +175,13 @@ func TestProbeGuestAgentReportsProgressForEveryBoundedSubrequest(t *testing.T) {
 	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/agent/info"):
-			fmt.Fprint(w, `{"data":{"version":"9.0","supported_commands":[{"name":"guest-get-osinfo","enabled":true},{"name":"guest-get-fsinfo","enabled":true},{"name":"guest-network-get-interfaces","enabled":true}]}}`)
+			fmt.Fprint(w, `{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-get-osinfo","enabled":true},{"name":"guest-get-fsinfo","enabled":true},{"name":"guest-network-get-interfaces","enabled":true}]}}}`)
 		case strings.HasSuffix(r.URL.Path, "/agent/get-osinfo"):
 			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 		case strings.HasSuffix(r.URL.Path, "/agent/get-fsinfo"):
-			fmt.Fprint(w, `{"data":[]}`)
+			fmt.Fprint(w, `{"data":{"result":[]}}`)
 		case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
-			fmt.Fprint(w, `{"data":[]}`)
+			fmt.Fprint(w, `{"data":{"result":[]}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -198,6 +198,57 @@ func TestProbeGuestAgentReportsProgressForEveryBoundedSubrequest(t *testing.T) {
 	}
 	if result.Availability["info"] != Available || result.Availability["os"] != Unavailable || result.Availability["filesystems"] != Available || result.Availability["interfaces"] != Available {
 		t.Fatalf("availability=%#v", result.Availability)
+	}
+	if result.Info == nil || result.Info.Version != "9.0" || len(result.Info.SupportedCommands) != 3 {
+		t.Fatalf("PVE result envelope was not decoded: info=%#v", result.Info)
+	}
+}
+
+func TestProbeGuestAgentDecodesPVECommandResultEnvelopes(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/agent/info"):
+			fmt.Fprint(w, `{"data":{"result":{"version":"8.2.0","supported_commands":[{"name":"guest-get-osinfo","enabled":true},{"name":"guest-get-fsinfo","enabled":true},{"name":"guest-network-get-interfaces","enabled":true},{"name":"guest-exec","enabled":true}]}}}`)
+		case strings.HasSuffix(r.URL.Path, "/agent/get-osinfo"):
+			fmt.Fprint(w, `{"data":{"result":{"name":"Ubuntu","version-id":"22.04","machine":"x86_64"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/agent/get-fsinfo"):
+			fmt.Fprint(w, `{"data":{"result":[{"name":"sda1","mountpoint":"/","type":"ext4","total-bytes":1024,"used-bytes":512}]}}`)
+		case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
+			fmt.Fprint(w, `{"data":{"result":[{"name":"eth0","hardware-address":"02:00:00:00:00:01","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"}]}]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	result, err := c.ProbeGuestAgent(context.Background(), "pve1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Info == nil || result.Info.Version != "8.2.0" || len(result.Info.SupportedCommands) != 4 {
+		t.Fatalf("info=%#v", result.Info)
+	}
+	if result.OS == nil || result.OS.VersionID != "22.04" || len(result.Filesystems) != 1 || len(result.Interfaces) != 1 {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestReadGuestTimezoneDecodesPVECommandResultEnvelope(t *testing.T) {
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/agent/get-timezone") {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data":{"result":{"zone":"Europe/Berlin","offset":7200}}}`)
+	}))
+	defer server.Close()
+
+	result, err := c.ReadGuestTimezone(context.Background(), "pve1", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Zone != "Europe/Berlin" || result.Offset != 7200 {
+		t.Fatalf("timezone=%#v", result)
 	}
 }
 

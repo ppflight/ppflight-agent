@@ -2,7 +2,9 @@ package pve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -84,8 +86,8 @@ func (c *Client) ProbeGuestAgent(ctx context.Context, node string, vmid int) (Gu
 	result := GuestAgentObservation{Availability: map[string]Availability{
 		"info": Unavailable, "os": Unavailable, "filesystems": Unavailable, "interfaces": Unavailable,
 	}}
-	var info GuestAgentInfo
-	if err := c.get(ctx, base+"/agent/info", nil, &info); err != nil {
+	info, err := c.GuestAgentInfo(ctx, node, vmid)
+	if err != nil {
 		// Agent absent and endpoint incompatibilities are normal states. Network
 		// failures are also deliberately contained here so a single VM cannot
 		// fail a node collection cycle.
@@ -95,23 +97,64 @@ func (c *Client) ProbeGuestAgent(ctx context.Context, node string, vmid int) (Gu
 	supported := supportedReadCommands(info)
 	if supported["guest-get-osinfo"] {
 		var v GuestOSInfo
-		if c.get(ctx, base+"/agent/get-osinfo", nil, &v) == nil {
+		if c.getGuestAgentResult(ctx, base+"/agent/get-osinfo", &v) == nil {
 			result.OS, result.Availability["os"] = &v, Available
 		}
 	}
 	if supported["guest-get-fsinfo"] {
 		var v []GuestFilesystem
-		if c.get(ctx, base+"/agent/get-fsinfo", nil, &v) == nil {
+		if c.getGuestAgentResult(ctx, base+"/agent/get-fsinfo", &v) == nil {
 			result.Filesystems, result.Availability["filesystems"] = v, Available
 		}
 	}
 	if supported["guest-network-get-interfaces"] {
 		var v []GuestInterface
-		if c.get(ctx, base+"/agent/network-get-interfaces", nil, &v) == nil {
+		if c.getGuestAgentResult(ctx, base+"/agent/network-get-interfaces", &v) == nil {
 			result.Interfaces, result.Availability["interfaces"] = v, Available
 		}
 	}
 	return result, nil
+}
+
+// GuestAgentInfo reads the QGA command inventory through PVE's documented
+// agent endpoint. PVE wraps every guest-agent command result inside
+// {"result": ...} within its ordinary {"data": ...} API envelope.
+func (c *Client) GuestAgentInfo(ctx context.Context, node string, vmid int) (GuestAgentInfo, error) {
+	base, err := guestPath("qemu", node, vmid)
+	if err != nil {
+		return GuestAgentInfo{}, err
+	}
+	var info GuestAgentInfo
+	if err := c.getGuestAgentResult(ctx, base+"/agent/info", &info); err != nil {
+		return GuestAgentInfo{}, err
+	}
+	return info, nil
+}
+
+// getGuestAgentResult removes PVE's command-specific result envelope after
+// the Client has already removed the top-level data envelope. Direct values
+// remain accepted for older PVE-compatible fixtures and proxies.
+func (c *Client) getGuestAgentResult(ctx context.Context, apiPath string, out any) error {
+	var raw json.RawMessage
+	if err := c.get(ctx, apiPath, nil, &raw); err != nil {
+		return err
+	}
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Result) > 0 {
+		if string(envelope.Result) == "null" {
+			return fmt.Errorf("PVE guest-agent response %s has no result", apiPath)
+		}
+		if err := json.Unmarshal(envelope.Result, out); err != nil {
+			return fmt.Errorf("decode PVE guest-agent result: %w", err)
+		}
+		return nil
+	}
+	if err := json.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("decode PVE guest-agent data: %w", err)
+	}
+	return nil
 }
 
 // ReadGuestTimezone uses QGA's fixed read-only guest-get-timezone command.
@@ -121,16 +164,9 @@ func (c *Client) ReadGuestTimezone(ctx context.Context, node string, vmid int) (
 	if err != nil {
 		return GuestTimezone{}, err
 	}
-	var response struct {
-		GuestTimezone
-		Result *GuestTimezone `json:"result,omitempty"`
-	}
-	if err := c.get(ctx, base+"/agent/get-timezone", nil, &response); err != nil {
+	var result GuestTimezone
+	if err := c.getGuestAgentResult(ctx, base+"/agent/get-timezone", &result); err != nil {
 		return GuestTimezone{}, err
-	}
-	result := response.GuestTimezone
-	if response.Result != nil {
-		result = *response.Result
 	}
 	if strings.TrimSpace(result.Zone) == "" {
 		return GuestTimezone{}, errors.New("QGA timezone response is missing zone")

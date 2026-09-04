@@ -559,9 +559,7 @@ func (c pveGuestCapabilityChecker) GuestAgentCommand(ctx context.Context, nodeRe
 	if c.client == nil || !nodeRE.MatchString(nodeRef) || vmid < 1 {
 		return GuestCapabilityUnavailable, nil
 	}
-	var info pve.GuestAgentInfo
-	path := fmt.Sprintf("/nodes/%s/qemu/%d/agent/info", nodeRef, vmid)
-	err := c.client.Do(ctx, http.MethodGet, path, nil, nil, &info)
+	info, err := c.client.GuestAgentInfo(ctx, nodeRef, vmid)
 	if err != nil {
 		return GuestCapabilityUnavailable, err
 	}
