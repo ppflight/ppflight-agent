@@ -94,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "27557eeb4498b718ce23a1a3de3c8d1500a7a04283e44bf58845534f6eeb52e0"
+	const expectedManifestSHA256 = "14d0870708736912f176c78bcd9995e2141317b10c385a07b9693ce65d7e2fe0"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -127,10 +127,13 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 	for _, required := range []string{
 		`--sockets 1 \`,
 		`grep -qx 'sockets: 1' <<< "$config"`,
+		`template_needs_tcg_customization()`,
+		`template_needs_tcg_customization "$template_name"`,
 		`LIBGUESTFS_BACKEND_SETTINGS=force_tcg`,
-		`virt-customize --format qcow2 --network -a "$prepared"`,
+		`unset LIBGUESTFS_BACKEND_SETTINGS`,
+		`run_virt_customize "$use_tcg" --format qcow2 --network -a "$prepared"`,
 		`--install "$QGA_PACKAGE"`,
-		`virt-customize --format qcow2 --no-network -a "$prepared"`,
+		`run_virt_customize "$use_tcg" --format qcow2 --no-network -a "$prepared"`,
 		`dpkg-query -W -f='${db:Status-Status}' qemu-guest-agent`,
 		`rpm -q --quiet qemu-guest-agent`,
 		`systemctl is-enabled qemu-guest-agent.service`,
@@ -144,8 +147,11 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 			t.Fatalf("template builder is missing the frozen socket baseline check %q", required)
 		}
 	}
-	if count := strings.Count(script, `LIBGUESTFS_BACKEND_SETTINGS=force_tcg`); count != 2 {
-		t.Fatalf("template builder must force TCG for both QGA installation and verification, got %d invocations", count)
+	if count := strings.Count(script, `run_virt_customize "$use_tcg"`); count != 2 {
+		t.Fatalf("template builder must use the same selected backend for QGA installation and verification, got %d invocations", count)
+	}
+	if count := strings.Count(script, `export LIBGUESTFS_BACKEND_SETTINGS=force_tcg`); count != 1 {
+		t.Fatalf("template builder must isolate its conditional TCG setting in one wrapper, got %d exports", count)
 	}
 	for _, forbidden := range []string{
 		"  - qemu-guest-agent\n",

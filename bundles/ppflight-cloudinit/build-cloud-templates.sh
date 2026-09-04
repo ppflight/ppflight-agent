@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.3.2"
+readonly SCRIPT_VERSION="3.3.3"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -286,6 +286,43 @@ report_host_cpu_compatibility() {
     log "Host CPU satisfies $level for $template_name"
   fi
 }
+
+host_cpu_has_flags() {
+  local flags flag
+  flags=" $(awk -F: '/^flags[[:space:]]*:/ {print $2; exit}' /proc/cpuinfo) "
+  [[ "$flags" != "  " ]] || return 1
+  for flag in "$@"; do
+    [[ "$flags" == *" $flag "* ]] || return 1
+  done
+}
+
+template_needs_tcg_customization() {
+  local template_name="$1"
+  case "$template_name" in
+    centos-stream-9)
+      ! host_cpu_has_flags cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2
+      ;;
+    centos-stream-10)
+      ! host_cpu_has_flags \
+        cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 \
+        avx avx2 bmi1 bmi2 f16c fma abm movbe xsave
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+run_virt_customize() (
+  local use_tcg="$1"
+  shift
+  if [[ "$use_tcg" == "1" ]]; then
+    export LIBGUESTFS_BACKEND_SETTINGS=force_tcg
+  else
+    # Do not let an operator shell accidentally force every ordinary image
+    # down the slow software-emulation path.
+    unset LIBGUESTFS_BACKEND_SETTINGS
+  fi
+  exec virt-customize "$@"
+)
 
 preflight_selected_cpu_levels() {
   local row _vmid name
@@ -802,7 +839,7 @@ SH
 }
 
 prepare_image_with_qga() {
-  local source="$1" vmid="$2" prepared
+  local source="$1" vmid="$2" template_name="$3" prepared use_tcg=0
   [[ -s "$source" ]] || die "source image is missing before QGA preparation: $source"
   prepared="$(mktemp "$CACHE_DIR/.ppflight-qga-${vmid}.XXXXXX.qcow2")"
   # mktemp creates the path securely, while qemu-img requires a non-existent
@@ -815,15 +852,18 @@ prepare_image_with_qga() {
   qemu-img convert -p -f qcow2 -O qcow2 "$source" "$prepared"
   qemu-img check "$prepared" >/dev/null || die "prepared QGA image is invalid for template $vmid"
 
-  # --network is necessary only for the distribution package manager. The
-  # catalog covers Ubuntu/Debian and RHEL-family GenericCloud images, whose
-  # package name and systemd unit are intentionally the same. Always force the
-  # libguestfs appliance through QEMU TCG: unlike KVM's `-cpu host`, TCG uses an
-  # emulated maximum CPU and can therefore execute x86-64-v2/v3 guest package
-  # tools even when the physical PVE test host lacks SSSE3/AVX2. This is slower
-  # but makes all seven immutable-image builds independent of host CPU flags.
-  LIBGUESTFS_BACKEND_SETTINGS=force_tcg \
-    virt-customize --format qcow2 --network -a "$prepared" \
+  # --network is necessary only for the distribution package manager. Use
+  # KVM for ordinary images. If this host cannot execute CentOS Stream's
+  # x86-64-v2/v3 userspace, use QEMU TCG (`-cpu max`) only for that image. This
+  # preserves complete offline package/service verification without making
+  # Ubuntu, Debian and AlmaLinux pay the software-emulation cost.
+  if template_needs_tcg_customization "$template_name"; then
+    use_tcg=1
+    log "Using QEMU TCG CPU emulation for $template_name offline customization"
+  else
+    log "Using hardware-accelerated offline customization for $template_name"
+  fi
+  run_virt_customize "$use_tcg" --format qcow2 --network -a "$prepared" \
     --install "$QGA_PACKAGE" \
     --run-command "$(qga_activate_service_command)" \
     --run-command "install -d -m 0755 /etc/ppflight && printf '%s\\n' '$QGA_MARKER_VALUE' > '$QGA_MARKER_PATH'" \
@@ -832,8 +872,7 @@ prepare_image_with_qga() {
   # Reopen the modified disk without a network, so successful eligibility is
   # based on the actual immutable filesystem state and not on a deferred
   # cloud-init package task or a PVE-side agent device setting.
-  LIBGUESTFS_BACKEND_SETTINGS=force_tcg \
-    virt-customize --format qcow2 --no-network -a "$prepared" \
+  run_virt_customize "$use_tcg" --format qcow2 --no-network -a "$prepared" \
     --run-command "$(qga_verify_command)" \
     || die "QGA package/service verification failed for template $vmid"
 
@@ -842,10 +881,10 @@ prepare_image_with_qga() {
 }
 
 prepare_selected_images_with_qga() {
-  local row vmid _name image
+  local row vmid name image
   for row in "${SELECTED_ROWS[@]}"; do
-    IFS='|' read -r vmid _name image _ <<< "$row"
-    prepare_image_with_qga "$CACHE_DIR/$image" "$vmid"
+    IFS='|' read -r vmid name image _ <<< "$row"
+    prepare_image_with_qga "$CACHE_DIR/$image" "$vmid" "$name"
   done
 }
 
