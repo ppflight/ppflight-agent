@@ -2730,16 +2730,21 @@ func mergeIP(old string, p networkP) (string, error) {
 			out = append(out, key+"="+value)
 		}
 	}
-	if p.IPv4 != nil {
+	// The signed network contract uses an empty string to mean that an
+	// address family (or its gateway) must be absent.  PVE does not accept
+	// empty sub-properties such as `ip6=` in an ipconfigN value, so removing
+	// the old property above is sufficient; only non-empty replacements are
+	// serialized back into the PVE form.
+	if p.IPv4 != nil && *p.IPv4 != "" {
 		out = append(out, "ip="+*p.IPv4)
 	}
-	if p.IPv6 != nil {
+	if p.IPv6 != nil && *p.IPv6 != "" {
 		out = append(out, "ip6="+*p.IPv6)
 	}
-	if p.Gateway4 != nil {
+	if p.Gateway4 != nil && *p.Gateway4 != "" {
 		out = append(out, "gw="+*p.Gateway4)
 	}
-	if p.Gateway6 != nil {
+	if p.Gateway6 != nil && *p.Gateway6 != "" {
 		out = append(out, "gw6="+*p.Gateway6)
 	}
 	return strings.Join(out, ","), nil

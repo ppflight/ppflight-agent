@@ -202,6 +202,42 @@ func TestExecutorResourceAndNetworkUseConfigDigest(t *testing.T) {
 	}
 }
 
+func TestSetNetworkRemovesEmptyQEMUIPConfigFields(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		switch requests {
+		case 1:
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+				t.Fatalf("config request: %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`{"data":{"digest":"d1","net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=0","ipconfig0":"ip=192.0.2.10/24,gw=192.0.2.1,ip6=manual,gw6=2001:db8::1"}}`))
+		case 2:
+			if r.Method != http.MethodPut || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+				t.Fatalf("network request: %s %s", r.Method, r.URL.Path)
+			}
+			_ = r.ParseForm()
+			if got := r.Form.Get("ipconfig0"); got != "ip=192.0.2.10/24,gw=192.0.2.1" {
+				t.Fatalf("empty address-family fields reached PVE: %q", got)
+			}
+			if r.Form.Get("digest") != "d1" {
+				t.Fatalf("network digest: %q", r.Form.Get("digest"))
+			}
+			_, _ = w.Write([]byte(`{"data":null}`))
+		}
+	}))
+	defer server.Close()
+
+	client := controlTestClient(t, server)
+	command := controlCommand("vm.set-network", "qemu", `{"interface":"net0","firewall":true,"ipv4":"192.0.2.10/24","ipv6":"","gateway4":"192.0.2.1","gateway6":""}`)
+	if _, _, err := executePVE(context.Background(), client, command); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests=%d", requests)
+	}
+}
+
 func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	t.Run("absolute disk growth and IO policy", func(t *testing.T) {
 		requests := 0
