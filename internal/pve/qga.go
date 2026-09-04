@@ -59,6 +59,8 @@ type GuestInterfaceStats struct {
 	TxPackets *uint64 `json:"tx-packets,omitempty"`
 }
 type GuestTimezone struct {
+	// Zone is QGA's current timezone abbreviation (for example PDT), not the
+	// configured IANA location name (for example America/Los_Angeles).
 	Zone   string `json:"zone"`
 	Offset int64  `json:"offset"`
 }
@@ -160,7 +162,9 @@ func (c *Client) getGuestAgentResult(ctx context.Context, apiPath string, out an
 }
 
 // ReadGuestTimezone uses QGA's fixed read-only guest-get-timezone command.
-// It never invokes guest-exec and returns only the typed zone/offset fields.
+// It never invokes guest-exec and returns only QGA's typed abbreviation and
+// UTC-offset fields. Callers that start from an IANA location must compare
+// both fields against that location at the observation instant.
 func (c *Client) ReadGuestTimezone(ctx context.Context, node string, vmid int) (GuestTimezone, error) {
 	base, err := guestPath("qemu", node, vmid)
 	if err != nil {

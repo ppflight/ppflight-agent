@@ -341,7 +341,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"Asia/Shanghai","offset":28800}}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"CST","offset":28800}}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -366,7 +366,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				}
 				_, _ = w.Write([]byte(`{"data":{"result":{"exited":true,"exitcode":0}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"America/Los_Angeles","offset":-25200}}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"PDT","offset":-25200}}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -428,6 +428,50 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 			t.Fatalf("receipt=%#v err=%v infoReads=%d", receipt, err, infoReads)
 		}
 	})
+}
+
+func TestGuestTimezoneMatchesQGAAbbreviationAndOffset(t *testing.T) {
+	tests := []struct {
+		name     string
+		observed pve.GuestTimezone
+		expected string
+		at       time.Time
+		match    bool
+	}{
+		{
+			name:     "Los Angeles summer",
+			observed: pve.GuestTimezone{Zone: "PDT", Offset: -7 * 60 * 60},
+			expected: "America/Los_Angeles",
+			at:       time.Date(2026, 9, 4, 9, 50, 0, 0, time.UTC),
+			match:    true,
+		},
+		{
+			name:     "Los Angeles winter",
+			observed: pve.GuestTimezone{Zone: "PST", Offset: -8 * 60 * 60},
+			expected: "America/Los_Angeles",
+			at:       time.Date(2026, 1, 4, 9, 50, 0, 0, time.UTC),
+			match:    true,
+		},
+		{
+			name:     "abbreviation without matching offset",
+			observed: pve.GuestTimezone{Zone: "PDT", Offset: -8 * 60 * 60},
+			expected: "America/Los_Angeles",
+			at:       time.Date(2026, 9, 4, 9, 50, 0, 0, time.UTC),
+		},
+		{
+			name:     "offset without matching abbreviation",
+			observed: pve.GuestTimezone{Zone: "MST", Offset: -7 * 60 * 60},
+			expected: "America/Los_Angeles",
+			at:       time.Date(2026, 9, 4, 9, 50, 0, 0, time.UTC),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := guestTimezoneMatches(tt.observed, tt.expected, tt.at); got != tt.match {
+				t.Fatalf("guestTimezoneMatches(%#v, %q, %s)=%t, want %t", tt.observed, tt.expected, tt.at, got, tt.match)
+			}
+		})
+	}
 }
 
 func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {

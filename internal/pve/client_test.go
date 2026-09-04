@@ -239,7 +239,7 @@ func TestReadGuestTimezoneDecodesPVECommandResultEnvelope(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprint(w, `{"data":{"result":{"zone":"Europe/Berlin","offset":7200}}}`)
+		fmt.Fprint(w, `{"data":{"result":{"zone":"CEST","offset":7200}}}`)
 	}))
 	defer server.Close()
 
@@ -247,7 +247,7 @@ func TestReadGuestTimezoneDecodesPVECommandResultEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Zone != "Europe/Berlin" || result.Offset != 7200 {
+	if result.Zone != "CEST" || result.Offset != 7200 {
 		t.Fatalf("timezone=%#v", result)
 	}
 }

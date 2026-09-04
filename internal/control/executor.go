@@ -1687,7 +1687,7 @@ func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base stri
 				return "", nil, errors.New("guest timezone command failed")
 			}
 			observed, readErr := c.ReadGuestTimezone(ctx, cmd.Identity.NodeRef, cmd.Identity.VMID)
-			if readErr != nil || observed.Zone != p.Timezone {
+			if readErr != nil || !guestTimezoneMatches(observed, p.Timezone, time.Now().UTC()) {
 				return "", nil, errors.New("guest timezone readback does not match")
 			}
 			result, _ := json.Marshal(map[string]any{"configured": true, "verified": true})
@@ -1880,6 +1880,28 @@ func validTimezone(value string) bool {
 	_, err := time.LoadLocation(value)
 	return err == nil
 }
+
+// guestTimezoneMatches translates the configured IANA location into the
+// abbreviation and UTC offset that QGA actually returns. QGA guest-get-timezone
+// does not return the configured IANA name: a Linux guest configured for
+// America/Los_Angeles reports PDT/-25200 in summer and PST/-28800 in winter.
+// Both values are required so a shared abbreviation or offset alone cannot
+// prove a match. The one-minute boundary allowance covers a DST transition
+// occurring between the guest observation and this local comparison.
+func guestTimezoneMatches(observed pve.GuestTimezone, expected string, observedAt time.Time) bool {
+	location, err := time.LoadLocation(expected)
+	if err != nil || observedAt.IsZero() || strings.TrimSpace(observed.Zone) != observed.Zone {
+		return false
+	}
+	for _, delta := range []time.Duration{0, -time.Minute, time.Minute} {
+		name, offset := observedAt.Add(delta).In(location).Zone()
+		if observed.Zone == name && observed.Offset == int64(offset) {
+			return true
+		}
+	}
+	return false
+}
+
 func validDelivery(p deliveryP) bool {
 	e := p.Expected
 	if p.NotBefore.IsZero() || p.NotBefore.Location() != time.UTC || e.Cores < 1 || e.Cores > 128 || e.Sockets < 1 || e.Sockets > 16 || e.MemoryMiB < 128 || e.MemoryMiB > 4194304 || !diskRE.MatchString(e.Disk.Interface) || e.Disk.MinimumGiB < 1 || e.Disk.MinimumGiB > 1048576 || !validTimezone(e.Timezone) || len(e.Networks) < 1 || len(e.Networks) > 8 {
@@ -2169,7 +2191,7 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 		}
 	}
 	timezone, err := client.ReadGuestTimezone(ctx, command.Identity.NodeRef, command.Identity.VMID)
-	if err != nil || timezone.Zone != p.Expected.Timezone {
+	if err != nil || !guestTimezoneMatches(timezone, p.Expected.Timezone, time.Now().UTC()) {
 		return nil, errors.New("guest timezone does not match delivery contract")
 	}
 	// The frozen cross-language receipt contract uses whole-second UTC. Keep
