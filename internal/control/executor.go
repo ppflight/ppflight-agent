@@ -36,8 +36,10 @@ const maxControlResultBytes = 1 << 20
 const maxJSONDepth = 64
 
 const (
-	defaultQGABootWait     = 60 * time.Second
-	defaultQGAPollInterval = 2 * time.Second
+	defaultQGABootWait           = 60 * time.Second
+	defaultQGAPollInterval       = 2 * time.Second
+	defaultReinstallReadyWait    = 10 * time.Minute
+	defaultReinstallPollInterval = 2 * time.Second
 )
 
 var (
@@ -66,11 +68,16 @@ type Executor struct {
 	// unavailable for a short period even though the device and package are
 	// correctly configured. Other interactive QGA actions still fail closed
 	// immediately when the capability is unavailable.
-	QGABootWait         time.Duration
-	QGAPollInterval     time.Duration
-	Mode                string
-	ProductionExecution bool
-	UpgradeSubmitter    UpgradeSubmitter
+	QGABootWait     time.Duration
+	QGAPollInterval time.Duration
+	// ReinstallReadyWait and ReinstallPollInterval bound the post-boot window
+	// in which an atomic reinstall waits for QGA, guest networking, timezone,
+	// and OS identity to become observable before deciding to compensate.
+	ReinstallReadyWait    time.Duration
+	ReinstallPollInterval time.Duration
+	Mode                  string
+	ProductionExecution   bool
+	UpgradeSubmitter      UpgradeSubmitter
 	// InitialResources authorizes the one-time exception to the normal
 	// grow-only resource policy from durable clone lineage. Production never
 	// trusts a caller-provided "new VM" boolean.
@@ -479,7 +486,10 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 			return finish(ErrQGAUnavailable)
 		}
 	}
-	upid, result, err := executePVE(ctx, e.Client, command)
+	upid, result, err := executePVEWithOptions(ctx, e.Client, command, pveExecutionOptions{
+		reinstallReadyWait:    e.ReinstallReadyWait,
+		reinstallPollInterval: e.ReinstallPollInterval,
+	})
 	r.PVETaskUPID, r.FinishedAt = upid, time.Now().UTC()
 	if err != nil {
 		var httpErr *pve.HTTPError
@@ -1216,10 +1226,22 @@ func validDiscoveryPhase(phase string) bool {
 	}
 }
 
+type pveExecutionOptions struct {
+	reinstallReadyWait    time.Duration
+	reinstallPollInterval time.Duration
+}
+
+type pveExecutionOptionsContextKey struct{}
+
+func executePVEWithOptions(ctx context.Context, client *pve.Client, c Command, options pveExecutionOptions) (string, json.RawMessage, error) {
+	return executePVE(context.WithValue(ctx, pveExecutionOptionsContextKey{}, options), client, c)
+}
+
 func executePVE(ctx context.Context, client *pve.Client, c Command) (string, json.RawMessage, error) {
 	if err := validateParameters(c); err != nil {
 		return "", nil, err
 	}
+	options, _ := ctx.Value(pveExecutionOptionsContextKey{}).(pveExecutionOptions)
 	base := fmt.Sprintf("/nodes/%s/%s/%d", c.Identity.NodeRef, c.Identity.GuestType, c.Identity.VMID)
 	node := "/nodes/" + c.Identity.NodeRef
 	var method, path string
@@ -1261,7 +1283,7 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	case "vm.cloud-init-snippet.delete":
 		return "", nil, errors.New("Cloud-Init snippet deletion requires durable journal dispatch")
 	case "vm.reinstall":
-		return reinstallGuest(ctx, client, c)
+		return reinstallGuest(ctx, client, c, options.reinstallReadyWait, options.reinstallPollInterval)
 	case "vm.console.create-session", "vm.console.revoke-session":
 		// Executor.Execute dispatches these through the ephemeral broker so
 		// console secrets can never enter the ordinary PVE result path.

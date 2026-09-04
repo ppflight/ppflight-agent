@@ -563,7 +563,7 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	return json.Marshal(publication)
 }
 
-func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (string, json.RawMessage, error) {
+func reinstallGuest(ctx context.Context, client *pve.Client, command Command, readyWait, pollInterval time.Duration) (string, json.RawMessage, error) {
 	var parameters reinstallP
 	_ = strictParameters(command.Parameters, &parameters)
 	resources, err := client.ClusterResources(ctx)
@@ -725,17 +725,7 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 	if err := waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef); err != nil {
 		return "", nil, compensate(err)
 	}
-	timezoneCommand := command
-	timezoneCommand.Parameters, _ = json.Marshal(timezoneP{Timezone: parameters.Expected.Timezone})
-	if _, _, err := setGuestTimezone(ctx, client, timezoneCommand, targetBase); err != nil {
-		return "", nil, compensate(err)
-	}
-	verifyCommand := command
-	verifyCommand.Parameters, _ = json.Marshal(deliveryP{NotBefore: parameters.NotBefore, Expected: parameters.Expected})
-	if _, err := verifyDelivery(ctx, client, verifyCommand); err != nil {
-		return "", nil, compensate(err)
-	}
-	if err := verifyReinstallOS(ctx, client, command, parameters.ExpectedOS); err != nil {
+	if err := waitForReinstallReadiness(ctx, client, command, targetBase, parameters, readyWait, pollInterval); err != nil {
 		return "", nil, compensate(err)
 	}
 	if err := waitMutation(http.MethodDelete, temporaryBase, url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"1"}}, command.Identity.NodeRef); err != nil {
@@ -743,6 +733,73 @@ func reinstallGuest(ctx context.Context, client *pve.Client, command Command) (s
 	}
 	result, _ := json.Marshal(map[string]any{"reinstalled": true, "verified": true, "templateRef": parameters.TemplateRef, "templateVersion": parameters.TemplateVersion, "templateConfigSha256": parameters.TemplateConfigSHA256, "vmGeneration": protocol.Counter(parameters.VMGeneration)})
 	return "", result, nil
+}
+
+func waitForReinstallReadiness(ctx context.Context, client *pve.Client, command Command, targetBase string, parameters reinstallP, readyWait, pollInterval time.Duration) error {
+	if readyWait == 0 {
+		readyWait = defaultReinstallReadyWait
+	}
+	if pollInterval <= 0 {
+		pollInterval = defaultReinstallPollInterval
+	}
+	timezoneCommand := command
+	timezoneCommand.Parameters, _ = json.Marshal(timezoneP{Timezone: parameters.Expected.Timezone})
+	verifyCommand := command
+	verifyCommand.Parameters, _ = json.Marshal(deliveryP{NotBefore: parameters.NotBefore, Expected: parameters.Expected})
+	timezoneVerified := false
+	verify := func() error {
+		if !timezoneVerified {
+			if _, _, err := setGuestTimezone(ctx, client, timezoneCommand, targetBase); err != nil {
+				return err
+			}
+			timezoneVerified = true
+		}
+		if _, err := verifyDelivery(ctx, client, verifyCommand); err != nil {
+			return err
+		}
+		return verifyReinstallOS(ctx, client, command, parameters.ExpectedOS)
+	}
+	lastErr := verify()
+	if lastErr == nil || readyWait < 0 || !reinstallReadinessRetryable(lastErr) {
+		return lastErr
+	}
+	timer := time.NewTimer(readyWait)
+	defer timer.Stop()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("reinstall readiness deadline exceeded: %w", lastErr)
+		case <-ticker.C:
+			lastErr = verify()
+			if lastErr == nil || !reinstallReadinessRetryable(lastErr) {
+				return lastErr
+			}
+		}
+	}
+}
+
+func reinstallReadinessRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *pve.HTTPError
+	if errors.As(err, &httpErr) && (httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "invalid pid") || strings.Contains(message, "invalid status") || strings.Contains(message, "timezone command failed") || strings.Contains(message, "os identity does not match") {
+		return false
+	}
+	switch deliveryFailureCheck(err) {
+	case "config_cores", "config_sockets", "config_memory", "disk_missing", "disk_size", "disk_io", "network_config", "firewall":
+		return false
+	default:
+		return true
+	}
 }
 
 func reinstallTargetPowerState(resources []pve.Resource, command Command) (bool, error) {

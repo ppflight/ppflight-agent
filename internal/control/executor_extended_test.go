@@ -434,6 +434,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	templateHash := fmt.Sprintf("%x", sha256.Sum256(canonical))
 	mutations := []string{}
 	targetStatus := "running"
+	timezoneAttempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			mutations = append(mutations, r.Method+" "+r.URL.Path)
@@ -444,6 +445,11 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 				targetStatus = "running"
 			}
 			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
+				timezoneAttempts++
+				if timezoneAttempts < 3 {
+					http.Error(w, "QGA is not running yet", http.StatusInternalServerError)
+					return
+				}
 				_, _ = w.Write([]byte(`{"data":17}`))
 				return
 			}
@@ -515,9 +521,12 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 	exact["networks"].([]any)[0].(map[string]any)["vlan"] = nil
 	raw, _ = json.Marshal(exact)
 	command := controlCommand("vm.reinstall", "qemu", string(raw))
-	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now())
+	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true, ReinstallReadyWait: 100 * time.Millisecond, ReinstallPollInterval: time.Millisecond}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"reinstalled":true`) || strings.Contains(string(receipt.Result), "fixture-secret") {
 		t.Fatalf("receipt=%#v mutations=%v err=%v", receipt, mutations, err)
+	}
+	if timezoneAttempts != 3 {
+		t.Fatalf("post-boot QGA was not retried: attempts=%d", timezoneAttempts)
 	}
 	wanted := []string{"POST /api2/json/nodes/pve1/qemu/101/status/shutdown", "POST /api2/json/nodes/pve1/qemu/101/clone", "DELETE /api2/json/nodes/pve1/qemu/101", "POST /api2/json/nodes/pve1/qemu/9001/clone", "DELETE /api2/json/nodes/pve1/qemu/800101"}
 	for _, expected := range wanted {
