@@ -1023,7 +1023,6 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 		{"firewall rule update", "firewall.rule.update", "qemu", `{"position":3,"direction":"out","action":"DROP","enable":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/rules/3", url.Values{"type": {"out"}, "action": {"DROP"}, "enable": {"1"}}},
 		{"ipset entry", "firewall.ipset.entry.create", "qemu", `{"name":"trusted","cidr":"10.0.0.0/24","noSubnet":false}`, http.MethodPost, "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted", url.Values{"cidr": {"10.0.0.0/24"}, "nomatch": {"0"}}},
 		{"ipset entry update", "firewall.ipset.entry.update", "qemu", `{"name":"trusted","cidr":"10.0.0.0/24","comment":"office","noSubnet":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted/10.0.0.0/24", url.Values{"comment": {"office"}, "nomatch": {"1"}}},
-		{"ipset entry delete", "firewall.ipset.entry.delete", "qemu", `{"name":"trusted","cidr":"10.0.0.0/24"}`, http.MethodDelete, "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted/10.0.0.0/24", nil},
 		{"ipset update", "firewall.ipset.update", "qemu", `{"name":"trusted","comment":"office"}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted", url.Values{"comment": {"office"}}},
 	}
 	for _, tt := range tests {
@@ -1051,6 +1050,61 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 			defer server.Close()
 			if _, _, err := executePVE(context.Background(), controlTestClient(t, server), controlCommand(tt.action, tt.guest, tt.parameters)); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFirewallIPSetEntryDeleteUsesEscapedCIDRAndRequiresAbsenceReadback(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		deleteStatus int
+		entries      string
+		wantError    bool
+	}{
+		{name: "deleted and absent", deleteStatus: http.StatusOK, entries: `[]`},
+		{name: "already absent is convergent", deleteStatus: http.StatusInternalServerError, entries: `[{"cidr":"10.0.0.1/32"}]`},
+		{name: "false success is rejected", deleteStatus: http.StatusOK, entries: `[{"cidr":"10.0.0.0/24"}]`, wantError: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			deletes, reads := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodDelete:
+					deletes++
+					if r.URL.Path != "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted/10.0.0.0/24" ||
+						!strings.Contains(r.URL.EscapedPath(), "10.0.0.0%2F24") ||
+						!strings.Contains(r.RequestURI, "10.0.0.0%2F24") {
+						t.Fatalf("unsafe delete URI: path=%q escaped=%q requestURI=%q", r.URL.Path, r.URL.EscapedPath(), r.RequestURI)
+					}
+					w.WriteHeader(tt.deleteStatus)
+					if tt.deleteStatus == http.StatusOK {
+						_, _ = w.Write([]byte(`{"data":null}`))
+					} else {
+						_, _ = w.Write([]byte(`{"data":null,"message":"entry does not exist"}`))
+					}
+				case http.MethodGet:
+					reads++
+					if r.URL.Path != "/api2/json/nodes/pve1/qemu/101/firewall/ipset/trusted" {
+						t.Fatalf("unexpected readback path: %s", r.URL.Path)
+					}
+					_, _ = w.Write([]byte(`{"data":` + tt.entries + `}`))
+				default:
+					t.Fatalf("unexpected method: %s", r.Method)
+				}
+			}))
+			defer server.Close()
+
+			_, _, err := executePVE(
+				context.Background(),
+				controlTestClient(t, server),
+				controlCommand("firewall.ipset.entry.delete", "qemu", `{"name":"trusted","cidr":"10.0.0.0/24"}`),
+			)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("err=%v wantError=%t", err, tt.wantError)
+			}
+			if deletes != 1 || reads != 1 {
+				t.Fatalf("deletes=%d reads=%d", deletes, reads)
 			}
 		})
 	}

@@ -100,6 +100,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.40` 将 cloud-init 的退出状态只作为“初始化已结束”信号：退出码 0、1、2 都会进入后续严格交付证明，其他异常退出码仍拒绝。即使 cloud-init 返回 1，替换实例也必须逐项通过时区、OS、QGA、CPU/内存/磁盘、双网卡地址和防火墙的全部签名回验，否则安全回滚原实例。Agent 会记录不含 guest 输出和密钥的重装验证阶段、cloud-init 退出码及最终真实失败原因。
 
+`0.1.1-rc.41` 修复 PVE IPFilter 条目删除的真实 API 路径和回验边界：CIDR 中的 `/` 始终作为同一个 URL 路径段转义；每次删除后必须再次读取该 IPSet 并证明目标条目确实不存在。PVE 返回错误但条目早已不存在时按幂等成功收敛；PVE 返回成功但条目仍存在、或删除后无法读取时明确失败，不再产生“删除成功、后续验证不一致”的虚假成功。
+
 ## NIC 角色、IP、网络与防盗用
 
 `vm.set-network` 只更新既有 `net0`..`net31`，支持固定 MAC、bridge、VLAN tag、MTU、NIC firewall、rate、IPv4/IPv6 和 gateway。QEMU 的 IP 字段写入对应 `ipconfigN`；LXC 写入 `netN`。QEMU Cloud-Init 配置写入不等于客户系统已经实时换 IP，官网必须在同一 `operationId` 中完成状态等待和回读后再提交 IPAM。

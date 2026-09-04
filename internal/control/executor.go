@@ -1478,7 +1478,7 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	case "firewall.ipset.entry.delete":
 		var p ipsetEntryDeleteP
 		_ = strictParameters(c.Parameters, &p)
-		method, path = http.MethodDelete, base+"/firewall/ipset/"+p.Name+"/"+p.CIDR
+		return deleteFirewallIPSetEntry(ctx, client, c, p)
 	default:
 		return "", nil, ErrUnsupported
 	}
@@ -1493,6 +1493,52 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		}
 	}
 	return upid, result, err
+}
+
+func deleteFirewallIPSetEntry(ctx context.Context, client *pve.Client, command Command, parameters ipsetEntryDeleteP) (string, json.RawMessage, error) {
+	ref := pve.FirewallRef{
+		Node: command.Identity.NodeRef,
+		Kind: command.Identity.GuestType,
+		VMID: command.Identity.VMID,
+	}
+	var result json.RawMessage
+	deleteErr := client.DeleteFirewallIPSetEntry(ctx, ref, parameters.Name, parameters.CIDR, &result)
+	absent, readErr := firewallIPSetEntryAbsent(ctx, client, ref, parameters.Name, parameters.CIDR)
+	if readErr != nil {
+		if deleteErr != nil {
+			return "", nil, deleteErr
+		}
+
+		return "", nil, errors.New("firewall IP-set deletion readback failed")
+	}
+	if !absent {
+		return "", nil, errors.New("firewall IP-set deletion was not reflected by PVE")
+	}
+	// Deletion is convergent. A provider error is harmless only after an
+	// independent bounded read proves that the exact target is already absent.
+	if len(result) > 4096 {
+		result = nil
+	}
+	return "", result, nil
+}
+
+func firewallIPSetEntryAbsent(ctx context.Context, client *pve.Client, ref pve.FirewallRef, name, cidr string) (bool, error) {
+	expected, ok := canonicalFirewallCIDR(cidr)
+	if !ok {
+		return false, errors.New("invalid firewall IP-set deletion target")
+	}
+	entries, err := client.FirewallIPSetEntries(ctx, ref, name)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		actual, valid := canonicalFirewallCIDR(entry.CIDR)
+		if valid && actual == expected {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func vmDeleteTargetAlreadyAbsent(command Command, httpErr *pve.HTTPError) bool {

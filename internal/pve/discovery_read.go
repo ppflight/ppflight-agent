@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
@@ -466,6 +468,33 @@ func (c *Client) FirewallIPSetEntries(ctx context.Context, ref FirewallRef, name
 	var result []FirewallIPSetEntry
 	err = c.get(ctx, base+"/ipset/"+part, nil, &result)
 	return result, err
+}
+
+// DeleteFirewallIPSetEntry deletes one validated CIDR as a single escaped PVE
+// path segment. A CIDR contains '/', so routing it through the generic Do
+// method would turn the prefix into another URL segment and can reach a
+// different API route while still returning a syntactically successful JSON
+// envelope.
+func (c *Client) DeleteFirewallIPSetEntry(ctx context.Context, ref FirewallRef, name, cidr string, out any) error {
+	base, err := firewallBase(ref)
+	if err != nil {
+		return err
+	}
+	part, err := segment(name)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cidr) != cidr || strings.ContainsAny(cidr, "%\\\x00\r\n") {
+		return errors.New("invalid firewall IP-set CIDR")
+	}
+	ip, network, err := net.ParseCIDR(cidr)
+	if err != nil || ip == nil || network == nil {
+		return errors.New("invalid firewall IP-set CIDR")
+	}
+	decodedPath := base + "/ipset/" + part + "/" + cidr
+	escapedPath := base + "/ipset/" + url.PathEscape(part) + "/" + url.PathEscape(cidr)
+
+	return c.do(ctx, http.MethodDelete, decodedPath, escapedPath, nil, nil, out)
 }
 
 func firewallBase(ref FirewallRef) (string, error) {
