@@ -24,10 +24,19 @@ SPEC.loader.exec_module(BOOTSTRAP)
 
 
 class FakeRunner:
-    def __init__(self, cluster_status=None, available_bytes=9876543210, missing_links=None):
+    def __init__(
+        self,
+        cluster_status=None,
+        available_bytes=9876543210,
+        missing_links=None,
+        cluster_resources=None,
+        qm_configs=None,
+    ):
         self.calls = []
         self.available_bytes = available_bytes
         self.missing_links = set(missing_links or [])
+        self.cluster_resources = list(cluster_resources or [])
+        self.qm_configs = dict(qm_configs or {})
         self.cluster_status = cluster_status or [
             {"type": "cluster", "name": "lab"},
             {"type": "node", "name": "pve-a", "local": 1},
@@ -58,7 +67,7 @@ class FakeRunner:
                 }
             ]
         if call == ("pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"):
-            return []
+            return self.cluster_resources
         raise AssertionError(f"unexpected JSON command: {call!r}")
 
     def run(self, argv, check=True, timeout=120):
@@ -75,6 +84,11 @@ class FakeRunner:
             if call[4] in self.missing_links:
                 return subprocess.CompletedProcess(call, 1, "", "not found")
             return subprocess.CompletedProcess(call, 0, "", "")
+        if call[:2] == ("qm", "config") and len(call) == 3:
+            config = self.qm_configs.get(int(call[2]))
+            if config is None:
+                return subprocess.CompletedProcess(call, 2, "", "configuration not found")
+            return subprocess.CompletedProcess(call, 0, config, "")
         raise AssertionError(f"unexpected command: {call!r}")
 
 
@@ -319,6 +333,72 @@ class DualBridgeRequestTest(unittest.TestCase):
             "/usr/bin/bash",
             [call[0] for call in runner.calls],
         )
+
+    def test_plan_safely_replaces_exact_managed_template(self):
+        runner = FakeRunner(
+            available_bytes=100_000_000_000,
+            cluster_resources=[{"vmid": 9001, "name": "ubuntu-2404", "type": "qemu"}],
+            qm_configs={
+                9001: (
+                    "name: ubuntu-2404\n"
+                    "template: 1\n"
+                    "tags: ppflight-cloudinit\n"
+                    "scsi0: local-zfs:base-9001-disk-0\n"
+                )
+            },
+        )
+
+        plan = BOOTSTRAP.prepare_plan(
+            self._arguments(items="ubuntu-2404"),
+            BOOTSTRAP.load_catalog(),
+            runner,
+        )
+
+        self.assertTrue(plan["executable"])
+        self.assertEqual(plan["state"], "ready")
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual(plan["items"][0]["state"], "planned")
+        self.assertIn("--replace", plan["command"]["argv"])
+        self.assertNotIn("--force-replace-unmanaged", plan["command"]["argv"])
+
+    def test_plan_refuses_existing_unmanaged_or_wrong_name_template(self):
+        for config in (
+            "name: ubuntu-2404\ntemplate: 1\n",
+            "name: customer-template\ntemplate: 1\ntags: ppflight-cloudinit\n",
+            "name: ubuntu-2404\ntags: ppflight-cloudinit\n",
+        ):
+            with self.subTest(config=config):
+                runner = FakeRunner(
+                    available_bytes=100_000_000_000,
+                    cluster_resources=[{"vmid": 9001, "name": "ubuntu-2404", "type": "qemu"}],
+                    qm_configs={9001: config},
+                )
+
+                plan = BOOTSTRAP.prepare_plan(
+                    self._arguments(items="ubuntu-2404"),
+                    BOOTSTRAP.load_catalog(),
+                    runner,
+                )
+
+                self.assertFalse(plan["executable"])
+                self.assertEqual(plan["state"], "blocked")
+                self.assertEqual(plan["errors"][0]["errorCode"], "VMID_REPLACEMENT_UNSAFE")
+                self.assertEqual(plan["items"][0]["errorCode"], "VMID_REPLACEMENT_UNSAFE")
+
+    def test_plan_refuses_existing_template_when_config_cannot_be_read(self):
+        runner = FakeRunner(
+            available_bytes=100_000_000_000,
+            cluster_resources=[{"vmid": 9001, "name": "ubuntu-2404", "type": "qemu"}],
+        )
+
+        plan = BOOTSTRAP.prepare_plan(
+            self._arguments(items="ubuntu-2404"),
+            BOOTSTRAP.load_catalog(),
+            runner,
+        )
+
+        self.assertFalse(plan["executable"])
+        self.assertEqual(plan["errors"][0]["errorCode"], "VMID_REPLACEMENT_UNVERIFIED")
 
 
 if __name__ == "__main__":

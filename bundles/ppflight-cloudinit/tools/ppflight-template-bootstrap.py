@@ -791,6 +791,43 @@ def _existing_vmids(runner: CommandRunner) -> Dict[int, Mapping[str, Any]]:
     return existing
 
 
+def _managed_template_replacement_error(
+    runner: CommandRunner,
+    vmid: int,
+    expected_name: str,
+) -> Optional[ContractError]:
+    """Return why an existing VMID cannot be replaced, or None when safe.
+
+    The shell builder repeats the same checks immediately before destruction.
+    This plan-time check makes the destructive intent visible before operator
+    confirmation without trusting the less detailed cluster resource row.
+    """
+    result = runner.run(("qm", "config", str(vmid)), check=False)
+    if result.returncode != 0:
+        return ContractError(
+            "VMID_REPLACEMENT_UNVERIFIED",
+            "existing VMID configuration could not be read; refusing replacement",
+            {"targetVmid": vmid},
+        )
+    lines = result.stdout.splitlines()
+    actual_name = next((line[len("name: ") :] for line in lines if line.startswith("name: ")), None)
+    tag_line = next((line for line in lines if line.startswith("tags: ")), "")
+    tags = re.split(r"[;,]", tag_line[len("tags: ") :]) if tag_line else []
+    if "template: 1" not in lines or actual_name != expected_name or "ppflight-cloudinit" not in tags:
+        return ContractError(
+            "VMID_REPLACEMENT_UNSAFE",
+            "existing VMID is not the exact PPFlight-managed template; refusing replacement",
+            {
+                "targetVmid": vmid,
+                "expectedName": expected_name,
+                "actualName": actual_name,
+                "isTemplate": "template: 1" in lines,
+                "managed": "ppflight-cloudinit" in tags,
+            },
+        )
+    return None
+
+
 def _error_dict(error: ContractError) -> Dict[str, Any]:
     return {"errorCode": error.code, "message": error.message, "details": error.details}
 
@@ -856,16 +893,12 @@ def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: C
     for item in items:
         vmid = item["target"]["vmid"]
         if vmid in existing:
-            conflict_codes[vmid] = "VMID_CONFLICT"
-            errors.append(
-                _error_dict(
-                    ContractError(
-                        "VMID_CONFLICT",
-                        "catalog target VMID already exists; bootstrap never replaces an existing VM or template",
-                        {"targetVmid": vmid, "existingName": existing[vmid].get("name"), "existingType": existing[vmid].get("type")},
-                    )
-                )
-            )
+            replacement_error = _managed_template_replacement_error(runner, vmid, item["build"]["templateName"])
+            if replacement_error is not None:
+                conflict_codes[vmid] = replacement_error.code
+                replacement_error.details.setdefault("existingName", existing[vmid].get("name"))
+                replacement_error.details.setdefault("existingType", existing[vmid].get("type"))
+                errors.append(_error_dict(replacement_error))
         spec = URL_SPECS[item["source"]["urlKey"]]
         source_volume = str(Path(cache_dir) / spec["filename"]) if cache_dir else None
         item_results.append(
@@ -905,6 +938,7 @@ def prepare_plan(args: argparse.Namespace, catalog: Mapping[str, Any], runner: C
         "--expected-catalog-sha256",
         catalog["_catalogSha256"],
         "--no-backup",
+        "--replace",
     ]
     if internal_bridge is not None:
         builder_argv.extend(("--internal-bridge", internal_bridge))
@@ -1067,8 +1101,10 @@ def execute_plan(plan: Dict[str, Any], runner: CommandRunner) -> Tuple[Dict[str,
             item["errorCode"] = error.code
         return plan, 2
 
-    # prepare_plan already checks cluster-wide VMIDs.  The builder repeats the
-    # check immediately before each qm create and is never passed --replace.
+    # prepare_plan already checks cluster-wide VMIDs and only admits an exact
+    # PPFlight-managed template. The builder repeats the ownership, template,
+    # and name checks immediately before destruction. It is never passed the
+    # unsafe --force-replace-unmanaged option.
     return_code = _stream_process(plan["command"]["argv"])
     if return_code != 0:
         error = ContractError("BUILDER_FAILED", "template builder exited unsuccessfully", {"returnCode": return_code})

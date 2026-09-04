@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.2.0"
+readonly SCRIPT_VERSION="3.3.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -264,6 +264,38 @@ validate_integer() {
   [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer"
 }
 
+require_host_cpu_flags() {
+  local template_name="$1" level="$2"
+  shift 2
+  local flags flag
+  [[ "$CPU_TYPE" == "host" ]] || die "$template_name requires $level; CPU_TYPE must be host so the required host features reach the guest"
+  flags=" $(awk -F: '/^flags[[:space:]]*:/ {print $2; exit}' /proc/cpuinfo) "
+  [[ "$flags" != "  " ]] || die "cannot read host CPU flags required by $template_name"
+  for flag in "$@"; do
+    [[ "$flags" == *" $flag "* ]] || die "$template_name requires $level but host CPU flag '$flag' is missing"
+  done
+  log "Host CPU satisfies $level for $template_name"
+}
+
+preflight_selected_cpu_levels() {
+  local row _vmid name
+  for row in "${SELECTED_ROWS[@]}"; do
+    IFS='|' read -r _vmid name _ <<< "$row"
+    case "$name" in
+      centos-stream-9)
+        # Linux reports SSE3 as pni on x86_64.
+        require_host_cpu_flags "$name" x86-64-v2 cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2
+        ;;
+      centos-stream-10)
+        # Linux reports LZCNT as abm on x86_64.
+        require_host_cpu_flags "$name" x86-64-v3 \
+          cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2 \
+          avx avx2 bmi1 bmi2 f16c fma abm movbe xsave
+        ;;
+    esac
+  done
+}
+
 storage_is_active() {
   pvesm status 2>/dev/null | awk -v id="$1" 'NR > 1 && $1 == id && $3 == "active" { found=1 } END { exit !found }'
 }
@@ -398,6 +430,8 @@ preflight() {
   [[ "$FORCE_REPLACE_UNMANAGED" == "0" || "$FORCE_REPLACE_UNMANAGED" == "1" ]] || die "FORCE_REPLACE_UNMANAGED must be 0 or 1"
   [[ "$CLEANUP_FAILED_VM" == "0" || "$CLEANUP_FAILED_VM" == "1" ]] || die "CLEANUP_FAILED_VM must be 0 or 1"
   [[ "$FORCE_REPLACE_UNMANAGED" == "0" || "$REPLACE_EXISTING" == "1" ]] || die "--force-replace-unmanaged also requires --replace"
+
+  preflight_selected_cpu_levels
 
   if [[ "$ENABLE_QOS" == "1" ]]; then
     local help field
