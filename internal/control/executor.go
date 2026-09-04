@@ -236,6 +236,15 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.FinishedAt = time.Now().UTC()
 		if verifyErr != nil {
 			r.State, r.Code = "failed", "DELIVERY_NOT_READY"
+			// Never serialize an upstream PVE/QGA error. Return one bounded,
+			// typed check identifier so the control plane can distinguish a
+			// configuration mismatch from a QGA/provider read failure without
+			// exposing guest data or raw API responses.
+			r.Result, _ = json.Marshal(DeliveryVerificationFailureResult{
+				Ready:       false,
+				ObservedAt:  r.FinishedAt.UTC().Truncate(time.Second),
+				FailedCheck: deliveryFailureCheck(verifyErr),
+			})
 			return finish(verifyErr)
 		}
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
@@ -2033,6 +2042,52 @@ type DeliveryVerificationResult struct {
 	QGAFresh            bool      `json:"qgaFresh"`
 	GuestAddressMatched bool      `json:"guestAddressMatched"`
 	TimezoneMatched     bool      `json:"timezoneMatched"`
+}
+
+type DeliveryVerificationFailureResult struct {
+	Ready       bool      `json:"ready"`
+	ObservedAt  time.Time `json:"observedAt"`
+	FailedCheck string    `json:"failedCheck"`
+}
+
+// deliveryFailureCheck maps only Agent-authored error text to a frozen safe
+// enum. Unknown provider errors collapse to provider_read; their raw text is
+// intentionally never emitted in a receipt.
+func deliveryFailureCheck(err error) string {
+	if err == nil {
+		return "internal"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case message == "guest is not running":
+		return "power_state"
+	case strings.HasPrefix(message, "guest cores "):
+		return "config_cores"
+	case strings.HasPrefix(message, "guest sockets "):
+		return "config_sockets"
+	case strings.HasPrefix(message, "guest memory "):
+		return "config_memory"
+	case message == "delivery disk does not exist":
+		return "disk_missing"
+	case strings.Contains(message, "disk size"):
+		return "disk_size"
+	case strings.Contains(message, "disk io"):
+		return "disk_io"
+	case strings.Contains(message, "qga") || strings.Contains(message, "guest agent"):
+		return "qga"
+	case strings.HasPrefix(message, "delivery network ") && strings.Contains(message, "guest addresses"):
+		return "guest_address"
+	case strings.HasPrefix(message, "delivery network "):
+		return "network_config"
+	case strings.Contains(message, "firewall") || strings.Contains(message, "ipfilter") || strings.Contains(message, "ip set") || strings.Contains(message, "mac filter"):
+		return "firewall"
+	case strings.Contains(message, "timezone"):
+		return "timezone"
+	case strings.Contains(message, "predates the command boundary"):
+		return "observation_boundary"
+	default:
+		return "provider_read"
+	}
 }
 
 func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -459,6 +460,7 @@ func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing
 		network      string
 		guestOptions string
 		wantError    bool
+		failedCheck  string
 	}{
 		{
 			name:         "explicit disabled values",
@@ -475,12 +477,14 @@ func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing
 			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=0,rate=100",
 			guestOptions: `{"enable":1}`,
 			wantError:    true,
+			failedCheck:  "firewall",
 		},
 		{
 			name:         "network firewall unexpectedly enabled",
 			network:      "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,mtu=1500,firewall=1,rate=100",
 			guestOptions: `{"enable":0}`,
 			wantError:    true,
+			failedCheck:  "network_config",
 		},
 	}
 	for _, tt := range tests {
@@ -514,6 +518,10 @@ func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing
 				if err == nil || receipt.State == "succeeded" {
 					t.Fatalf("receipt=%#v err=%v, want fail-closed mismatch", receipt, err)
 				}
+				var failure DeliveryVerificationFailureResult
+				if json.Unmarshal(receipt.Result, &failure) != nil || failure.Ready || failure.FailedCheck != tt.failedCheck || failure.ObservedAt.IsZero() {
+					t.Fatalf("unsafe or missing delivery failure diagnostic: %s", receipt.Result)
+				}
 				return
 			}
 			if err != nil || receipt.State != "succeeded" || receipt.DryRun {
@@ -524,6 +532,26 @@ func TestDeliveryVerificationAcceptsOnlyExactDisabledFirewallReadback(t *testing
 				t.Fatalf("result=%s", receipt.Result)
 			}
 		})
+	}
+}
+
+func TestDeliveryFailureDiagnosticIsBoundedAndNeverLeaksProviderError(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want string
+	}{
+		{errors.New("guest is not running"), "power_state"},
+		{errors.New("guest cores does not match delivery contract"), "config_cores"},
+		{errors.New("delivery network net0 guest addresses are not ready"), "guest_address"},
+		{errors.New("guest timezone does not match delivery contract"), "timezone"},
+		{errors.New("token=secret raw upstream body"), "provider_read"},
+	} {
+		if got := deliveryFailureCheck(test.err); got != test.want {
+			t.Fatalf("error=%q got=%q want=%q", test.err, got, test.want)
+		}
+		if strings.Contains(deliveryFailureCheck(test.err), "secret") {
+			t.Fatal("provider error leaked into bounded diagnostic")
+		}
 	}
 }
 
