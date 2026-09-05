@@ -4,6 +4,7 @@ package upgradecontract
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,7 +28,13 @@ var (
 	releaseTagRE = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$`)
 	hex64RE      = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	assetRE      = regexp.MustCompile(`^ppflight-agent-[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?-linux-(amd64|arm64)\.tar\.gz$`)
+	keyIDRE      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$`)
 )
+
+type CommandSigningRotation struct {
+	KeyID     string `json:"keyId"`
+	PublicKey string `json:"publicKey"`
+}
 
 type Artifact struct {
 	Architecture string `json:"architecture"`
@@ -38,10 +45,11 @@ type Artifact struct {
 }
 
 type Parameters struct {
-	SchemaVersion  int      `json:"schemaVersion"`
-	ReleaseTag     string   `json:"releaseTag"`
-	AgentCommitSHA string   `json:"agentCommitSha"`
-	Artifact       Artifact `json:"artifact"`
+	SchemaVersion          int                     `json:"schemaVersion"`
+	ReleaseTag             string                  `json:"releaseTag"`
+	AgentCommitSHA         string                  `json:"agentCommitSha"`
+	Artifact               Artifact                `json:"artifact"`
+	CommandSigningRotation *CommandSigningRotation `json:"commandSigningRotation,omitempty"`
 }
 
 type Manifest struct {
@@ -99,7 +107,16 @@ func (p Parameters) Validate(architecture string) error {
 	if p.SchemaVersion != SchemaVersion || !releaseTagRE.MatchString(p.ReleaseTag) || !hex64RE.MatchString(p.AgentCommitSHA) {
 		return errors.New("upgrade parameters identity is invalid")
 	}
-	return p.Artifact.Validate(p.ReleaseTag, architecture)
+	if err := p.Artifact.Validate(p.ReleaseTag, architecture); err != nil {
+		return err
+	}
+	if p.CommandSigningRotation != nil {
+		decoded, err := base64.StdEncoding.DecodeString(p.CommandSigningRotation.PublicKey)
+		if err != nil || len(decoded) != 32 || !keyIDRE.MatchString(p.CommandSigningRotation.KeyID) {
+			return errors.New("command signing rotation is invalid")
+		}
+	}
+	return nil
 }
 
 func (a Artifact) Validate(releaseTag, architecture string) error {

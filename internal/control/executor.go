@@ -315,11 +315,20 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 			// typed check identifier so the control plane can distinguish a
 			// configuration mismatch from a QGA/provider read failure without
 			// exposing guest data or raw API responses.
-			r.Result, _ = json.Marshal(DeliveryVerificationFailureResult{
+			failure := DeliveryVerificationFailureResult{
 				Ready:       false,
 				ObservedAt:  r.FinishedAt.UTC().Truncate(time.Second),
 				FailedCheck: deliveryFailureCheck(verifyErr),
-			})
+			}
+			var timezoneMismatch *deliveryTimezoneMismatchError
+			if errors.As(verifyErr, &timezoneMismatch) {
+				failure.Timezone = &DeliveryTimezoneFailureResult{
+					ExpectedIANA:          timezoneMismatch.ExpectedIANA,
+					ObservedZone:          timezoneMismatch.ObservedZone,
+					ObservedOffsetSeconds: timezoneMismatch.ObservedOffsetSeconds,
+				}
+			}
+			r.Result, _ = json.Marshal(failure)
 			return finish(verifyErr)
 		}
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
@@ -2368,9 +2377,26 @@ type DeliveryVerificationResult struct {
 }
 
 type DeliveryVerificationFailureResult struct {
-	Ready       bool      `json:"ready"`
-	ObservedAt  time.Time `json:"observedAt"`
-	FailedCheck string    `json:"failedCheck"`
+	Ready       bool                           `json:"ready"`
+	ObservedAt  time.Time                      `json:"observedAt"`
+	FailedCheck string                         `json:"failedCheck"`
+	Timezone    *DeliveryTimezoneFailureResult `json:"timezone,omitempty"`
+}
+
+type DeliveryTimezoneFailureResult struct {
+	ExpectedIANA          string `json:"expectedIana"`
+	ObservedZone          string `json:"observedZone"`
+	ObservedOffsetSeconds int64  `json:"observedOffsetSeconds"`
+}
+
+type deliveryTimezoneMismatchError struct {
+	ExpectedIANA          string
+	ObservedZone          string
+	ObservedOffsetSeconds int64
+}
+
+func (e *deliveryTimezoneMismatchError) Error() string {
+	return "guest timezone does not match delivery contract"
 }
 
 // deliveryFailureCheck maps only Agent-authored error text to a frozen safe
@@ -2470,8 +2496,19 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 		}
 	}
 	timezone, err := client.ReadGuestTimezone(ctx, command.Identity.NodeRef, command.Identity.VMID)
-	if err != nil || !guestTimezoneMatches(timezone, p.Expected.Timezone, time.Now().UTC()) {
+	if err != nil {
 		return nil, errors.New("guest timezone does not match delivery contract")
+	}
+	if !guestTimezoneMatches(timezone, p.Expected.Timezone, time.Now().UTC()) {
+		zone := strings.TrimSpace(timezone.Zone)
+		if len(zone) < 1 || len(zone) > 64 || !regexp.MustCompile(`\A[A-Za-z0-9_+:/-]+\z`).MatchString(zone) {
+			zone = "unknown"
+		}
+		return nil, &deliveryTimezoneMismatchError{
+			ExpectedIANA:          p.Expected.Timezone,
+			ObservedZone:          zone,
+			ObservedOffsetSeconds: timezone.Offset,
+		}
 	}
 	// The frozen cross-language receipt contract uses whole-second UTC. Keep
 	// the observation boundary deterministic instead of emitting RFC3339Nano.

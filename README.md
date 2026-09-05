@@ -104,6 +104,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.44` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并分别绑定官网 canonical payload 哈希与历史签名 wire body 哈希，以及旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
 
+`0.1.1-rc.50` 在 rc.49 的 350/384 台分片采集与 make-before-break 校验基础上，将控制命令的历史批量领取默认值从 20 安全迁移为 1，避免串行长任务使同批后续租约过期；管理员自定义值保持不变。交付验证的时区失败回执增加严格、无客体敏感数据的期望 IANA、观测 zone 与 UTC offset。自升级 root helper 还支持由当前设备旧 Ed25519 密钥签名授权下一代公钥：新二进制、binding state 和服务重启一起回验，任一步失败同时恢复旧二进制和旧公钥，使官网可逐台迁移独立信任根而不影响其他设备。
+
 `0.1.1-rc.49` 把官网控制任务默认领取间隔从 30 秒缩短到 5 秒。升级安装会把旧版精确默认值 `30s` 写成 `5s`；官网签名自升级只替换二进制、无法重写 root 配置，因此新 Agent 启动时还会在内存中完成同一兼容迁移并记录日志。其他管理员自定义值保持不变，从而缩短由多个串行 Agent 命令组成的防火墙与 VPS 生命周期任务等待时间。单 Agent 按常态约 350 台、设计上限 384 台 VPS 规划：CPU、内存、磁盘和流量继续通过一次 `/cluster/resources` 批量采集；逐 VM 的配置与 QGA 读取则按 `sampleInterval` 均匀分片，在一个 `guestInterval` 内完成全量轮转。默认 10 秒/2 分钟配置下，384 台被拆为每批 32 台、共 12 批，避免周期性集中访问全部 VM。该版本还为主 IP 的 make-before-break 切换增加只读交付验证模式：客体网络必须已经使用新地址，而 PVE IPFilter 可在提交前精确包含同地址族的一条旧地址；普通创建、重装和最终交付仍坚持地址与 IPFilter 完全相等。
 
 ## NIC 角色、IP、网络与防盗用

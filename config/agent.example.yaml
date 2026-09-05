@@ -119,7 +119,7 @@
     "commandPublicKeyEnv": "",
     "pveTokenIdEnv": "PVE_CONTROL_TOKEN_ID",
     "pveTokenSecretEnv": "PVE_CONTROL_TOKEN_SECRET",
-    "maxCommandsPerPoll": 20,
+    "maxCommandsPerPoll": 1,
     "allowedActions": ["vm.start", "vm.shutdown", "vm.reboot"],
     "productionExecution": false
   }

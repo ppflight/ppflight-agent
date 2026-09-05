@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,7 +21,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/control"
+	"github.com/ppflight/ppflight-agent/internal/enrollment"
 	"github.com/ppflight/ppflight-agent/internal/fsutil"
 	"github.com/ppflight/ppflight-agent/internal/upgradecontract"
 )
@@ -134,9 +137,40 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		return fail("install_candidate", err)
 	}
 	slog.Info("agent upgrade candidate installed atomically", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
+	var previousBinding *bindstate.State
+	if rotation := parameters.CommandSigningRotation; rotation != nil {
+		state, stateErr := bindstate.Load(cfg.StateDirectory)
+		if stateErr != nil || state.CommandSigningCredential.KeyID != request.Command.SigningKeyID {
+			if stateErr == nil {
+				stateErr = errors.New("active command signing key does not match signed rotation authority")
+			}
+			_ = restoreBackup(cfg.BinaryPath, backupPath)
+			return fail("rotate_command_key", stateErr)
+		}
+		decoded, decodeErr := base64.StdEncoding.DecodeString(rotation.PublicKey)
+		if decodeErr != nil || len(decoded) != 32 {
+			_ = restoreBackup(cfg.BinaryPath, backupPath)
+			return fail("rotate_command_key", errors.New("replacement command signing key is invalid"))
+		}
+		previous := state
+		previousBinding = &previous
+		state.CommandSigningCredential = enrollment.CommandSigningCredential{
+			KeyID: rotation.KeyID, Algorithm: "ed25519", PublicKey: rotation.PublicKey,
+		}
+		if stateErr = bindstate.Save(cfg.StateDirectory, state); stateErr != nil {
+			_ = restoreBackup(cfg.BinaryPath, backupPath)
+			return fail("rotate_command_key", stateErr)
+		}
+		slog.Info("agent command signing public key rotated", "upgradeId", request.UpgradeID, "keyId", rotation.KeyID)
+	}
 	rollback := func(cause error) error {
 		slog.Error("agent upgrade health check failed; rollback started", "upgradeId", request.UpgradeID, "reason", safeHelperText([]byte(cause.Error())))
 		rollbackErr := restoreBackup(cfg.BinaryPath, backupPath)
+		if previousBinding != nil {
+			if bindingErr := bindstate.Save(cfg.StateDirectory, *previousBinding); rollbackErr == nil {
+				rollbackErr = bindingErr
+			}
+		}
 		if rollbackErr == nil {
 			rollbackErr = cfg.RunSystemctl(ctx, "restart", cfg.ServiceName)
 		}

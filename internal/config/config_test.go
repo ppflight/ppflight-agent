@@ -33,11 +33,33 @@ func TestParseAppliesSafeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" {
+	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" || cfg.Control.MaxCommandsPerPoll != 1 {
 		t.Fatalf("defaults not applied: %#v", cfg)
 	}
 	if cfg.PVE.Source != "disabled" || cfg.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" {
 		t.Fatalf("unexpected source defaults: %#v", cfg.PVE)
+	}
+}
+
+func TestParseNormalizesHistoricalControlBatchDefaultInMemory(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"maxCommandsPerPoll":20,"enabled":true`, 1)
+	cfg, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Control.MaxCommandsPerPoll != 1 || !cfg.Control.LegacyMaxCommandsNormalized {
+		t.Fatalf("historical command batch default was not normalized: %#v", cfg.Control)
+	}
+}
+
+func TestParsePreservesCustomControlBatchLimit(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"maxCommandsPerPoll":7,"enabled":true`, 1)
+	cfg, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Control.MaxCommandsPerPoll != 7 || cfg.Control.LegacyMaxCommandsNormalized {
+		t.Fatalf("custom command batch limit was changed: %#v", cfg.Control)
 	}
 }
 

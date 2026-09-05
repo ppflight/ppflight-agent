@@ -167,6 +167,10 @@ type ControlConfig struct {
 	// LegacyPollIntervalNormalized records an in-memory compatibility
 	// migration. It is never accepted from or written to agent.yaml.
 	LegacyPollIntervalNormalized bool `json:"-"`
+	// LegacyMaxCommandsNormalized records the exact released batch default
+	// migration. A single claim prevents later serial commands from losing
+	// their website lease while an earlier long PVE task is still executing.
+	LegacyMaxCommandsNormalized bool `json:"-"`
 }
 
 // Secrets is populated from environment variables after config validation.
@@ -234,7 +238,7 @@ func defaults() Config {
 		},
 		Control: ControlConfig{
 			Enabled: false, PollInterval: Duration{5 * time.Second}, RequestTimeout: Duration{10 * time.Second},
-			MaxCommandsPerPoll: 20, ProductionExecution: false,
+			MaxCommandsPerPoll: 1, ProductionExecution: false,
 			Auth:           AuthConfig{Mode: "hmac-sha256"},
 			AllowedActions: []string{"vm.start", "vm.shutdown", "vm.reboot"},
 		},
@@ -284,6 +288,10 @@ func Parse(contents []byte) (Config, error) {
 	if result.Control.PollInterval.Duration == 30*time.Second {
 		result.Control.PollInterval = Duration{5 * time.Second}
 		result.Control.LegacyPollIntervalNormalized = true
+	}
+	if result.Control.MaxCommandsPerPoll == 20 {
+		result.Control.MaxCommandsPerPoll = 1
+		result.Control.LegacyMaxCommandsNormalized = true
 	}
 	if err := result.Validate(); err != nil {
 		return Config{}, err

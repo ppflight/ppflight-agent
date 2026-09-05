@@ -521,6 +521,7 @@ func TestGuestTimezoneMatchesQGAAbbreviationAndOffset(t *testing.T) {
 }
 
 func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
+	timezoneResult := `{"data":{"result":{"zone":"UTC","offset":0}}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status/current"):
@@ -532,7 +533,7 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/agent/network-get-interfaces"):
 			_, _ = w.Write([]byte(`{"data":{"result":[{"name":"eth0","hardware-address":"aa:bb:cc:dd:ee:ff","ip-addresses":[{"ip-address":"192.0.2.10","prefix":24,"ip-address-type":"ipv4"},{"ip-address":"2001:db8::10","prefix":64,"ip-address-type":"ipv6"}]}]}}`))
 		case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
-			_, _ = w.Write([]byte(`{"data":{"result":{"zone":"UTC","offset":0}}}`))
+			_, _ = w.Write([]byte(timezoneResult))
 		case strings.HasSuffix(r.URL.Path, "/firewall/options"):
 			if r.URL.Path == "/api2/json/cluster/firewall/options" {
 				_, _ = w.Write([]byte(`{"data":{"enable":1}}`))
@@ -559,6 +560,16 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	}
 	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
 		t.Fatalf("delivery result timestamp is not the whole-second golden: %s", receipt.Result)
+	}
+
+	timezoneResult = `{"data":{"result":{"zone":"CST","offset":28800}}}`
+	receipt, err = (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.Code != "DELIVERY_NOT_READY" {
+		t.Fatalf("timezone mismatch receipt=%#v err=%v", receipt, err)
+	}
+	var failure DeliveryVerificationFailureResult
+	if json.Unmarshal(receipt.Result, &failure) != nil || failure.FailedCheck != "timezone" || failure.Timezone == nil || failure.Timezone.ExpectedIANA != "UTC" || failure.Timezone.ObservedZone != "CST" || failure.Timezone.ObservedOffsetSeconds != 28800 {
+		t.Fatalf("timezone failure diagnostic is incomplete: %s", receipt.Result)
 	}
 }
 

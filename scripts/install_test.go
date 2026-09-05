@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -154,10 +155,10 @@ func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
 	}
 	migration := installer[start : start+end]
 
-	run := func(name, interval string) string {
+	run := func(name, interval string, maxCommands int) string {
 		t.Helper()
 		target := filepath.Join(t.TempDir(), name)
-		raw := `{"mode":"production","pve":{"source":"api"},"control":{"pollInterval":"` + interval + `"}}` + "\n"
+		raw := fmt.Sprintf(`{"mode":"production","pve":{"source":"api"},"control":{"pollInterval":"%s","maxCommandsPerPoll":%d}}`, interval, maxCommands) + "\n"
 		if err := os.WriteFile(target, []byte(raw), 0o640); err != nil {
 			t.Fatal(err)
 		}
@@ -177,10 +178,10 @@ func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
 		return string(updated)
 	}
 
-	if updated := run("legacy-default.json", "30s"); !strings.Contains(updated, `"pollInterval": "5s"`) {
+	if updated := run("legacy-default.json", "30s", 20); !strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"maxCommandsPerPoll": 1`) {
 		t.Fatalf("legacy default was not migrated: %s", updated)
 	}
-	if updated := run("operator-custom.json", "7s"); strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"pollInterval":"7s"`) {
+	if updated := run("operator-custom.json", "7s", 7); strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"pollInterval":"7s"`) || !strings.Contains(updated, `"maxCommandsPerPoll":7`) {
 		t.Fatalf("operator custom interval was modified: %s", updated)
 	}
 }

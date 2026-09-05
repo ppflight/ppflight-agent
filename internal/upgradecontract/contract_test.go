@@ -1,6 +1,7 @@
 package upgradecontract
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"runtime"
 	"strings"
@@ -14,6 +15,23 @@ func validParameters() Parameters {
 		Architecture: arch, AssetName: "ppflight-agent-0.1.0-rc.9-linux-" + arch + ".tar.gz", SizeBytes: "1048576", SHA256: strings.Repeat("b", 64),
 		DownloadURL: "https://www.ppflight.com" + ArtifactPath("v0.1.0-rc.9", arch),
 	}}
+}
+
+func TestParametersAcceptOneStrictCommandSigningRotation(t *testing.T) {
+	value := validParameters()
+	value.CommandSigningRotation = &CommandSigningRotation{
+		KeyID:     "pve1.binding.device-01.g2",
+		PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
+	}
+	raw, _ := json.Marshal(value)
+	if _, err := DecodeParameters(raw); err != nil {
+		t.Fatal(err)
+	}
+	value.CommandSigningRotation.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 31))
+	raw, _ = json.Marshal(value)
+	if _, err := DecodeParameters(raw); err == nil {
+		t.Fatal("short command signing public key was accepted")
+	}
 }
 
 func TestParametersRejectArbitraryURLUnknownFieldsAndUnsafeIntegers(t *testing.T) {
