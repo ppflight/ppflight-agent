@@ -252,6 +252,67 @@ func TestReadGuestTimezoneDecodesPVECommandResultEnvelope(t *testing.T) {
 	}
 }
 
+func TestQGAExecTransportUsesSupportedMajorAndCachesOnlySuccess(t *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		version string
+		want    QGAExecTransport
+		wantErr bool
+	}{
+		{name: "PVE 8", version: "8.4.0", want: QGAExecTransportPVE8},
+		{name: "PVE 9", version: "9.1.0", want: QGAExecTransportPVE9},
+		{name: "unknown major", version: "10.0.0", want: QGAExecTransportUnknown, wantErr: true},
+		{name: "malformed", version: "development", want: QGAExecTransportUnknown, wantErr: true},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			reads := 0
+			c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/api2/json/version" {
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				reads++
+				_, _ = fmt.Fprintf(w, `{"data":{"version":%q}}`, fixture.version)
+			}))
+			defer server.Close()
+			for range 2 {
+				got, err := c.QGAExecTransport(context.Background())
+				if (err != nil) != fixture.wantErr || got != fixture.want {
+					t.Fatalf("transport=%v err=%v", got, err)
+				}
+			}
+			if fixture.wantErr && reads != 2 {
+				t.Fatalf("failed/unknown version was cached: reads=%d", reads)
+			}
+			if !fixture.wantErr && reads != 1 {
+				t.Fatalf("successful version was not cached: reads=%d", reads)
+			}
+		})
+	}
+}
+
+func TestQGAExecTransportRefreshesAfterTTL(t *testing.T) {
+	version := "8.4.0"
+	reads := 0
+	c, server := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/version" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		reads++
+		_, _ = fmt.Fprintf(w, `{"data":{"version":%q}}`, version)
+	}))
+	defer server.Close()
+	if got, err := c.QGAExecTransport(context.Background()); err != nil || got != QGAExecTransportPVE8 {
+		t.Fatalf("first transport=%v err=%v", got, err)
+	}
+	version = "9.0.1"
+	c.qgaExecTransportMu.Lock()
+	c.qgaExecTransportAt = time.Now().Add(-qgaExecTransportTTL - time.Nanosecond)
+	c.qgaExecTransportMu.Unlock()
+	if got, err := c.QGAExecTransport(context.Background()); err != nil || got != QGAExecTransportPVE9 || reads != 2 {
+		t.Fatalf("refreshed transport=%v err=%v reads=%d", got, err, reads)
+	}
+}
+
 func TestGuestAgentResultEnvelopeRejectsNullAndWrongTypes(t *testing.T) {
 	for _, tt := range []struct {
 		name string

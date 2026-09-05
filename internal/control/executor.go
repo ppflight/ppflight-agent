@@ -137,11 +137,13 @@ type Executor struct {
 	ReadClient   *pve.Client
 	Discovery    *discovery.Service
 	Capabilities GuestCapabilityChecker
-	// QGABootWait and QGAPollInterval bound the startup grace period used only
-	// by vm.set-timezone. A newly started QEMU guest commonly reports QGA as
-	// unavailable for a short period even though the device and package are
-	// correctly configured. Other interactive QGA actions still fail closed
-	// immediately when the capability is unavailable.
+	// QGABootWait and QGAPollInterval bound the startup grace period used by
+	// vm.set-timezone and vm.inspect-timezone. A newly started QEMU guest
+	// commonly reports QGA as unavailable for a short period even though the
+	// device and package are correctly configured. Inspection must establish
+	// guest-exec readiness before it can provide the signed precondition for a
+	// later network change; it never falls through to guest execution while QGA
+	// is unavailable.
 	QGABootWait     time.Duration
 	QGAPollInterval time.Duration
 	// ReinstallReadyWait and ReinstallPollInterval bound the post-boot window
@@ -370,6 +372,26 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		if client == nil {
 			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
 			return finish(errors.New("PVE read client is unavailable"))
+		}
+		// This observation is the gate before a website network mutation. Do not
+		// send agent/exec until PVE has explicitly reported guest-exec as enabled;
+		// newly booted QGA is allowed its bounded startup window just like the
+		// timezone setter.
+		capability, capabilityErr := e.guestAgentCommand(ctx, command, "guest-exec")
+		if capability == GuestCapabilityUnavailable {
+			capability, capabilityErr = e.waitForGuestAgentCommand(ctx, command, "guest-exec")
+		}
+		r.FinishedAt = time.Now().UTC()
+		switch {
+		case capabilityErr != nil, capability == GuestCapabilityUnavailable:
+			r.State, r.Code = "rejected", "QGA_UNAVAILABLE"
+			return finish(ErrQGAUnavailable)
+		case capability == GuestCapabilityUnsupported:
+			r.State, r.Code = "rejected", "QGA_COMMAND_UNSUPPORTED"
+			return finish(ErrQGACommandUnsupported)
+		case capability != GuestCapabilityAvailable:
+			r.State, r.Code = "rejected", "QGA_CAPABILITY_INDETERMINATE"
+			return finish(ErrQGAUnavailable)
 		}
 		result, inspectErr := inspectGuestTimezone(ctx, client, command)
 		r.FinishedAt = time.Now().UTC()
@@ -670,6 +692,15 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		case capability != GuestCapabilityAvailable:
 			r.State, r.Code = "rejected", "QGA_CAPABILITY_INDETERMINATE"
 			return finish(ErrQGAUnavailable)
+		}
+		if command.Action == "vm.set-timezone" {
+			// The version-specific form is a precondition, not a fallback after a
+			// possibly accepted guest-exec. An unresolved PVE major is therefore a
+			// safe rejection before any guest mutation.
+			if _, transportErr := e.Client.QGAExecTransport(ctx); transportErr != nil {
+				r.State, r.Code, r.FinishedAt = "rejected", "QGA_TRANSPORT_UNAVAILABLE", time.Now().UTC()
+				return finish(transportErr)
+			}
 		}
 	}
 	upid, result, err := executePVEWithOptions(ctx, e.Client, command, pveExecutionOptions{
@@ -2047,7 +2078,11 @@ func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, labe
 // stdout/stderr remains private to the node and is never copied into logs or
 // signed receipts.
 func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, argv ...string) (int, error) {
-	form, err := qgaExecForm(argv, false)
+	transport, err := c.QGAExecTransport(ctx)
+	if err != nil {
+		return 0, err
+	}
+	form, err := qgaExecForm(argv, transport)
 	if err != nil {
 		return 0, err
 	}
@@ -2104,7 +2139,11 @@ func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, ar
 // delivery contract.  stdout is validated locally and only that bounded IANA
 // value is returned in the signed receipt.
 func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (string, error) {
-	form, err := qgaExecForm([]string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}, true)
+	transport, err := c.QGAExecTransport(ctx)
+	if err != nil {
+		return "", err
+	}
+	form, err := qgaExecForm([]string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}, transport)
 	if err != nil {
 		return "", err
 	}
@@ -2166,31 +2205,37 @@ func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (str
 	}
 }
 
-// qgaExecForm encodes the documented PVE agent/exec form shape.  In
-// particular, command is one executable string and argv[1:] are repeated
-// extra-args fields.  Sending argv as repeated command fields happens to work
-// with permissive test fixtures but PVE 8.4 rejects it during parameter
-// validation, before it forwards anything to QGA.
+// qgaExecForm encodes the exact versioned PVE agent/exec form. PVE 8 registers
+// command as an array; its stable REST handler normalizes repeated form keys
+// into that array. PVE 9 instead registers repeated extra-args and requires
+// asynchronous execution for the PID/exec-status protocol. Neither branch
+// accepts QGA-internal capture-output/timeout/pass-stdin fields from Agent.
 //
 // The executor only supplies fixed command paths and independently validated
 // signed values.  This helper nevertheless refuses control characters and an
 // empty executable so a future caller cannot accidentally turn it into an
 // arbitrary form builder.
-func qgaExecForm(argv []string, captureOutput bool) (url.Values, error) {
+func qgaExecForm(argv []string, transport pve.QGAExecTransport) (url.Values, error) {
 	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" || strings.ContainsAny(argv[0], "\x00\r\n") {
 		return nil, errors.New("QGA exec requires one safe command")
 	}
-	form := url.Values{"command": {argv[0]}}
-	for _, arg := range argv[1:] {
+	for _, arg := range argv {
 		if strings.ContainsAny(arg, "\x00\r\n") {
 			return nil, errors.New("QGA exec argument is unsafe")
 		}
-		form.Add("extra-args", arg)
 	}
-	if captureOutput {
-		form.Set("capture-output", "1")
+	switch transport {
+	case pve.QGAExecTransportPVE8:
+		return url.Values{"command": append([]string(nil), argv...)}, nil
+	case pve.QGAExecTransportPVE9:
+		form := url.Values{"synchronous": {"0"}}
+		for _, arg := range argv {
+			form.Add("extra-args", arg)
+		}
+		return form, nil
+	default:
+		return nil, errors.New("QGA exec transport is unknown")
 	}
-	return form, nil
 }
 
 // PVE's guest-agent proxy has returned both direct command results and a

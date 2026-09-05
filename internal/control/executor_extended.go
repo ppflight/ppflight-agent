@@ -654,6 +654,12 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command Command, readyWait, pollInterval time.Duration) (string, json.RawMessage, error) {
 	var parameters reinstallP
 	_ = strictParameters(command.Parameters, &parameters)
+	// Reinstall becomes destructive after the compensation clone preflight. Its
+	// fixed cloud-init and timezone guest-exec calls must therefore resolve a
+	// supported PVE form contract before any clone, stop or delete operation.
+	if _, err := client.QGAExecTransport(ctx); err != nil {
+		return "", nil, fmt.Errorf("%w: QGA exec transport unavailable: %v", ErrReinstallPreflight, err)
+	}
 	resources, err := client.ClusterResources(ctx)
 	if err != nil {
 		return "", nil, fmt.Errorf("%w: assigned VM inventory unavailable: %v", ErrReinstallPreflight, err)

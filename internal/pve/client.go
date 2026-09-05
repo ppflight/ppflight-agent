@@ -17,6 +17,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
@@ -31,6 +32,7 @@ const (
 	defaultTimeout      = 15 * time.Second
 	defaultResponseSize = int64(8 << 20) // 8 MiB
 	maxResponseSize     = int64(32 << 20)
+	qgaExecTransportTTL = time.Minute
 )
 
 // Config contains connection settings for a PVE API endpoint. TokenID has the
@@ -57,6 +59,13 @@ type Client struct {
 	secret   string
 	maxBytes int64
 	progress func()
+
+	// qgaExecTransport is filled only after a successful, supported GET
+	// /version observation and expires quickly so an in-place PVE major upgrade
+	// cannot leave the Agent on a stale agent/exec form contract.
+	qgaExecTransportMu sync.Mutex
+	qgaExecTransport   QGAExecTransport
+	qgaExecTransportAt time.Time
 }
 
 // NewClient creates a client. It does not make a network request.

@@ -5,8 +5,63 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 )
+
+// QGAExecTransport is the version-specific PVE API form contract for
+// /agent/exec. It is deliberately distinct from QGA's own guest-exec schema.
+type QGAExecTransport uint8
+
+const (
+	QGAExecTransportUnknown QGAExecTransport = iota
+	QGAExecTransportPVE8
+	QGAExecTransportPVE9
+)
+
+// QGAExecTransport resolves and caches the exact registered PVE REST form
+// contract. It never guesses from an agent/exec response: an unknown PVE
+// major or a failed GET /version remains an error and callers must not submit
+// guest-exec. Successful observations are cached for at most one minute so an
+// in-place PVE major upgrade is picked up without an Agent restart. Failed
+// lookups are intentionally not cached so a transient PVE startup condition
+// can be retried safely without replaying a guest command.
+func (c *Client) QGAExecTransport(ctx context.Context) (QGAExecTransport, error) {
+	if c == nil {
+		return QGAExecTransportUnknown, errors.New("PVE client is unavailable")
+	}
+	c.qgaExecTransportMu.Lock()
+	defer c.qgaExecTransportMu.Unlock()
+	if c.qgaExecTransport != QGAExecTransportUnknown && time.Since(c.qgaExecTransportAt) < qgaExecTransportTTL {
+		return c.qgaExecTransport, nil
+	}
+	version, err := c.Version(ctx)
+	if err != nil {
+		return QGAExecTransportUnknown, fmt.Errorf("read PVE version for QGA exec: %w", err)
+	}
+	value := strings.TrimSpace(version.Version)
+	majorText := value
+	if cut := strings.IndexByte(majorText, '.'); cut >= 0 {
+		majorText = majorText[:cut]
+	}
+	major, err := strconv.Atoi(majorText)
+	if err != nil || majorText == "" {
+		return QGAExecTransportUnknown, fmt.Errorf("unsupported PVE version %q for QGA exec", value)
+	}
+	var transport QGAExecTransport
+	switch major {
+	case 8:
+		transport = QGAExecTransportPVE8
+	case 9:
+		transport = QGAExecTransportPVE9
+	default:
+		return QGAExecTransportUnknown, fmt.Errorf("unsupported PVE major version %d for QGA exec", major)
+	}
+	c.qgaExecTransport = transport
+	c.qgaExecTransportAt = time.Now().UTC()
+	return transport, nil
+}
 
 // Availability deliberately distinguishes a missing guest-agent field from a
 // numeric zero. Serialisers should omit nil fields and carry this state.

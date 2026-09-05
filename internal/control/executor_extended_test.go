@@ -507,13 +507,21 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 			}
 			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
 				_ = r.ParseForm()
-				guestCommand := strings.Join(append(append([]string{}, r.Form["command"]...), r.Form["extra-args"]...), "|")
+				if r.Method != http.MethodPost {
+					t.Fatalf("QGA exec method: %s", r.Method)
+				}
+				if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+					t.Fatalf("QGA exec content type: %q", r.Header.Get("Content-Type"))
+				}
+				guestCommand := strings.Join(r.Form["command"], "|")
 				guestCommands = append(guestCommands, guestCommand)
 				if guestCommand == "/usr/bin/cloud-init|status|--wait" {
+					assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/cloud-init", "status", "--wait"})
 					cloudInitAttempts++
 					_, _ = w.Write([]byte(`{"data":16}`))
 					return
 				}
+				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "set-timezone", "UTC"})
 				timezoneAttempts++
 				if timezoneAttempts < 3 {
 					http.Error(w, "QGA is not running yet", http.StatusInternalServerError)
@@ -526,6 +534,8 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/api2/json/version":
+			_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 		case "/api2/json/cluster/resources":
 			_, _ = fmt.Fprintf(w, `{"data":[{"type":"qemu","node":"pve1","vmid":101,"template":0,"status":%q},{"type":"qemu","node":"pve1","vmid":9001,"template":1,"status":"stopped"}]}`, targetStatus)
 		case "/api2/json/nodes/pve1/qemu/9001/config":
@@ -624,6 +634,8 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 func TestReinstallReadinessDeadlineBoundsBlockingCloudInit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/version":
+			_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/agent/exec"):
 			_, _ = w.Write([]byte(`{"data":41}`))
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
@@ -665,6 +677,8 @@ func TestCloudInitCommandReportsExactTerminalExitCode(t *testing.T) {
 		t.Run(fixture.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/api2/json/version":
+					_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/agent/exec"):
 					_, _ = w.Write([]byte(`{"data":42}`))
 				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
@@ -873,6 +887,8 @@ func runReinstallFailureCompensation(t *testing.T, staleReadback bool) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			switch r.URL.Path {
+			case "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 			case "/api2/json/cluster/resources":
 				resources := []map[string]any{{"type": "qemu", "node": "pve1", "vmid": 9001, "template": 1, "status": "stopped"}}
 				if targetExists {
@@ -1023,10 +1039,17 @@ func mutationIndex(values []string, wanted string) int {
 
 func TestReinstallMissingTargetIsDeterministicPreflightFailure(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/cluster/resources" {
+		if r.Method != http.MethodGet {
 			t.Fatalf("preflight reached unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"data":[]}`))
+		switch r.URL.Path {
+		case "/api2/json/version":
+			_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
+		case "/api2/json/cluster/resources":
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		default:
+			t.Fatalf("preflight reached unexpected request: %s %s", r.Method, r.URL.Path)
+		}
 	}))
 	defer server.Close()
 	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.reinstall", "qemu", reinstallFixture()), time.Now())

@@ -110,7 +110,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.56` 增加 `vm.inspect-timezone`：它只读执行固定 QGA `timedatectl show --property=Timezone --value`，只接受一个 IANA 区域并回传 versioned exact observation。该新 action/result schema 是独立能力门；历史 `vm.verify-delivery` 的 `timezoneMatched` 布尔值和重装 receipt 都不能建立或迁移官网时区基线。
 
-`0.1.1-rc.57` 修复 PVE 8.4 的 QGA `agent/exec` 参数编码：可执行文件只写入单个 `command`，其余固定参数写入重复 `extra-args`。这恢复了只读 `vm.inspect-timezone` 的真实 PVE 调用，并同步修复既有固定 QGA 命令；来宾输出仍只在本地严格校验，绝不进入回执或日志。
+`0.1.1-rc.58` 按 PVE 8 stable 与 PVE 9+ 的实际注册 API 修正 QGA `agent/exec` 参数编码：Agent 先用最小只读 `/version` 严格解析主版本，并仅成功缓存至多一分钟；未知版本或读取失败绝不发送 guest-exec，也不会根据一次失败猜测或重试另一套编码。PVE 8 以重复 `command` 表单键传递完整固定 argv；PVE 9+ 以重复 `extra-args` 传递完整 argv 并传 `synchronous=0`，随后继续以返回的 PID 轮询状态。两套都不得发送 QGA 内部的 `capture-output`、`timeout` 或 `pass-stdin`。该版本同时让只读 `vm.inspect-timezone` 在实际执行前严格等待 `guest-exec` ready；超时返回可重试的 `QGA_UNAVAILABLE` 且绝不发送 guest-exec，因此不会为后续网络变更建立错误基线。来宾输出仍只在本地严格校验，绝不进入回执或日志。
 
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 

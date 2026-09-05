@@ -74,25 +74,154 @@ func controlTestClient(t *testing.T, server *httptest.Server) *pve.Client {
 	return c
 }
 
-func TestQGAExecFormUsesPVE84CommandAndExtraArgsFields(t *testing.T) {
-	form, err := qgaExecForm([]string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}, true)
+func assertPVE8QGAExecForm(t *testing.T, form url.Values, wantArgs []string) {
+	t.Helper()
+	command, present := form["command"]
+	if !present || !reflect.DeepEqual(command, wantArgs) {
+		t.Fatalf("PVE 8 agent/exec command=%#v want=%#v", command, wantArgs)
+	}
+	if len(form) != 1 {
+		t.Fatalf("PVE 8 agent/exec form contains unexpected fields: %v", form)
+	}
+	for _, forbidden := range []string{"extra-args", "synchronous", "capture-output", "timeout", "pass-stdin"} {
+		if _, present := form[forbidden]; present {
+			t.Fatalf("PVE 8 agent/exec form must omit %q: %v", forbidden, form)
+		}
+	}
+}
+
+func assertPVE9QGAExecForm(t *testing.T, form url.Values, wantArgs []string) {
+	t.Helper()
+	if got := form["extra-args"]; !reflect.DeepEqual(got, wantArgs) {
+		t.Fatalf("PVE 9 agent/exec extra-args=%#v want=%#v", got, wantArgs)
+	}
+	if form.Get("synchronous") != "0" || len(form) != 2 {
+		t.Fatalf("PVE 9 agent/exec form=%v", form)
+	}
+	for _, forbidden := range []string{"command", "capture-output", "timeout", "pass-stdin"} {
+		if _, present := form[forbidden]; present {
+			t.Fatalf("PVE 9 agent/exec form must omit %q: %v", forbidden, form)
+		}
+	}
+}
+
+func TestQGAExecFormUsesVersionedPVEForms(t *testing.T) {
+	argv := []string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}
+	form, err := qgaExecForm(argv, pve.QGAExecTransportPVE8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(form["command"], "|"); got != "/usr/bin/timedatectl" {
-		t.Fatalf("command=%q", got)
+	assertPVE8QGAExecForm(t, form, argv)
+	form, err = qgaExecForm(argv, pve.QGAExecTransportPVE9)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := strings.Join(form["extra-args"], "|"); got != "show|--property=Timezone|--value" {
-		t.Fatalf("extra-args=%q", got)
-	}
-	if form.Get("capture-output") != "1" {
-		t.Fatalf("capture-output=%q", form.Get("capture-output"))
-	}
+	assertPVE9QGAExecForm(t, form, argv)
 	for _, argv := range [][]string{nil, {""}, {"/usr/bin/timedatectl", "bad\nvalue"}} {
-		if _, err := qgaExecForm(argv, false); err == nil {
+		if _, err := qgaExecForm(argv, pve.QGAExecTransportPVE8); err == nil {
 			t.Fatalf("unsafe argv accepted: %#v", argv)
 		}
 	}
+	if _, err := qgaExecForm(argv, pve.QGAExecTransportUnknown); err == nil {
+		t.Fatal("unknown QGA exec transport was accepted")
+	}
+}
+
+func TestPVE9QGAExecTransportCoversFixedGuestCommands(t *testing.T) {
+	t.Run("set timezone", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"9.0.1"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_ = r.ParseForm()
+				assertPVE9QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "set-timezone", "UTC"})
+				_, _ = w.Write([]byte(`{"data":{"pid":1}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/get-timezone"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"zone":"UTC","offset":0}}}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(
+			context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"UTC"}`), time.Now(),
+		)
+		if err != nil || receipt.State != "succeeded" {
+			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+	})
+
+	t.Run("inspect timezone", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"9.0.1"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_ = r.ParseForm()
+				assertPVE9QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"})
+				_, _ = w.Write([]byte(`{"data":{"pid":2}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				out := base64.StdEncoding.EncodeToString([]byte("UTC\n"))
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"` + out + `"}}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(
+			context.Background(), controlCommand("vm.inspect-timezone", "qemu", `{"notBefore":"2026-01-01T00:00:00Z"}`), time.Now(),
+		)
+		if err != nil || receipt.State != "succeeded" {
+			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+	})
+
+	t.Run("cloud init wait", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"9.0.1"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_ = r.ParseForm()
+				assertPVE9QGAExecForm(t, r.Form, []string{"/usr/bin/cloud-init", "status", "--wait"})
+				_, _ = w.Write([]byte(`{"data":{"pid":3}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		if err := runGuestCommand(context.Background(), controlTestClient(t, server), "/nodes/pve1/qemu/101", "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("unknown major sends no guest exec", func(t *testing.T) {
+		execPosts := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"10.0.0"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				execPosts++
+				_, _ = w.Write([]byte(`{"data":{"pid":4}}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		if err := runGuestCommand(context.Background(), controlTestClient(t, server), "/nodes/pve1/qemu/101", "cloud-init readiness", "/usr/bin/cloud-init", "status", "--wait"); err == nil || execPosts != 0 {
+			t.Fatalf("err=%v execPosts=%d", err, execPosts)
+		}
+	})
 }
 
 func controlCommand(action, guest string, parameters string) Command {
@@ -417,11 +546,17 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	t.Run("timezone waits for QGA command completion", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
 				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_ = r.ParseForm()
-				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl" || strings.Join(r.Form["extra-args"], "|") != "set-timezone|Asia/Shanghai" {
+				if r.Method != http.MethodPost {
+					t.Fatalf("timezone method: %s", r.Method)
+				}
+				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "set-timezone", "Asia/Shanghai"})
+				if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
 					t.Fatalf("timezone command: %v", r.Form)
 				}
 				_, _ = w.Write([]byte(`{"data":{"pid":7}}`))
@@ -446,6 +581,8 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	t.Run("timezone decodes nested QGA command result envelopes", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
 				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
@@ -471,12 +608,17 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	t.Run("timezone inspection returns only a versioned IANA observation", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_ = r.ParseForm()
-				// PVE 8.4 validates command as one scalar parameter.  The rest of
-				// the argv must use its repeated extra-args field; repeated command
-				// values are rejected before QGA is reached.
-				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl" || strings.Join(r.Form["extra-args"], "|") != "show|--property=Timezone|--value" || r.Form.Get("capture-output") != "1" {
+				if r.Method != http.MethodPost {
+					t.Fatalf("timezone inspection method: %s", r.Method)
+				}
+				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"})
+				if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
 					t.Fatalf("timezone inspection command: %v", r.Form)
 				}
 				_, _ = w.Write([]byte(`{"data":{"result":{"pid":12}}}`))
@@ -503,10 +645,105 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		}
 	})
 
+	t.Run("timezone inspection waits for guest exec before its network precondition", func(t *testing.T) {
+		infoReads, execPosts := 0, 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				infoReads++
+				if infoReads < 3 {
+					w.WriteHeader(http.StatusInternalServerError)
+					_, _ = w.Write([]byte(`{"data":null}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				execPosts++
+				_ = r.ParseForm()
+				if r.Method != http.MethodPost {
+					t.Fatalf("timezone inspection exec method: %s", r.Method)
+				}
+				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"})
+				if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+					t.Fatalf("timezone inspection exec request: %s %v", r.Method, r.Form)
+				}
+				_, _ = w.Write([]byte(`{"data":{"pid":12}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				if r.Method != http.MethodGet || r.URL.Query().Get("pid") != "12" {
+					t.Fatalf("timezone inspection status request: %s %v", r.Method, r.URL.Query())
+				}
+				out := base64.StdEncoding.EncodeToString([]byte("UTC\n"))
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"` + out + `"}}`))
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		executor := Executor{
+			Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true,
+			QGABootWait: 100 * time.Millisecond, QGAPollInterval: time.Millisecond,
+		}
+		receipt, err := executor.Execute(context.Background(), controlCommand("vm.inspect-timezone", "qemu", `{"notBefore":"2026-01-01T00:00:00Z"}`), time.Now())
+		if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || infoReads != 3 || execPosts != 1 {
+			t.Fatalf("receipt=%#v err=%v infoReads=%d execPosts=%d", receipt, err, infoReads, execPosts)
+		}
+	})
+
+	t.Run("timezone inspection expires its QGA readiness deadline without guest exec", func(t *testing.T) {
+		infoReads, execPosts := 0, 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/agent/info") {
+				infoReads++
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"data":null}`))
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
+				execPosts++
+			}
+			t.Fatalf("unexpected request after unavailable QGA: %s %s", r.Method, r.URL.Path)
+		}))
+		defer server.Close()
+		executor := Executor{
+			Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true,
+			QGABootWait: 20 * time.Millisecond, QGAPollInterval: time.Millisecond,
+		}
+		receipt, err := executor.Execute(context.Background(), controlCommand("vm.inspect-timezone", "qemu", `{"notBefore":"2026-01-01T00:00:00Z"}`), time.Now())
+		if err == nil || receipt.State != "rejected" || receipt.Code != "QGA_UNAVAILABLE" || receipt.Error == nil || receipt.Error.Source != "qga" || infoReads < 2 || execPosts != 0 {
+			t.Fatalf("receipt=%#v err=%v infoReads=%d execPosts=%d", receipt, err, infoReads, execPosts)
+		}
+	})
+
+	t.Run("timezone inspection keeps a post-readiness error retryable", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				http.Error(w, "QEMU guest agent is not running", http.StatusInternalServerError)
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(
+			context.Background(), controlCommand("vm.inspect-timezone", "qemu", `{"notBefore":"2026-01-01T00:00:00Z"}`), time.Now(),
+		)
+		if err == nil || receipt.State != "failed" || receipt.Code != "TIMEZONE_OBSERVATION_NOT_READY" || receipt.Error == nil || receipt.Error.Source != "qga" || receipt.Error.HTTPStatus != http.StatusInternalServerError {
+			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+	})
+
 	t.Run("timezone waits for QGA to become available after guest boot", func(t *testing.T) {
 		infoReads := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
 				infoReads++
 				if infoReads < 3 {
