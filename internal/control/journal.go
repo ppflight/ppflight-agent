@@ -501,6 +501,9 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 		(migration.AssignmentRevision == record.AssignmentRevision ||
 			(isIPFilterRecovery && record.AuditContext != nil && ipFilterResult.LegacyAssignmentRevision == record.AuditContext.AssignmentRevision &&
 				record.AssignmentRevision == ipFilterResult.LegacyAssignmentRevision && migration.AssignmentRevision > record.AssignmentRevision))
+	if isIPFilterRecovery && legacyRetirementAuthorityMatches(record, migration, ipFilterResult.LegacyAssignmentRevision) {
+		authorityMatches = true
+	}
 	if migration.CommandID != record.RetiredByCommandID || migration.Action != "vm.migrate-legacy-journal" ||
 		migration.ResourceKey != record.ResourceKey || !recordSucceeded(migration) || migration.AuditContext == nil ||
 		migration.AuditContext.Action != migration.Action || migration.AuditContext.ApprovalRef == "" ||
@@ -525,7 +528,7 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 			ipFilterResult.LegacyAssignmentRevision == record.AuditContext.AssignmentRevision &&
 			ipFilterResult.FailedCommandID == record.CommandID && ipFilterResult.FailedOperationID == record.OperationID &&
 			ipFilterResult.FailedCommandDigest == record.Digest &&
-			record.AuditContext.PayloadDigest == "sha256:"+ipFilterResult.FailedPayloadSHA256, nil
+			record.AuditContext.PayloadDigest == "sha256:"+ipFilterResult.FailedWireBodySHA256, nil
 	}
 	var result LegacyJournalMigrationResult
 	if !validLegacyMigrationJournalResult(&migration, migration.Receipt.Result) ||
@@ -538,6 +541,34 @@ func (j *Journal) retirementCommittedLocked(record journalRecord) (bool, error) 
 		}
 	}
 	return false, nil
+}
+
+// legacyRetirementAuthorityMatches accepts the rc.27 journal shape where the
+// record-level lineage fields were not yet persisted. Authority is still
+// anchored to the immutable signed audit projection, while every lineage
+// field that is present on the old record must equal the migration record.
+func legacyRetirementAuthorityMatches(record, migration journalRecord, legacyAssignmentRevision protocol.Counter) bool {
+	if record.AuditContext == nil || migration.AuditContext == nil ||
+		record.AgentRef != migration.AgentRef || record.NodeRef != migration.NodeRef || record.Scope != ScopeVM ||
+		record.AuditContext.AssignmentRevision != legacyAssignmentRevision ||
+		migration.AssignmentRevision <= legacyAssignmentRevision ||
+		record.AuditContext.WebsiteCommandKeyID != migration.AuditContext.WebsiteCommandKeyID ||
+		record.AuditContext.TargetRef != migration.AuditContext.TargetRef ||
+		record.AuditContext.CommandID != record.CommandID || record.AuditContext.OperationID != record.OperationID ||
+		record.AuditContext.Scope != ScopeVM || record.AuditContext.ApprovalRef == "" ||
+		migration.AuditContext.Action != "vm.migrate-legacy-journal" || migration.AuditContext.ApprovalRef == "" {
+		return false
+	}
+	return optionalStringMatches(record.BindingID, migration.BindingID) &&
+		optionalStringMatches(record.DeviceID, migration.DeviceID) &&
+		optionalCounterMatches(record.CredentialEpoch, migration.CredentialEpoch) &&
+		optionalCounterMatches(record.AssignmentRevision, legacyAssignmentRevision) &&
+		optionalStringMatches(record.ClusterRef, migration.ClusterRef) &&
+		optionalStringMatches(record.ServiceRef, migration.ServiceRef) &&
+		optionalStringMatches(record.InstanceUUID, migration.InstanceUUID) &&
+		optionalStringMatches(record.GuestType, migration.GuestType) &&
+		optionalIntMatches(record.VMID, migration.VMID) &&
+		optionalCounterMatches(record.Generation, migration.Generation)
 }
 
 func (j *Journal) Complete(command Command, receipt Receipt) error {

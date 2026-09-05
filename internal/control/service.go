@@ -458,6 +458,10 @@ func verificationRejectionCode(err error) string {
 }
 
 func claimRejectionCode(err error) string {
+	var ipFilterEligibility *ipFilterDeleteRecoveryEligibilityError
+	if errors.As(err, &ipFilterEligibility) {
+		return ipFilterEligibility.receiptCode()
+	}
 	switch {
 	case errors.Is(err, ErrCommandConflict):
 		return "COMMAND_ID_CONFLICT"

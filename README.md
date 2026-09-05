@@ -100,7 +100,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.40` 将 cloud-init 的退出状态只作为“初始化已结束”信号：退出码 0、1、2 都会进入后续严格交付证明，其他异常退出码仍拒绝。即使 cloud-init 返回 1，替换实例也必须逐项通过时区、OS、QGA、CPU/内存/磁盘、双网卡地址和防火墙的全部签名回验，否则安全回滚原实例。Agent 会记录不含 guest 输出和密钥的重装验证阶段、cloud-init 退出码及最终真实失败原因。
 
-`0.1.1-rc.43` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并绑定旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
+`0.1.1-rc.44` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并分别绑定官网 canonical payload 哈希与历史签名 wire body 哈希，以及旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
 
 ## NIC 角色、IP、网络与防盗用
 

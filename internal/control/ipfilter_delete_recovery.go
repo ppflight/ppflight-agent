@@ -14,6 +14,39 @@ import (
 
 const ipFilterDeleteRecoveryKind = "ipfilter-delete-readback-v1"
 
+type ipFilterDeleteRecoveryEligibilityError struct{ reason string }
+
+func (e *ipFilterDeleteRecoveryEligibilityError) Error() string {
+	return "IPFilter delete recovery record is not eligible: " + e.reason
+}
+
+func (e *ipFilterDeleteRecoveryEligibilityError) Unwrap() error { return ErrListedRecordNotEligible }
+
+func (e *ipFilterDeleteRecoveryEligibilityError) receiptCode() string {
+	switch e.reason {
+	case "request":
+		return "IPFILTER_RECOVERY_REQUEST_MISMATCH"
+	case "identity":
+		return "IPFILTER_RECOVERY_IDENTITY_MISMATCH"
+	case "receipt":
+		return "IPFILTER_RECOVERY_RECEIPT_MISMATCH"
+	case "audit":
+		return "IPFILTER_RECOVERY_AUDIT_MISMATCH"
+	case "target":
+		return "IPFILTER_RECOVERY_TARGET_MISMATCH"
+	case "authority":
+		return "IPFILTER_RECOVERY_AUTHORITY_MISMATCH"
+	case "retirement":
+		return "IPFILTER_RECOVERY_RETIREMENT_MISMATCH"
+	default:
+		return "LISTED_RECORD_NOT_ELIGIBLE"
+	}
+}
+
+func ipFilterDeleteRecoveryMismatch(reason string) error {
+	return &ipFilterDeleteRecoveryEligibilityError{reason: reason}
+}
+
 type ipFilterDeleteRecoveryP struct {
 	RecoveryKind             string           `json:"recoveryKind"`
 	LegacyAssignmentRevision protocol.Counter `json:"legacyAssignmentRevision"`
@@ -21,6 +54,7 @@ type ipFilterDeleteRecoveryP struct {
 	FailedOperationID        string           `json:"failedOperationId"`
 	FailedCommandDigest      string           `json:"failedCommandDigest"`
 	FailedPayloadSHA256      string           `json:"failedPayloadSha256"`
+	FailedWireBodySHA256     string           `json:"failedWireBodySha256"`
 	Name                     string           `json:"name"`
 	CIDR                     string           `json:"cidr"`
 }
@@ -33,12 +67,14 @@ type IPFilterDeleteRecoveryResult struct {
 	FailedOperationID        string           `json:"failedOperationId"`
 	FailedCommandDigest      string           `json:"failedCommandDigest"`
 	FailedPayloadSHA256      string           `json:"failedPayloadSha256"`
+	FailedWireBodySHA256     string           `json:"failedWireBodySha256"`
 	FailedReceiptCode        string           `json:"failedReceiptCode"`
 	Name                     string           `json:"name"`
 	CIDR                     string           `json:"cidr"`
 	ProviderReadVerified     bool             `json:"providerReadVerified"`
 	TargetPresent            bool             `json:"targetPresent"`
 	ObservedCIDR             string           `json:"observedCidr"`
+	JournalRecordRetired     bool             `json:"journalRecordRetired"`
 }
 
 func decodeIPFilterDeleteRecovery(command Command) (ipFilterDeleteRecoveryP, bool) {
@@ -56,37 +92,58 @@ func validIPFilterDeleteRecovery(command Command, parameters ipFilterDeleteRecov
 		(command.AssignmentRevision == 0 || parameters.LegacyAssignmentRevision < command.AssignmentRevision) &&
 		commandIDRE.MatchString(parameters.FailedCommandID) && commandIDRE.MatchString(parameters.FailedOperationID) &&
 		bodyHashRE.MatchString(parameters.FailedCommandDigest) && bodyHashRE.MatchString(parameters.FailedPayloadSHA256) &&
+		bodyHashRE.MatchString(parameters.FailedWireBodySHA256) &&
 		parameters.FailedPayloadSHA256 == ipFilterDeletePayloadSHA256(parameters.Name, parameters.CIDR) &&
 		validIPSetEntry(parameters.Name, parameters.CIDR) &&
 		command.CommandID != parameters.FailedCommandID && command.OperationID != parameters.FailedOperationID
 }
 
 func ipFilterDeleteRecordEligible(record journalRecord, command Command, parameters ipFilterDeleteRecoveryP, resourceKey string) bool {
-	if !validIPFilterDeleteRecovery(command, parameters) || record.CommandID != parameters.FailedCommandID ||
+	return ipFilterDeleteRecordEligibility(record, command, parameters, resourceKey) == nil
+}
+
+func ipFilterDeleteRecordEligibility(record journalRecord, command Command, parameters ipFilterDeleteRecoveryP, resourceKey string) error {
+	recordAction, actionOK := legacyRecordAction(record)
+	if !validIPFilterDeleteRecovery(command, parameters) {
+		return ipFilterDeleteRecoveryMismatch("request")
+	}
+	if record.CommandID != parameters.FailedCommandID ||
 		record.OperationID != parameters.FailedOperationID || record.Digest != parameters.FailedCommandDigest ||
-		record.ResourceKey != resourceKey || record.Action != "firewall.ipset.entry.delete" || !record.Mutating ||
-		record.Scope != ScopeVM || record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" ||
-		record.Receipt == nil || record.Receipt.State != "indeterminate" || record.Receipt.Code != "PVE_RESULT_INDETERMINATE" ||
+		record.ResourceKey != resourceKey || !actionOK || recordAction != "firewall.ipset.entry.delete" || !record.Mutating ||
+		record.Scope != ScopeVM || record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" {
+		return ipFilterDeleteRecoveryMismatch("identity")
+	}
+	if record.Receipt == nil || record.Receipt.State != "indeterminate" || record.Receipt.Code != "PVE_RESULT_INDETERMINATE" ||
 		record.Receipt.CommandID != record.CommandID || record.Receipt.OperationID != record.OperationID ||
 		record.Receipt.AgentRef != record.AgentRef || record.Receipt.Accepted || record.Receipt.Asynchronous ||
-		!record.Receipt.MutationMayHaveSucceeded || record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "" ||
-		record.AuditContext == nil || record.AuditContext.Action != "firewall.ipset.entry.delete" ||
+		!record.Receipt.MutationMayHaveSucceeded || record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "" {
+		return ipFilterDeleteRecoveryMismatch("receipt")
+	}
+	if record.AuditContext == nil || record.AuditContext.Action != "firewall.ipset.entry.delete" ||
 		record.AuditContext.CommandID != record.CommandID || record.AuditContext.OperationID != record.OperationID ||
-		record.AuditContext.IdempotencyKey != record.IdempotencyKey ||
+		(record.IdempotencyKey != "" && record.AuditContext.IdempotencyKey != record.IdempotencyKey) ||
 		record.AuditContext.AssignmentRevision != parameters.LegacyAssignmentRevision ||
 		record.AuditContext.Scope != ScopeVM || record.AuditContext.WebsiteCommandKeyID != command.SigningKeyID ||
-		record.AuditContext.ApprovalRef == "" || record.AuditContext.PayloadDigest != "sha256:"+parameters.FailedPayloadSHA256 {
-		return false
+		record.AuditContext.ApprovalRef == "" || record.AuditContext.PayloadDigest != "sha256:"+parameters.FailedWireBodySHA256 {
+		return ipFilterDeleteRecoveryMismatch("audit")
 	}
 	targetRef, err := auditTargetRef(command)
 	if err != nil || record.AuditContext.TargetRef != targetRef {
-		return false
+		return ipFilterDeleteRecoveryMismatch("target")
 	}
 	if record.RetiredByCommandID == "" && record.RetiredAt == nil {
-		return legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision)
+		if !legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision) {
+			return ipFilterDeleteRecoveryMismatch("authority")
+		}
+		return nil
 	}
-	return record.RetiredByCommandID == command.CommandID && record.RetiredAt != nil &&
-		legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision)
+	if record.RetiredByCommandID != command.CommandID || record.RetiredAt == nil {
+		return ipFilterDeleteRecoveryMismatch("retirement")
+	}
+	if !legacyRecordAuthorityMatches(record, command, parameters.LegacyAssignmentRevision) {
+		return ipFilterDeleteRecoveryMismatch("authority")
+	}
+	return nil
 }
 
 func (j *Journal) validateIPFilterDeleteRecoveryClaimLocked(command Command, parameters ipFilterDeleteRecoveryP) error {
@@ -95,8 +152,11 @@ func (j *Journal) validateIPFilterDeleteRecoveryClaimLocked(command Command, par
 		return err
 	}
 	record, err := readJournal(j.path(parameters.FailedCommandID))
-	if err != nil || !ipFilterDeleteRecordEligible(record, command, parameters, resourceKey) {
+	if err != nil {
 		return fmt.Errorf("%w: %s", ErrListedRecordNotEligible, parameters.FailedCommandID)
+	}
+	if eligibilityErr := ipFilterDeleteRecordEligibility(record, command, parameters, resourceKey); eligibilityErr != nil {
+		return eligibilityErr
 	}
 	entries, err := os.ReadDir(j.directory)
 	if err != nil {
@@ -162,9 +222,10 @@ func (j *Journal) ReconcileIPFilterDelete(command Command, parameters ipFilterDe
 		LegacyAssignmentRevision: parameters.LegacyAssignmentRevision,
 		FailedCommandID:          parameters.FailedCommandID, FailedOperationID: parameters.FailedOperationID,
 		FailedCommandDigest: parameters.FailedCommandDigest, FailedPayloadSHA256: parameters.FailedPayloadSHA256,
-		FailedReceiptCode: "PVE_RESULT_INDETERMINATE",
-		Name:              parameters.Name, CIDR: parameters.CIDR, ProviderReadVerified: true,
-		TargetPresent: targetPresent, ObservedCIDR: observedCIDR,
+		FailedWireBodySHA256: parameters.FailedWireBodySHA256,
+		FailedReceiptCode:    "PVE_RESULT_INDETERMINATE",
+		Name:                 parameters.Name, CIDR: parameters.CIDR, ProviderReadVerified: true,
+		TargetPresent: targetPresent, ObservedCIDR: observedCIDR, JournalRecordRetired: true,
 	}, nil
 }
 
@@ -177,9 +238,10 @@ func validIPFilterDeleteRecoveryJournalResult(record *journalRecord, raw []byte)
 		result.LegacyAssignmentRevision == 0 || result.LegacyAssignmentRevision >= record.AssignmentRevision ||
 		!commandIDRE.MatchString(result.FailedCommandID) || !commandIDRE.MatchString(result.FailedOperationID) ||
 		!bodyHashRE.MatchString(result.FailedCommandDigest) || !bodyHashRE.MatchString(result.FailedPayloadSHA256) ||
+		!bodyHashRE.MatchString(result.FailedWireBodySHA256) ||
 		result.FailedPayloadSHA256 != ipFilterDeletePayloadSHA256(result.Name, result.CIDR) ||
 		result.FailedReceiptCode != "PVE_RESULT_INDETERMINATE" ||
-		!validIPSetEntry(result.Name, result.CIDR) || !result.ProviderReadVerified {
+		!validIPSetEntry(result.Name, result.CIDR) || !result.ProviderReadVerified || !result.JournalRecordRetired {
 		return false
 	}
 	expected, expectedOK := canonicalFirewallCIDR(result.CIDR)
