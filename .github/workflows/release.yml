@@ -126,10 +126,16 @@ jobs:
           cd release
           cat SHA256SUMS-amd64 SHA256SUMS-arm64 > SHA256SUMS
           sha256sum --check SHA256SUMS
+          release_channel_args=()
+          if [[ "$TAG" == *-rc.* ]]; then
+            release_channel_args+=(--prerelease)
+          else
+            release_channel_args+=(--latest)
+          fi
           gh release create "$TAG" \
             ppflight-agent-*-linux-*.tar.gz SHA256SUMS \
             --verify-tag \
-            --prerelease \
+            "${release_channel_args[@]}" \
             --title "PPFlight Agent $TAG" \
             --generate-notes
 
