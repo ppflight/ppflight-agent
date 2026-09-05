@@ -106,7 +106,7 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.54` 修正备份删除：PVE backup volid 中的 `:` 和 `/` 会作为单个不透明路径段编码，且声明的备份存储必须与卷标识前缀一致，避免删除请求落到错误的 API 路径。
 
-`0.1.1-rc.55` 增加安全的并发命令调度：同一 VM 写操作仍严格串行，noVNC 最多 8 路、短任务最多 4 路可越过无关长任务；并增加限速写后回读、不可用时区诊断、备份库存绑定及 384 台规模下的一分钟遥测节奏。
+`0.1.1-rc.56` 在 rc.55 的有界并发、限速回读、备份绑定及 384 台一分钟遥测基础上，增加签名只读 QGA 时区观测，旧版布尔匹配回执不再能建立 guest 时区基线。
 
 `0.1.1-rc.56` 增加 `vm.inspect-timezone`：它只读执行固定 QGA `timedatectl show --property=Timezone --value`，只接受一个 IANA 区域并回传 versioned exact observation。该新 action/result schema 是独立能力门；历史 `vm.verify-delivery` 的 `timezoneMatched` 布尔值和重装 receipt 都不能建立或迁移官网时区基线。
 
