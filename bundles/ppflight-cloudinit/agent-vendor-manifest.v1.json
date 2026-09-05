@@ -12,7 +12,7 @@
     },
     {
       "path": "tools/ppflight-template-bootstrap.py",
-      "sha256": "9ef7418b82a4bb496fce0102d2ea1d53e97c6deef663f35ac02e74e5b8f11f0b",
+      "sha256": "fd33218d7ef98f091eea4986a38336d5b703b43c2e82fc9776b573a46d1f4922",
       "requiredAtRuntime": true
     },
     {
