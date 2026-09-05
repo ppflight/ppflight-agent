@@ -79,6 +79,10 @@ func executionError(action string, err error) *ExecutionError {
 		}
 	}
 
+	// Upstream PVE errors can mirror fragments of request data. Sanitize before
+	// any diagnostic is persisted in the journal, audit log, or signed receipt.
+	reason = sanitizeDiagnostic(reason)
+
 	// Collapse whitespace/control characters and cap the diagnostic before it
 	// enters a signed receipt. Request bodies, credentials and raw response
 	// bodies are never selected above for typed PVE failures.
@@ -103,17 +107,27 @@ const (
 )
 
 var (
-	nodeRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	netRE         = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
-	diskRE        = regexp.MustCompile(`^(scsi|virtio|sata|ide)[0-9]{1,2}$`)
-	nameRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	macRE         = regexp.MustCompile(`(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
-	deliveryMACRE = regexp.MustCompile(`^[0-9A-F]{2}(:[0-9A-F]{2}){5}$`)
-	storageRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
-	snapRE        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
-	upidRE        = regexp.MustCompile(`^UPID:[A-Za-z0-9@!+,:._-]{1,511}$`)
-	portListRE    = regexp.MustCompile(`^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$`)
+	nodeRE                     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	netRE                      = regexp.MustCompile(`^net([0-9]|[12][0-9]|3[01])$`)
+	diskRE                     = regexp.MustCompile(`^(scsi|virtio|sata|ide)[0-9]{1,2}$`)
+	nameRE                     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	macRE                      = regexp.MustCompile(`(?i)^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+	deliveryMACRE              = regexp.MustCompile(`^[0-9A-F]{2}(:[0-9A-F]{2}){5}$`)
+	storageRE                  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	snapRE                     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$`)
+	upidRE                     = regexp.MustCompile(`^UPID:[A-Za-z0-9@!+,:._-]{1,511}$`)
+	portListRE                 = regexp.MustCompile(`^[0-9]{1,5}(-[0-9]{1,5})?(,[0-9]{1,5}(-[0-9]{1,5})?)*$`)
+	sensitiveDiagnosticValueRE = regexp.MustCompile(`(?i)\b(password|passwd|secret|token|cipassword|authorization)\b["']?\s*(?::|=)\s*(?:"[^"]*"|'[^']*'|[^\s,;&}\]]+)`)
+	bearerDiagnosticRE         = regexp.MustCompile(`(?i)\b(?:bearer|pveapitoken)\s+[A-Za-z0-9._~+/=-]+`)
+	queryDiagnosticRE          = regexp.MustCompile(`(?i)([?&](?:password|passwd|secret|token|cipassword|authorization|key|auth|signature)=)[^&#\s]+`)
 )
+
+func sanitizeDiagnostic(reason string) string {
+	reason = sensitiveDiagnosticValueRE.ReplaceAllString(reason, "$1=[REDACTED]")
+	reason = bearerDiagnosticRE.ReplaceAllString(reason, "[REDACTED]")
+	reason = queryDiagnosticRE.ReplaceAllString(reason, "$1[REDACTED]")
+	return strings.Join(strings.Fields(reason), " ")
+}
 
 type Executor struct {
 	// Client is the mutation client and should use the dedicated control token.
@@ -1354,7 +1368,7 @@ func validDiscoveryScope(phase, scope string) bool {
 
 func validDiscoveryPhase(phase string) bool {
 	switch phase {
-	case discovery.PhaseVersion, discovery.PhasePermissions, discovery.PhaseNodes, discovery.PhaseStorage, discovery.PhaseTemplates, discovery.PhaseNetworks, discovery.PhaseCapacity, discovery.PhaseFirewall, discovery.PhaseReadiness:
+	case discovery.PhaseVersion, discovery.PhasePermissions, discovery.PhaseNodes, discovery.PhaseStorage, discovery.PhaseTemplates, discovery.PhaseGuests, discovery.PhaseNetworks, discovery.PhaseCapacity, discovery.PhaseFirewall, discovery.PhaseReadiness:
 		return true
 	default:
 		return false

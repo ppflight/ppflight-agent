@@ -190,6 +190,28 @@ func TestExecutionErrorClassifiesPVEProxiedGuestAgentFailure(t *testing.T) {
 	}
 }
 
+func TestExecutionErrorRedactsUpstreamCredentialDiagnostics(t *testing.T) {
+	diagnostic := executionError("vm.reset-password", &pve.HTTPError{
+		StatusCode: http.StatusBadRequest,
+		Reason:     `upstream rejected {"password":"never-log","token":"also-never"} url=?secret=query-never`,
+		Method:     http.MethodPost,
+		Path:       "/nodes/pve1/qemu/101/agent/set-user-password",
+	})
+	if diagnostic == nil {
+		t.Fatal("expected diagnostic")
+	}
+	for _, forbidden := range []string{"never-log", "also-never", "query-never"} {
+		if strings.Contains(diagnostic.Reason, forbidden) {
+			t.Fatalf("credential leaked in diagnostic: %q", diagnostic.Reason)
+		}
+	}
+	for _, required := range []string{"password=[REDACTED]", "token=[REDACTED]", "secret=[REDACTED]"} {
+		if !strings.Contains(diagnostic.Reason, required) {
+			t.Fatalf("missing redaction %q in diagnostic: %q", required, diagnostic.Reason)
+		}
+	}
+}
+
 func TestExecutorResourceAndNetworkUseConfigDigest(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
