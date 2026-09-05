@@ -27,6 +27,7 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/config"
 	"github.com/ppflight/ppflight-agent/internal/enrollment"
+	"github.com/ppflight/ppflight-agent/internal/hostfirewall"
 	"github.com/ppflight/ppflight-agent/internal/monitorenrollment"
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
@@ -347,7 +348,13 @@ func TestBindingSettingsExplicitlyDiscardRevokedWebsitePendingWithoutTouchingMon
 func TestSystemOverviewShowsCoreSectionsWithoutSecrets(t *testing.T) {
 	filename := prepareBindConfig(t)
 	var output, stderr bytes.Buffer
-	instance := &cli{in: strings.NewReader("4\n0\n"), out: &output, errOut: &stderr, effectiveUID: func() int { return 0 }}
+	instance := &cli{
+		in: strings.NewReader("4\n0\n"), out: &output, errOut: &stderr,
+		effectiveUID: func() int { return 0 },
+		inspectHostFirewall: func() (hostfirewall.TransactionOverview, error) {
+			return hostfirewall.TransactionOverview{}, nil
+		},
+	}
 	if code := instance.menu(filename); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}

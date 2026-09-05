@@ -50,6 +50,8 @@ sudo ag-pve bind \
 
 包内底层安装器落盘的未配置样例仍是 `mode=production`、`pve.source=disabled`，避免在校验前启动；一键脚本会紧接着自动完成真实 PVE 准备、exporter 配置迁移、专用 control ACL、启动和开机启用。运行时只有 `mode=production` 加 `pve.source=api` 可采集；遗留配置中的 `mode=test` 或 `pve.source=simulator` 在升级时自动转为 `production+disabled`，随后由同一自动准备流程恢复真实采集，绑定无需重做。若本机证书 DNS 无法自动确定，一键安装会明确失败而不会静默降级；可在修正主机 FQDN/证书后重试。CA 只接受安装器维护的 `/etc/ppflight-agent/pve-root-ca.pem`。专用 control role 虽在 `/` 生效，但动作仍须同时通过官网 Ed25519 签名、binding/device/epoch、assignment revision、固定 action schema/allowlist、审批与资源锁；独立 monitoring audit 未绑定时 `productionExecution` 保持 false，完成双绑定后自动打开。
 
+控制任务默认每 5 秒领取一次。升级时只有旧版精确默认值 `30s` 会自动迁移为 `5s`，其他管理员自定义轮询值保持不变。
+
 也可用 `--code-file FILE` 读取仅 owner 可读、非符号链接的私密文件；CLI 拒绝额外位置参数，也没有接收 code 值的命令行选项。Agent 在发送前持久化 UUID `requestId` 与 canonical 请求指纹以便安全重试，绑定码参与 hash 但原文不落盘。绑定成功后，官网必须返回 `bindingId`、匹配的 `deviceId`、身份、同源 HTTPS 端点、分用途 HMAC 凭据、Ed25519 命令验签公钥、初始 assignment、`networkPolicy` 和 `credentialEpoch`，并保存到 `<stateDirectory>/bindings/binding-state.json`；稳定 device ID 和 pending 幂等状态也在该私有子目录，PVE Token 永不上传官网。
 
 监控站采用另一套一次性绑定码和独立信任域。官网与监控 bind 都不接受人工 PVE 版本：固定 `/usr/bin/pveversion`、无 shell 拼接地自动发现并规范化版本；真实 PVE readiness、版本发现或 API 校验失败时，在读取/发送绑定码前 fail closed。绑定请求先持久化同码可重试的 pending `requestId`；一旦服务端签发新凭据，Agent 绝不回滚到可能已被服务端撤销的旧凭据。它以 fail-closed commit marker 保持服务停止，并在操作者使用**同一绑定码**重试时复用同一请求恢复写入、严格回读、受控重启和本地 `/status` 的 `bindingId/credentialEpoch` 回验。监控 key 只能按服务端逐路由 scope 用于 `monitoring:telemetry.write`、`monitoring:audit.write` 和固定同源的 `monitoring:status.read`，不能授权官网 API 或 PVE mutation。官网 bind/replace 不得创建、覆盖、轮换或复用监控站凭据/`networkPolicy`。
@@ -101,6 +103,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 `0.1.1-rc.40` 将 cloud-init 的退出状态只作为“初始化已结束”信号：退出码 0、1、2 都会进入后续严格交付证明，其他异常退出码仍拒绝。即使 cloud-init 返回 1，替换实例也必须逐项通过时区、OS、QGA、CPU/内存/磁盘、双网卡地址和防火墙的全部签名回验，否则安全回滚原实例。Agent 会记录不含 guest 输出和密钥的重装验证阶段、cloud-init 退出码及最终真实失败原因。
 
 `0.1.1-rc.44` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并分别绑定官网 canonical payload 哈希与历史签名 wire body 哈希，以及旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
+
+`0.1.1-rc.45` 把官网控制任务默认领取间隔从 30 秒缩短到 5 秒。升级安装只迁移旧版精确默认值 `30s`，保留其他管理员自定义值，从而缩短由多个串行 Agent 命令组成的防火墙与 VPS 生命周期任务等待时间。
 
 ## NIC 角色、IP、网络与防盗用
 

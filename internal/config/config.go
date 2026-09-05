@@ -230,7 +230,7 @@ func defaults() Config {
 			MonitoringAudit:  defaultDestination(512<<20, "audit-v1"),
 		},
 		Control: ControlConfig{
-			Enabled: false, PollInterval: Duration{30 * time.Second}, RequestTimeout: Duration{10 * time.Second},
+			Enabled: false, PollInterval: Duration{5 * time.Second}, RequestTimeout: Duration{10 * time.Second},
 			MaxCommandsPerPoll: 20, ProductionExecution: false,
 			Auth:           AuthConfig{Mode: "hmac-sha256"},
 			AllowedActions: []string{"vm.start", "vm.shutdown", "vm.reboot"},

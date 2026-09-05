@@ -112,7 +112,7 @@
     "pollUrl": "",
     "resultUrl": "",
     "auth": { "mode": "hmac-sha256", "keyIdEnv": "", "secretEnv": "" },
-    "pollInterval": "30s",
+    "pollInterval": "5s",
     "requestTimeout": "10s",
     "commandSecretEnv": "",
     "commandSigningKeyIdEnv": "",

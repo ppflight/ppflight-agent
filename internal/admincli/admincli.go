@@ -82,6 +82,9 @@ type cli struct {
 	quiesceBinding    func(context.Context) error
 	completeUninstall func(context.Context) error
 	completeUpdate    func(context.Context) (string, error)
+	// inspectHostFirewall is a read-only test boundary. Production callers
+	// leave it nil and inspect the fixed host firewall transaction store.
+	inspectHostFirewall func() (hostfirewall.TransactionOverview, error)
 	// managedWritePolicy is an explicit in-process test/embedding boundary for
 	// production-path ownership validation. Real CLI construction leaves it nil
 	// and therefore always uses the fixed installer paths on Linux root.
@@ -1347,7 +1350,11 @@ func (c *cli) systemOverview(filename string) int {
 	fmt.Fprintf(c.out, "  SMART 采集：%s；开机启动：%s\n", systemdUnitState("ppflight-smartctl-exporter.service"), systemdUnitEnabledState("ppflight-smartctl-exporter.service"))
 
 	fmt.Fprintln(c.out, "\n[PVE 主机防火墙]")
-	firewallTransaction, firewallErr := hostfirewall.InspectTransaction()
+	inspectHostFirewall := c.inspectHostFirewall
+	if inspectHostFirewall == nil {
+		inspectHostFirewall = hostfirewall.InspectTransaction
+	}
+	firewallTransaction, firewallErr := inspectHostFirewall()
 	if firewallErr != nil {
 		fmt.Fprintln(c.out, "  全新安装事务：状态文件不安全或损坏（禁止推断或修改）")
 	} else if !firewallTransaction.Present {

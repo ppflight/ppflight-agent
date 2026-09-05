@@ -404,12 +404,26 @@ try:
     document = json.loads(raw.decode("utf-8"))
     mode = document["mode"]
     source = document["pve"]["source"]
+    control_poll_interval = document["control"]["pollInterval"]
 except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
     raise SystemExit("agent config cannot be safely parsed") from error
+if not isinstance(control_poll_interval, str):
+    raise SystemExit("agent control.pollInterval cannot be safely parsed")
+changed = False
 if source == "simulator" or mode == "test":
     document["mode"] = "production"
     document["pve"]["source"] = "disabled"
-    replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc13.", dir=directory)
+    source = "disabled"
+    mode = "production"
+    changed = True
+# 30 seconds was the released default through RC.44. Migrate only that exact
+# inherited value; explicit operator values other than the old default remain
+# untouched.
+if control_poll_interval == "30s":
+    document["control"]["pollInterval"] = "5s"
+    changed = True
+if changed:
+    replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc45.", dir=directory)
     try:
         os.fchmod(replacement, 0o640)
         os.fchown(replacement, metadata.st_uid, metadata.st_gid)
@@ -433,8 +447,6 @@ if source == "simulator" or mode == "test":
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-    source = "disabled"
-    mode = "production"
 if source not in {"api", "disabled"}:
     raise SystemExit("invalid pve.source in existing Agent config")
 if mode != "production":

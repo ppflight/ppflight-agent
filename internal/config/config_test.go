@@ -33,7 +33,7 @@ func TestParseAppliesSafeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" {
+	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" {
 		t.Fatalf("defaults not applied: %#v", cfg)
 	}
 	if cfg.PVE.Source != "disabled" || cfg.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" {

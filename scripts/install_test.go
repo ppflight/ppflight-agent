@@ -63,6 +63,8 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 		`if source == "simulator" or mode == "test":`,
 		`document["mode"] = "production"`,
 		`document["pve"]["source"] = "disabled"`,
+		`if control_poll_interval == "30s":`,
+		`document["control"]["pollInterval"] = "5s"`,
 		`if mode != "production":`,
 		`PVE collection is disabled and the service remains stopped`,
 	} {
@@ -132,6 +134,54 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 		if strings.Contains(unit, forbidden) {
 			t.Fatalf("systemd unit interferes with an administrator stop: %q", forbidden)
 		}
+	}
+}
+
+func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("installer migration requires the same root ownership contract as production")
+	}
+	installer := readDeploymentFile(t, "install.sh")
+	startMarker := "python3 -I - \"$target\" <<'PY'\n"
+	start := strings.Index(installer, startMarker)
+	if start < 0 {
+		t.Fatal("cannot locate installer config migration")
+	}
+	start += len(startMarker)
+	end := strings.Index(installer[start:], "\nPY\n}\n")
+	if end < 0 {
+		t.Fatal("cannot locate installer config migration terminator")
+	}
+	migration := installer[start : start+end]
+
+	run := func(name, interval string) string {
+		t.Helper()
+		target := filepath.Join(t.TempDir(), name)
+		raw := `{"mode":"production","pve":{"source":"api"},"control":{"pollInterval":"` + interval + `"}}` + "\n"
+		if err := os.WriteFile(target, []byte(raw), 0o640); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("python3", "-I", "-", target)
+		command.Stdin = strings.NewReader(migration)
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("migration failed: %v: %s", err, output)
+		}
+		if strings.TrimSpace(string(output)) != "api" {
+			t.Fatalf("unexpected migration source output %q", output)
+		}
+		updated, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(updated)
+	}
+
+	if updated := run("legacy-default.json", "30s"); !strings.Contains(updated, `"pollInterval": "5s"`) {
+		t.Fatalf("legacy default was not migrated: %s", updated)
+	}
+	if updated := run("operator-custom.json", "7s"); strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"pollInterval":"7s"`) {
+		t.Fatalf("operator custom interval was modified: %s", updated)
 	}
 }
 
