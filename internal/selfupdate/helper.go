@@ -139,28 +139,12 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	slog.Info("agent upgrade candidate installed atomically", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	var previousBinding *bindstate.State
 	if rotation := parameters.CommandSigningRotation; rotation != nil {
-		state, stateErr := bindstate.Load(cfg.StateDirectory)
-		if stateErr != nil || state.CommandSigningCredential.KeyID != request.Command.SigningKeyID {
-			if stateErr == nil {
-				stateErr = errors.New("active command signing key does not match signed rotation authority")
-			}
+		previous, stateErr := stageCommandSigningRotation(cfg.StateDirectory, request.Command.SigningKeyID, *rotation)
+		if stateErr != nil {
 			_ = restoreBackup(cfg.BinaryPath, backupPath)
 			return fail("rotate_command_key", stateErr)
 		}
-		decoded, decodeErr := base64.StdEncoding.DecodeString(rotation.PublicKey)
-		if decodeErr != nil || len(decoded) != 32 {
-			_ = restoreBackup(cfg.BinaryPath, backupPath)
-			return fail("rotate_command_key", errors.New("replacement command signing key is invalid"))
-		}
-		previous := state
-		previousBinding = &previous
-		state.CommandSigningCredential = enrollment.CommandSigningCredential{
-			KeyID: rotation.KeyID, Algorithm: "ed25519", PublicKey: rotation.PublicKey,
-		}
-		if stateErr = bindstate.Save(cfg.StateDirectory, state); stateErr != nil {
-			_ = restoreBackup(cfg.BinaryPath, backupPath)
-			return fail("rotate_command_key", stateErr)
-		}
+		previousBinding = previous
 		slog.Info("agent command signing public key rotated", "upgradeId", request.UpgradeID, "keyId", rotation.KeyID)
 	}
 	rollback := func(cause error) error {
@@ -207,6 +191,26 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	_ = os.Remove(requestPath)
 	slog.Info("agent upgrade completed", "upgradeId", request.UpgradeID, "version", targetVersion)
 	return nil
+}
+
+func stageCommandSigningRotation(stateDirectory, authorityKeyID string, rotation upgradecontract.CommandSigningRotation) (*bindstate.State, error) {
+	state, err := bindstate.Load(stateDirectory)
+	if err != nil {
+		return nil, err
+	}
+	if state.CommandSigningCredential.KeyID != authorityKeyID {
+		return nil, errors.New("active command signing key does not match signed rotation authority")
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rotation.PublicKey)
+	if err != nil || len(decoded) != 32 {
+		return nil, errors.New("replacement command signing key is invalid")
+	}
+	previous := state
+	state.CommandSigningCredential = enrollment.CommandSigningCredential{KeyID: rotation.KeyID, Algorithm: "ed25519", PublicKey: rotation.PublicKey}
+	if err := bindstate.Save(stateDirectory, state); err != nil {
+		return nil, err
+	}
+	return &previous, nil
 }
 
 func nextRequest(stateDirectory string) (string, Request, error) {

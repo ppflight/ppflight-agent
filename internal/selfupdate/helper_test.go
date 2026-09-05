@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -12,9 +14,46 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
+	"github.com/ppflight/ppflight-agent/internal/bindstate"
+	"github.com/ppflight/ppflight-agent/internal/enrollment"
+	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 	"github.com/ppflight/ppflight-agent/internal/upgradecontract"
 )
+
+func TestStageCommandSigningRotationPersistsOnlyAuthorizedReplacement(t *testing.T) {
+	directory := t.TempDir()
+	secret := enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")))
+	credential := enrollment.HMACCredential{KeyID: "hmac-key-01", Secret: secret}
+	state := bindstate.FromResponse("https://www.ppflight.com/api/pve-agent/v1/enrollments/redeem", "device-0123456789abcdef", enrollment.Response{
+		SchemaVersion: enrollment.SchemaVersion, BindingID: "123e4567-e89b-42d3-a456-426614174001", DeviceID: "device-0123456789abcdef",
+		AgentRef: "agent-01", CollectorRef: "collector-01", SourceRef: "source-01", ClusterRef: "cluster-01", NodeRef: "node-01", Site: "site-01",
+		Endpoints:                enrollment.Endpoints{Metering: "https://www.ppflight.com/metering", Telemetry: "https://www.ppflight.com/telemetry", Assignments: "https://www.ppflight.com/assignments", Commands: "https://www.ppflight.com/commands", Receipts: "https://www.ppflight.com/receipts"},
+		HMACCredentials:          enrollment.HMACCredentials{Metering: credential, Telemetry: credential, Assignments: credential, Commands: credential, Receipts: credential},
+		CommandSigningCredential: enrollment.CommandSigningCredential{KeyID: "old-key-01", Algorithm: "ed25519", PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32))},
+		AllowedActions:           []string{"agent.upgrade"}, AssignmentDocument: json.RawMessage(`{"schemaVersion":1,"revision":"rev-01","issuedAt":"2026-08-30T00:00:00Z","assignments":[]}`),
+		NetworkPolicy: netpolicy.NetworkPolicy{AgentObservedIPv4: "127.0.0.1"}, CredentialEpoch: 1, IssuedAt: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC),
+	})
+	if err := bindstate.Save(directory, state); err != nil {
+		t.Fatal(err)
+	}
+	rotation := upgradecontract.CommandSigningRotation{KeyID: "new-key-02", PublicKey: base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))}
+	if _, err := stageCommandSigningRotation(directory, "wrong-key", rotation); err == nil {
+		t.Fatal("rotation signed by a non-active key was accepted")
+	}
+	previous, err := stageCommandSigningRotation(directory, "old-key-01", rotation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := bindstate.Load(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if previous.CommandSigningCredential.KeyID != "old-key-01" || current.CommandSigningCredential.KeyID != "new-key-02" || current.CommandSigningCredential.PublicKey != rotation.PublicKey {
+		t.Fatal("binding signing credential was not atomically rotated")
+	}
+}
 
 func TestVerifiedBinaryRequiresInternalVersionAndChecksum(t *testing.T) {
 	binary := []byte("verified linux binary")
