@@ -326,6 +326,15 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 			processed++
 			continue
 		}
+		// Check the class-specific executor lane before any durable claim. The
+		// service admission mutex stays held through dispatcher.submit below, so
+		// another poll cannot consume capacity between this check and enqueue.
+		// A busy lane therefore leaves the opaque website command unclaimed and
+		// its cursor unadvanced, instead of stranding a running journal record
+		// which no worker owns.
+		if s.mode == "production" && s.executor.ProductionExecution && !s.dispatcher.hasCapacity(ctx, command) {
+			return processed, errors.New("control dispatcher lane is full")
+		}
 		var receipt Receipt
 		var duplicate bool
 		var claimErr error

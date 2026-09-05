@@ -534,6 +534,15 @@ func requireStoppedNonTemplate(ctx context.Context, client *pve.Client, command 
 	return errors.New("assigned VM was not found")
 }
 
+// pveTaskExitError keeps a task terminal status private while allowing a
+// narrowly-scoped convergence check after a known power-state race. Its Error
+// deliberately does not expose arbitrary PVE task output to receipts or logs.
+type pveTaskExitError struct {
+	exitStatus string
+}
+
+func (e *pveTaskExitError) Error() string { return "PVE task failed" }
+
 func waitPVEUPID(ctx context.Context, client *pve.Client, node, upid string) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -544,7 +553,7 @@ func waitPVEUPID(ctx context.Context, client *pve.Client, node, upid string) err
 		}
 		if status.Status == "stopped" {
 			if !strings.EqualFold(status.ExitStatus, "OK") {
-				return errors.New("PVE task failed")
+				return &pveTaskExitError{exitStatus: status.ExitStatus}
 			}
 			return nil
 		}
@@ -554,6 +563,114 @@ func waitPVEUPID(ctx context.Context, client *pve.Client, node, upid string) err
 		case <-ticker.C:
 		}
 	}
+}
+
+func powerActionDesiredState(action string) (string, bool) {
+	switch action {
+	case "start":
+		return "running", true
+	case "shutdown", "stop":
+		return "stopped", true
+	default:
+		return "", false
+	}
+}
+
+func guestHasPowerState(current pve.GuestCurrent, wanted string) bool {
+	return strings.EqualFold(strings.TrimSpace(current.Status), wanted)
+}
+
+func lifecyclePowerResult(powerState string) json.RawMessage {
+	result, _ := json.Marshal(map[string]any{
+		"powerState":     powerState,
+		"verified":       true,
+		"alreadyDesired": true,
+		"mutation":       false,
+	})
+	return result
+}
+
+func powerActionAlreadyDesiredMessage(value, action string) bool {
+	wanted, supported := powerActionDesiredState(action)
+	if !supported {
+		return false
+	}
+	return strings.Contains(strings.ToLower(value), "already "+wanted)
+}
+
+// powerActionAlreadyDesiredError is intentionally constrained to PVE's
+// documented already-running/already-stopped terminal conditions. A matching
+// phrase alone is not sufficient: every caller must independently read the
+// scoped guest and prove the requested state before it accepts convergence.
+func powerActionAlreadyDesiredError(err error, action string) bool {
+	var httpErr *pve.HTTPError
+	if errors.As(err, &httpErr) {
+		return powerActionAlreadyDesiredMessage(httpErr.Reason+" "+httpErr.Body, action)
+	}
+	var taskErr *pveTaskExitError
+	return errors.As(err, &taskErr) && powerActionAlreadyDesiredMessage(taskErr.exitStatus, action)
+}
+
+// executeLifecyclePowerTransition protects start/shutdown/stop from stale
+// website state. The PVE read is authoritative: an already-reached target is
+// a verified no-op rather than a failing task. Reboot is not convergent: it is
+// allowed only for a currently running guest and a stopped guest stays a clear
+// precondition failure.
+func executeLifecyclePowerTransition(ctx context.Context, client *pve.Client, command Command, base string) (string, json.RawMessage, error) {
+	action := strings.TrimPrefix(command.Action, "vm.")
+	current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return "", nil, err
+	}
+	if action == "reboot" {
+		if !guestHasPowerState(current, "running") {
+			return "", nil, fmt.Errorf("%w: reboot requires a running guest (current state %q)", ErrPowerStatePrecondition, strings.TrimSpace(current.Status))
+		}
+	} else if wanted, supported := powerActionDesiredState(action); supported && guestHasPowerState(current, wanted) {
+		return "", lifecyclePowerResult(wanted), nil
+	}
+
+	upid, result, err := doPVE(ctx, client, http.MethodPost, base+"/status/"+action, nil)
+	if err == nil || !powerActionAlreadyDesiredError(err, action) {
+		return upid, result, err
+	}
+	// The state can legitimately change between the authoritative pre-read and
+	// PVE's transition task. Normalize only the exact already-desired provider
+	// error plus this second scoped read; all other errors remain failures.
+	observed, readErr := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	wanted, supported := powerActionDesiredState(action)
+	if readErr == nil && supported && guestHasPowerState(observed, wanted) {
+		return "", lifecyclePowerResult(wanted), nil
+	}
+	return upid, result, err
+}
+
+// ensureDesiredPowerState provides the same constrained convergence rule to
+// reinstall compensation, where PVE task terminal status is available before
+// the workflow can safely continue.
+func ensureDesiredPowerState(ctx context.Context, client *pve.Client, command Command, base, action string, mutate func() error) error {
+	wanted, supported := powerActionDesiredState(action)
+	if !supported {
+		return fmt.Errorf("unsupported convergent power action %q", action)
+	}
+	current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil {
+		return err
+	}
+	if guestHasPowerState(current, wanted) {
+		return nil
+	}
+	if err := mutate(); err != nil {
+		if !powerActionAlreadyDesiredError(err, action) {
+			return err
+		}
+		observed, readErr := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+		if readErr == nil && guestHasPowerState(observed, wanted) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func executePowerTransition(ctx context.Context, client *pve.Client, command Command, base string) (string, json.RawMessage, error) {
@@ -706,18 +823,13 @@ func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command
 		return false, nil
 	}
 	restorePower := func() error {
-		current, currentErr := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
-		if currentErr != nil {
-			return currentErr
+		action := "stop"
+		if originalRunning {
+			action = "start"
 		}
-		running := strings.EqualFold(strings.TrimSpace(current.Status), "running")
-		if originalRunning && !running {
-			return waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef)
-		}
-		if !originalRunning && running {
-			return waitMutation(http.MethodPost, targetBase+"/status/stop", nil, command.Identity.NodeRef)
-		}
-		return nil
+		return ensureDesiredPowerState(ctx, client, command, targetBase, action, func() error {
+			return waitMutation(http.MethodPost, targetBase+"/status/"+action, nil, command.Identity.NodeRef)
+		})
 	}
 	cleanupTemporary := func() error {
 		exists, inventoryErr := resourceExists(parameters.TemporaryVMID)
@@ -738,13 +850,13 @@ func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command
 		}
 		return reinstallRolledBack(stage, cause)
 	}
-	if originalRunning {
-		if err := waitMutation(http.MethodPost, targetBase+"/status/shutdown", nil, command.Identity.NodeRef); err != nil {
-			if powerErr := restorePower(); powerErr != nil {
-				return "", nil, fmt.Errorf("%w: shutdown failed and original VM power could not be verified", ErrReinstallIndeterminate)
-			}
-			return "", nil, reinstallRolledBack("shutdown_original", err)
+	if err := ensureDesiredPowerState(ctx, client, command, targetBase, "shutdown", func() error {
+		return waitMutation(http.MethodPost, targetBase+"/status/shutdown", nil, command.Identity.NodeRef)
+	}); err != nil {
+		if powerErr := restorePower(); powerErr != nil {
+			return "", nil, fmt.Errorf("%w: shutdown failed and original VM power could not be verified", ErrReinstallIndeterminate)
 		}
+		return "", nil, reinstallRolledBack("shutdown_original", err)
 	}
 	// A full clone of the current stopped VM is the compensation boundary.
 	if err := waitMutation(http.MethodPost, targetBase+"/clone", url.Values{"newid": {strconv.Itoa(parameters.TemporaryVMID)}, "full": {"1"}, "target": {command.Identity.NodeRef}, "storage": {parameters.Storage}, "name": {"ppflight-reinstall-rollback-" + strconv.Itoa(command.Identity.VMID)}}, command.Identity.NodeRef); err != nil {
@@ -826,7 +938,9 @@ func reinstallGuest(ctx context.Context, client, readClient *pve.Client, command
 	if _, _, err := setDiskLimits(ctx, client, ioCommand, targetBase); err != nil {
 		return "", nil, compensate("set_disk_io", err)
 	}
-	if err := waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef); err != nil {
+	if err := ensureDesiredPowerState(ctx, client, command, targetBase, "start", func() error {
+		return waitMutation(http.MethodPost, targetBase+"/status/start", nil, command.Identity.NodeRef)
+	}); err != nil {
 		return "", nil, compensate("start_replacement", err)
 	}
 	if err := waitForReinstallReadiness(ctx, client, readClient, command, targetBase, parameters, readyWait, pollInterval); err != nil {

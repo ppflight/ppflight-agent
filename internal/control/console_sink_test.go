@@ -234,6 +234,28 @@ func TestConsoleSinkReservesConfiguredCapacityBeforeOpeningPVEConnections(t *tes
 	}
 }
 
+func TestConsoleSinkEnforcesEightActiveSessionsBeforeWebsiteFIFOAdmission(t *testing.T) {
+	sink, err := NewHTTPSConsoleSessionSinkWithLimit("https://www.example/api/control/receipts", "key-1", []byte("0123456789abcdef"), time.Second, DefaultMaxActiveConsoleSessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < DefaultMaxActiveConsoleSessions; index++ {
+		if err := sink.Reserve("session-" + string(rune('a'+index))); err != nil {
+			t.Fatalf("session %d did not reserve: %v", index+1, err)
+		}
+	}
+	if err := sink.Reserve("session-ninth"); err == nil || err.Error() != "active console session limit reached" {
+		t.Fatalf("ninth session error=%v", err)
+	}
+	// The Agent reports capacity truthfully before PVE vncproxy. Persistent
+	// FIFO admission belongs to the website broker, which receives the close
+	// notification from serve()/notifyClosed and then submits the next create.
+	sink.Release("session-a")
+	if err := sink.Reserve("session-ninth"); err != nil {
+		t.Fatalf("released eighth slot did not admit next FIFO candidate: %v", err)
+	}
+}
+
 func TestConsoleSinkNotifiesWebsiteWhenTunnelCloses(t *testing.T) {
 	now := time.Now().UTC()
 	registration := consoleRegistration(now)

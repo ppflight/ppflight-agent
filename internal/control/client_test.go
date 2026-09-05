@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -310,10 +311,17 @@ func TestProductionServiceQueuesRunningReceiptBeforeMutationResult(t *testing.T)
 	command.SigningKeyID = "website-key-1"
 	command.Signature, _ = SignCommandEd25519(command, privateKey)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api2/json/nodes/pve-1/qemu/101/status/start" {
-			t.Fatalf("unexpected mutation %s %s", r.Method, r.URL.Path)
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve-1/qemu/101/status/current":
+			// Lifecycle power execution must establish the authoritative state
+			// before it sends a mutation. The stopped fixture makes start the
+			// required idempotent transition.
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped"}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve-1/qemu/101/status/start":
+			_, _ = w.Write([]byte(`{"data":"UPID:pve-1:1:2:3:qmstart:101:root@pam:"}`))
+		default:
+			t.Fatalf("unexpected PVE request %s %s", r.Method, r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"data":"UPID:pve-1:1:2:3:qmstart:101:root@pam:"}`))
 	}))
 	defer server.Close()
 	directory := t.TempDir()
@@ -360,6 +368,81 @@ func TestProductionServiceQueuesRunningReceiptBeforeMutationResult(t *testing.T)
 	}
 	if running.State != "running" || running.Code != "COMMAND_STARTED" || !running.Accepted || !running.Asynchronous || terminal.State != "submitted" || terminal.Code != "PVE_TASK_SUBMITTED" {
 		t.Fatalf("running=%#v terminal=%#v", running, terminal)
+	}
+}
+
+func TestProductionServiceLeavesFullDispatcherCommandUnclaimedAtWebsiteCursor(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	command, assignments := signedCommand(t, now)
+	command.Action = "vm.delete"
+	command.Parameters = json.RawMessage(`{"purge":true,"destroyUnreferencedDisks":true}`)
+	command.BodySHA256 = protocolHash(command.Parameters)
+	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{8}, ed25519.SeedSize))
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	command.SigningKeyID = "website-key-1"
+	var err error
+	command.Signature, err = SignCommandEd25519(command, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	journal, err := OpenJournal(directory + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := &memoryReceiptQueue{}
+	service, err := NewService(ServiceConfig{
+		AgentRef: "agent-1", ClusterRef: "cluster-1", Mode: "production",
+		BindingID: command.BindingID, DeviceID: command.DeviceID, CredentialEpoch: uint64(command.CredentialEpoch),
+		AssignmentRevision:  func() uint64 { return uint64(command.AssignmentRevision) },
+		CommandSigningKeyID: "website-key-1", CommandPublicKey: publicKey,
+		AllowedActions: []string{command.Action}, Assignments: assignments,
+		Poller:  fixedPoller{PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []Command{command}}},
+		Journal: journal, Executor: Executor{Mode: "production", ProductionExecution: true},
+		ReceiptQueue: queue, AuditSink: &memoryAuditSink{}, AgentVersion: "test-version",
+		CursorFile: directory + "/cursor.json", Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	full := newCommandDispatcher(func(_ context.Context, queued Command) {
+		if queued.CommandID == "lane-active" {
+			close(started)
+			<-release
+		}
+	})
+	defer close(release)
+	if !full.submit(ctx, Command{CommandID: "lane-active", Action: "vm.delete"}) {
+		t.Fatal("active heavy lane command was not admitted")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("heavy lane did not become active")
+	}
+	for index := 0; index < cap(full.heavy); index++ {
+		if !full.submit(ctx, Command{CommandID: "lane-queued-" + string(rune('a'+index)), Action: "vm.delete"}) {
+			t.Fatalf("heavy lane buffer item %d was not admitted", index)
+		}
+	}
+	service.dispatcher = full
+
+	if processed, pollErr := service.PollOnce(ctx); processed != 0 || pollErr == nil || !strings.Contains(pollErr.Error(), "dispatcher lane is full") {
+		t.Fatalf("processed=%d err=%v", processed, pollErr)
+	}
+	if len(queue.snapshot()) != 0 {
+		t.Fatal("full dispatcher wrote a running receipt before owning the command")
+	}
+	entries, err := os.ReadDir(journal.directory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("full dispatcher durable journal=%v err=%v", entries, err)
+	}
+	if _, err := os.Stat(directory + "/cursor.json"); !os.IsNotExist(err) {
+		t.Fatalf("full dispatcher advanced the website cursor: %v", err)
 	}
 }
 

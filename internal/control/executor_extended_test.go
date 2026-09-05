@@ -1074,6 +1074,47 @@ func TestReinstallUnknownPVEVersionRejectsBeforeAnyMutation(t *testing.T) {
 	}
 }
 
+func TestEnsureDesiredPowerStateNormalizesOnlyProvenAlreadyDesiredTaskRace(t *testing.T) {
+	t.Run("start task already running with verified readback", func(t *testing.T) {
+		state, reads, mutations := "stopped", 0, 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/status/current" {
+				t.Fatalf("unexpected state read: %s %s", r.Method, r.URL.Path)
+			}
+			reads++
+			_, _ = fmt.Fprintf(w, `{"data":{"status":%q}}`, state)
+		}))
+		defer server.Close()
+		err := ensureDesiredPowerState(context.Background(), controlTestClient(t, server), controlCommand("vm.reinstall", "qemu", `{}`), "/nodes/pve1/qemu/101", "start", func() error {
+			mutations++
+			state = "running"
+			return &pveTaskExitError{exitStatus: "VM 101 is already running"}
+		})
+		if err != nil || reads != 2 || mutations != 1 {
+			t.Fatalf("err=%v reads=%d mutations=%d", err, reads, mutations)
+		}
+	})
+
+	t.Run("different terminal error is not swallowed", func(t *testing.T) {
+		reads, mutations := 0, 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/status/current" {
+				t.Fatalf("unexpected state read: %s %s", r.Method, r.URL.Path)
+			}
+			reads++
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped"}}`))
+		}))
+		defer server.Close()
+		err := ensureDesiredPowerState(context.Background(), controlTestClient(t, server), controlCommand("vm.reinstall", "qemu", `{}`), "/nodes/pve1/qemu/101", "start", func() error {
+			mutations++
+			return &pveTaskExitError{exitStatus: "VM 101 lock timeout"}
+		})
+		if err == nil || reads != 1 || mutations != 1 {
+			t.Fatalf("err=%v reads=%d mutations=%d", err, reads, mutations)
+		}
+	})
+}
+
 func TestSuspendResumeUseFixedStatusEndpoints(t *testing.T) {
 	for _, action := range []string{"vm.suspend", "vm.resume"} {
 		t.Run(action, func(t *testing.T) {

@@ -28,10 +28,11 @@ import (
 )
 
 var (
-	ErrUnsupported           = errors.New("controlled PVE action is unsupported")
-	ErrResultTooLarge        = errors.New("controlled PVE result is too large")
-	ErrQGAUnavailable        = errors.New("QEMU guest agent is unavailable")
-	ErrQGACommandUnsupported = errors.New("QEMU guest agent command is unsupported")
+	ErrUnsupported            = errors.New("controlled PVE action is unsupported")
+	ErrResultTooLarge         = errors.New("controlled PVE result is too large")
+	ErrQGAUnavailable         = errors.New("QEMU guest agent is unavailable")
+	ErrQGACommandUnsupported  = errors.New("QEMU guest agent command is unsupported")
+	ErrPowerStatePrecondition = errors.New("PVE power action precondition is not met")
 )
 
 const maxControlResultBytes = 1 << 20
@@ -713,6 +714,8 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		var httpErr *pve.HTTPError
 		if errors.Is(err, ErrReinstallPreflight) {
 			r.State, r.Code = "failed", "REINSTALL_PREFLIGHT_REJECTED"
+		} else if errors.Is(err, ErrPowerStatePrecondition) {
+			r.State, r.Code = "failed", "POWER_STATE_PRECONDITION_REJECTED"
 		} else if errors.Is(err, ErrReinstallRolledBack) {
 			r.State, r.Code = "failed", "REINSTALL_ROLLED_BACK"
 		} else if errors.Is(err, ErrReinstallIndeterminate) {
@@ -1496,7 +1499,7 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	var form url.Values
 	switch c.Action {
 	case "vm.start", "vm.shutdown", "vm.stop", "vm.reboot":
-		method, path = http.MethodPost, base+"/status/"+strings.TrimPrefix(c.Action, "vm.")
+		return executeLifecyclePowerTransition(ctx, client, c, base)
 	case "vm.suspend", "vm.resume":
 		return executePowerTransition(ctx, client, c, base)
 	case "vm.create":

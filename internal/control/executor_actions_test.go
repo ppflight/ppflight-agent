@@ -287,6 +287,93 @@ func TestVMDeleteIsConvergentAndClassifiesPVEHTTPFailures(t *testing.T) {
 	}
 }
 
+func TestLifecyclePowerTransitionsUseAuthoritativeStateAndNarrowRaceConvergence(t *testing.T) {
+	t.Run("already desired start shutdown and stop skip mutation", func(t *testing.T) {
+		for _, fixture := range []struct {
+			action string
+			status string
+			want   string
+		}{
+			{action: "vm.start", status: "running", want: "running"},
+			{action: "vm.shutdown", status: "stopped", want: "stopped"},
+			{action: "vm.stop", status: "stopped", want: "stopped"},
+		} {
+			t.Run(fixture.action, func(t *testing.T) {
+				requests := 0
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests++
+					if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/status/current" {
+						t.Fatalf("already-desired action sent mutation: %s %s", r.Method, r.URL.Path)
+					}
+					_, _ = fmt.Fprintf(w, `{"data":{"status":%q}}`, fixture.status)
+				}))
+				defer server.Close()
+				receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand(fixture.action, "qemu", `{}`), time.Now())
+				if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || requests != 1 || !strings.Contains(string(receipt.Result), `"alreadyDesired":true`) || !strings.Contains(string(receipt.Result), `"mutation":false`) || !strings.Contains(string(receipt.Result), `"powerState":"`+fixture.want+`"`) {
+					t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+				}
+			})
+		}
+	})
+
+	t.Run("reboot refuses stopped guest without mutation", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/status/current" {
+				t.Fatalf("stopped reboot sent mutation: %s %s", r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`{"data":{"status":"stopped"}}`))
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.reboot", "qemu", `{}`), time.Now())
+		if err == nil || !errors.Is(err, ErrPowerStatePrecondition) || receipt.State != "failed" || receipt.Code != "POWER_STATE_PRECONDITION_REJECTED" || receipt.Accepted || receipt.MutationMayHaveSucceeded || requests != 1 {
+			t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+		}
+	})
+
+	t.Run("start race normalizes only proven already-running PVE error", func(t *testing.T) {
+		status, requests := "stopped", 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/status/current":
+				_, _ = fmt.Fprintf(w, `{"data":{"status":%q}}`, status)
+			case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/status/start":
+				status = "running"
+				http.Error(w, `{"data":null,"message":"VM 101 is already running"}`, http.StatusInternalServerError)
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.start", "qemu", `{}`), time.Now())
+		if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || requests != 3 || !strings.Contains(string(receipt.Result), `"alreadyDesired":true`) || !strings.Contains(string(receipt.Result), `"mutation":false`) {
+			t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+		}
+	})
+
+	t.Run("unrelated provider error remains an error", func(t *testing.T) {
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/status/current":
+				_, _ = w.Write([]byte(`{"data":{"status":"stopped"}}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/api2/json/nodes/pve1/qemu/101/status/start":
+				http.Error(w, `{"data":null,"message":"VM 101 lock timeout"}`, http.StatusInternalServerError)
+			default:
+				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.start", "qemu", `{}`), time.Now())
+		if err == nil || receipt.State != "indeterminate" || receipt.Code != "PVE_ACTION_INDETERMINATE" || requests != 2 {
+			t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+		}
+	})
+}
+
 func TestVMDeleteMissingConfigRequiresExactSignedGuestIdentity(t *testing.T) {
 	qemu := controlCommand("vm.delete", "qemu", `{"purge":true,"destroyUnreferencedDisks":true}`)
 	lxc := controlCommand("vm.delete", "lxc", `{"purge":true,"destroyUnreferencedDisks":true}`)
