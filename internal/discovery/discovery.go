@@ -22,6 +22,7 @@ const (
 	PhaseNodes       = "nodes"
 	PhaseStorage     = "storage"
 	PhaseTemplates   = "templates"
+	PhaseGuests      = "guests"
 	PhaseNetworks    = "networks"
 	PhaseCapacity    = "capacity"
 	PhaseFirewall    = "firewall"
@@ -63,11 +64,20 @@ type Data struct {
 	Nodes       []pve.Node             `json:"nodes,omitempty"`
 	Storage     []pve.Storage          `json:"storage,omitempty"`
 	Templates   []pve.TemplateInfo     `json:"templates,omitempty"`
+	Guests      []Guest                `json:"guests,omitempty"`
 	Networks    []pve.NetworkInterface `json:"networks,omitempty"`
 	SDN         []pve.SDNConfig        `json:"sdn,omitempty"`
 	Capacity    *Capacity              `json:"capacity,omitempty"`
 	Firewall    []FirewallScope        `json:"firewall,omitempty"`
 	Readiness   *Readiness             `json:"readiness,omitempty"`
+}
+
+// Guest is the smallest signed inventory projection needed by the website's
+// VMID allocator. It intentionally excludes guest names and live telemetry.
+type Guest struct {
+	Kind string `json:"kind"`
+	Node string `json:"node"`
+	VMID int    `json:"vmid"`
 }
 
 type PermissionPath struct {
@@ -180,6 +190,19 @@ func (s *Service) Discover(ctx context.Context, request Request) Result {
 				return result.fail(infoErr)
 			}
 			result.Data.Templates = append(result.Data.Templates, info)
+		}
+		result.NextCursor, result.Complete = sourcePage(offset, limit, len(resources))
+	case PhaseGuests:
+		resources, err := s.client.ClusterResourcesPage(ctx, offset, limit)
+		if err != nil {
+			return result.fail(err)
+		}
+		for _, resource := range resources {
+			kind, ok := resourceKind(resource)
+			if !ok || resource.Template != 0 || (request.NodeRef != "" && resource.Node != request.NodeRef) {
+				continue
+			}
+			result.Data.Guests = append(result.Data.Guests, Guest{Kind: kind, Node: resource.Node, VMID: resource.VMID})
 		}
 		result.NextCursor, result.Complete = sourcePage(offset, limit, len(resources))
 	case PhaseNetworks:
@@ -327,7 +350,7 @@ func (r Result) invalid() Result       { r.ErrorCode, r.Complete = "INVALID_REQU
 
 func validPhase(phase string) bool {
 	switch phase {
-	case PhaseVersion, PhasePermissions, PhaseNodes, PhaseStorage, PhaseTemplates, PhaseNetworks, PhaseCapacity, PhaseFirewall, PhaseReadiness:
+	case PhaseVersion, PhasePermissions, PhaseNodes, PhaseStorage, PhaseTemplates, PhaseGuests, PhaseNetworks, PhaseCapacity, PhaseFirewall, PhaseReadiness:
 		return true
 	}
 	return false

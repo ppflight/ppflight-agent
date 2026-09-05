@@ -66,6 +66,26 @@ func TestDiscoverTemplatesIsBoundedAndPageable(t *testing.T) {
 	}
 }
 
+func TestDiscoverGuestsReturnsOnlyNonTemplateVMIDs(t *testing.T) {
+	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api2/json/cluster/resources" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, `{"data":[{"id":"qemu/100","type":"qemu","node":"pve1","vmid":100,"template":1},{"id":"qemu/101","type":"qemu","node":"pve1","vmid":101,"template":0},{"id":"lxc/102","type":"lxc","node":"pve2","vmid":102,"template":0}]}`)
+	}))
+	defer server.Close()
+
+	result := service.Discover(context.Background(), Request{OperationID: "guest-inventory", Phase: PhaseGuests, Limit: 50})
+	if result.ErrorCode != "" || !result.Complete || len(result.Data.Guests) != 2 {
+		t.Fatalf("guest inventory %#v", result)
+	}
+	if result.Data.Guests[0] != (Guest{Kind: "qemu", Node: "pve1", VMID: 101}) || result.Data.Guests[1] != (Guest{Kind: "lxc", Node: "pve2", VMID: 102}) {
+		t.Fatalf("unexpected guests %#v", result.Data.Guests)
+	}
+}
+
 func TestDiscoverTemplateBaselineFailureIsNotReportedAsConnectionOutage(t *testing.T) {
 	service, server := testService(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
