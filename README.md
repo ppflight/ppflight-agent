@@ -104,6 +104,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.44` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并分别绑定官网 canonical payload 哈希与历史签名 wire body 哈希，以及旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
 
+`0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。
+
 `0.1.1-rc.51` 为当前 Agent v1 控制端点增加签名长轮询：空闲请求最多等待 25 秒且不持有命令租约或数据库锁，新任务可立即送达；每次仍只领取一条，HTTP 超时自动保持在长轮询窗口以上，审计上传也不会因等待而饿死。noVNC 在 Agent 端增加默认 8 个活跃会话的硬限制，网站超量请求使用持久 FIFO 等待、释放即补位。该版本继续保持 rc.50 的 350/384 台分片采集与逐设备签名密钥轮换能力。
 
 `0.1.1-rc.50` 在 rc.49 的 350/384 台分片采集与 make-before-break 校验基础上，将控制命令的历史批量领取默认值从 20 安全迁移为 1，避免串行长任务使同批后续租约过期；管理员自定义值保持不变。交付验证的时区失败回执增加严格、无客体敏感数据的期望 IANA、观测 zone 与 UTC offset。自升级 root helper 还支持由当前设备旧 Ed25519 密钥签名授权下一代公钥：新二进制、binding state 和服务重启一起回验，任一步失败同时恢复旧二进制和旧公钥，使官网可逐台迁移独立信任根而不影响其他设备。
