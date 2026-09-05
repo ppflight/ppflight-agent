@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Installs a released PPFlight agent on one PVE 8/9 node. It deliberately does
-# not start services unless --start is passed. Run only on the target PVE host.
+# Stages a released PPFlight agent on one PVE 8/9 node. This low-level helper
+# deliberately does not claim end-to-end completion: verified PVE preparation,
+# service/exporter health and host-firewall reconciliation are orchestrated by
+# quick-install or performed explicitly afterward. Run only on the target host.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -80,8 +82,8 @@ Optional exporters (all four archive/checksum arguments are required):
   --install-smartmontools       Install smartmontools using apt before smartctl exporter.
 
 Activation:
-  --enable                      Enable units for boot, but do not start them.
-  --start                       Start units now (implies --enable).
+  --enable                      Stage units as boot-enabled; not a completed install.
+  --start                       Start eligible units (implies --enable); still staging.
 
 The installer never accepts an unverified network download and never replaces
 an existing agent.yaml, agent.env, or state assignments/assignments.json.
@@ -204,6 +206,15 @@ fi
 # commonly create a verified binary as 0600/0644. The root-owned destination is
 # made executable explicitly by install(1) below, after SHA-256 verification.
 [[ -f "$BINARY" ]] || die "agent binary is not a regular file: $BINARY"
+
+# Run the released root helper from an executable private staging copy before
+# apt, account, systemd or installation mutation. This is deliberately a
+# read-only gate; live UFW removal occurs only after PVE replacement protection
+# is committed and verified by activate/reconcile.
+PREFLIGHT_BINARY="$TMP_DIR/ppflight-agent-firewall-preflight"
+install -o root -g root -m 0700 "$BINARY" "$PREFLIGHT_BINARY"
+"$PREFLIGHT_BINARY" host-firewall prepare \
+  || die 'UFW safety preflight failed before installation mutation'
 
 if [[ $INSTALL_EXPORTERS -eq 1 ]]; then
   [[ -n "$NODE_ARCHIVE" && -n "$NODE_SHA256" && -n "$SMART_ARCHIVE" && -n "$SMART_SHA256" ]] || die '--install-exporters requires both local exporter archives and their SHA-256 values'
@@ -529,10 +540,11 @@ elif [[ $START -eq 1 ]]; then
 fi
 
 if [[ $PVE_PREPARATION_REQUIRED -eq 1 ]]; then
-  note "Installed $APP for PVE $pve_version. PVE collection is disabled and the service remains stopped until the caller completes verified local PVE preparation."
+  note "Staged $APP for PVE $pve_version. PVE collection is disabled and the service remains stopped until the caller completes verified local PVE preparation."
 elif [[ $SERVICE_WAS_ACTIVE -eq 1 ]]; then
-  note "Installed $APP for PVE $pve_version and restored the previously active service."
+  note "Staged $APP for PVE $pve_version and restored the previously active service."
 else
-  note "Installed $APP for PVE $pve_version. No service was started unless --start was supplied."
+  note "Staged $APP for PVE $pve_version. No service was started unless --start was supplied."
 fi
-note "Verified local PVE preparation enables pve.source=api before the service can collect or upload."
+note "STAGING ONLY: this helper has not completed the service/exporter health gate or PVE-only host-firewall/UFW postflight."
+note "Use the verified quick-install workflow, or complete local PVE preparation and run host-firewall reconcile only after every required service is healthy."

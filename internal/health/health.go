@@ -30,9 +30,18 @@ type ControlState struct {
 	Enabled             bool       `json:"enabled"`
 	Configured          bool       `json:"configured"`
 	ProductionExecution bool       `json:"productionExecution"`
+	SigningKeyID        string     `json:"signingKeyId,omitempty"`
 	LastPoll            *time.Time `json:"lastPoll,omitempty"`
 	LastSuccess         *time.Time `json:"lastSuccess,omitempty"`
 	LastError           string     `json:"lastError,omitempty"`
+}
+
+// ControlSigningKey records the public identifier of the signing key loaded
+// by this running process so upgrade activation can be verified after restart.
+func (r *Registry) ControlSigningKey(keyID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.status.Control.SigningKeyID = keyID
 }
 
 type BindingState struct {

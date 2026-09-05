@@ -215,12 +215,16 @@ case "$INSTALL_MODE" in
     printf '%s\n' '检测到未完成的全新安装事务：将安全恢复并完成主机防火墙阶段。'
     ;;
   update)
-    printf '%s\n' '检测到现有安装：保留全部防火墙策略；仅对已有 PPFlight committed 主机防火墙事务修复 INPUT 优先级。'
+    printf '%s\n' '检测到现有安装：将建立并严格回验 PPFlight/PVE 防护，再移除冲突的 UFW。'
     ;;
   *)
     die '主机防火墙安装分类返回了未知状态'
     ;;
 esac
+
+printf '%s\n' '正在只读预检 UFW 软件包、服务与配置；此阶段不会修改现有防火墙。'
+./ppflight-agent host-firewall prepare \
+  || die 'UFW 安全预检失败；尚未执行依赖安装、服务或防火墙变更'
 
 download_verified() {
   local url=$1 output=$2 expected=$3 label=$4
@@ -384,13 +388,11 @@ if [[ "$INSTALL_MODE" == 'fresh' || "$INSTALL_MODE" == 'resume' ]]; then
   printf '%s\n' 'Agent、官网、监控、控制和更新均使用出站连接；状态和 exporter 仍仅监听 127.0.0.1。'
 else
 
-  # Existing installations remain untouched unless they carry a committed,
-  # root-owned PPFlight fresh-install firewall journal. That narrow migration
-  # closes the rc.26 ordering gap where aaPanel/UFW accepted traffic before
-  # INPUT reached PVEFW-INPUT; journal-less updates are a strict no-op.
+  # Historical journal-less installations are enrolled into the same PVE
+  # replacement-protection transaction before the irreversible UFW purge.
   /usr/local/bin/ppflight-agent host-firewall reconcile \
     || die '已有 PPFlight 主机防火墙事务无法安全提升到宝塔/UFW 之前；更新未报告成功'
-  printf '%s\n' '现有安装更新已完成；Cluster/Node/VM/CT 防火墙状态均保持不变。'
+  printf '%s\n' '现有安装更新已完成；PPFlight/PVE 防火墙已严格回验，UFW 已移除。'
 fi
 
 printf '\n安装或更新完成：真实 PVE 读取已就绪，Agent 已启动并加入开机启动。现在输入 AG 进入 PPFlight 菜单。\n'

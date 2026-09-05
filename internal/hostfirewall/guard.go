@@ -13,16 +13,26 @@ const ingressGuardUnit = "ppflight-host-firewall.service"
 type iptablesFamily struct {
 	name    string
 	command string
+	save    string
 	restore string
 }
 
 var iptablesFamilies = []iptablesFamily{
-	{name: "ipv4", command: "/usr/sbin/iptables-legacy", restore: "/usr/sbin/iptables-legacy-restore"},
-	{name: "ipv6", command: "/usr/sbin/ip6tables-legacy", restore: "/usr/sbin/ip6tables-legacy-restore"},
+	{name: "ipv4", command: "/usr/sbin/iptables-legacy", save: "/usr/sbin/iptables-legacy-save", restore: "/usr/sbin/iptables-legacy-restore"},
+	{name: "ipv6", command: "/usr/sbin/ip6tables-legacy", save: "/usr/sbin/ip6tables-legacy-save", restore: "/usr/sbin/ip6tables-legacy-restore"},
 }
 
 type parsedInputChain struct {
 	family         string
+	rules          []string
+	nativePosition int
+	nativeCount    int
+	pveJumpCount   int
+}
+
+type parsedForwardChain struct {
+	family         string
+	policy         string
 	rules          []string
 	nativePosition int
 	nativeCount    int
@@ -59,6 +69,33 @@ func (b *commandBackend) CaptureIngressGuard(ctx context.Context) ([]nativeInput
 		return nil, err
 	}
 	return result, nil
+}
+
+// CaptureRetainedIngressGuard recognizes only the exact first-position hook
+// deliberately left by a prior PPFlight uninstall. It is not a tail-restore
+// snapshot; UFWPhase prevents that irreversible migration from using rollback.
+func (b *commandBackend) CaptureRetainedIngressGuard(ctx context.Context) ([]nativeInputHookSnapshot, error) {
+	unlock, err := b.lockProcess(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	result := make([]nativeInputHookSnapshot, 0, len(iptablesFamilies))
+	for _, family := range iptablesFamilies {
+		parsed, err := b.readInputChain(ctx, family)
+		if err != nil {
+			return nil, err
+		}
+		available, err := validateNativeHookInventory(parsed)
+		if err != nil {
+			return nil, err
+		}
+		if !available || parsed.nativePosition != 0 {
+			return nil, fmt.Errorf("%s retained PVE native INPUT hook is not first", family.name)
+		}
+		result = append(result, nativeInputHookSnapshot{Family: family.name, Captured: true, RetainedFirst: true})
+	}
+	return result, validateNativeHookSnapshots(result)
 }
 
 func (b *commandBackend) EnsureIngressGuard(ctx context.Context, journal Journal) error {
@@ -114,6 +151,15 @@ func (b *commandBackend) maintainIngressGuard(ctx context.Context, journal Journ
 			return changed, err
 		}
 	}
+	if journal.UFWPhase == UFWPhaseRemoving || journal.UFWPhase == UFWPhaseRemoved {
+		for _, family := range iptablesFamilies {
+			familyChanged, err := b.maintainForwardGuard(ctx, family, requireAvailable)
+			if err != nil {
+				return changed, err
+			}
+			changed = changed || familyChanged
+		}
+	}
 	return changed, nil
 }
 
@@ -130,8 +176,127 @@ func (b *commandBackend) VerifyIngressGuard(ctx context.Context, journal Journal
 		if err := b.verifyNativeHookPosition(ctx, family, 0, true); err != nil {
 			return err
 		}
+		if journal.UFWPhase == UFWPhaseRemoving || journal.UFWPhase == UFWPhaseRemoved {
+			if err := b.verifyForwardGuard(ctx, family, true); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func (b *commandBackend) maintainForwardGuard(ctx context.Context, family iptablesFamily, requireAvailable bool) (bool, error) {
+	parsed, err := b.readForwardChain(ctx, family)
+	if err != nil {
+		return false, err
+	}
+	available, err := validateForwardHookInventory(parsed)
+	if err != nil {
+		return false, err
+	}
+	if !available {
+		if requireAvailable {
+			return false, fmt.Errorf("%s PVE native FORWARD hook is unavailable", family.name)
+		}
+		return false, nil
+	}
+	if parsed.nativePosition == 0 && parsed.policy == "ACCEPT" {
+		return false, nil
+	}
+	var commands []string
+	if parsed.nativePosition != 0 {
+		commands = append(commands, "-D FORWARD -j PVEFW-FORWARD", "-I FORWARD 1 -j PVEFW-FORWARD")
+	}
+	if parsed.policy != "ACCEPT" {
+		commands = append(commands, "-P FORWARD ACCEPT")
+	}
+	payload := []byte("*filter\n" + strings.Join(commands, "\n") + "\nCOMMIT\n")
+	if _, err := b.runner.RunInput(ctx, payload, family.restore, "-w", "10", "-n"); err != nil {
+		return false, fmt.Errorf("cannot atomically restore %s PVE native FORWARD guard: %w", family.name, err)
+	}
+	if err := b.verifyForwardGuard(ctx, family, requireAvailable); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (b *commandBackend) verifyForwardGuard(ctx context.Context, family iptablesFamily, requireAvailable bool) error {
+	parsed, err := b.readForwardChain(ctx, family)
+	if err != nil {
+		return err
+	}
+	available, err := validateForwardHookInventory(parsed)
+	if err != nil {
+		return err
+	}
+	if !available {
+		if requireAvailable {
+			return fmt.Errorf("%s PVE native FORWARD hook is unavailable", family.name)
+		}
+		return nil
+	}
+	if parsed.nativePosition != 0 || parsed.policy != "ACCEPT" {
+		return fmt.Errorf("%s PVE native FORWARD guard is not first with ACCEPT base policy", family.name)
+	}
+	return nil
+}
+
+func (b *commandBackend) readForwardChain(ctx context.Context, family iptablesFamily) (parsedForwardChain, error) {
+	raw, err := b.runner.Run(ctx, family.command, "-w", "10", "-S", "FORWARD")
+	if err != nil {
+		return parsedForwardChain{}, fmt.Errorf("cannot inspect %s base FORWARD chain", family.name)
+	}
+	return parseForwardChain(family.name, raw)
+}
+
+func parseForwardChain(family string, raw []byte) (parsedForwardChain, error) {
+	if (family != "ipv4" && family != "ipv6") || len(raw) == 0 || len(raw) > 2<<20 {
+		return parsedForwardChain{}, errors.New("base FORWARD chain inventory is invalid")
+	}
+	result := parsedForwardChain{family: family, nativePosition: -1}
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if strings.HasPrefix(line, "-P FORWARD ") {
+			fields := strings.Fields(line)
+			if len(fields) != 3 || result.policy != "" {
+				return parsedForwardChain{}, errors.New("base FORWARD policy inventory is ambiguous")
+			}
+			result.policy = fields[2]
+			continue
+		}
+		if !strings.HasPrefix(line, "-A FORWARD ") {
+			continue
+		}
+		position := len(result.rules)
+		result.rules = append(result.rules, line)
+		fields := strings.Fields(line)
+		target := firewallTarget(fields)
+		if isUFWChain(target) {
+			return parsedForwardChain{}, fmt.Errorf("%s FORWARD contains a reintroduced UFW jump", family)
+		}
+		if target != "PVEFW-FORWARD" {
+			continue
+		}
+		result.pveJumpCount++
+		if len(fields) == 4 && fields[0] == "-A" && fields[1] == "FORWARD" && fields[2] == "-j" && fields[3] == "PVEFW-FORWARD" {
+			result.nativeCount++
+			result.nativePosition = position
+		}
+	}
+	if result.policy == "" {
+		return parsedForwardChain{}, errors.New("base FORWARD policy is missing")
+	}
+	return result, nil
+}
+
+func validateForwardHookInventory(parsed parsedForwardChain) (bool, error) {
+	if parsed.pveJumpCount == 0 {
+		return false, nil
+	}
+	if parsed.pveJumpCount != 1 || parsed.nativeCount != 1 {
+		return false, fmt.Errorf("%s FORWARD must contain exactly one unmodified PVE native jump", parsed.family)
+	}
+	return true, nil
 }
 
 // RemoveIngressGuard restores the sole PVE-native hook to PVE's canonical
@@ -144,6 +309,11 @@ func (b *commandBackend) RemoveIngressGuard(ctx context.Context, journal Journal
 	}
 	if err := requireNativeHookSnapshots(journal); err != nil {
 		return err
+	}
+	for _, snapshot := range journal.NativeHooks {
+		if snapshot.RetainedFirst {
+			return errors.New("retained first-position PVE hook has no safe tail rollback")
+		}
 	}
 	unlock, err := b.lockProcess(ctx)
 	if err != nil {

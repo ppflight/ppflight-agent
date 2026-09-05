@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -124,6 +125,104 @@ func TestNativeHookJournalSnapshotValidationIsStrictAndBackwardCompatible(t *tes
 	} {
 		if err := validateNativeHookSnapshots(invalid); err == nil {
 			t.Fatalf("invalid native snapshot accepted: %#v", invalid)
+		}
+	}
+}
+
+func TestUFWPreflightRejectsPVE9NFTBackendBeforeUFWInspection(t *testing.T) {
+	fake := newFakeBackend()
+	fake.backendErr = errors.New("PVE 9 Rust/nft backend is selected")
+	service := testService(t, fake)
+	err := service.PreflightUFW(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "before installation mutation") {
+		t.Fatalf("PVE 9 nft preflight error = %v", err)
+	}
+	if strings.Join(fake.events, ",") != "backend-verify" {
+		t.Fatalf("UFW inspection ran after unsupported backend detection: %v", fake.events)
+	}
+
+	fake = newFakeBackend()
+	service = testService(t, fake)
+	if err := service.PreflightUFW(context.Background()); err != nil {
+		t.Fatalf("legacy backend preflight failed: %v", err)
+	}
+	if strings.Join(fake.events, ",") != "backend-verify,ufw-preflight" {
+		t.Fatalf("legacy backend/UFW preflight order = %v", fake.events)
+	}
+}
+
+func TestSupervisorReloadsJournalAndRepairsForwardAfterUFWRemoval(t *testing.T) {
+	fake := newFakeBackend()
+	fake.guard = true
+	fake.maintainObserved = make(chan string, 8)
+	service := testService(t, fake)
+	if _, err := service.Classify(); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := service.store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal.Phase = PhaseRulesEnabled
+	journal.Node = "pve1"
+	journal.Interfaces = []string{"vmbr0"}
+	journal.OwnedRules = []ownedRule{{Interface: "vmbr0", Comment: ownedRuleComment(journal.InstallID, "vmbr0")}}
+	journal.NativeHooks = []nativeInputHookSnapshot{
+		{Family: "ipv4", Captured: true, WasTail: true},
+		{Family: "ipv6", Captured: true, WasTail: true},
+	}
+	if err := service.store.save(journal); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- service.Supervise(ctx) }()
+	waitSupervisorPhase(t, fake.maintainObserved, "")
+
+	journal.Phase = PhaseCommitted
+	journal.UFWPhase = UFWPhaseRemoved
+	if err := service.store.save(journal); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	waitSupervisorPhase(t, fake.maintainObserved, UFWPhaseRemoved)
+	if !fake.forwardGuard.Load() {
+		cancel()
+		t.Fatal("supervisor did not begin FORWARD maintenance after journal transitioned to UFW removed")
+	}
+
+	// Disturb FORWARD without restarting the long-running supervisor. Its next
+	// iteration must reload the removed phase and repair the guard again.
+	fake.forwardGuard.Store(false)
+	waitSupervisorPhase(t, fake.maintainObserved, UFWPhaseRemoved)
+	if !fake.forwardGuard.Load() {
+		cancel()
+		t.Fatal("running supervisor retained its startup journal and left FORWARD disturbed")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("supervisor shutdown failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not stop after cancellation")
+	}
+}
+
+func waitSupervisorPhase(t *testing.T, observed <-chan string, wanted string) {
+	t.Helper()
+	timer := time.NewTimer(2500 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case phase := <-observed:
+			if phase == wanted {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("supervisor did not observe UFW phase %q", wanted)
 		}
 	}
 }
@@ -293,15 +392,24 @@ func TestCommittedRC26JournalReconcilesOwnedPriorityGuard(t *testing.T) {
 	}
 }
 
-func TestJournalLessUpdateReconcileIsZeroMutation(t *testing.T) {
+func TestJournalLessUpdateEstablishesPVEProtectionBeforeUFWRemoval(t *testing.T) {
 	fake := newFakeBackend()
+	fake.ufwPresent = true
 	service := testService(t, fake)
 	changed, err := service.ReconcileCommitted(context.Background())
-	if err != nil || changed {
+	if err != nil || !changed {
 		t.Fatalf("journal-less reconcile = %t, %v", changed, err)
 	}
-	if len(fake.events) != 0 || fake.guard || fake.persistent {
-		t.Fatalf("journal-less reconcile mutated state: %#v", fake)
+	if !fake.guard || !fake.persistent || fake.ufwPresent {
+		t.Fatalf("journal-less reconcile did not establish replacement protection: %#v", fake)
+	}
+	if eventIndex(fake.events, "guard-ensure") < 0 || eventIndex(fake.events, "ufw-remove") < 0 ||
+		eventIndex(fake.events, "guard-ensure") > eventIndex(fake.events, "ufw-remove") {
+		t.Fatalf("UFW removal did not follow PVE protection: %v", fake.events)
+	}
+	journal, err := service.store.load()
+	if err != nil || journal.Phase != PhaseCommitted || journal.UFWPhase != UFWPhaseRemoved {
+		t.Fatalf("journal-less update did not commit UFW migration: %#v, %v", journal, err)
 	}
 }
 
@@ -342,7 +450,7 @@ func TestCommittedTransactionLiveOverviewChecksRuntimeNotOnlyJournal(t *testing.
 	}
 }
 
-func TestUninstallRemovesOnlyTransactionOwnedPriorityState(t *testing.T) {
+func TestUninstallAfterUFWRemovalPreservesPersistentPVEProtection(t *testing.T) {
 	fake := newFakeBackend()
 	service := testService(t, fake)
 	if _, err := service.Classify(); err != nil {
@@ -358,8 +466,158 @@ func TestUninstallRemovesOnlyTransactionOwnedPriorityState(t *testing.T) {
 	if err != nil || journal.Phase != PhaseUninstalled {
 		t.Fatalf("uninstall journal = %q, %v", journal.Phase, err)
 	}
-	if fake.guard || fake.persistent || len(fake.rules) != 0 {
-		t.Fatalf("uninstall retained owned state: guard=%t persistent=%t rules=%#v", fake.guard, fake.persistent, fake.rules)
+	if !fake.guard || fake.persistent || len(fake.rules) != len(fake.interfaces) || fake.ufwPresent {
+		t.Fatalf("uninstall did not preserve PVE replacement protection: guard=%t persistent=%t rules=%#v ufw=%t", fake.guard, fake.persistent, fake.rules, fake.ufwPresent)
+	}
+	if !canonicalBool(fake.cluster["enable"]) || !canonicalBool(fake.node["enable"]) {
+		t.Fatalf("uninstall disabled PVE replacement protection: cluster=%#v node=%#v", fake.cluster, fake.node)
+	}
+}
+
+func TestUninstallFinalJournalSaveFailureReenablesGuardOnRetry(t *testing.T) {
+	fake := newFakeBackend()
+	service := testService(t, fake)
+	if _, err := service.Classify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service.store.writeFault = func(stage string, journal Journal) error {
+		if stage == "before-write" && journal.Phase == PhaseUninstalled {
+			return errors.New("injected final journal save failure")
+		}
+		return nil
+	}
+	if err := service.Rollback(context.Background(), true); err == nil || !strings.Contains(err.Error(), "injected final") {
+		t.Fatalf("final journal failure = %v", err)
+	}
+	journal, err := service.store.load()
+	if err != nil || journal.Phase != PhaseCommitted || journal.UFWPhase != UFWPhaseRemoving || fake.persistent {
+		t.Fatalf("pre-save crash state = journal %#v persistent=%t err=%v", journal, fake.persistent, err)
+	}
+
+	service.store.writeFault = nil
+	eventStart := len(fake.events)
+	if err := service.Rollback(context.Background(), true); err != nil {
+		t.Fatalf("uninstall retry failed: %v", err)
+	}
+	journal, err = service.store.load()
+	if err != nil || journal.Phase != PhaseUninstalled || journal.UFWPhase != UFWPhaseRemoved || fake.persistent {
+		t.Fatalf("retried uninstall state = journal %#v persistent=%t err=%v", journal, fake.persistent, err)
+	}
+	retryEvents := fake.events[eventStart:]
+	ensure := eventIndex(retryEvents, "guard-ensure")
+	enable := eventIndex(retryEvents, "guard-persistence-enable")
+	disable := eventIndex(retryEvents, "guard-persistence-disable")
+	if ensure < 0 || enable <= ensure || disable <= enable {
+		t.Fatalf("retry did not restore supervised protection before final disable: %v", retryEvents)
+	}
+}
+
+func TestPhaseUninstalledRetryRepairsDriftAndReprovesRetainedState(t *testing.T) {
+	fake := newFakeBackend()
+	service := testService(t, fake)
+	if _, err := service.Classify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service.store.writeFault = func(stage string, journal Journal) error {
+		if stage == "after-replace" && journal.Phase == PhaseUninstalled {
+			return errors.New("injected final journal directory fsync failure")
+		}
+		return nil
+	}
+	if err := service.Rollback(context.Background(), true); err == nil || !strings.Contains(err.Error(), "directory fsync") {
+		t.Fatalf("ambiguous final journal save = %v", err)
+	}
+	journal, err := service.store.load()
+	if err != nil || journal.Phase != PhaseUninstalled || journal.UFWPhase != UFWPhaseRemoved || fake.persistent {
+		t.Fatalf("post-replace crash state = journal %#v persistent=%t err=%v", journal, fake.persistent, err)
+	}
+
+	// Model an aaPanel/PVE rewrite after the supervisor stopped but before the
+	// operator retried the failed uninstall command.
+	fake.guard = false
+	fake.forwardGuard.Store(false)
+	for index := range fake.inputOrder {
+		fake.inputOrder[index].PVEJumpPosition = 1
+		fake.inputOrder[index].PrecedingRules = []string{"-A INPUT -j IN_BT"}
+	}
+	service.store.writeFault = nil
+	eventStart := len(fake.events)
+	if err := service.Rollback(context.Background(), true); err != nil {
+		t.Fatalf("PhaseUninstalled retained-state retry failed: %v", err)
+	}
+	if !fake.guard || !fake.forwardGuard.Load() || fake.persistent {
+		t.Fatalf("retry did not repair then retain guards: input=%t forward=%t persistent=%t", fake.guard, fake.forwardGuard.Load(), fake.persistent)
+	}
+	for _, order := range fake.inputOrder {
+		if order.PVEJumpPosition != 0 || len(order.PrecedingRules) != 0 {
+			t.Fatalf("retry left INPUT hook drift: %#v", fake.inputOrder)
+		}
+	}
+	retryEvents := fake.events[eventStart:]
+	if eventIndex(retryEvents, "ufw-verify") < 0 || eventIndex(retryEvents, "runtime-drops-verify") < 0 ||
+		eventIndex(retryEvents, "guard-persistence-enable") < 0 || eventIndex(retryEvents, "guard-persistence-disable") < 0 {
+		t.Fatalf("PhaseUninstalled retry skipped strict retained-state proof: %v", retryEvents)
+	}
+}
+
+func TestNonPurgeReinstallReclaimsRetainedPVEProtection(t *testing.T) {
+	fake := newFakeBackend()
+	service := testService(t, fake)
+	if _, err := service.Classify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Rollback(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := service.ReconcileCommitted(context.Background()); err != nil || !changed {
+		t.Fatalf("non-purge reinstall reconcile = %t, %v", changed, err)
+	}
+	journal, err := service.store.load()
+	if err != nil || journal.Phase != PhaseCommitted || journal.UFWPhase != UFWPhaseRemoved {
+		t.Fatalf("reclaimed journal = %#v, %v", journal, err)
+	}
+	if !fake.guard || !fake.persistent || len(fake.rules) != len(fake.interfaces) {
+		t.Fatalf("retained protection was not reclaimed: %#v", fake)
+	}
+}
+
+func TestPurgeReinstallAdoptsExactRetainedPVERuleBlock(t *testing.T) {
+	fake := newFakeBackend()
+	service := testService(t, fake)
+	if _, err := service.Classify(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Activate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	original, err := service.store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Rollback(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(service.store.journalPath); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := service.ReconcileCommitted(context.Background()); err != nil || !changed {
+		t.Fatalf("purge reinstall reconcile = %t, %v", changed, err)
+	}
+	reclaimed, err := service.store.load()
+	if err != nil || reclaimed.InstallID != original.InstallID || reclaimed.Phase != PhaseCommitted || reclaimed.UFWPhase != UFWPhaseRemoved {
+		t.Fatalf("adopted journal = %#v, %v; original=%#v", reclaimed, err, original)
+	}
+	if len(fake.rules) != len(fake.interfaces) {
+		t.Fatalf("purge reinstall duplicated retained PVE rules: %#v", fake.rules)
 	}
 }
 
@@ -393,19 +651,24 @@ func eventIndex(events []string, prefix string) int {
 }
 
 type fakeBackend struct {
-	cluster         map[string]any
-	node            map[string]any
-	nodes           []string
-	interfaces      []string
-	rules           []firewallRule
-	digest          int
-	events          []string
-	healthErr       error
-	onHealth        func()
-	guard           bool
-	persistent      bool
-	nativeAvailable bool
-	inputOrder      []inputChainOrder
+	cluster          map[string]any
+	node             map[string]any
+	nodes            []string
+	interfaces       []string
+	rules            []firewallRule
+	digest           int
+	events           []string
+	healthErr        error
+	onHealth         func()
+	guard            bool
+	persistent       bool
+	nativeAvailable  bool
+	inputOrder       []inputChainOrder
+	ufwPresent       bool
+	ufwErr           error
+	backendErr       error
+	maintainObserved chan string
+	forwardGuard     atomic.Bool
 }
 
 func newFakeBackend() *fakeBackend {
@@ -513,6 +776,33 @@ func (fake *fakeBackend) DeleteNodeRule(_ context.Context, _ string, position in
 
 func (fake *fakeBackend) VerifyIngressBackend(context.Context) error {
 	fake.events = append(fake.events, "backend-verify")
+	return fake.backendErr
+}
+
+func (fake *fakeBackend) PreflightUFW(context.Context) error {
+	fake.events = append(fake.events, "ufw-preflight")
+	return fake.ufwErr
+}
+
+func (fake *fakeBackend) RemoveUFW(context.Context) (bool, error) {
+	fake.events = append(fake.events, "ufw-remove")
+	if fake.ufwErr != nil {
+		return false, fake.ufwErr
+	}
+	changed := fake.ufwPresent
+	fake.ufwPresent = false
+	fake.forwardGuard.Store(true)
+	return changed, nil
+}
+
+func (fake *fakeBackend) VerifyUFWAbsent(context.Context) error {
+	fake.events = append(fake.events, "ufw-verify")
+	if fake.ufwErr != nil {
+		return fake.ufwErr
+	}
+	if fake.ufwPresent {
+		return errors.New("ufw present")
+	}
 	return nil
 }
 
@@ -527,27 +817,50 @@ func (fake *fakeBackend) CaptureIngressGuard(context.Context) ([]nativeInputHook
 	}, nil
 }
 
-func (fake *fakeBackend) EnsureIngressGuard(context.Context, Journal) error {
+func (fake *fakeBackend) CaptureRetainedIngressGuard(context.Context) ([]nativeInputHookSnapshot, error) {
+	fake.events = append(fake.events, "native-retained-capture")
+	if !fake.nativeAvailable {
+		return nil, errors.New("native hook unavailable")
+	}
+	return []nativeInputHookSnapshot{
+		{Family: "ipv4", Captured: true, RetainedFirst: true},
+		{Family: "ipv6", Captured: true, RetainedFirst: true},
+	}, nil
+}
+
+func (fake *fakeBackend) EnsureIngressGuard(_ context.Context, journal Journal) error {
 	fake.events = append(fake.events, "guard-ensure")
 	if !fake.nativeAvailable {
 		return errors.New("native hook unavailable")
 	}
 	fake.guard = true
 	fake.promoteInputOrder()
+	if journal.UFWPhase == UFWPhaseRemoving || journal.UFWPhase == UFWPhaseRemoved {
+		fake.forwardGuard.Store(true)
+	}
 	return nil
 }
 
-func (fake *fakeBackend) MaintainIngressGuard(context.Context, Journal) (bool, error) {
+func (fake *fakeBackend) MaintainIngressGuard(_ context.Context, journal Journal) (bool, error) {
 	fake.events = append(fake.events, "guard-maintain")
-	if !fake.nativeAvailable {
-		return false, nil
+	changed := false
+	if fake.nativeAvailable && !fake.guard {
+		fake.guard = true
+		fake.promoteInputOrder()
+		changed = true
 	}
-	if fake.guard {
-		return false, nil
+	if journal.UFWPhase == UFWPhaseRemoving || journal.UFWPhase == UFWPhaseRemoved {
+		if fake.forwardGuard.CompareAndSwap(false, true) {
+			changed = true
+		}
 	}
-	fake.guard = true
-	fake.promoteInputOrder()
-	return true, nil
+	if fake.maintainObserved != nil {
+		select {
+		case fake.maintainObserved <- journal.UFWPhase:
+		default:
+		}
+	}
+	return changed, nil
 }
 
 func (fake *fakeBackend) promoteInputOrder() {
@@ -557,10 +870,13 @@ func (fake *fakeBackend) promoteInputOrder() {
 	}
 }
 
-func (fake *fakeBackend) VerifyIngressGuard(context.Context, Journal) error {
+func (fake *fakeBackend) VerifyIngressGuard(_ context.Context, journal Journal) error {
 	fake.events = append(fake.events, "guard-verify")
 	if !fake.guard {
 		return errors.New("guard missing")
+	}
+	if (journal.UFWPhase == UFWPhaseRemoving || journal.UFWPhase == UFWPhaseRemoved) && !fake.forwardGuard.Load() {
+		return errors.New("FORWARD guard missing")
 	}
 	return nil
 }

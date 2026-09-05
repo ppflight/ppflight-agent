@@ -207,6 +207,52 @@ func TestSmartmontoolsInstallUsesOnlyIsolatedOfficialDebianSources(t *testing.T)
 	}
 }
 
+func TestHostFirewallPreflightRunsBeforeInstallerMutation(t *testing.T) {
+	installer := readDeploymentFile(t, "install.sh")
+	ordered := []string{
+		`verify_sha256 "$BINARY" "$BINARY_SHA256"`,
+		`install -o root -g root -m 0700 "$BINARY" "$PREFLIGHT_BINARY"`,
+		`"$PREFLIGHT_BINARY" host-firewall prepare`,
+		`apt-get "${smart_apt_options[@]}" update`,
+		`getent group ppflight-agent >/dev/null || groupadd --system ppflight-agent`,
+		`systemctl stop ppflight-agent.service`,
+	}
+	previous := -1
+	for _, fragment := range ordered {
+		position := strings.Index(installer, fragment)
+		if position < 0 {
+			t.Fatalf("installer is missing firewall preflight ordering step %q", fragment)
+		}
+		if position <= previous {
+			t.Fatalf("installer firewall preflight step %q is out of order", fragment)
+		}
+		previous = position
+	}
+}
+
+func TestLowLevelInstallerReportsStagingWithoutDuplicateFirewallPostflight(t *testing.T) {
+	installer := readDeploymentFile(t, "install.sh")
+	for _, required := range []string{
+		"--enable                      Stage units as boot-enabled; not a completed install.",
+		"Staged $APP for PVE $pve_version",
+		"STAGING ONLY: this helper has not completed the service/exporter health gate or PVE-only host-firewall/UFW postflight.",
+		"run host-firewall reconcile only after every required service is healthy",
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("low-level installer is missing staging contract %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`"$BIN_PATH" host-firewall activate`,
+		`"$BIN_PATH" host-firewall reconcile`,
+		"Installed $APP for PVE",
+	} {
+		if strings.Contains(installer, forbidden) {
+			t.Fatalf("low-level staging installer claims or duplicates completion via %q", forbidden)
+		}
+	}
+}
+
 func TestTemplateBundleInstallStagesBeforeAtomicSymlinkSwitch(t *testing.T) {
 	installer := readDeploymentFile(t, "install.sh")
 	ordered := []string{

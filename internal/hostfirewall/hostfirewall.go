@@ -2,6 +2,7 @@ package hostfirewall
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -154,6 +155,22 @@ func (service *Service) Classify() (InstallMode, error) {
 	return ModeFresh, nil
 }
 
+// PreflightUFW is intentionally read-only. Installers run it before apt,
+// systemd, PVE or filesystem mutation so an ambiguous package/unit/configuration
+// fails before deployment begins. Live UFW removal happens only after Activate
+// or ReconcileCommitted has established and verified replacement PVE protection.
+func (service *Service) PreflightUFW(ctx context.Context) error {
+	transactionUnlock, err := service.lockTransaction(ctx)
+	if err != nil {
+		return err
+	}
+	defer transactionUnlock()
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return fmt.Errorf("PVE 8/9 legacy firewall preflight failed before installation mutation: %w", err)
+	}
+	return service.backend.PreflightUFW(ctx)
+}
+
 func validateInstallationEvidence(path string) (bool, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -212,15 +229,20 @@ func (service *Service) Activate(ctx context.Context) (returnErr error) {
 		if err := service.verifyEffective(ctx, journal, true); err != nil {
 			return fmt.Errorf("committed host firewall no longer verifies: %w", err)
 		}
-		return service.backend.Health(ctx)
+		if err := service.backend.Health(ctx); err != nil {
+			return err
+		}
+		_, err := service.removeUFWCommitted(ctx, &journal)
+		return err
 	}
 	if journal.Phase == PhaseRollbackPending {
 		if err := service.rollback(ctx, &journal, false); err != nil {
 			return fmt.Errorf("cannot finish prior host firewall rollback: %w", err)
 		}
 	}
+	rollbackArmed := true
 	defer func() {
-		if returnErr == nil {
+		if returnErr == nil || !rollbackArmed {
 			return
 		}
 		rollbackContext, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -279,7 +301,40 @@ func (service *Service) Activate(ctx context.Context) (returnErr error) {
 	if err := service.store.save(journal); err != nil {
 		return err
 	}
-	return nil
+	// UFW removal is intentionally irreversible and must never enter the PVE
+	// rollback scope. From this point onward the committed PVE replacement stays
+	// live even if package purge/readback fails; a retry resumes from UFWPhase.
+	rollbackArmed = false
+	_, err = service.removeUFWCommitted(ctx, &journal)
+	return err
+}
+
+func (service *Service) removeUFWCommitted(ctx context.Context, journal *Journal) (bool, error) {
+	if journal.Phase != PhaseCommitted {
+		return false, errors.New("UFW removal requires a committed PVE host firewall transaction")
+	}
+	journal.UFWPhase = UFWPhaseRemoving
+	if err := service.store.save(*journal); err != nil {
+		return false, err
+	}
+	changed, err := service.backend.RemoveUFW(ctx)
+	if err != nil {
+		return changed, err
+	}
+	if err := service.backend.VerifyUFWAbsent(ctx); err != nil {
+		return changed, err
+	}
+	if err := service.verifyEffective(ctx, *journal, true); err != nil {
+		return changed, fmt.Errorf("PVE protection changed during UFW removal: %w", err)
+	}
+	if err := service.backend.Health(ctx); err != nil {
+		return changed, err
+	}
+	journal.UFWPhase = UFWPhaseRemoved
+	if err := service.store.save(*journal); err != nil {
+		return changed, err
+	}
+	return changed, nil
 }
 
 func (service *Service) prepare(ctx context.Context, journal *Journal) error {
@@ -314,11 +369,6 @@ func (service *Service) prepare(ctx context.Context, journal *Journal) error {
 	if err != nil {
 		return err
 	}
-	for _, rule := range ruleSet.Items {
-		if strings.HasPrefix(rule.Comment, "PPFlight host firewall:") {
-			return errors.New("an unowned or duplicate PPFlight host firewall rule already exists")
-		}
-	}
 	clusterPolicyIn, err := snapshotValue(cluster.Values, "policy_in")
 	if err != nil {
 		return err
@@ -330,6 +380,31 @@ func (service *Service) prepare(ctx context.Context, journal *Journal) error {
 	nodeEnable, err := snapshotValue(nodeOptions.Values, "enable")
 	if err != nil {
 		return err
+	}
+	retainedID, retainedRules, err := retainedPVERulePlan(ruleSet.Items, interfaces)
+	if err != nil {
+		return err
+	}
+	if retainedID != "" {
+		if !optionEquals(clusterEnable, "1") || !optionEquals(clusterPolicyIn, "DROP") ||
+			!optionEquals(clusterPolicyOut, "ACCEPT") || !optionEquals(nodeEnable, "1") {
+			return errors.New("retained PPFlight rules exist without the exact PVE replacement options")
+		}
+		journal.InstallID = retainedID
+		journal.Node = node
+		journal.Interfaces = interfaces
+		journal.Preimage = journalPreimage{
+			Cluster: optionSnapshot{Enable: clusterEnable, PolicyIn: clusterPolicyIn, PolicyOut: clusterPolicyOut},
+			Node:    optionSnapshot{Enable: nodeEnable},
+		}
+		journal.OwnedRules = retainedRules
+		journal.NativeHooks, err = service.backend.CaptureRetainedIngressGuard(ctx)
+		if err != nil {
+			return err
+		}
+		journal.UFWPhase = UFWPhaseRemoving
+		journal.Phase = PhaseRulesEnabled
+		return service.store.save(*journal)
 	}
 	rulePlan := make([]ownedRule, 0, len(interfaces))
 	for _, iface := range interfaces {
@@ -344,6 +419,62 @@ func (service *Service) prepare(ctx context.Context, journal *Journal) error {
 	journal.OwnedRules = rulePlan
 	journal.Phase = PhasePrepared
 	return service.store.save(*journal)
+}
+
+func optionEquals(value optionValue, wanted string) bool {
+	return value.Present && value.Value == wanted
+}
+
+func retainedPVERulePlan(rules []firewallRule, interfaces []string) (string, []ownedRule, error) {
+	wanted := map[string]bool{}
+	for _, iface := range interfaces {
+		wanted[iface] = true
+	}
+	found := map[string]firewallRule{}
+	installID := ""
+	maxOwned := -1
+	minOther := int(^uint(0) >> 1)
+	for _, rule := range rules {
+		if !strings.HasPrefix(rule.Comment, "PPFlight host firewall:") {
+			if rule.Position < minOther {
+				minOther = rule.Position
+			}
+			continue
+		}
+		remainder := strings.TrimPrefix(rule.Comment, "PPFlight host firewall:")
+		identity, iface, ok := strings.Cut(remainder, ":")
+		if !ok || len(identity) != 32 || !wanted[iface] || found[iface].Comment != "" {
+			return "", nil, errors.New("retained PPFlight PVE rule inventory is ambiguous")
+		}
+		if _, err := hex.DecodeString(identity); err != nil {
+			return "", nil, errors.New("retained PPFlight PVE rule identity is invalid")
+		}
+		if installID != "" && installID != identity {
+			return "", nil, errors.New("retained PPFlight PVE rules have mixed ownership identities")
+		}
+		if rule.Direction != "in" || rule.Action != "DROP" || rule.Interface != iface || !rule.Enabled {
+			return "", nil, errors.New("retained PPFlight PVE rule does not match the safe replacement policy")
+		}
+		installID = identity
+		found[iface] = rule
+		if rule.Position > maxOwned {
+			maxOwned = rule.Position
+		}
+	}
+	if installID == "" {
+		return "", nil, nil
+	}
+	if len(found) != len(wanted) || (minOther != int(^uint(0)>>1) && maxOwned >= minOther) {
+		return "", nil, errors.New("retained PPFlight PVE rule block is incomplete or displaced")
+	}
+	result := make([]ownedRule, 0, len(interfaces))
+	for _, iface := range interfaces {
+		if found[iface].Comment == "" {
+			return "", nil, errors.New("retained PPFlight PVE rule block is incomplete")
+		}
+		result = append(result, ownedRule{Interface: iface, Comment: ownedRuleComment(installID, iface)})
+	}
+	return installID, result, nil
 }
 
 func (service *Service) ensureDisabledRules(ctx context.Context, journal *Journal) error {
@@ -537,28 +668,63 @@ func (service *Service) verifyRuntimeIngressDrops(ctx context.Context, journal J
 	}
 }
 
-// ReconcileCommitted upgrades only an already-owned committed fresh-install
-// transaction. Existing installations without a journal remain a strict no-op,
-// so an ordinary rolling update never opts a host into firewall management.
+// ReconcileCommitted brings every installed node to the same verified PVE-only
+// firewall state. Historical installations without a journal are enrolled into
+// the normal crash-safe Activate transaction before UFW removal; an upgrade is
+// never allowed to report success while no replacement PVE protection exists.
 func (service *Service) ReconcileCommitted(ctx context.Context) (bool, error) {
 	transactionUnlock, lockErr := service.lockTransaction(ctx)
 	if lockErr != nil {
 		return false, lockErr
 	}
-	defer transactionUnlock()
+	locked := true
+	defer func() {
+		if locked {
+			transactionUnlock()
+		}
+	}()
 	exists, err := service.store.exists()
-	if err != nil || !exists {
+	if err != nil {
 		return false, err
+	}
+	if !exists {
+		if _, err := service.store.createInitial(); err != nil {
+			return false, err
+		}
+		transactionUnlock()
+		locked = false
+		if err := service.Activate(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	journal, err := service.store.load()
 	if err != nil {
 		return false, err
 	}
 	if journal.Phase == PhaseUninstalled {
-		return false, nil
+		if journal.UFWPhase != UFWPhaseRemoved {
+			return false, errors.New("cannot reconcile an uninstalled legacy host firewall transaction")
+		}
+		journal.UFWPhase = UFWPhaseRemoving
+		journal.Phase = PhaseRulesEnabled
+		if err := service.store.save(journal); err != nil {
+			return false, err
+		}
+		transactionUnlock()
+		locked = false
+		if err := service.Activate(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if journal.Phase != PhaseCommitted {
-		return false, fmt.Errorf("cannot reconcile incomplete host firewall transaction in phase %s", journal.Phase)
+		transactionUnlock()
+		locked = false
+		if err := service.Activate(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
 		return false, err
@@ -583,7 +749,11 @@ func (service *Service) ReconcileCommitted(ctx context.Context) (bool, error) {
 	if err := service.backend.Health(ctx); err != nil {
 		return false, err
 	}
-	return true, nil
+	changed, err := service.removeUFWCommitted(ctx, &journal)
+	if err != nil {
+		return false, err
+	}
+	return changed || journal.UFWPhase == UFWPhaseRemoved, nil
 }
 
 // EnforceCommitted is run by the root-only supervisor. It never creates a new
@@ -601,7 +771,7 @@ func (service *Service) EnforceCommitted(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if journal.Phase != PhaseRulesEnabled && journal.Phase != PhaseCommitted {
+	if !allowsIngressGuard(journal) {
 		return fmt.Errorf("host firewall priority guard is not allowed in phase %s", journal.Phase)
 	}
 	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
@@ -637,21 +807,17 @@ func (service *Service) EnforceCommitted(ctx context.Context) error {
 	if err := validateInputChainInspection(order); err != nil {
 		return err
 	}
-	return service.verifyRuntimeIngressDrops(ctx, journal)
+	if err := service.verifyRuntimeIngressDrops(ctx, journal); err != nil {
+		return err
+	}
+	if journal.UFWPhase == UFWPhaseRemoved {
+		return service.backend.VerifyUFWAbsent(ctx)
+	}
+	return nil
 }
 
 func (service *Service) Supervise(ctx context.Context) error {
-	journal, err := service.store.load()
-	if err != nil {
-		return err
-	}
-	if journal.Phase != PhaseRulesEnabled && journal.Phase != PhaseCommitted {
-		return fmt.Errorf("host firewall priority supervisor is not allowed in phase %s", journal.Phase)
-	}
-	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
-		return err
-	}
-	if err := requireNativeHookSnapshots(journal); err != nil {
+	if err := service.superviseIteration(ctx, true); err != nil {
 		return err
 	}
 	ticker := time.NewTicker(time.Second)
@@ -661,15 +827,48 @@ func (service *Service) Supervise(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			// The steady-state loop is intentionally limited to two local
-			// iptables-legacy -S INPUT inspections (IPv4/IPv6). The systemd unit performs
-			// full PVE API readback once in ExecStartPre when Cluster firewall is
-			// enabled; an explicit Cluster disable is observed and left waiting.
-			if _, err := service.backend.MaintainIngressGuard(ctx, journal); err != nil {
+			if err := service.superviseIteration(ctx, false); err != nil {
 				return err
 			}
 		}
 	}
+}
+
+func (service *Service) superviseIteration(ctx context.Context, verifyBackend bool) error {
+	// Reload the atomically replaced journal while holding the same process
+	// lock used by netfilter mutation. UFW removal changes its durable phase
+	// after this long-running process starts; using a startup snapshot would
+	// leave FORWARD unguarded until the next service restart.
+	lockedContext, enforcementUnlock, err := service.lockEnforcement(ctx)
+	if err != nil {
+		return err
+	}
+	defer enforcementUnlock()
+	journal, err := service.store.load()
+	if err != nil {
+		return err
+	}
+	if !allowsIngressGuard(journal) {
+		return fmt.Errorf("host firewall priority supervisor is not allowed in phase %s", journal.Phase)
+	}
+	if err := requireNativeHookSnapshots(journal); err != nil {
+		return err
+	}
+	if verifyBackend {
+		if err := service.backend.VerifyIngressBackend(lockedContext); err != nil {
+			return err
+		}
+	}
+	// Before UFW migration this is limited to INPUT in both families. Once the
+	// reloaded phase is removing/removed it also maintains the unique PVE
+	// FORWARD hook first with the PVE-compatible ACCEPT base policy.
+	_, err = service.backend.MaintainIngressGuard(lockedContext, journal)
+	return err
+}
+
+func allowsIngressGuard(journal Journal) bool {
+	return journal.Phase == PhaseRulesEnabled || journal.Phase == PhaseCommitted ||
+		(journal.Phase == PhaseUninstalled && journal.UFWPhase == UFWPhaseRemoved)
 }
 
 func (service *Service) verifyOptions(ctx context.Context, journal Journal) error {
@@ -765,7 +964,56 @@ func (service *Service) Rollback(ctx context.Context, uninstall bool) error {
 
 func (service *Service) rollback(ctx context.Context, journal *Journal, uninstall bool) error {
 	if journal.Phase == PhaseUninstalled {
-		return nil
+		if journal.UFWPhase != UFWPhaseRemoved {
+			// A transaction uninstalled before irreversible UFW migration has no
+			// retained PVE-only state to re-establish. Re-save it so a prior
+			// directory-fsync failure is nevertheless made durable on retry.
+			return service.store.save(*journal)
+		}
+		if !uninstall {
+			return errors.New("an uninstalled PVE-only firewall transaction cannot be rolled back")
+		}
+		if err := service.establishRetainedUninstallState(ctx, *journal); err != nil {
+			return err
+		}
+		if err := service.backend.DisableIngressGuardPersistence(ctx); err != nil {
+			return err
+		}
+		if err := service.verifyRetainedUninstallState(ctx, *journal); err != nil {
+			return err
+		}
+		return service.store.save(*journal)
+	}
+	if !uninstall && journal.UFWPhase != "" {
+		return errors.New("PVE protection cannot be rolled back after irreversible UFW removal")
+	}
+	if uninstall && journal.UFWPhase != "" {
+		// UFW removal is intentionally irreversible. Rolling PVE options and the
+		// owned host DROP block back to a disabled preimage here would leave the
+		// node unprotected after uninstall. Finish/verify the idempotent UFW purge,
+		// retain the persistent PVE policy and only stop the Agent supervisor.
+		if journal.Phase != PhaseCommitted {
+			return errors.New("cannot uninstall during UFW removal without a committed PVE replacement")
+		}
+		journal.UFWPhase = UFWPhaseRemoving
+		if err := service.store.save(*journal); err != nil {
+			return err
+		}
+		if _, err := service.backend.RemoveUFW(ctx); err != nil {
+			return fmt.Errorf("cannot finish UFW removal before uninstall: %w", err)
+		}
+		if err := service.establishRetainedUninstallState(ctx, *journal); err != nil {
+			return fmt.Errorf("cannot preserve PVE replacement protection during uninstall: %w", err)
+		}
+		if err := service.backend.DisableIngressGuardPersistence(ctx); err != nil {
+			return err
+		}
+		if err := service.verifyRetainedUninstallState(ctx, *journal); err != nil {
+			return fmt.Errorf("cannot prove retained PVE protection after stopping its supervisor: %w", err)
+		}
+		journal.UFWPhase = UFWPhaseRemoved
+		journal.Phase = PhaseUninstalled
+		return service.store.save(*journal)
 	}
 	if journal.Phase == PhaseInstalling {
 		if uninstall {
@@ -819,6 +1067,51 @@ func (service *Service) rollback(ctx context.Context, journal *Journal, uninstal
 		journal.Phase = PhaseRolledBack
 	}
 	return service.store.save(*journal)
+}
+
+func (service *Service) establishRetainedUninstallState(ctx context.Context, journal Journal) error {
+	if journal.UFWPhase != UFWPhaseRemoving && journal.UFWPhase != UFWPhaseRemoved {
+		return errors.New("retained PVE protection requires an irreversible UFW removal phase")
+	}
+	if err := service.backend.VerifyUFWAbsent(ctx); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
+	if err := service.backend.EnsureIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	if err := service.backend.EnableIngressGuardPersistence(ctx); err != nil {
+		return err
+	}
+	if err := service.verifyEffective(ctx, journal, true); err != nil {
+		return err
+	}
+	return service.backend.VerifyUFWAbsent(ctx)
+}
+
+func (service *Service) verifyRetainedUninstallState(ctx context.Context, journal Journal) error {
+	if err := service.backend.VerifyUFWAbsent(ctx); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressBackend(ctx); err != nil {
+		return err
+	}
+	if err := service.verify(ctx, journal, true); err != nil {
+		return err
+	}
+	if err := service.backend.VerifyIngressGuard(ctx, journal); err != nil {
+		return err
+	}
+	order, err := service.backend.InputChainOrder(ctx)
+	if err != nil {
+		return err
+	}
+	if err := validateInputChainInspection(order); err != nil {
+		return err
+	}
+	return service.verifyRuntimeIngressDrops(ctx, journal)
 }
 
 func (service *Service) removeOwnedRules(ctx context.Context, journal Journal) error {
@@ -898,7 +1191,7 @@ func Run(args []string, out, errOut io.Writer) int {
 		return 1
 	}
 	if len(args) == 0 {
-		fmt.Fprintln(errOut, "host firewall helper requires classify, activate, reconcile, enforce, supervise, or rollback")
+		fmt.Fprintln(errOut, "host firewall helper requires classify, prepare, activate, reconcile, enforce, supervise, or rollback")
 		return 2
 	}
 	service := productionService()
@@ -916,6 +1209,19 @@ func Run(args []string, out, errOut io.Writer) int {
 			return 1
 		}
 		fmt.Fprintln(out, mode)
+		return 0
+	case "prepare":
+		if len(args) != 1 {
+			fmt.Fprintln(errOut, "prepare accepts no arguments")
+			return 2
+		}
+		preflightContext, preflightCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer preflightCancel()
+		if err := service.PreflightUFW(preflightContext); err != nil {
+			fmt.Fprintf(errOut, "host firewall UFW preflight failed: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(out, "UFW 软件包、服务和配置已完成只读安全预检；删除只会在 PVE 替代防护严格回验后执行。")
 		return 0
 	case "activate":
 		if len(args) != 1 {
@@ -943,9 +1249,9 @@ func Run(args []string, out, errOut io.Writer) int {
 			return 1
 		}
 		if changed {
-			fmt.Fprintln(out, "PPFlight 已有主机防火墙事务已提升到宝塔/UFW 之前并严格回验。")
+			fmt.Fprintln(out, "PPFlight/PVE 主机与虚拟机转发防火墙已严格回验，UFW 已安全清除。")
 		} else {
-			fmt.Fprintln(out, "当前安装没有 PPFlight 自有主机防火墙事务；防火墙保持不变。")
+			fmt.Fprintln(out, "PPFlight/PVE 防火墙与 UFW 缺失状态已严格回验。")
 		}
 		return 0
 	case "supervise":
@@ -983,7 +1289,7 @@ func Run(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(errOut, "host firewall rollback failed: %v\n", err)
 			return 1
 		}
-		fmt.Fprintln(out, "PPFlight 自有主机防火墙规则已移除，未冲突的原选项已恢复。")
+		fmt.Fprintln(out, "主机防火墙卸载收尾已完成；UFW 不会恢复，本次已回验并保留 PVE 配置与首位 hook。移除 Agent 后不再持续纠偏，后续 PVE/aaPanel reload 由管理员检查。")
 		return 0
 	default:
 		fmt.Fprintln(errOut, "unknown host firewall helper command")

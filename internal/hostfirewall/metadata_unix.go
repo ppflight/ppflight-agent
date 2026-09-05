@@ -4,8 +4,12 @@ package hostfirewall
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -39,6 +43,178 @@ func inspectFirewallSelectorPath(path string) (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// inspectUFWDisablePreconditions validates the package-controlled inputs used
+// by the safe removal path. We never invoke `ufw disable`/force-stop. The
+// MANAGE_BUILTINS value is accepted for inventory only because ordinary stop
+// and dpkg prerm are made inert first by atomically setting ENABLED=no.
+func inspectUFWDisablePreconditions(libraryPrefix string) error {
+	if libraryPrefix != "/lib" && libraryPrefix != "/usr/lib" {
+		return errors.New("unsupported UFW package library layout")
+	}
+	for _, path := range []string{
+		"/usr/sbin/ufw", libraryPrefix + "/ufw/ufw-init", libraryPrefix + "/ufw/ufw-init-functions",
+		libraryPrefix + "/systemd/system/ufw.service", "/etc/default/ufw", "/etc/ufw/ufw.conf",
+	} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			return errors.New("cannot inspect packaged UFW disable precondition")
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ownedByRoot(info) || info.Mode().Perm()&0o022 != 0 {
+			return errors.New("packaged UFW disable precondition has unsafe metadata")
+		}
+	}
+	binary, err := os.Lstat("/usr/sbin/ufw")
+	if err != nil || binary.Mode().Perm()&0o111 == 0 {
+		return errors.New("packaged UFW executable is missing or not executable")
+	}
+	if err := verifyPackagedUFWRuntimeHashes(libraryPrefix); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile("/etc/default/ufw")
+	if err != nil || len(raw) == 0 || len(raw) > 64<<10 {
+		return errors.New("cannot safely read /etc/default/ufw")
+	}
+	if _, err := parseSafeUFWDefaults(raw); err != nil {
+		return err
+	}
+	conf, err := os.ReadFile("/etc/ufw/ufw.conf")
+	if err != nil || len(conf) == 0 || len(conf) > 64<<10 {
+		return errors.New("cannot safely read /etc/ufw/ufw.conf")
+	}
+	if _, _, err := rewriteUFWEnabled(conf); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyPackagedUFWRuntimeHashes(libraryPrefix string) error {
+	manifestPath := "/var/lib/dpkg/info/ufw.md5sums"
+	info, err := os.Lstat(manifestPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		!ownedByRoot(info) || info.Mode().Perm()&0o022 != 0 {
+		return errors.New("UFW package checksum manifest metadata is unsafe")
+	}
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil || len(raw) == 0 || len(raw) > 2<<20 {
+		return errors.New("cannot safely read UFW package checksum manifest")
+	}
+	wanted := map[string]string{}
+	for _, path := range []string{
+		"/usr/sbin/ufw", libraryPrefix + "/ufw/ufw-init", libraryPrefix + "/ufw/ufw-init-functions",
+		libraryPrefix + "/systemd/system/ufw.service",
+	} {
+		wanted[strings.TrimPrefix(path, "/")] = ""
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return errors.New("UFW package checksum manifest is invalid")
+		}
+		if _, tracked := wanted[fields[1]]; !tracked {
+			continue
+		}
+		if wanted[fields[1]] != "" || len(fields[0]) != md5.Size*2 {
+			return errors.New("UFW package checksum manifest is ambiguous")
+		}
+		if _, err := hex.DecodeString(fields[0]); err != nil {
+			return errors.New("UFW package checksum manifest contains an invalid digest")
+		}
+		wanted[fields[1]] = strings.ToLower(fields[0])
+	}
+	for relativePath, expected := range wanted {
+		if expected == "" {
+			return errors.New("UFW package checksum manifest is incomplete")
+		}
+		file, err := os.Open("/" + relativePath)
+		if err != nil {
+			return errors.New("cannot open packaged UFW runtime for verification")
+		}
+		openedInfo, statErr := file.Stat()
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !ownedByRoot(openedInfo) ||
+			openedInfo.Mode().Perm()&0o022 != 0 || openedInfo.Size() < 1 || openedInfo.Size() > 4<<20 {
+			_ = file.Close()
+			return errors.New("opened packaged UFW runtime metadata is unsafe")
+		}
+		hash := md5.New() // dpkg's package manifest format is MD5 by definition.
+		_, copyErr := io.Copy(hash, file)
+		closeErr := file.Close()
+		if copyErr != nil || closeErr != nil || hex.EncodeToString(hash.Sum(nil)) != expected {
+			return errors.New("packaged UFW runtime checksum verification failed")
+		}
+	}
+	return nil
+}
+
+func disableUFWAtBoot() error {
+	directoryInfo, err := os.Lstat("/etc/ufw")
+	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 ||
+		!ownedByRoot(directoryInfo) || directoryInfo.Mode().Perm()&0o022 != 0 {
+		return errors.New("UFW configuration directory metadata is unsafe")
+	}
+	info, err := os.Lstat("/etc/ufw/ufw.conf")
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		!ownedByRoot(info) || info.Mode().Perm()&0o022 != 0 {
+		return errors.New("UFW boot configuration metadata is unsafe")
+	}
+	raw, err := os.ReadFile("/etc/ufw/ufw.conf")
+	if err != nil || len(raw) == 0 || len(raw) > 64<<10 {
+		return errors.New("cannot safely read UFW boot configuration")
+	}
+	replacement, changed, err := rewriteUFWEnabled(raw)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	temporary, err := os.CreateTemp("/etc/ufw", ".ppflight-ufw.conf.*")
+	if err != nil {
+		return errors.New("cannot create UFW boot configuration replacement")
+	}
+	temporaryPath := temporary.Name()
+	cleanup := func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporaryPath)
+	}
+	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
+		cleanup()
+		return errors.New("cannot set UFW boot configuration replacement mode")
+	}
+	if _, err := temporary.Write(replacement); err != nil {
+		cleanup()
+		return errors.New("cannot write UFW boot configuration replacement")
+	}
+	if err := temporary.Sync(); err != nil {
+		cleanup()
+		return errors.New("cannot sync UFW boot configuration replacement")
+	}
+	if err := temporary.Close(); err != nil {
+		_ = os.Remove(temporaryPath)
+		return errors.New("cannot close UFW boot configuration replacement")
+	}
+	if err := os.Rename(temporaryPath, "/etc/ufw/ufw.conf"); err != nil {
+		_ = os.Remove(temporaryPath)
+		return errors.New("cannot atomically disable UFW boot configuration")
+	}
+	directory, err := os.Open("/etc/ufw")
+	if err != nil {
+		return errors.New("cannot open UFW configuration directory")
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return errors.New("cannot sync UFW configuration directory")
+	}
+	verify, err := os.ReadFile("/etc/ufw/ufw.conf")
+	if err != nil {
+		return errors.New("cannot read back UFW boot configuration")
+	}
+	_, verifyChanged, err := rewriteUFWEnabled(verify)
+	if err != nil || verifyChanged {
+		return errors.New("UFW boot configuration disable readback failed")
+	}
+	return nil
 }
 
 func acquireFirewallProcessLock(ctx context.Context) (func(), error) {

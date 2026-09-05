@@ -182,6 +182,30 @@ func TestEnsureMovesOnlyNativeHookWithAtomicLegacyRestore(t *testing.T) {
 	}
 }
 
+func TestRemovingUFWJournalMaintainsPVEForwardGuardAfterCrash(t *testing.T) {
+	input := inputRules("-A INPUT -j PVEFW-INPUT")
+	unsafeForward := []byte("-P FORWARD DROP\n-A FORWARD -j CUSTOM-FORWARD\n-A FORWARD -j PVEFW-FORWARD\n")
+	safeForward := []byte("-P FORWARD ACCEPT\n-A FORWARD -j PVEFW-FORWARD\n-A FORWARD -j CUSTOM-FORWARD\n")
+	runner := &recordingRunner{outputs: [][]byte{
+		input, input,
+		unsafeForward, nil, safeForward,
+		unsafeForward, nil, safeForward,
+	}}
+	backend := &commandBackend{runner: runner}
+	journal := nativeJournal()
+	journal.UFWPhase = UFWPhaseRemoving
+	changed, err := backend.MaintainIngressGuard(context.Background(), journal)
+	if err != nil || !changed {
+		t.Fatalf("crash-resume forward guard = %t, %v", changed, err)
+	}
+	want := "*filter\n-D FORWARD -j PVEFW-FORWARD\n-I FORWARD 1 -j PVEFW-FORWARD\n-P FORWARD ACCEPT\nCOMMIT\n"
+	for _, index := range []int{3, 6} {
+		if index >= len(runner.commands) || string(runner.commands[index].input) != want {
+			t.Fatalf("forward guard restore command[%d]=%#v, want payload %q", index, runner.commands, want)
+		}
+	}
+}
+
 func TestSupervisorWaitsDuringPVEDisableAndPromotesAfterReenable(t *testing.T) {
 	missing := inputRules("-A INPUT -j IN_BT")
 	runner := &recordingRunner{outputs: [][]byte{missing, missing}}

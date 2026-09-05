@@ -44,6 +44,17 @@ type UpgradeResolution struct {
 	Error   *ExecutionError
 }
 
+const (
+	// AgentUpgradeLegacySuccessCode is emitted by helpers which predate the
+	// mandatory host-firewall postflight. The website uses this exact legacy
+	// receipt to enqueue one signed same-version completion handoff, but never
+	// treats it as authority to promote the release.
+	AgentUpgradeLegacySuccessCode = "AGENT_UPGRADE_SUCCEEDED"
+	// AgentUpgradeHostFirewallSuccessCode proves both candidate health and the
+	// privileged host-firewall reconciliation completed successfully.
+	AgentUpgradeHostFirewallSuccessCode = "AGENT_UPGRADE_SUCCEEDED_HOST_FIREWALL_V1"
+)
+
 // TaskResolution is intentionally a small PVE-neutral task view. Status is
 // normally "queued", "running", or a terminal value; ExitStatus is "OK" only
 // for a successful terminal task.
@@ -707,7 +718,12 @@ func (s *Service) reconciledUpgradeReceipt(task SubmittedTask, result UpgradeRes
 		case "pending", "running":
 			receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_WAITING"
 		case "succeeded":
-			receipt.State, receipt.Code = "succeeded", "AGENT_UPGRADE_SUCCEEDED"
+			switch result.Code {
+			case AgentUpgradeLegacySuccessCode, AgentUpgradeHostFirewallSuccessCode:
+				receipt.State, receipt.Code = "succeeded", result.Code
+			default:
+				receipt.State, receipt.Code = "waiting", "AGENT_UPGRADE_STATUS_INDETERMINATE"
+			}
 		case "rolled_back":
 			receipt.State, receipt.Code = "failed", "AGENT_UPGRADE_ROLLED_BACK"
 			receipt.Error = result.Error

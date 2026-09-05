@@ -32,6 +32,7 @@ import (
 const requestSchema = 1
 
 var resultErrorStageRE = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,127}$`)
+var agentVersionRE = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-rc\.([0-9]+))?$`)
 
 type Config struct {
 	StateDirectory  string
@@ -122,6 +123,9 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 	if err := manifest.Match(parameters); err != nil {
 		return "", err
 	}
+	if err := validateUpgradeTransition(c.cfg.CurrentVersion, parameters.ReleaseTag); err != nil {
+		return "", err
+	}
 	slog.Info("agent upgrade manifest verified",
 		"operationId", command.OperationID,
 		"releaseTag", parameters.ReleaseTag,
@@ -174,6 +178,72 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 		"releaseTag", parameters.ReleaseTag,
 	)
 	return upgradeID, nil
+}
+
+// validateUpgradeTransition rejects rollback while deliberately permitting an
+// exact same-version handoff. The latter is required when an older helper has
+// installed a new binary but cannot itself perform that binary's mandatory
+// host-firewall postflight.
+func validateUpgradeTransition(currentVersion, targetRelease string) error {
+	current, err := parseAgentVersion(currentVersion)
+	if err != nil {
+		return fmt.Errorf("current agent version is invalid: %w", err)
+	}
+	target, err := parseAgentVersion(targetRelease)
+	if err != nil {
+		return fmt.Errorf("target agent version is invalid: %w", err)
+	}
+	for index := 0; index < 3; index++ {
+		if current.numbers[index] < target.numbers[index] {
+			return nil
+		}
+		if current.numbers[index] > target.numbers[index] {
+			return errors.New("agent downgrade is forbidden")
+		}
+	}
+	if current.release != target.release {
+		if current.release {
+			return errors.New("agent downgrade is forbidden")
+		}
+		return nil
+	}
+	if current.release {
+		return nil
+	}
+	if current.rc > target.rc {
+		return errors.New("agent downgrade is forbidden")
+	}
+	return nil
+}
+
+type agentVersion struct {
+	numbers [3]uint64
+	release bool
+	rc      uint64
+}
+
+func parseAgentVersion(value string) (agentVersion, error) {
+	matches := agentVersionRE.FindStringSubmatch(value)
+	if matches == nil {
+		return agentVersion{}, errors.New("version must be X.Y.Z or X.Y.Z-rc.N")
+	}
+	var parsed agentVersion
+	for index := 0; index < 3; index++ {
+		number, err := strconv.ParseUint(matches[index+1], 10, 64)
+		if err != nil {
+			return agentVersion{}, errors.New("version component exceeds uint64")
+		}
+		parsed.numbers[index] = number
+	}
+	parsed.release = matches[4] == ""
+	if !parsed.release {
+		rc, err := strconv.ParseUint(matches[4], 10, 64)
+		if err != nil {
+			return agentVersion{}, errors.New("release candidate component exceeds uint64")
+		}
+		parsed.rc = rc
+	}
+	return parsed, nil
 }
 
 func (c *Coordinator) ResolveUpgrade(_ context.Context, upgradeID string) (control.UpgradeResolution, error) {

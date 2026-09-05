@@ -366,7 +366,7 @@ func (b *commandBackend) VerifyIngressGuardPersistence(ctx context.Context) erro
 }
 
 func (b *commandBackend) readSystemdUnitState(ctx context.Context, unit string) (systemdUnitState, error) {
-	if unit != ingressGuardUnit && unit != "pve-firewall.service" && unit != "proxmox-firewall.service" {
+	if unit != ingressGuardUnit && unit != "pve-firewall.service" && unit != "proxmox-firewall.service" && unit != "ufw.service" {
 		return systemdUnitState{}, errors.New("unsupported systemd unit inspection")
 	}
 	raw, err := b.runner.Run(ctx, "systemctl", "show",

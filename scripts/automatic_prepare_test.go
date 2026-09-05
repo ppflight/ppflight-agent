@@ -166,6 +166,7 @@ func TestQuickInstallAutomaticallyPreparesPVEAndVerifiesServices(t *testing.T) {
 func TestQuickInstallFreshOnlyHostFirewallTransactionOrder(t *testing.T) {
 	quickInstall := readDeploymentFile(t, "quick-install.sh")
 	classify := strings.Index(quickInstall, `INSTALL_MODE="$(./ppflight-agent host-firewall classify)"`)
+	ufwPreflight := strings.Index(quickInstall, "./ppflight-agent host-firewall prepare")
 	aptMutation := strings.LastIndex(quickInstall, "install_host_dependencies")
 	installMutation := strings.Index(quickInstall, "\nscripts/install.sh \\")
 	prepare := strings.Index(quickInstall, "/usr/local/bin/ag-pve pve prepare --local-only")
@@ -173,17 +174,17 @@ func TestQuickInstallFreshOnlyHostFirewallTransactionOrder(t *testing.T) {
 	activate := strings.Index(quickInstall, "/usr/local/bin/ppflight-agent host-firewall activate")
 	reconcile := strings.Index(quickInstall, "/usr/local/bin/ppflight-agent host-firewall reconcile")
 	success := strings.LastIndex(quickInstall, "安装或更新完成")
-	if classify < 0 || aptMutation < 0 || installMutation < 0 || prepare < 0 || lastServiceCheck < 0 || activate < 0 || reconcile < 0 || success < 0 {
+	if classify < 0 || ufwPreflight < 0 || aptMutation < 0 || installMutation < 0 || prepare < 0 || lastServiceCheck < 0 || activate < 0 || reconcile < 0 || success < 0 {
 		t.Fatalf("quick installer is missing host firewall lifecycle anchors")
 	}
-	if !(classify < aptMutation && classify < installMutation && installMutation < prepare && prepare < lastServiceCheck && lastServiceCheck < activate && activate < success) {
+	if !(classify < ufwPreflight && ufwPreflight < aptMutation && classify < installMutation && installMutation < prepare && prepare < lastServiceCheck && lastServiceCheck < activate && activate < success) {
 		t.Fatalf("host firewall lifecycle order is unsafe: classify=%d apt=%d install=%d prepare=%d checks=%d activate=%d success=%d", classify, aptMutation, installMutation, prepare, lastServiceCheck, activate, success)
 	}
 	for _, required := range []string{
 		`case "$INSTALL_MODE" in`,
 		`if [[ "$INSTALL_MODE" == 'fresh' || "$INSTALL_MODE" == 'resume' ]]; then`,
 		`/usr/local/bin/ppflight-agent host-firewall reconcile`,
-		"现有安装更新已完成；Cluster/Node/VM/CT 防火墙状态均保持不变",
+		"现有安装更新已完成；PPFlight/PVE 防火墙已严格回验，UFW 已移除",
 		"Agent、官网、监控、控制和更新均使用出站连接；状态和 exporter 仍仅监听 127.0.0.1",
 	} {
 		if !strings.Contains(quickInstall, required) {
@@ -317,7 +318,7 @@ func runQuickInstallFixture(t *testing.T, prepareExit int) (string, string, erro
 	writeQuickInstallMock(t, smartctl, "#!/usr/bin/env bash\nexit 0\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "curl"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nprintf 'curl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\nout=''\nwhile [[ $# -gt 0 ]]; do\n  case \"$1\" in\n    --output) out=$2; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[[ -n $out ]]\ncase ${out##*/} in\n  rolling-ref.json) printf '%s\\n' '{\"ref\":\"refs/heads/rolling-main\",\"object\":{\"type\":\"commit\",\"sha\":\"1111111111111111111111111111111111111111\"}}' >\"$out\" ;;\n  manifest.json) printf '%s\\n' '{\"schemaVersion\":1,\"channel\":\"main\",\"sourceCommitSha\":\"2222222222222222222222222222222222222222\",\"artifacts\":[{\"arch\":\"amd64\",\"name\":\"ppflight-agent-main-linux-amd64.tar.gz\",\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"size\":8}]}' >\"$out\" ;;\n  SHA256SUMS) printf '%064d  ppflight-agent-main-linux-amd64.tar.gz\\n%064d  ppflight-agent-main-linux-arm64.tar.gz\\n' 0 0 >\"$out\" ;;\n  ppflight-agent-main-linux-amd64.tar.gz) printf 'archive\\n' >\"$out\" ;;\n  *) printf 'node_network_receive_bytes_total{device=\"eth0\"} 1\\nnode_network_transmit_bytes_total{device=\"eth0\"} 2\\nnode_disk_read_bytes_total{device=\"sda\"} 3\\nnode_disk_written_bytes_total{device=\"sda\"} 4\\nsmartctl_device_info{device=\"/dev/sda\"} 1\\n' >\"$out\" ;;\nesac\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "sha256sum"), "#!/usr/bin/env bash\ncase \" $* \" in *' --check '*) exit 0 ;; esac\nexit 97\n")
-	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf '#!/usr/bin/env bash\\nif [[ $1 == host-firewall && $2 == classify ]]; then printf \\\"update\\\\n\\\"; exit 0; fi\\nif [[ $1 == host-firewall && $2 == reconcile ]]; then exit 0; fi\\nexit 97\\n' >ppflight-agent/ppflight-agent\nchmod 0700 ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
+	writeQuickInstallMock(t, filepath.Join(mockDir, "tar"), "#!/usr/bin/env bash\nset -Eeuo pipefail\nmkdir -p ppflight-agent/scripts\nprintf '#!/usr/bin/env bash\\nprintf \\\"install:%%s\\\\n\\\" \\\"$*\\\" >>\\\"${TEST_QUICK_LOG:?}\\\"\\n' >ppflight-agent/scripts/install.sh\nchmod 0700 ppflight-agent/scripts/install.sh\nprintf '#!/usr/bin/env bash\\nif [[ $1 == host-firewall && $2 == classify ]]; then printf \\\"update\\\\n\\\"; exit 0; fi\\nif [[ $1 == host-firewall && $2 == prepare ]]; then exit 0; fi\\nif [[ $1 == host-firewall && $2 == reconcile ]]; then exit 0; fi\\nexit 97\\n' >ppflight-agent/ppflight-agent\nchmod 0700 ppflight-agent/ppflight-agent\nprintf 'hash  ppflight-agent\\n' >ppflight-agent/ppflight-agent.sha256\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "systemctl"), "#!/usr/bin/env bash\nprintf 'systemctl:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "pveversion"), "#!/usr/bin/env bash\nprintf 'pve-manager/8.4.0/fixture\\n'\n")
 	writeQuickInstallMock(t, filepath.Join(mockDir, "apt-get"), "#!/usr/bin/env bash\nprintf 'apt-get:%s\\n' \"$*\" >>\"${TEST_QUICK_LOG:?}\"\n")

@@ -27,6 +27,9 @@ const (
 	PhaseRollbackPending = "rollback-pending"
 	PhaseRolledBack      = "rolled-back"
 	PhaseUninstalled     = "uninstalled"
+
+	UFWPhaseRemoving = "removing"
+	UFWPhaseRemoved  = "removed"
 )
 
 const (
@@ -60,9 +63,10 @@ type ownedRule struct {
 // can therefore atomically append that same native jump without depending on
 // mutable aaPanel/UFW neighbours.
 type nativeInputHookSnapshot struct {
-	Family   string `json:"family"`
-	Captured bool   `json:"captured"`
-	WasTail  bool   `json:"wasTail"`
+	Family        string `json:"family"`
+	Captured      bool   `json:"captured"`
+	WasTail       bool   `json:"wasTail"`
+	RetainedFirst bool   `json:"retainedFirst,omitempty"`
 }
 
 type Journal struct {
@@ -75,6 +79,7 @@ type Journal struct {
 	Preimage      journalPreimage           `json:"preimage,omitempty"`
 	OwnedRules    []ownedRule               `json:"ownedRules,omitempty"`
 	NativeHooks   []nativeInputHookSnapshot `json:"nativeInputHooks,omitempty"`
+	UFWPhase      string                    `json:"ufwPhase,omitempty"`
 	CreatedAt     string                    `json:"createdAt"`
 	UpdatedAt     string                    `json:"updatedAt"`
 }
@@ -94,6 +99,11 @@ func (j Journal) validate() error {
 		PhaseRulesEnabled, PhaseCommitted, PhaseRollbackPending, PhaseRolledBack, PhaseUninstalled:
 	default:
 		return errors.New("invalid host firewall journal phase")
+	}
+	switch j.UFWPhase {
+	case "", UFWPhaseRemoving, UFWPhaseRemoved:
+	default:
+		return errors.New("invalid UFW removal journal phase")
 	}
 	if j.CreatedAt == "" || j.UpdatedAt == "" {
 		return errors.New("host firewall journal timestamp missing")
@@ -149,8 +159,8 @@ func validateNativeHookSnapshots(values []nativeInputHookSnapshot) error {
 			return errors.New("native INPUT hook snapshot family is invalid")
 		}
 		seen[value.Family] = true
-		if !value.Captured || !value.WasTail {
-			return errors.New("native INPUT hook snapshot lacks canonical tail proof")
+		if !value.Captured || value.WasTail == value.RetainedFirst {
+			return errors.New("native INPUT hook snapshot lacks one exact origin proof")
 		}
 	}
 	return nil
@@ -161,6 +171,7 @@ type store struct {
 	journalPath    string
 	requireRoot    bool
 	now            func() time.Time
+	writeFault     func(string, Journal) error
 }
 
 func productionStore() store {
@@ -246,6 +257,11 @@ func (s store) write(journal Journal, exclusive bool) error {
 	if err := journal.validate(); err != nil {
 		return err
 	}
+	if s.writeFault != nil {
+		if err := s.writeFault("before-write", journal); err != nil {
+			return err
+		}
+	}
 	if err := ensureStateDirectory(s.stateDirectory, s.requireRoot); err != nil {
 		return err
 	}
@@ -300,6 +316,14 @@ func (s store) write(journal Journal, exclusive bool) error {
 	}
 	if err := os.Chmod(s.journalPath, 0o600); err != nil {
 		return err
+	}
+	// Tests use this boundary to model a crash or fsync failure after the
+	// atomic replacement became observable but before directory durability was
+	// acknowledged. Production stores never install a fault hook.
+	if s.writeFault != nil {
+		if err := s.writeFault("after-replace", journal); err != nil {
+			return err
+		}
 	}
 	directory, err := os.Open(s.stateDirectory)
 	if err != nil {

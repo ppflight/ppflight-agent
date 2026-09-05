@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,18 +30,35 @@ import (
 )
 
 type HelperConfig struct {
-	StateDirectory  string
-	BinaryPath      string
-	ServiceName     string
-	StatusURL       string
-	WebsiteEndpoint string
-	CurrentVersion  string
-	Verify          control.VerifyConfig
-	Journal         *control.Journal
-	HTTPClient      *http.Client
-	Now             func() time.Time
-	RunSystemctl    func(context.Context, ...string) error
+	StateDirectory            string
+	BinaryPath                string
+	ServiceName               string
+	StatusURL                 string
+	WebsiteEndpoint           string
+	CurrentVersion            string
+	Verify                    control.VerifyConfig
+	Journal                   *control.Journal
+	HTTPClient                *http.Client
+	Now                       func() time.Time
+	RunSystemctl              func(context.Context, ...string) error
+	RunHostFirewallPreflight  func(context.Context, string) error
+	RunHostFirewallPostflight func(context.Context, string) error
+	SaveResult                func(string, Result) error
 }
+
+const (
+	// UpgradeHelperOverallTimeout plus the independent recovery budget stays
+	// below the 180s TimeoutStartSec shipped by the already-installed v0.1.5 unit.
+	LegacyUpgradeUnitTimeout      = 180 * time.Second
+	UpgradeHelperOverallTimeout   = 140 * time.Second
+	hostFirewallPreflightTimeout  = 30 * time.Second
+	hostFirewallPostflightTimeout = 55 * time.Second
+	hostFirewallTransientTimeout  = 50 * time.Second
+	helperRollbackTimeout         = 30 * time.Second
+	installedAgentBinary          = "/usr/local/bin/ppflight-agent"
+)
+
+var transientUpgradeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$`)
 
 type statusBinding struct {
 	BindingID       string `json:"bindingId"`
@@ -49,13 +67,18 @@ type statusBinding struct {
 }
 
 type localStatus struct {
-	Version  string `json:"version"`
+	Version string `json:"version"`
+	Control struct {
+		SigningKeyID string `json:"signingKeyId"`
+	} `json:"control"`
 	Bindings struct {
 		Website statusBinding `json:"website"`
 	} `json:"bindings"`
 }
 
 func RunHelper(ctx context.Context, cfg HelperConfig) error {
+	ctx, cancel := context.WithTimeout(ctx, UpgradeHelperOverallTimeout)
+	defer cancel()
 	if cfg.Journal == nil || cfg.StateDirectory == "" || cfg.BinaryPath == "" || cfg.WebsiteEndpoint == "" || cfg.StatusURL == "" {
 		return errors.New("upgrade helper configuration is incomplete")
 	}
@@ -76,6 +99,15 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 			return nil
 		}
 	}
+	if cfg.RunHostFirewallPostflight == nil {
+		cfg.RunHostFirewallPostflight = runHostFirewallPostflight
+	}
+	if cfg.RunHostFirewallPreflight == nil {
+		cfg.RunHostFirewallPreflight = runHostFirewallPreflight
+	}
+	if cfg.SaveResult == nil {
+		cfg.SaveResult = saveResult
+	}
 	coordinator, err := New(Config{StateDirectory: cfg.StateDirectory, WebsiteEndpoint: cfg.WebsiteEndpoint, CurrentVersion: cfg.CurrentVersion, HTTPClient: cfg.HTTPClient, Now: cfg.Now})
 	if err != nil {
 		return err
@@ -91,7 +123,7 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	result := Result{SchemaVersion: requestSchema, UpgradeID: request.UpgradeID, Status: "failed", Code: "UPGRADE_HELPER_FAILED", FinishedAt: cfg.Now().UTC()}
 	writeResult := func() {
 		result.FinishedAt = cfg.Now().UTC()
-		if saveResult(cfg.StateDirectory, result) == nil {
+		if cfg.SaveResult(cfg.StateDirectory, result) == nil {
 			if request.ArtifactFile == request.UpgradeID+".tar.gz" && filepath.Base(request.ArtifactFile) == request.ArtifactFile {
 				_ = os.Remove(filepath.Join(filepath.Dir(requestPath), request.ArtifactFile))
 			}
@@ -101,12 +133,13 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		}
 	}
 	fail := func(stage string, cause error) error {
+		result.Status, result.Code, result.Version = "failed", "UPGRADE_HELPER_FAILED", ""
 		result.Error = &control.ExecutionError{Source: "agent", Stage: stage, Reason: safeHelperText([]byte(cause.Error()))}
 		slog.Error("agent upgrade root helper failed", "upgradeId", request.UpgradeID, "stage", stage, "reason", result.Error.Reason)
 		writeResult()
 		return cause
 	}
-	if err := validateHelperRequest(requestPath, request, cfg); err != nil {
+	if err := validateHelperRequest(ctx, requestPath, request, cfg); err != nil {
 		return fail("validate_request", err)
 	}
 	parameters, _ := upgradecontract.DecodeParameters(request.Command.Parameters)
@@ -122,6 +155,9 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	if err := manifest.Match(parameters); err != nil {
 		return fail("match_manifest", err)
 	}
+	if err := validateUpgradeTransition(cfg.CurrentVersion, parameters.ReleaseTag); err != nil {
+		return fail("validate_version_transition", err)
+	}
 	slog.Info("agent upgrade root helper reverified authority", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
 	if err := upgradecontract.SameOrigin(cfg.WebsiteEndpoint, parameters.Artifact.DownloadURL); err != nil {
 		return fail("verify_origin", err)
@@ -132,40 +168,33 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		return fail("verify_archive", err)
 	}
 	slog.Info("agent upgrade root helper verified archive", "upgradeId", request.UpgradeID, "sha256", parameters.Artifact.SHA256)
+	if err := candidateHostFirewallPreflight(ctx, cfg, request.UpgradeID, binary); err != nil {
+		return fail("host_firewall_preflight", err)
+	}
+	slog.Info("agent upgrade candidate host firewall preflight passed", "upgradeId", request.UpgradeID)
 	backupPath, err := installCandidate(cfg.BinaryPath, cfg.StateDirectory, request.UpgradeID, binary)
 	if err != nil {
 		return fail("install_candidate", err)
 	}
 	slog.Info("agent upgrade candidate installed atomically", "upgradeId", request.UpgradeID, "releaseTag", parameters.ReleaseTag)
-	var previousBinding *bindstate.State
-	if rotation := parameters.CommandSigningRotation; rotation != nil {
-		previous, stateErr := stageCommandSigningRotation(cfg.StateDirectory, request.Command.SigningKeyID, *rotation)
-		if stateErr != nil {
-			_ = restoreBackup(cfg.BinaryPath, backupPath)
-			return fail("rotate_command_key", stateErr)
-		}
-		previousBinding = previous
-		slog.Info("agent command signing public key rotated", "upgradeId", request.UpgradeID, "keyId", rotation.KeyID)
-	}
 	rollback := func(cause error) error {
 		slog.Error("agent upgrade health check failed; rollback started", "upgradeId", request.UpgradeID, "reason", safeHelperText([]byte(cause.Error())))
+		rollbackContext, rollbackCancel := context.WithTimeout(context.Background(), helperRollbackTimeout)
+		defer rollbackCancel()
 		rollbackErr := restoreBackup(cfg.BinaryPath, backupPath)
-		if previousBinding != nil {
-			if bindingErr := bindstate.Save(cfg.StateDirectory, *previousBinding); rollbackErr == nil {
-				rollbackErr = bindingErr
-			}
+		if rollbackErr == nil {
+			rollbackErr = cfg.RunSystemctl(rollbackContext, "restart", cfg.ServiceName)
 		}
 		if rollbackErr == nil {
-			rollbackErr = cfg.RunSystemctl(ctx, "restart", cfg.ServiceName)
+			// v0.1.5 does not expose the active signing key in /status.
+			rollbackErr = waitForStatus(rollbackContext, cfg, cfg.CurrentVersion, "")
 		}
-		if rollbackErr == nil {
-			rollbackErr = waitForStatus(ctx, cfg, cfg.CurrentVersion)
-		}
-		result.Status, result.Code = "rolled_back", "AGENT_UPGRADE_ROLLED_BACK"
-		result.Error = &control.ExecutionError{Source: "agent", Stage: "restart_health_check", Reason: safeHelperText([]byte(cause.Error()))}
 		if rollbackErr != nil {
-			result.Error.Stage = "rollback"
-			result.Error.Reason = safeHelperText([]byte(fmt.Sprintf("upgrade failed (%v); rollback failed (%v)", cause, rollbackErr)))
+			result.Status, result.Code = "failed", "UPGRADE_HELPER_FAILED"
+			result.Error = &control.ExecutionError{Source: "agent", Stage: "rollback", Reason: safeHelperText([]byte(fmt.Sprintf("upgrade failed (%v); rollback failed (%v)", cause, rollbackErr)))}
+		} else {
+			result.Status, result.Code = "rolled_back", "AGENT_UPGRADE_ROLLED_BACK"
+			result.Error = &control.ExecutionError{Source: "agent", Stage: "restart_health_check", Reason: safeHelperText([]byte(cause.Error()))}
 		}
 		writeResult()
 		slog.Warn("agent upgrade rollback completed", "upgradeId", request.UpgradeID, "rollbackSucceeded", rollbackErr == nil)
@@ -178,19 +207,159 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 		return rollback(err)
 	}
 	targetVersion := strings.TrimPrefix(parameters.ReleaseTag, "v")
-	if err := waitForStatus(ctx, cfg, targetVersion); err != nil {
+	if err := waitForStatus(ctx, cfg, targetVersion, request.Command.SigningKeyID); err != nil {
 		return rollback(err)
 	}
 	slog.Info("agent upgrade health check passed", "upgradeId", request.UpgradeID, "version", targetVersion)
-	result.Status, result.Code, result.Version = "succeeded", "AGENT_UPGRADE_SUCCEEDED", targetVersion
+	postflightContext, postflightCancel := context.WithTimeout(ctx, hostFirewallPostflightTimeout)
+	postflightErr := cfg.RunHostFirewallPostflight(postflightContext, request.UpgradeID)
+	postflightCancel()
+	if postflightErr != nil {
+		return fail("host_firewall_reconcile", postflightErr)
+	}
+	slog.Info("agent upgrade host firewall postflight passed", "upgradeId", request.UpgradeID)
+	var previousBinding *bindstate.State
+	if rotation := parameters.CommandSigningRotation; rotation != nil {
+		previousBinding, err = stageCommandSigningRotation(cfg.StateDirectory, request.Command.SigningKeyID, *rotation)
+		if err != nil {
+			return fail("rotate_command_key", err)
+		}
+		recoverRotation := func(stage string, cause error) error {
+			recoveryErr := restoreSigningRotation(cfg, *previousBinding, targetVersion)
+			if recoveryErr != nil {
+				return fail("rotate_command_key_recovery", fmt.Errorf("%s failed (%v); old signing key recovery failed (%v)", stage, cause, recoveryErr))
+			}
+			return fail(stage, cause)
+		}
+		if err := cfg.RunSystemctl(ctx, "restart", cfg.ServiceName); err != nil {
+			return recoverRotation("rotate_command_key_restart", err)
+		}
+		if err := waitForStatus(ctx, cfg, targetVersion, rotation.KeyID); err != nil {
+			return recoverRotation("rotate_command_key_health_check", err)
+		}
+		slog.Info("agent command signing public key rotated and activated", "upgradeId", request.UpgradeID, "keyId", rotation.KeyID)
+	}
+	result.Status, result.Code, result.Version = "succeeded", control.AgentUpgradeHostFirewallSuccessCode, targetVersion
 	result.FinishedAt = cfg.Now().UTC()
-	if err := saveResult(cfg.StateDirectory, result); err != nil {
-		return err
+	if err := cfg.SaveResult(cfg.StateDirectory, result); err != nil {
+		if previousBinding != nil {
+			if recoveryErr := restoreSigningRotation(cfg, *previousBinding, targetVersion); recoveryErr != nil {
+				return fail("rotate_command_key_recovery", fmt.Errorf("save success result failed (%v); old signing key recovery failed (%v)", err, recoveryErr))
+			}
+		}
+		return fail("save_success_result", err)
 	}
 	_ = os.Remove(filepath.Join(filepath.Dir(requestPath), request.ArtifactFile))
 	_ = os.Remove(requestPath)
 	slog.Info("agent upgrade completed", "upgradeId", request.UpgradeID, "version", targetVersion)
 	return nil
+}
+
+// candidateHostFirewallPreflight durably stages the already verified candidate
+// in a root-only directory, runs its read-only firewall validation, and removes
+// it before any installed binary, service, or signing state can be mutated.
+func candidateHostFirewallPreflight(ctx context.Context, cfg HelperConfig, upgradeID string, binary []byte) error {
+	preflightDirectory, err := fsutil.EnsureControlledSubdirectory(filepath.Join(cfg.StateDirectory, "upgrades"), "preflight", 0o700)
+	if err != nil {
+		return err
+	}
+	candidatePath := filepath.Join(preflightDirectory, upgradeID+".bin")
+	if err := fsutil.AtomicWriteFile(candidatePath, binary, 0o700, false); err != nil {
+		return fmt.Errorf("stage candidate firewall preflight: %w", err)
+	}
+	preflightContext, preflightCancel := context.WithTimeout(ctx, hostFirewallPreflightTimeout)
+	preflightErr := cfg.RunHostFirewallPreflight(preflightContext, candidatePath)
+	preflightCancel()
+	removeErr := os.Remove(candidatePath)
+	if removeErr == nil {
+		directory, openErr := os.Open(preflightDirectory)
+		if openErr != nil {
+			removeErr = openErr
+		} else {
+			removeErr = directory.Sync()
+			_ = directory.Close()
+		}
+	}
+	if preflightErr != nil {
+		if removeErr != nil {
+			return fmt.Errorf("candidate firewall preflight failed (%v); cleanup failed (%v)", preflightErr, removeErr)
+		}
+		return preflightErr
+	}
+	if removeErr != nil {
+		return fmt.Errorf("clean up candidate firewall preflight: %w", removeErr)
+	}
+	return nil
+}
+
+func runHostFirewallPreflight(ctx context.Context, candidatePath string) error {
+	name, args := hostFirewallPreflightCommand(candidatePath)
+	command := exec.CommandContext(ctx, name, args...)
+	command.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("host firewall candidate preflight timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("host firewall candidate preflight failed: %s", safeHelperText(output))
+	}
+	return nil
+}
+
+func hostFirewallPreflightCommand(candidatePath string) (string, []string) {
+	return candidatePath, []string{"host-firewall", "prepare"}
+}
+
+// runHostFirewallPostflight asks PID 1 to create one uniquely named, collected
+// root worker. This escapes the downloader/helper mount sandbox without
+// widening it and makes the exact candidate binary and fixed reconcile action
+// the only privileged payload.
+func runHostFirewallPostflight(ctx context.Context, upgradeID string) error {
+	name, args, err := hostFirewallPostflightCommand(upgradeID)
+	if err != nil {
+		return err
+	}
+	command := exec.CommandContext(ctx, name, args...)
+	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	output, err := command.CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("host firewall transient worker timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("host firewall transient worker failed: %s", safeHelperText(output))
+	}
+	return nil
+}
+
+func hostFirewallPostflightCommand(upgradeID string) (string, []string, error) {
+	if !transientUpgradeIDRE.MatchString(upgradeID) {
+		return "", nil, errors.New("upgrade ID is unsafe for a transient unit")
+	}
+	unit := "ppflight-agent-upgrade-postflight-" + upgradeID + ".service"
+	args := []string{
+		"--quiet", "--wait", "--pipe", "--collect", "--no-ask-password",
+		"--unit=" + unit,
+		"--service-type=oneshot",
+		"--property=User=root",
+		"--property=Group=root",
+		"--property=UMask=0077",
+		"--property=NoNewPrivileges=yes",
+		"--property=PrivateTmp=yes",
+		"--property=ProtectHome=yes",
+		"--property=ProtectSystem=no",
+		"--property=RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6",
+		"--property=SystemCallArchitectures=native",
+		"--property=LockPersonality=yes",
+		"--property=RestrictRealtime=yes",
+		"--property=KillMode=mixed",
+		"--property=TimeoutStartSec=" + strconv.FormatInt(int64(hostFirewallTransientTimeout/time.Second), 10) + "s",
+		// PartOf propagates an explicit stop/restart of the parent upgrade unit.
+		// Do not add After: the parent oneshot waits for this transient unit.
+		"--property=PartOf=ppflight-agent-upgrade.service",
+		"--setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		installedAgentBinary, "host-firewall", "reconcile",
+	}
+	return "/usr/bin/systemd-run", args, nil
 }
 
 func stageCommandSigningRotation(stateDirectory, authorityKeyID string, rotation upgradecontract.CommandSigningRotation) (*bindstate.State, error) {
@@ -211,6 +380,21 @@ func stageCommandSigningRotation(stateDirectory, authorityKeyID string, rotation
 		return nil, err
 	}
 	return &previous, nil
+}
+
+func restoreSigningRotation(cfg HelperConfig, previous bindstate.State, version string) error {
+	recoveryContext, recoveryCancel := context.WithTimeout(context.Background(), helperRollbackTimeout)
+	defer recoveryCancel()
+	if err := bindstate.Save(cfg.StateDirectory, previous); err != nil {
+		return fmt.Errorf("restore old signing binding: %w", err)
+	}
+	if err := cfg.RunSystemctl(recoveryContext, "restart", cfg.ServiceName); err != nil {
+		return fmt.Errorf("restart with old signing binding: %w", err)
+	}
+	if err := waitForStatus(recoveryContext, cfg, version, previous.CommandSigningCredential.KeyID); err != nil {
+		return fmt.Errorf("verify old signing binding: %w", err)
+	}
+	return nil
 }
 
 func nextRequest(stateDirectory string) (string, Request, error) {
@@ -251,7 +435,7 @@ func nextRequest(stateDirectory string) (string, Request, error) {
 	return "", Request{}, os.ErrNotExist
 }
 
-func validateHelperRequest(requestPath string, request Request, cfg HelperConfig) error {
+func validateHelperRequest(ctx context.Context, requestPath string, request Request, cfg HelperConfig) error {
 	if request.SchemaVersion != requestSchema || request.UpgradeID == "" || filepath.Base(request.UpgradeID) != request.UpgradeID || filepath.Base(request.ArtifactFile) != request.ArtifactFile || request.ArtifactFile != request.UpgradeID+".tar.gz" || request.PreparedAt.IsZero() {
 		return errors.New("upgrade request identity is invalid")
 	}
@@ -267,16 +451,27 @@ func validateHelperRequest(requestPath string, request Request, cfg HelperConfig
 	if err := control.Verify(request.Command, verify); err != nil {
 		return fmt.Errorf("upgrade command re-verification failed: %w", err)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+	retry := time.NewTicker(100 * time.Millisecond)
+	defer retry.Stop()
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		err = cfg.Journal.AuthorizeUpgrade(request.Command.CommandID, control.Digest(request.Command), request.UpgradeID)
 		if err == nil {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
 			return errors.New("upgrade journal handoff was not durably submitted")
+		case <-retry.C:
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -480,7 +675,7 @@ func replaceBinary(binaryPath string, binary []byte) error {
 	return directoryHandle.Sync()
 }
 
-func waitForStatus(ctx context.Context, cfg HelperConfig, version string) error {
+func waitForStatus(ctx context.Context, cfg HelperConfig, version, signingKeyID string) error {
 	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
@@ -490,7 +685,7 @@ func waitForStatus(ctx context.Context, cfg HelperConfig, version string) error 
 			body, readErr := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 			response.Body.Close()
 			var status localStatus
-			if readErr == nil && response.StatusCode == http.StatusOK && json.Unmarshal(body, &status) == nil && status.Version == version && status.Bindings.Website.BindingID == cfg.Verify.BindingID && status.Bindings.Website.DeviceID == cfg.Verify.DeviceID && status.Bindings.Website.CredentialEpoch == strconv.FormatUint(cfg.Verify.CredentialEpoch, 10) {
+			if readErr == nil && response.StatusCode == http.StatusOK && json.Unmarshal(body, &status) == nil && status.Version == version && status.Bindings.Website.BindingID == cfg.Verify.BindingID && status.Bindings.Website.DeviceID == cfg.Verify.DeviceID && status.Bindings.Website.CredentialEpoch == strconv.FormatUint(cfg.Verify.CredentialEpoch, 10) && (signingKeyID == "" || status.Control.SigningKeyID == signingKeyID) {
 				return nil
 			}
 		}

@@ -42,6 +42,9 @@ type inputChainOrder struct {
 }
 
 type backend interface {
+	PreflightUFW(context.Context) error
+	RemoveUFW(context.Context) (bool, error)
+	VerifyUFWAbsent(context.Context) error
 	LocalNode(context.Context) (string, error)
 	ClusterNodes(context.Context) ([]string, error)
 	DefaultRouteInterfaces(context.Context) ([]string, error)
@@ -55,6 +58,7 @@ type backend interface {
 	DeleteNodeRule(context.Context, string, int, string) error
 	VerifyIngressBackend(context.Context) error
 	CaptureIngressGuard(context.Context) ([]nativeInputHookSnapshot, error)
+	CaptureRetainedIngressGuard(context.Context) ([]nativeInputHookSnapshot, error)
 	EnsureIngressGuard(context.Context, Journal) error
 	MaintainIngressGuard(context.Context, Journal) (bool, error)
 	VerifyIngressGuard(context.Context, Journal) error
@@ -135,17 +139,21 @@ func (buffer *cappedBuffer) Write(value []byte) (int, error) {
 }
 
 type commandBackend struct {
-	runner      commandRunner
-	client      *http.Client
-	pathProbe   func(string) (bool, error)
-	processLock func(context.Context) (func(), error)
+	runner           commandRunner
+	client           *http.Client
+	pathProbe        func(string) (bool, error)
+	ufwPreflight     func(string) error
+	disableUFWConfig func() error
+	processLock      func(context.Context) (func(), error)
 }
 
 func productionBackend() *commandBackend {
 	return &commandBackend{
-		runner:      execRunner{},
-		pathProbe:   inspectFirewallSelectorPath,
-		processLock: acquireFirewallProcessLock,
+		runner:           execRunner{},
+		pathProbe:        inspectFirewallSelectorPath,
+		ufwPreflight:     inspectUFWDisablePreconditions,
+		disableUFWConfig: disableUFWAtBoot,
+		processLock:      acquireFirewallProcessLock,
 		client: &http.Client{
 			Timeout: 8 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {

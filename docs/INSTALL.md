@@ -6,9 +6,12 @@
 
 `smartctl` 已存在时绝不调用 APT。缺失时只使用安装器临时生成的 Debian 官方 HTTPS 源：PVE 8 固定 `bookworm`，PVE 9 固定 `trixie`，强制 IPv4 并保留 Debian archive 签名验证；本机 `/etc/apt/sources.list*` 中的 Enterprise、Ceph 或第三方源不会被读取、更新或改写。
 
+每次全新安装和升级还会执行 PVE-only 主机防火墙 postflight：先建立并严格回验 PVE Cluster/Node 入站规则、双栈 INPUT hooks 和 FORWARD hooks，再安全删除 UFW 软件包、服务及其专属 netfilter 命名空间。该阶段不运行 `ufw disable`，不使用 apt/autoremove，也不触碰 aaPanel 或管理员的非 UFW 规则。UFW 阶段开始后 PVE 替代保护不再回滚，失败会由持久 journal 续跑且绝不打印成功。完整细节见 [HOST-FIREWALL-INSTALL-V1](HOST-FIREWALL-INSTALL-V1.md)。
+
 ## 1. 前置条件
 
 - Debian 系 PVE 8.x 或 9.x，root 管理权限；
+- PVE host firewall 必须选择 legacy `pve-firewall` backend；PVE 9 Rust/nft backend 当前不受支持，安装器会在 mutation 前拒绝；
 - NTP/chrony 正常，生产请求默认只容忍约五分钟时钟偏差；
 - Agent 到官网和监控站的出站 HTTPS 只能走 IPv4；DNS 必须有经审批的 A 记录，不能依赖 AAAA 或 IPv6 fallback；无需开放入站 8006/9100/9633；
 - 为 website 与 monitoring trust domain 分别准备稳定的 NAT/出口 IPv4；每次 bind response 的 exact `networkPolicy` 只含对应服务端从可信连接元数据观察到的 canonical `agentObservedIPv4`，两端分别冻结该地址/32，地址变化走显式 rebind/轮换；
@@ -53,6 +56,10 @@ sudo scripts/install.sh \
   --binary-sha256 '<发布页给出的64位SHA-256>' \
   --enable
 ```
+
+这条 `install.sh --enable` 命令只是低层 **staging**：它校验并落盘发布物、配置 unit 的开机启用状态，但不会把“unit 已 enable”当作安装完成，也不会自行重复 quick-install 的健康门禁或防火墙 mutation。完整一键流程应使用仓库入口 `quick-install.sh`。选择离线分步安装时，必须继续完成本页的 PVE 凭据/配置、exporter 与真实采集回验，并在所有必需 unit 健康后执行第 7 节的 host-firewall postflight；在此之前 UFW 保持不变，不能对外宣称安装完成。
+
+安装器在 apt、账号、systemd unit 或已安装文件变更前，会从私有临时路径运行候选二进制的 `host-firewall prepare`。它只读核对 PVE backend、精确 UFW dpkg/unit 状态、PVE 8 `/lib` 或 PVE 9 `/usr/lib` 包布局、将被普通 stop 加载的安全赋值和包内运行文件摘要。包缺失但存在同名自定义 unit、unit drop-in/额外 stop、shell 配置行、修改后的 UFW runtime 或不安全元数据都会 fail closed。真正的 UFW 删除只在新服务、PVE 保护和 loopback health 均已回验后发生。
 
 底层安装器会创建专用系统用户和目录、安装 `/usr/local/bin/ppflight-agent`，并创建 `/usr/local/bin/ag-pve`、`/usr/local/bin/ag`、`/usr/local/bin/AG` 软链接。它保留已有 `/etc/ppflight-agent/agent.yaml`、`agent.env` 和 assignment 数据，且没有 `--start` 时不会自行启动 disabled 服务。仓库根的一键脚本会在它之后自动安装、启用并启动只监听本机的 `ppflight-node-exporter` 与 `ppflight-smartctl-exporter`，要求 9100 指标同时含真实网卡收发累计字节和磁盘读写累计字节，再执行 `ag-pve pve prepare --local-only`；等待真实本地采集成功后启动升级监听，并严格核对 Agent、升级监听和两个 exporter 均为 enabled+active。远端暂时不可用不会阻止本地队列继续积压重试。生产 assignment 的目标路径是 `/var/lib/ppflight-agent/assignments/assignments.json`；从旧 `/etc/ppflight-agent/assignments.json` 迁移时必须保留现有内容、再按目标 `ppflight-agent:ppflight-agent/0640` 元数据落盘，不能用空文件覆盖。
 
@@ -245,6 +252,17 @@ sudo systemctl start ppflight-agent
 sudo ag-pve pve status
 ```
 
+低层 `install.sh` staging 还必须在 Agent、升级监听、node_exporter、smartctl_exporter 均为 active 且 loopback health/metrics 已验证后，执行一次统一、可重入的防火墙 postflight：
+
+```bash
+sudo systemctl start ppflight-agent-upgrade.path \
+  ppflight-node-exporter.service \
+  ppflight-smartctl-exporter.service
+sudo /usr/local/bin/ppflight-agent host-firewall reconcile
+```
+
+`reconcile` 会为 journal-less 的新/旧安装建立同一 PVE transaction，也会安全续跑已有 transaction；不要再额外调用 `activate`，以免把分步说明变成两个竞争的最终入口。它只有在 PVE options/rules、双栈 INPUT/FORWARD hooks、全部本机健康检查和 UFW 缺失状态均严格回验后才成功。若没有安装两个 exporter，此完整合同会按设计失败；应补齐发布包内固定 exporter，或改用一键流程，而不是跳过 postflight。
+
 root 直接运行 `/usr/local/bin/ppflight-agent --config /etc/ppflight-agent/agent.yaml --check-config` 时，会优先通过 no-follow、owner/mode/link-count 校验读取 root-only `/etc/ppflight-agent/agent.env`，并仅为四个固定 `PVE_*` 名称创建进程内 overlay；sudo 遗留的 ambient PVE 变量不能混入或覆盖该值，Token 不会写回配置、日志、argv 或子进程。非 root 的 service account 无法读取该 0600 文件，必须由 systemd manager 的 `EnvironmentFile=` 提供一套完整凭据；缺少任一所需值会 fail closed，绝不混合环境和文件来源。上面的 transient service 因此是验证实际 service 运行条件的推荐方式。不要用 `env KEY=secret ...` 或命令替换把 Token 值放进 argv。`ag-pve validate` 不替代这项 secret-aware 校验。`AG` 绑定向导会自动编排这些步骤，但 control ACL、`productionExecution` 和生产变更验收仍是独立人工安全门槛。
 
 本地 Agent ready 后可分别检查远端状态；外部 status 服务未部署时以下命令按设计非零退出，不影响本地 `/healthz` 事实：
@@ -365,7 +383,9 @@ Executor 的动作全集和网络/IPFilter 编排见 [Agent API v1](AGENT-API-V1
 
 不要删除 `/var/lib/ppflight-agent` 中的 queue、control journal、assignment refresh state，或 `/var/lib/ppflight-agent/bindings` 中的 binding state、device ID/pending state。它们用于幂等、UPID 恢复和凭据防回滚。卸载前先确认官网已经接收所有关键队列，并明确是否保留绑定状态。
 
-完整卸载会先停止并验证 Agent/升级 units，再通过固定、无参数的 root helper 撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户以及这些身份拥有的全部 ACL。随后在 PVE 自身的 `user.cfg` 集群锁内，对 `PPFlightAgentAudit`/`PPFlightAgentControl` 做“已发布历史权限集合 + 无剩余 ACL 引用”的原子检查；只有两项都满足才删除角色，因此 RC.5/RC.6 遗留的 pre-SDN read role 能被完整清理，管理员自定义或仍被其他主体引用的同名角色会保留并明确告警。任何 ACL、Token、用户或原子角色清理失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。即使机器曾用旧卸载器留下 pre-SDN role，新安装器也会识别其 exact 历史权限并在创建新凭据前迁移；未知权限集合仍 fail-closed。完整卸载不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
+完整卸载会先停止并验证 Agent/升级 units，并在主机防火墙 supervisor 仍可完成严格回验时调用固定 root helper。若 UFW 迁移尚未开始，helper 可按 journal 恢复 PPFlight 自有 PVE 变更；若 UFW 已开始删除，则必须先完成/验证删除，并在卸载当场保留 PVE Cluster/Node 选项、PPFlight DROP 规则和首位 native INPUT hooks，只停止 supervisor，绝不重装 UFW 或主动把 hooks 降回尾部。`--purge` 删除本地 journal 后，后续安装也只能在规则块、ownership ID、PVE 选项和双栈 hooks 全部精确匹配时重新认领，任何歧义都会拒绝而不是复制规则。完整卸载会移除 Agent 与 supervisor，因此之后不再持续修复 hook 顺序；后续 PVE firewall/aaPanel reload、重启后的实际顺序与远程恢复通道由管理员负责检查。
+
+防火墙收尾后，卸载器才撤销 `ppflight-agent@pve!collector`、`ppflight-control@pve!executor`、两个专用用户以及这些身份拥有的全部 ACL。随后在 PVE 自身的 `user.cfg` 集群锁内，对 `PPFlightAgentAudit`/`PPFlightAgentControl` 做“已发布历史权限集合 + 无剩余 ACL 引用”的原子检查；只有两项都满足才删除角色，因此 RC.5/RC.6 遗留的 pre-SDN read role 能被完整清理，管理员自定义或仍被其他主体引用的同名角色会保留并明确告警。任何防火墙、ACL、Token、用户或原子角色清理失败都会保留本地 Agent 文件供安全重试。随后才删除 `/usr/local/lib/ppflight-agent`、配置、双绑定凭据和持久状态。即使机器曾用旧卸载器留下 pre-SDN role，新安装器也会识别其 exact 历史权限并在创建新凭据前迁移；未知权限集合仍 fail-closed。完整卸载不会删除 PVE 虚拟机、Cloud-Init 模板、镜像缓存、storage 或备份。
 
 ## 11. 故障检查
 

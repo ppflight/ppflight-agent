@@ -28,4 +28,4 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service @network-io
 ReadOnlyPaths=/etc/ppflight-agent
 ReadWritePaths=/usr/local/bin /var/lib/ppflight-agent
-TimeoutStartSec=180s
+TimeoutStartSec=300s

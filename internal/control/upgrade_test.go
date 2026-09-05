@@ -67,6 +67,38 @@ func TestReconciledUpgradeFailureCarriesBoundedHelperDiagnostic(t *testing.T) {
 	}
 }
 
+func TestReconciledUpgradeSuccessPreservesLegacyAndVerifiedEvidenceCodes(t *testing.T) {
+	now := time.Now().UTC()
+	task := SubmittedTask{
+		AgentUpgradeID: "upgrade-01",
+		OperationID:    "operation-01",
+		Receipt: Receipt{
+			SchemaVersion: 1, ReceiptID: "receipt-01", CommandID: "command-01", AgentRef: "agent-01",
+			State: "submitted", Code: "AGENT_UPGRADE_SUBMITTED", ExecutionMode: "production", StartedAt: now,
+		},
+	}
+	for _, test := range []struct {
+		name       string
+		resultCode string
+		wantState  string
+		wantCode   string
+	}{
+		{name: "legacy schedules website postflight", resultCode: AgentUpgradeLegacySuccessCode, wantState: "succeeded", wantCode: AgentUpgradeLegacySuccessCode},
+		{name: "host firewall verified", resultCode: AgentUpgradeHostFirewallSuccessCode, wantState: "succeeded", wantCode: AgentUpgradeHostFirewallSuccessCode},
+		{name: "unknown success evidence", resultCode: "AGENT_UPGRADE_UNKNOWN_SUCCESS", wantState: "waiting", wantCode: "AGENT_UPGRADE_STATUS_INDETERMINATE"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receipt, err := (&Service{}).reconciledUpgradeReceipt(task, UpgradeResolution{Status: "succeeded", Code: test.resultCode}, nil, now.Add(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if receipt.State != test.wantState || receipt.Code != test.wantCode {
+				t.Fatalf("receipt=%#v", receipt)
+			}
+		})
+	}
+}
+
 func TestJournalAuthorizesOnlyExactSubmittedUpgrade(t *testing.T) {
 	journal, err := OpenJournal(t.TempDir())
 	if err != nil {
@@ -111,6 +143,7 @@ func TestAgentUpgradeAuditGoldenMapping(t *testing.T) {
 		{"submitted", "AGENT_UPGRADE_SUBMITTED", "submitted"},
 		{"waiting", "AGENT_UPGRADE_WAITING", "submitted"},
 		{"succeeded", "AGENT_UPGRADE_SUCCEEDED", "succeeded"},
+		{"succeeded", AgentUpgradeHostFirewallSuccessCode, "succeeded"},
 		{"failed", "AGENT_UPGRADE_ROLLED_BACK", "rolled_back"},
 		{"failed", "AGENT_UPGRADE_FAILED", "failed"},
 	}

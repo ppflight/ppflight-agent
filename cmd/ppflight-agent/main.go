@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/admincli"
 	"github.com/ppflight/ppflight-agent/internal/agent"
@@ -196,7 +195,7 @@ func runUpgradeHelper(args []string) int {
 		return 1
 	}
 	statusURL := "http://" + cfg.Runtime.ListenAddress + "/status"
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), selfupdate.UpgradeHelperOverallTimeout)
 	defer cancel()
 	err = selfupdate.RunHelper(ctx, selfupdate.HelperConfig{
 		StateDirectory: cfg.Runtime.StateDirectory, BinaryPath: "/usr/local/bin/ppflight-agent", ServiceName: "ppflight-agent.service",

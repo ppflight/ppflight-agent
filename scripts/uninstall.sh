@@ -77,18 +77,86 @@ stop_required_unit() {
   fi
 }
 
-# The upgrade helper and host-firewall supervisor are privileged, so they are
-# held to the same fail-closed stop/zero-PID rule as the main Agent. Stopping
-# the supervisor before transactional rollback prevents it from racing hook
-# removal; rollback's disable operation is intentionally idempotent.
-for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service ppflight-host-firewall.service; do
+# The upgrade helper is privileged, so it is held to the same fail-closed
+# stop/zero-PID rule as the main Agent. The firewall supervisor remains active
+# until the transactional helper has verified the retained or reversible PVE
+# state; the helper then disables it itself.
+for required_unit in ppflight-agent-upgrade.path ppflight-agent-upgrade.service ppflight-agent.service; do
   stop_required_unit "$required_unit" || exit 1
 done
 
-# A fresh installation may have committed PPFlight-owned host ingress rules
-# and Cluster/Node option changes. Revert that durable transaction before PVE
-# credentials or recovery binaries can be removed. Absence means this was an
-# older install or an update that never owned host firewall state.
+# A verified upgrade may have delegated host-firewall reconciliation to one
+# root transient service. The downloader/helper is now stopped, so no new
+# worker may be submitted. Strictly enumerate the fixed unit namespace, stop
+# every exact safe name, prove zero PID, then repeat once to absorb a job which
+# was already queued at the first enumeration boundary.
+list_upgrade_postflight_units() {
+  local inventory line first second unit
+  if ! inventory="$(LC_ALL=C systemctl list-units --all --type=service --no-legend --no-pager --full --plain 'ppflight-agent-upgrade-postflight-*.service')"; then
+    printf '%s\n' 'error: cannot enumerate PPFlight upgrade postflight services; no firewall or files were removed' >&2
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    first=''
+    second=''
+    IFS=$' \t' read -r first second _ <<<"$line"
+    unit="$first"
+    if [[ "$first" == '●' || "$first" == '*' ]]; then
+      unit="$second"
+    fi
+    if [[ ! "$unit" =~ ^ppflight-agent-upgrade-postflight-[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\.service$ ]]; then
+      printf 'error: unsafe or ambiguous PPFlight postflight unit inventory line: %s\n' "$line" >&2
+      return 1
+    fi
+    printf '%s\n' "$unit"
+  done <<<"$inventory"
+}
+
+stop_upgrade_postflight_unit() {
+  local unit=$1 load_state active_state main_pid
+  if ! load_state="$(systemctl show --property=LoadState --value "$unit" 2>/dev/null)" || [[ -z "$load_state" ]]; then
+    printf 'error: cannot inspect upgrade postflight unit %s; no firewall or files were removed\n' "$unit" >&2
+    return 1
+  fi
+  if [[ "$load_state" != 'not-found' ]] && ! systemctl stop "$unit"; then
+    # --collect may remove an already-finished transient between enumeration
+    # and stop. Accept only a strict not-found readback; every other stop
+    # failure remains fatal.
+    if ! load_state="$(systemctl show --property=LoadState --value "$unit" 2>/dev/null)" || [[ "$load_state" != 'not-found' ]]; then
+      printf 'error: cannot stop upgrade postflight unit %s; no firewall or files were removed\n' "$unit" >&2
+      return 1
+    fi
+  fi
+  if ! active_state="$(systemctl show --property=ActiveState --value "$unit" 2>/dev/null)" \
+      || ! main_pid="$(systemctl show --property=MainPID --value "$unit" 2>/dev/null)"; then
+    printf 'error: cannot verify upgrade postflight unit %s stopped; no firewall or files were removed\n' "$unit" >&2
+    return 1
+  fi
+  if [[ ( "$active_state" != 'inactive' && "$active_state" != 'failed' ) || "$main_pid" != '0' ]]; then
+    printf 'error: upgrade postflight unit %s is still active (state=%s pid=%s); no firewall or files were removed\n' "$unit" "$active_state" "$main_pid" >&2
+    return 1
+  fi
+}
+
+stop_upgrade_postflight_units() {
+  local pass inventory unit
+  for pass in 1 2; do
+    inventory="$(list_upgrade_postflight_units)" || return 1
+    while IFS= read -r unit; do
+      [[ -n "$unit" ]] || continue
+      stop_upgrade_postflight_unit "$unit" || return 1
+    done <<<"$inventory"
+  done
+}
+
+stop_upgrade_postflight_units || exit 1
+
+# Every current installation may own a durable PVE-only host firewall
+# transaction. Before UFW migration, uninstall reverses it. Once UFW removal
+# has begun, uninstall instead finishes that irreversible purge and retains
+# the verified PVE options, rules and first-position native hooks. Absence is
+# accepted only for an older install which never entered this transaction.
 HOST_FIREWALL_JOURNAL='/var/lib/ppflight-agent/host-firewall/transaction.json'
 HOST_FIREWALL_HELPER='/usr/local/bin/ppflight-agent'
 if [[ -e "$HOST_FIREWALL_JOURNAL" || -L "$HOST_FIREWALL_JOURNAL" ]]; then
@@ -97,10 +165,15 @@ if [[ -e "$HOST_FIREWALL_JOURNAL" || -L "$HOST_FIREWALL_JOURNAL" ]]; then
     exit 1
   }
   "$HOST_FIREWALL_HELPER" host-firewall rollback --uninstall || {
-    printf 'error: PPFlight host firewall restoration is incomplete; recovery binary, journal, credentials, and files were preserved\n' >&2
+    printf 'error: PPFlight host firewall uninstall finalization is incomplete; recovery binary, journal, credentials, and files were preserved\n' >&2
     exit 1
   }
 fi
+
+# The helper disables the supervisor after proving the final firewall state.
+# Keep an explicit readback here for legacy/no-journal installations and to
+# ensure no privileged process survives file removal.
+stop_required_unit ppflight-host-firewall.service || exit 1
 
 # A complete purge must also revoke the cluster-side credentials created by
 # automatic local PVE preparation. Otherwise agent.env would be deleted while
