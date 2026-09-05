@@ -3,7 +3,6 @@ package control
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,13 +91,14 @@ func assertPVE8QGAExecForm(t *testing.T, form url.Values, wantArgs []string) {
 
 func assertPVE9QGAExecForm(t *testing.T, form url.Values, wantArgs []string) {
 	t.Helper()
-	if got := form["extra-args"]; !reflect.DeepEqual(got, wantArgs) {
-		t.Fatalf("PVE 9 agent/exec extra-args=%#v want=%#v", got, wantArgs)
+	command, present := form["command"]
+	if !present || !reflect.DeepEqual(command, wantArgs) {
+		t.Fatalf("PVE 9 agent/exec command=%#v want=%#v", command, wantArgs)
 	}
-	if form.Get("synchronous") != "0" || len(form) != 2 {
+	if len(form) != 1 {
 		t.Fatalf("PVE 9 agent/exec form=%v", form)
 	}
-	for _, forbidden := range []string{"command", "capture-output", "timeout", "pass-stdin"} {
+	for _, forbidden := range []string{"extra-args", "synchronous", "capture-output", "timeout", "pass-stdin"} {
 		if _, present := form[forbidden]; present {
 			t.Fatalf("PVE 9 agent/exec form must omit %q: %v", forbidden, form)
 		}
@@ -168,8 +168,7 @@ func TestPVE9QGAExecTransportCoversFixedGuestCommands(t *testing.T) {
 				assertPVE9QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"})
 				_, _ = w.Write([]byte(`{"data":{"pid":2}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
-				out := base64.StdEncoding.EncodeToString([]byte("UTC\n"))
-				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"` + out + `"}}`))
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"UTC\n"}}`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -626,8 +625,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				if r.URL.Query().Get("pid") != "12" {
 					t.Fatalf("pid query: %v", r.URL.Query())
 				}
-				out := base64.StdEncoding.EncodeToString([]byte("America/Los_Angeles\n"))
-				_, _ = w.Write([]byte(`{"data":{"result":{"exited":true,"exitcode":0,"out-data":"` + out + `"}}}`))
+				_, _ = w.Write([]byte(`{"data":{"result":{"exited":true,"exitcode":0,"out-data":"America/Los_Angeles\n"}}}`))
 			default:
 				t.Fatalf("unexpected request: %s", r.URL.Path)
 			}
@@ -674,8 +672,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				if r.Method != http.MethodGet || r.URL.Query().Get("pid") != "12" {
 					t.Fatalf("timezone inspection status request: %s %v", r.Method, r.URL.Query())
 				}
-				out := base64.StdEncoding.EncodeToString([]byte("UTC\n"))
-				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"` + out + `"}}`))
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0,"out-data":"UTC\n"}}`))
 			default:
 				t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
 			}
@@ -1668,9 +1665,13 @@ func TestExecutorPasswordReceiptDoesNotExposePassword(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-set-user-password","enabled":true}]}}}`))
 			return
 		}
+		if r.Method != http.MethodPost || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/agent/set-user-password" {
+			t.Fatalf("unexpected password request: %s %s", r.Method, r.URL.Path)
+		}
 		_ = r.ParseForm()
-		if r.Form.Get("password") != "secret-value" {
-			t.Fatal("password did not reach PVE form")
+		want := url.Values{"username": {"root"}, "password": {"secret-value"}, "crypted": {"0"}}
+		if got := r.Form; !reflect.DeepEqual(got, want) {
+			t.Fatalf("PVE 8/9 set-user-password form=%v want=%v", got, want)
 		}
 		// Even a surprising upstream echo must never reach a receipt or journal.
 		_, _ = w.Write([]byte(`{"data":{"result":{"password":"secret-value"}}}`))

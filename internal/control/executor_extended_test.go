@@ -1058,6 +1058,22 @@ func TestReinstallMissingTargetIsDeterministicPreflightFailure(t *testing.T) {
 	}
 }
 
+func TestReinstallUnknownPVEVersionRejectsBeforeAnyMutation(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method != http.MethodGet || r.URL.Path != "/api2/json/version" {
+			t.Fatalf("unsupported PVE version reached request: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":{"version":"10.0.0"}}`))
+	}))
+	defer server.Close()
+	receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.reinstall", "qemu", reinstallFixture()), time.Now())
+	if err == nil || !errors.Is(err, ErrReinstallPreflight) || receipt.State != "failed" || receipt.Code != "REINSTALL_PREFLIGHT_REJECTED" || receipt.Accepted || receipt.MutationMayHaveSucceeded || requests != 1 {
+		t.Fatalf("receipt=%#v err=%v requests=%d", receipt, err, requests)
+	}
+}
+
 func TestSuspendResumeUseFixedStatusEndpoints(t *testing.T) {
 	for _, action := range []string{"vm.suspend", "vm.resume"} {
 		t.Run(action, func(t *testing.T) {

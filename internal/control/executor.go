@@ -2136,8 +2136,10 @@ func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, ar
 // guest-get-timezone endpoint commonly returns an abbreviation (PDT/PST),
 // which cannot identify a single IANA zone.  timedatectl's configured
 // Timezone value is the authoritative IANA identity required by the website
-// delivery contract.  stdout is validated locally and only that bounded IANA
-// value is returned in the signed receipt.
+// delivery contract. PVE's /agent/exec-status handler decodes QGA's internal
+// base64 out-data before it returns the REST result (on both PVE 8 and 9).
+// That decoded stdout is validated locally and only the bounded IANA value is
+// returned in the signed receipt.
 func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (string, error) {
 	transport, err := c.QGAExecTransport(ctx)
 	if err != nil {
@@ -2187,11 +2189,7 @@ func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (str
 			if status.ExitCode != 0 {
 				return "", fmt.Errorf("guest timezone inspection failed with exit code %d", status.ExitCode)
 			}
-			decoded, err := base64.StdEncoding.DecodeString(status.OutData)
-			if err != nil {
-				return "", errors.New("QGA timezone inspection returned invalid output")
-			}
-			zone := strings.TrimSuffix(strings.TrimSuffix(string(decoded), "\n"), "\r")
+			zone := strings.TrimSuffix(strings.TrimSuffix(status.OutData, "\n"), "\r")
 			if zone == "" || strings.ContainsAny(zone, "\x00\r\n") || !validTimezone(zone) {
 				return "", errors.New("QGA timezone inspection returned an invalid IANA timezone")
 			}
@@ -2205,11 +2203,10 @@ func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (str
 	}
 }
 
-// qgaExecForm encodes the exact versioned PVE agent/exec form. PVE 8 registers
-// command as an array; its stable REST handler normalizes repeated form keys
-// into that array. PVE 9 instead registers repeated extra-args and requires
-// asynchronous execution for the PID/exec-status protocol. Neither branch
-// accepts QGA-internal capture-output/timeout/pass-stdin fields from Agent.
+// qgaExecForm encodes the exact PVE 8 and PVE 9 agent/exec form. Both supported
+// PVE major versions register command as an array; their stable REST handlers
+// normalize repeated form keys into that array. Neither accepts QGA-internal
+// capture-output/timeout/pass-stdin fields from Agent.
 //
 // The executor only supplies fixed command paths and independently validated
 // signed values.  This helper nevertheless refuses control characters and an
@@ -2225,14 +2222,8 @@ func qgaExecForm(argv []string, transport pve.QGAExecTransport) (url.Values, err
 		}
 	}
 	switch transport {
-	case pve.QGAExecTransportPVE8:
+	case pve.QGAExecTransportPVE8, pve.QGAExecTransportPVE9:
 		return url.Values{"command": append([]string(nil), argv...)}, nil
-	case pve.QGAExecTransportPVE9:
-		form := url.Values{"synchronous": {"0"}}
-		for _, arg := range argv {
-			form.Add("extra-args", arg)
-		}
-		return form, nil
 	default:
 		return nil, errors.New("QGA exec transport is unknown")
 	}
@@ -2270,6 +2261,9 @@ func resetPassword(ctx context.Context, c *pve.Client, cmd Command, base string)
 	var p passwordP
 	_ = strictParameters(cmd.Parameters, &p)
 	if cmd.Identity.GuestType == "qemu" {
+		// set-user-password is a separately registered, stable PVE 8/9 API
+		// endpoint. It handles QGA's password encoding server-side and is not a
+		// guest-exec call, so it must not use the versioned exec transport.
 		upid, _, err := doPVE(ctx, c, http.MethodPost, base+"/agent/set-user-password", url.Values{"username": {p.Username}, "password": {p.Password}, "crypted": {boolText(*p.Crypted)}})
 		return upid, nil, err
 	}
