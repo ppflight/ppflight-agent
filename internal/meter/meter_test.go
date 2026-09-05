@@ -1,6 +1,8 @@
 package meter
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,6 +11,71 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/observation"
 	"github.com/ppflight/ppflight-agent/internal/store"
 )
+
+// A normal production node is sized for at most 384 VPSs.  This is a real
+// per-NIC metering batch (not a synthetic encoder-only fixture): it proves a
+// one-public-NIC fleet stays below the website's 1,000-event admission limit,
+// well below the 64 MiB durable queue budget, and keeps its checkpoints after
+// an Agent process restart.
+func TestCapacity384PerNICMeteringBatchAndRestart(t *testing.T) {
+	now := time.Date(2026, 9, 5, 8, 0, 0, 0, time.UTC)
+	cutover := now.Add(-time.Hour)
+	items := make([]inventory.Assignment, 0, 384)
+	guests := make([]observation.Guest, 0, 384)
+	interfaces := make([]exporter.InterfaceObservation, 0, 384)
+	for offset := 0; offset < 384; offset++ {
+		vmid := 1000 + offset
+		mac := fmt.Sprintf("02:00:00:%02X:%02X:%02X", (offset>>16)&0xff, (offset>>8)&0xff, offset&0xff)
+		items = append(items, inventory.Assignment{
+			ServiceRef: fmt.Sprintf("service-%d", vmid), ClusterRef: "cluster-1", NodeRef: "pve-1",
+			VMID: vmid, Generation: 1, InstanceUUID: fmt.Sprintf("instance-%d", vmid), GuestType: "qemu",
+			BillingState: "active", CutoverAt: &cutover,
+			NICBindings: []inventory.NICBinding{{Interface: "net0", Role: "public", Primary: true, Metered: true, Monitoring: true, ExpectedMAC: mac, Bridge: "vmbr0", IPFilterPolicy: "required"}},
+		})
+		aggregateIn, aggregateOut := uint64(vmid), uint64(vmid+1)
+		guests = append(guests, observation.Guest{
+			VMID: vmid, GuestType: "qemu", Node: "pve-1", Networks: []observation.Network{{Index: 0, Interface: "net0", MAC: mac}},
+			PVE: observation.PVEGuestView{Availability: observation.Availability{Available: true, ObservedAt: now}, IngressBytes: &aggregateIn, EgressBytes: &aggregateOut},
+		})
+		interfaces = append(interfaces, testHostInterface(fmt.Sprintf("tap%di0", vmid), fmt.Sprint(vmid+10), fmt.Sprint(vmid+20)))
+	}
+	assignments := inventory.NewStore(inventory.Document{SchemaVersion: 1, Revision: "capacity-384", IssuedAt: now, Assignments: items})
+	queueRoot, meterRoot := t.TempDir(), t.TempDir()
+	queue, err := store.Open(store.Config{Root: queueRoot, Destination: "website", Kind: store.Metering, Policy: store.Policy{MaxBytes: 64 << 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager, err := Open(Config{Directory: meterRoot, Mode: "production", AgentRef: "agent-1", CollectorRef: "collector-1", SourceRef: "source-1", ClusterRef: "cluster-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := observation.Snapshot{ClusterRef: "cluster-1", ObservedAt: now, Guests: guests, Host: &exporter.HostObservation{ObservedAt: now, Interfaces: interfaces}}
+	batch, created, err := manager.Observe(snapshot, assignments, queue)
+	if err != nil || !created || len(batch.Events) != 384 || queue.Len() != 1 {
+		t.Fatalf("384-vps first observation created=%v events=%d queue=%d err=%v", created, len(batch.Events), queue.Len(), err)
+	}
+	payload, err := json.Marshal(batch)
+	if err != nil || len(payload) >= 1<<20 {
+		t.Fatalf("384-vps batch payload=%d err=%v, want <1MiB", len(payload), err)
+	}
+	t.Logf("384-vps per-NIC metering batch: %d events, %d bytes; 64MiB durable queue holds at least %d such batches", len(batch.Events), len(payload), (64<<20)/len(payload))
+
+	// Reopen from the persisted checkpoints to model the systemd restart path.
+	restarted, err := Open(Config{Directory: meterRoot, Mode: "production", AgentRef: "agent-1", CollectorRef: "collector-1", SourceRef: "source-1", ClusterRef: "cluster-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.ObservedAt = now.Add(time.Minute)
+	snapshot.Host.ObservedAt = snapshot.ObservedAt
+	for index := range snapshot.Host.Interfaces {
+		vmid := 1000 + index
+		snapshot.Host.Interfaces[index] = testHostInterface(fmt.Sprintf("tap%di0", vmid), fmt.Sprint(vmid+110), fmt.Sprint(vmid+220))
+	}
+	second, created, err := restarted.Observe(snapshot, assignments, queue)
+	if err != nil || !created || len(second.Events) != 384 || second.Sequence <= batch.Sequence || second.Events[0].CounterEpoch != batch.Events[0].CounterEpoch {
+		t.Fatalf("384-vps restart observation created=%v events=%d sequence=%d epoch=%q err=%v", created, len(second.Events), second.Sequence, second.Events[0].CounterEpoch, err)
+	}
+}
 
 func TestObservePersistsEpochAndDetectsReset(t *testing.T) {
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
