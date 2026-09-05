@@ -81,7 +81,6 @@ type App struct {
 	lifecycle                *lifecycle.Session
 
 	lastInventory time.Time
-	lastGuest     time.Time
 	lastHost      time.Time
 	lastSMART     time.Time
 	lastMeter     time.Time
@@ -849,17 +848,16 @@ func (a *App) enqueueLifecycleTelemetry(snapshot observation.Snapshot, now time.
 func (a *App) sample(ctx context.Context, now time.Time) error {
 	due := collector.Due{
 		Inventory: a.lastInventory.IsZero() || now.Sub(a.lastInventory) >= a.cfg.Collection.InventoryInterval.Duration,
-		Guest:     a.lastGuest.IsZero() || now.Sub(a.lastGuest) >= a.cfg.Collection.GuestInterval.Duration,
-		Host:      a.lastHost.IsZero() || now.Sub(a.lastHost) >= a.cfg.Collection.MonitoringInterval.Duration,
-		SMART:     a.lastSMART.IsZero() || now.Sub(a.lastSMART) >= a.cfg.Collection.SMARTInterval.Duration,
+		// The PVE collector shards config/QGA work over GuestInterval, so it
+		// receives one bounded slice on every lightweight sample cycle.
+		Guest: true,
+		Host:  a.lastHost.IsZero() || now.Sub(a.lastHost) >= a.cfg.Collection.MonitoringInterval.Duration,
+		SMART: a.lastSMART.IsZero() || now.Sub(a.lastSMART) >= a.cfg.Collection.SMARTInterval.Duration,
 	}
 	snapshot, collectionErr := a.source.Collect(ctx, now, due)
 	a.health.Collection(now, collectionErr)
 	if due.Inventory {
 		a.lastInventory = now
-	}
-	if due.Guest {
-		a.lastGuest = now
 	}
 	if due.Host {
 		a.lastHost = now

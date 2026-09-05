@@ -67,20 +67,21 @@ func New(cfg config.Config, secrets config.Secrets) (Source, error) {
 }
 
 type PVECollector struct {
-	mu         sync.Mutex
-	cfg        config.Config
-	client     *pve.Client
-	localNode  string
-	version    pve.Version
-	nodes      []observation.Node
-	storages   []observation.Storage
-	tasks      []observation.Task
-	qga        map[string]observation.QGAView
-	networks   map[string][]observation.Network
-	host       *exporter.HostObservation
-	smart      *exporter.SmartObservation
-	components map[string]observation.Availability
-	progress   func()
+	mu          sync.Mutex
+	cfg         config.Config
+	client      *pve.Client
+	localNode   string
+	version     pve.Version
+	nodes       []observation.Node
+	storages    []observation.Storage
+	tasks       []observation.Task
+	qga         map[string]observation.QGAView
+	networks    map[string][]observation.Network
+	guestCursor int
+	host        *exporter.HostObservation
+	smart       *exporter.SmartObservation
+	components  map[string]observation.Availability
+	progress    func()
 }
 
 func (c *PVECollector) PVEClient() *pve.Client { return c.client }
@@ -273,13 +274,12 @@ func (c *PVECollector) collectGuestDetails(ctx context.Context, now time.Time, r
 		qga      observation.QGAView
 		networks []observation.Network
 	}
-	results := make(chan result, len(resources))
+	batch, nextCursor := guestDetailBatch(resources, c.cfg.Collection.SampleInterval.Duration, c.cfg.Collection.GuestInterval.Duration, c.guestCursor)
+	c.guestCursor = nextCursor
+	results := make(chan result, len(batch))
 	sem := make(chan struct{}, c.cfg.Collection.GuestRequestConcurrency)
 	var group sync.WaitGroup
-	for _, resource := range resources {
-		if resource.Template != 0 || resource.Type != "qemu" && resource.Type != "lxc" {
-			continue
-		}
+	for _, resource := range batch {
 		resource := resource
 		group.Add(1)
 		go func() {
@@ -318,6 +318,47 @@ func (c *PVECollector) collectGuestDetails(ctx context.Context, now time.Time, r
 		c.qga[result.key], c.networks[result.key] = result.qga, result.networks
 	}
 	c.setAvailable("qga", now, c.cfg.Collection.GuestInterval.Duration*2)
+}
+
+// guestDetailBatch spreads the per-guest config/QGA reads evenly across the
+// configured full-sweep interval. ClusterResources remains one batched PVE
+// request, while a 500-guest node using the 10s/2m defaults probes at most 42
+// guests per sample instead of creating a 500-guest periodic burst.
+func guestDetailBatch(resources []pve.Resource, sampleInterval, sweepInterval time.Duration, cursor int) ([]pve.Resource, int) {
+	candidates := make([]pve.Resource, 0, len(resources))
+	for _, resource := range resources {
+		if resource.Template == 0 && (resource.Type == "qemu" || resource.Type == "lxc") {
+			candidates = append(candidates, resource)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Node != candidates[j].Node {
+			return candidates[i].Node < candidates[j].Node
+		}
+		if candidates[i].Type != candidates[j].Type {
+			return candidates[i].Type < candidates[j].Type
+		}
+		return candidates[i].VMID < candidates[j].VMID
+	})
+	if len(candidates) == 0 {
+		return nil, 0
+	}
+	if cursor < 0 || cursor >= len(candidates) {
+		cursor = 0
+	}
+	cycles := int((sweepInterval + sampleInterval - 1) / sampleInterval)
+	if cycles < 1 {
+		cycles = 1
+	}
+	batchSize := (len(candidates) + cycles - 1) / cycles
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	batch := make([]pve.Resource, 0, batchSize)
+	for offset := 0; offset < batchSize && offset < len(candidates); offset++ {
+		batch = append(batch, candidates[(cursor+offset)%len(candidates)])
+	}
+	return batch, (cursor + len(batch)) % len(candidates)
 }
 
 func (c *PVECollector) collectHost(ctx context.Context, now time.Time) {
