@@ -322,8 +322,8 @@ func (c *PVECollector) collectGuestDetails(ctx context.Context, now time.Time, r
 
 // guestDetailBatch spreads the per-guest config/QGA reads evenly across the
 // configured full-sweep interval. ClusterResources remains one batched PVE
-// request, while a 500-guest node using the 10s/2m defaults probes at most 42
-// guests per sample instead of creating a 500-guest periodic burst.
+// request, while a maximum-size 384-guest node using the 10s/2m defaults
+// probes 32 guests per sample instead of creating a 384-guest periodic burst.
 func guestDetailBatch(resources []pve.Resource, sampleInterval, sweepInterval time.Duration, cursor int) ([]pve.Resource, int) {
 	candidates := make([]pve.Resource, 0, len(resources))
 	for _, resource := range resources {

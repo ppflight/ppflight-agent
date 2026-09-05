@@ -7,9 +7,9 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/pve"
 )
 
-func TestGuestDetailBatchSpreadsFiveHundredGuestsAcrossSweep(t *testing.T) {
-	resources := make([]pve.Resource, 0, 502)
-	for vmid := 500; vmid >= 1; vmid-- {
+func TestGuestDetailBatchSpreadsMaximumThreeHundredEightyFourGuestsAcrossSweep(t *testing.T) {
+	resources := make([]pve.Resource, 0, 386)
+	for vmid := 384; vmid >= 1; vmid-- {
 		resources = append(resources, pve.Resource{Type: "qemu", Node: "pve", VMID: vmid})
 	}
 	resources = append(resources,
@@ -21,8 +21,8 @@ func TestGuestDetailBatchSpreadsFiveHundredGuestsAcrossSweep(t *testing.T) {
 	seen := map[int]bool{}
 	for cycle := 0; cycle < 12; cycle++ {
 		batch, next := guestDetailBatch(resources, 10*time.Second, 2*time.Minute, cursor)
-		if len(batch) != 42 {
-			t.Fatalf("cycle %d batch size=%d want 42", cycle, len(batch))
+		if len(batch) != 32 {
+			t.Fatalf("cycle %d batch size=%d want 32", cycle, len(batch))
 		}
 		for _, resource := range batch {
 			if resource.Template != 0 || resource.Type != "qemu" {
@@ -32,8 +32,8 @@ func TestGuestDetailBatchSpreadsFiveHundredGuestsAcrossSweep(t *testing.T) {
 		}
 		cursor = next
 	}
-	if len(seen) != 500 {
-		t.Fatalf("full sweep observed %d guests want 500", len(seen))
+	if len(seen) != 384 {
+		t.Fatalf("full sweep observed %d guests want 384", len(seen))
 	}
 }
 
