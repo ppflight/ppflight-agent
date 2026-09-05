@@ -689,6 +689,9 @@ func TestParseTemplateBridgeUPIDRequiresStrictJSONAndSafeAlphabet(t *testing.T) 
 	if value, err := parseTemplateBridgeUPID([]byte(valid)); err != nil || value != strings.Trim(valid, `"`) {
 		t.Fatalf("value=%q err=%v", value, err)
 	}
+	if value, err := parseTemplateBridgeUPID([]byte("\n null \n")); err != nil || value != "" {
+		t.Fatalf("synchronous value=%q err=%v", value, err)
+	}
 	for _, raw := range []string{
 		`UPID:pve:1`,
 		`"UPID:pve:1?query"`,

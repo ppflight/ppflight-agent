@@ -3232,6 +3232,12 @@ func (c *cli) promptTemplateItems(reader *bufio.Reader, catalog templateCatalog)
 	if err != nil || value == "" || strings.EqualFold(value, "all") {
 		return "all", err
 	}
+	// Operators commonly enter lists with Chinese IMEs. Normalize the two
+	// Chinese comma variants (and whitespace) before resolving menu numbers so
+	// the interactive CLI and the bootstrap contract receive one canonical
+	// comma-separated selector list.
+	value = strings.NewReplacer("，", ",", "、", ",").Replace(value)
+	value = strings.Join(strings.Fields(value), ",")
 	parts := strings.Split(value, ",")
 	for index := range parts {
 		part := strings.TrimSpace(parts[index])

@@ -366,6 +366,9 @@ def catalog_without_internal_fields(catalog: Mapping[str, Any]) -> Dict[str, Any
 
 
 def select_items(catalog: Mapping[str, Any], selector_text: str) -> List[Mapping[str, Any]]:
+    # Accept the separators operators naturally type with Chinese IMEs as well
+    # as whitespace, while retaining comma as the canonical contract form.
+    selector_text = re.sub(r"[，、\s]+", ",", selector_text.strip()).strip(",")
     items = list(catalog["items"])
     if selector_text == "all":
         return items

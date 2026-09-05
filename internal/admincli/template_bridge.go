@@ -471,6 +471,13 @@ func (m *pveTemplateBridgeManager) waitForTask(ctx context.Context, upid string)
 }
 
 func parseTemplateBridgeUPID(raw []byte) (string, error) {
+	// PVE versions/backends legitimately implement network reload in either
+	// asynchronous (UPID) or synchronous (JSON null) form. A synchronous return
+	// is not success by itself: createSafely still performs the same strict
+	// pending-file, active-config and kernel-interface verification below.
+	if string(bytes.TrimSpace(raw)) == "null" {
+		return "", nil
+	}
 	var value string
 	if err := decodeSingleJSON(raw, &value); err != nil {
 		return "", errors.New("PVE network apply 未返回 JSON UPID")

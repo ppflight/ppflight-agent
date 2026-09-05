@@ -132,11 +132,14 @@ func (m *pveTemplateBridgeManager) createSafely(ctx context.Context, name string
 		_ = releaseApplyLock()
 		return templateBridgeState{}, fmt.Errorf("%w；reload 任务可能已经启动但状态无法跟踪，未自动回滚；请检查 PVE 任务与接口 %s", err, name)
 	}
-	if !strings.HasPrefix(upid, "UPID:"+m.node+":") {
+	if upid != "" && !strings.HasPrefix(upid, "UPID:"+m.node+":") {
 		_ = releaseApplyLock()
 		return templateBridgeState{}, fmt.Errorf("PVE network apply 返回了其他节点的 UPID；reload 任务可能已经启动但状态无法跟踪，未自动回滚；请检查 PVE 任务与接口 %s", name)
 	}
-	stopped, waitErr := m.waitForTask(ctx, upid)
+	stopped, waitErr := true, error(nil)
+	if upid != "" {
+		stopped, waitErr = m.waitForTask(ctx, upid)
+	}
 	if waitErr != nil {
 		if releaseErr := releaseApplyLock(); releaseErr != nil {
 			return templateBridgeState{}, fmt.Errorf("%w；且释放 PVE network 配置锁失败: %v；为避免竞态误删管理员网络，未自动回滚，请检查接口 %s 与 pending network", waitErr, releaseErr, name)
