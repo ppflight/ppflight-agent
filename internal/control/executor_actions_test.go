@@ -542,13 +542,13 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset"):
 			_, _ = w.Write([]byte(`{"data":[{"name":"ipfilter-net0"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/firewall/ipset/ipfilter-net0"):
-			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"2001:db8::10/128","nomatch":0}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"cidr":"192.0.2.9/32","nomatch":0},{"cidr":"192.0.2.10/32","nomatch":0},{"cidr":"2001:db8::10/128","nomatch":0}]}`))
 		default:
 			t.Fatalf("unexpected request: %s", r.URL.Path)
 		}
 	}))
 	defer server.Close()
-	command := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`)
+	command := controlCommand("vm.verify-delivery", "qemu", `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.9/32","192.0.2.10/32","2001:db8::10/128"],"ipFilterMatch":"make-before-break"}],"timezone":"UTC"}}`)
 	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
 	if err != nil || receipt.State != "succeeded" || receipt.DryRun {
 		t.Fatalf("receipt=%#v err=%v", receipt, err)
@@ -559,6 +559,38 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	}
 	if !regexp.MustCompile(`"observedAt":"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"`).Match(receipt.Result) {
 		t.Fatalf("delivery result timestamp is not the whole-second golden: %s", receipt.Result)
+	}
+}
+
+func TestDeliveryMakeBeforeBreakFilterContractIsNarrow(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(validActionParameterFixtures()["vm.verify-delivery"]), &payload); err != nil {
+		t.Fatal(err)
+	}
+	network := payload["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)
+	network["ipFilterMatch"] = "make-before-break"
+	network["ipFilterCidrs"] = []any{"192.0.2.9/32", "192.0.2.10/32", "2001:db8::10/128"}
+	valid, _ := json.Marshal(payload)
+	if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(valid))); err != nil {
+		t.Fatalf("rejected bounded make-before-break delivery: %v", err)
+	}
+
+	for name, cidrs := range map[string][]any{
+		"no old address":               {"192.0.2.10/32", "2001:db8::10/128"},
+		"two old addresses one family": {"192.0.2.8/32", "192.0.2.9/32", "192.0.2.10/32", "2001:db8::10/128"},
+		"missing configured address":   {"192.0.2.9/32", "2001:db8::10/128"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var candidate map[string]any
+			if err := json.Unmarshal(valid, &candidate); err != nil {
+				t.Fatal(err)
+			}
+			candidate["expected"].(map[string]any)["networks"].([]any)[0].(map[string]any)["ipFilterCidrs"] = cidrs
+			raw, _ := json.Marshal(candidate)
+			if err := validateParameters(controlCommand("vm.verify-delivery", "qemu", string(raw))); err == nil {
+				t.Fatalf("accepted unsafe make-before-break filter set: %s", raw)
+			}
+		})
 	}
 }
 

@@ -890,6 +890,7 @@ type deliveryNetwork struct {
 	IPv4          string   `json:"ipv4"`
 	IPv6          string   `json:"ipv6"`
 	IPFilterCIDRs []string `json:"ipFilterCidrs"`
+	IPFilterMatch string   `json:"ipFilterMatch,omitempty"`
 }
 type snapP struct {
 	Name        string `json:"name"`
@@ -2071,7 +2072,7 @@ func exactDeliveryKeys(raw json.RawMessage) bool {
 	}
 	for _, network := range networks {
 		required := []string{"interface", "bridge", "mac", "vlan", "mtu", "firewall", "rateMbps", "ipv4", "ipv6", "ipFilterCidrs"}
-		if !hasExactKeys(network, required...) {
+		if !hasExactKeys(network, required...) && !hasExactKeys(network, append(required, "ipFilterMatch")...) {
 			return false
 		}
 	}
@@ -2168,8 +2169,12 @@ func validDelivery(p deliveryP) bool {
 	for _, network := range e.Networks {
 		ipv4Filter, ipv4OK := deliveryAddressFilter(network.IPv4, 4)
 		ipv6Filter, ipv6OK := deliveryAddressFilter(network.IPv6, 6)
+		ipFilterMatch := network.IPFilterMatch
+		if ipFilterMatch == "" {
+			ipFilterMatch = "exact"
+		}
 		dynamicAddress := network.IPv4 == "dhcp" || network.IPv4 == "manual" || network.IPv6 == "auto" || network.IPv6 == "dhcp" || network.IPv6 == "manual"
-		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !ipv4OK || !ipv6OK || *network.Firewall && dynamicAddress || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) {
+		if !netRE.MatchString(network.Interface) || seen[network.Interface] || !nodeRE.MatchString(network.Bridge) || !deliveryMACRE.MatchString(network.MAC) || seenMAC[network.MAC] || network.MTU < 576 || network.MTU > 9216 || network.Firewall == nil || !validRate(network.RateMbps) || !ipv4OK || !ipv6OK || *network.Firewall && dynamicAddress || len(network.IPFilterCIDRs) > 16 || network.VLAN != nil && (*network.VLAN < 0 || *network.VLAN > 4094) || ipFilterMatch != "exact" && ipFilterMatch != "make-before-break" || ipFilterMatch == "make-before-break" && !*network.Firewall {
 			return false
 		}
 		if firewallStateSet && firewallState != *network.Firewall {
@@ -2194,10 +2199,14 @@ func validDelivery(p deliveryP) bool {
 		if ipv6Filter != "" {
 			expectedCIDRs[ipv6Filter] = true
 		}
-		if *network.Firewall && len(expectedCIDRs) != len(network.IPFilterCIDRs) {
+		if *network.Firewall && ipFilterMatch == "exact" && len(expectedCIDRs) != len(network.IPFilterCIDRs) {
+			return false
+		}
+		if ipFilterMatch == "make-before-break" && (len(network.IPFilterCIDRs) <= len(expectedCIDRs) || len(network.IPFilterCIDRs) > len(expectedCIDRs)+2) {
 			return false
 		}
 		cidrs := map[string]bool{}
+		extraFamilies := map[int]bool{}
 		for _, cidr := range network.IPFilterCIDRs {
 			ip, parsed, err := net.ParseCIDR(cidr)
 			if err != nil || !ip.Equal(parsed.IP) || parsed.String() != cidr || cidrs[cidr] {
@@ -2208,9 +2217,28 @@ func validDelivery(p deliveryP) bool {
 				return false
 			}
 			if !expectedCIDRs[cidr] {
-				return false
+				if ipFilterMatch != "make-before-break" {
+					return false
+				}
+				family := 6
+				configuredFamily := ipv6Filter != ""
+				if ip.To4() != nil {
+					family = 4
+					configuredFamily = ipv4Filter != ""
+				}
+				if !configuredFamily || extraFamilies[family] {
+					return false
+				}
+				extraFamilies[family] = true
 			}
 			cidrs[cidr] = true
+		}
+		if *network.Firewall {
+			for expected := range expectedCIDRs {
+				if !cidrs[expected] {
+					return false
+				}
+			}
 		}
 	}
 	return true
