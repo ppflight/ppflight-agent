@@ -1068,6 +1068,7 @@ func TestNewActionsRejectUnknownFieldsAndArbitrarySources(t *testing.T) {
 		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true,"endpoint":"/arbitrary"}`),
 		controlCommand("snapshot.list", "qemu", `{"limit":10,"path":"/etc"}`),
 		controlCommand("backup.get", "qemu", `{"storage":"backup1","volume":"../../etc/shadow"}`),
+		controlCommand("backup.get", "qemu", `{"storage":"backup1","volume":"other:backup/vzdump-qemu-101.vma.zst"}`),
 		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":29,"webSocket":true}`),
 		controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":301,"webSocket":true}`),
 		controlCommand("vm.console.create-session", "lxc", `{"ttlSeconds":60,"webSocket":true}`),
