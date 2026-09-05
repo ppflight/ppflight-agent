@@ -585,6 +585,43 @@ func (j *Journal) Complete(command Command, receipt Receipt) error {
 	return j.completeLocked(filename, &record, receipt)
 }
 
+// BeginRunning makes the accepted execution durable before it is handed to an
+// in-memory dispatcher.  It is deliberately separate from Complete: a crash
+// while a bounded worker is executing must be reported as indeterminate on
+// the next process start, never replayed as a second mutation.
+func (j *Journal) BeginRunning(command Command, receipt Receipt) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	filename := j.path(command.CommandID)
+	record, err := readJournal(filename)
+	if err != nil {
+		return err
+	}
+	if record.Digest != Digest(command) {
+		return ErrCommandConflict
+	}
+	if record.Receipt != nil {
+		if record.State == "running" && record.Receipt.State == "running" {
+			return nil
+		}
+		return ErrCommandConflict
+	}
+	if receipt.CommandID != record.CommandID {
+		return errors.New("receipt command ID does not match journal record")
+	}
+	if receipt.OperationID == "" {
+		receipt.OperationID = record.OperationID
+	}
+	ApplyReceiptCompatibility(&receipt)
+	// A running progress receipt is intentionally not an audit outcome. The
+	// terminal receipt written by Complete carries the one durable audit event.
+	record.State = "running"
+	record.UpdatedAt = receipt.FinishedAt.UTC()
+	record.Receipt = &receipt
+	record.ReceiptPending = true
+	return writeJournal(filename, record)
+}
+
 // BeginCloudInitSnippetDelete binds a safe one-way projection of the exact
 // volume to the existing signed claim. Raw volume IDs and config strings are
 // deliberately not representable in the journal record.
@@ -954,6 +991,17 @@ func (j *Journal) MarkReceiptQueued(commandID, receiptID string) error {
 // indeterminate. Such a record has no UPID, so retrying its mutation would be
 // unsafe; a terminal receipt is the only honest recovery outcome.
 func (j *Journal) RecoverIncomplete(now time.Time, mode string) ([]Receipt, error) {
+	return j.recoverIncomplete(now, mode, nil)
+}
+
+// RecoverIncompleteExcept preserves commands presently owned by this process'
+// bounded dispatcher. A command marked running on disk is otherwise an
+// interrupted mutation after restart and must become indeterminate.
+func (j *Journal) RecoverIncompleteExcept(now time.Time, mode string, active func(string) bool) ([]Receipt, error) {
+	return j.recoverIncomplete(now, mode, active)
+}
+
+func (j *Journal) recoverIncomplete(now time.Time, mode string, active func(string) bool) ([]Receipt, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	entries, err := os.ReadDir(j.directory)
@@ -970,7 +1018,8 @@ func (j *Journal) RecoverIncomplete(now time.Time, mode string) ([]Receipt, erro
 		if err != nil {
 			return nil, err
 		}
-		if record.State != "received" || record.Receipt != nil || !record.Mutating || record.Action == "vm.cloud-init-snippet.delete" {
+		if !((record.State == "received" && record.Receipt == nil) || (record.State == "running" && record.Receipt != nil && record.Receipt.State == "running")) ||
+			!record.Mutating || record.Action == "vm.cloud-init-snippet.delete" || (active != nil && active(record.CommandID)) {
 			continue
 		}
 		id, err := protocol.NewID()
@@ -1012,7 +1061,7 @@ func (j *Journal) resourceBusyLocked(resourceKey string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if record.Mutating && record.ResourceKey == resourceKey && (record.State == "received" || record.State == "submitted" || record.State == "waiting" || record.State == "indeterminate") {
+		if record.Mutating && record.ResourceKey == resourceKey && (record.State == "received" || record.State == "running" || record.State == "submitted" || record.State == "waiting" || record.State == "indeterminate") {
 			retired, retireErr := j.retirementCommittedLocked(record)
 			if retireErr != nil {
 				return false, retireErr

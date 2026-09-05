@@ -1073,19 +1073,26 @@ func (a *App) deliveryLoop(ctx context.Context, item delivery) {
 }
 
 func (a *App) controlLoop(ctx context.Context) {
-	a.runControlLogged(ctx)
-	ticker := time.NewTicker(a.cfg.Control.PollInterval.Duration)
-	defer ticker.Stop()
 	for {
+		// A successful Agent v1 poll long-waits for up to 25 seconds when
+		// idle, so immediately opening the next poll does not busy-loop. It
+		// lets console and unrelated short VM commands enter their bounded
+		// dispatch lanes while a heavyweight workflow is still executing.
+		if a.runControlLogged(ctx) {
+			continue
+		}
+		backoff := time.NewTimer(a.cfg.Control.PollInterval.Duration)
 		select {
 		case <-ctx.Done():
+			if !backoff.Stop() {
+				<-backoff.C
+			}
 			return
-		case <-ticker.C:
-			a.runControlLogged(ctx)
+		case <-backoff.C:
 		}
 	}
 }
-func (a *App) runControlLogged(ctx context.Context) {
+func (a *App) runControlLogged(ctx context.Context) bool {
 	a.controlAuditGate.Lock()
 	a.controlAuditReady.Store(false)
 	reconciledBefore, reconcileBeforeErr := a.control.ReconcileOnce(ctx)
@@ -1093,7 +1100,7 @@ func (a *App) runControlLogged(ctx context.Context) {
 		a.controlAuditGate.Unlock()
 		a.health.ControlPoll(time.Now(), reconcileBeforeErr)
 		a.logger.Warn("control journal reconciliation failed; command polling remains paused", "error", safeLogError(reconcileBeforeErr))
-		return
+		return false
 	}
 	// A command long-poll can deliberately block for 25 seconds.  The journal
 	// is now reconciled, so monitoring-audit delivery may proceed while the
@@ -1126,6 +1133,8 @@ func (a *App) runControlLogged(ctx context.Context) {
 	if reconciledBefore+reconciledAfter > 0 {
 		a.logger.Info("control tasks reconciled", "count", reconciledBefore+reconciledAfter)
 	}
+
+	return err == nil
 }
 
 func safeLogError(err error) string {

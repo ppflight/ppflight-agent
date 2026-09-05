@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,11 +60,26 @@ type fixedPoller struct{ response PollResponse }
 
 func (p fixedPoller) Poll(context.Context, string) (PollResponse, error) { return p.response, nil }
 
-type memoryReceiptQueue struct{ payloads [][]byte }
+type memoryReceiptQueue struct {
+	mu       sync.Mutex
+	payloads [][]byte
+}
 
 func (q *memoryReceiptQueue) Enqueue(_ string, payload []byte) (store.Item, bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 	q.payloads = append(q.payloads, append([]byte(nil), payload...))
 	return store.Item{}, true, nil
+}
+
+func (q *memoryReceiptQueue) snapshot() [][]byte {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	result := make([][]byte, len(q.payloads))
+	for index := range q.payloads {
+		result[index] = append([]byte(nil), q.payloads[index]...)
+	}
+	return result
 }
 
 type memoryAuditSink struct{ events []auditlog.Event }
@@ -323,14 +339,23 @@ func TestProductionServiceQueuesRunningReceiptBeforeMutationResult(t *testing.T)
 	if processed, pollErr := service.PollOnce(context.Background()); pollErr != nil || processed != 1 {
 		t.Fatalf("processed=%d err=%v", processed, pollErr)
 	}
-	if len(queue.payloads) != 2 {
-		t.Fatalf("receipt count=%d", len(queue.payloads))
+	var payloads [][]byte
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		payloads = queue.snapshot()
+		if len(payloads) == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("receipt count=%d", len(payloads))
 	}
 	var running, terminal Receipt
-	if err := json.Unmarshal(queue.payloads[0], &running); err != nil {
+	if err := json.Unmarshal(payloads[0], &running); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(queue.payloads[1], &terminal); err != nil {
+	if err := json.Unmarshal(payloads[1], &terminal); err != nil {
 		t.Fatal(err)
 	}
 	if running.State != "running" || running.Code != "COMMAND_STARTED" || !running.Accepted || !running.Asynchronous || terminal.State != "submitted" || terminal.Code != "PVE_TASK_SUBMITTED" {

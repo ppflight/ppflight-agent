@@ -108,6 +108,7 @@ type Service struct {
 	cursorFile           string
 	cursor               string
 	now                  func() time.Time
+	dispatcher           *commandDispatcher
 }
 
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -173,6 +174,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if err := service.loadCursor(); err != nil {
 		return nil, err
 	}
+	service.dispatcher = newCommandDispatcher(service.executeDispatched)
 	return service, nil
 }
 
@@ -248,9 +250,10 @@ func (s *Service) ApplyAssignmentAuthority(document inventory.Document, revision
 	return nil
 }
 
-// PollOnce advances the server cursor only after every command has a durable
-// result in the receipt queue. A crash after PVE execution is reconciled from
-// the command journal and cannot silently execute the command twice.
+// PollOnce durably admits at most one command, then hands execution to a
+// bounded class-specific worker. The cursor advances only after a running or
+// terminal receipt is durably queued. A crash after admission is reconciled
+// from the journal and cannot silently execute a mutation twice.
 func (s *Service) PollOnce(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,49 +334,62 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		} else {
 			receipt, duplicate, claimErr = s.journal.Claim(command, now)
 		}
-		journaled := false
 		switch {
 		case claimErr != nil:
 			receipt, err = s.rejection(command, claimRejectionCode(claimErr), now)
 		case duplicate:
-			journaled = true
-			err = nil
+			if err = s.enqueueJournaled(command.CommandID, receipt); err == nil {
+				processed++
+			}
+			if err != nil {
+				return processed, err
+			}
+			continue
 		default:
-			// Persist a running receipt before any production mutation begins. This
-			// advances the website out of its command-lease state while long, fully
-			// synchronous workflows (notably reinstall) are still executing.
-			if s.mode == "production" && s.executor.ProductionExecution && auditable {
-				started, startedErr := s.runningReceipt(command, now)
-				if startedErr != nil {
-					return processed, startedErr
+			// Test/dry-run execution remains synchronous so the non-production
+			// contract stays deterministic. Production mutations use the
+			// bounded dispatcher below.
+			if s.mode != "production" || !s.executor.ProductionExecution {
+				receipt, err = s.executor.Execute(ctx, command, now)
+				receipt.OperationID = command.OperationID
+				ApplyReceiptCompatibility(&receipt)
+				if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
+					return processed, completeErr
 				}
-				if startedErr = s.enqueue(started); startedErr != nil {
-					return processed, startedErr
+				logCommandReceipt(command, receipt)
+				if err != nil && receipt.ReceiptID == "" {
+					return processed, err
 				}
+				if err = s.enqueueJournaled(command.CommandID, receipt); err != nil {
+					return processed, err
+				}
+				processed++
+				continue
 			}
-			slog.Info("control command execution started",
-				"operationId", command.OperationID,
-				"commandId", command.CommandID,
-				"action", command.Action,
-				"scope", command.Scope,
-			)
-			receipt, err = s.executor.Execute(ctx, command, now)
-			receipt.OperationID = command.OperationID
-			ApplyReceiptCompatibility(&receipt)
-			// Only bounded structured provider diagnostics are exposed; raw response
-			// bodies, request bodies and credentials remain local to the Agent.
-			if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
-				return processed, completeErr
+			started, startedErr := s.runningReceipt(command, now)
+			if startedErr != nil {
+				return processed, startedErr
 			}
-			journaled = true
+			if startedErr = s.journal.BeginRunning(command, started); startedErr != nil {
+				return processed, startedErr
+			}
+			if startedErr = s.enqueueJournaled(command.CommandID, started); startedErr != nil {
+				return processed, startedErr
+			}
+			if !s.dispatcher.submit(ctx, command) {
+				// The command is not claimed by an in-memory worker. Leave its
+				// website cursor unadvanced so it cannot strand an opaque body;
+				// the durable running marker makes any process loss fail closed.
+				return processed, errors.New("control dispatcher lane is full")
+			}
+			processed++
+			continue
 		}
-		logCommandReceipt(command, receipt)
-		if err != nil && receipt.ReceiptID == "" {
+		if err != nil {
 			return processed, err
 		}
-		if journaled {
-			err = s.enqueueJournaled(command.CommandID, receipt)
-		} else if auditable && s.auditSink != nil {
+		logCommandReceipt(command, receipt)
+		if auditable && s.auditSink != nil {
 			err = s.enqueueDeniedAudit(command, receipt, now)
 		} else {
 			err = s.enqueue(receipt)
@@ -387,6 +403,45 @@ func (s *Service) PollOnce(ctx context.Context) (int, error) {
 		return processed, err
 	}
 	return processed, nil
+}
+
+// executeDispatched runs outside the admission mutex. Journal resource keys
+// are the durable same-VM mutation fence; different VM short operations and
+// console setup can progress without waiting for a heavyweight workflow.
+func (s *Service) executeDispatched(ctx context.Context, command Command) {
+	now := s.now().UTC()
+	slog.Info("control command execution started",
+		"operationId", command.OperationID,
+		"commandId", command.CommandID,
+		"action", command.Action,
+		"scope", command.Scope,
+	)
+	receipt, err := s.executor.Execute(ctx, command, now)
+	receipt.OperationID = command.OperationID
+	ApplyReceiptCompatibility(&receipt)
+	if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
+		slog.Error("control command journal completion failed", "commandId", command.CommandID, "error", safeControlLogError(completeErr))
+		return
+	}
+	logCommandReceipt(command, receipt)
+	if err != nil && receipt.ReceiptID == "" {
+		slog.Error("control command execution failed without receipt", "commandId", command.CommandID, "error", safeControlLogError(err))
+		return
+	}
+	if err := s.enqueueJournaled(command.CommandID, receipt); err != nil {
+		slog.Error("control command receipt delivery deferred", "commandId", command.CommandID, "error", safeControlLogError(err))
+	}
+}
+
+func safeControlLogError(err error) string {
+	if err == nil {
+		return ""
+	}
+	value := err.Error()
+	if len(value) > 512 {
+		return value[:512]
+	}
+	return value
 }
 
 // logCommandReceipt emits only bounded identifiers and the same sanitized
@@ -499,7 +554,7 @@ func (s *Service) ReconcileOnce(ctx context.Context) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	updated := 0
-	incomplete, err := s.journal.RecoverIncomplete(s.now().UTC(), s.mode)
+	incomplete, err := s.journal.RecoverIncompleteExcept(s.now().UTC(), s.mode, s.dispatcher.activeCommand)
 	if err != nil {
 		return updated, err
 	}
