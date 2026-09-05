@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="3.3.3"
+readonly SCRIPT_VERSION="3.3.4"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
 readonly SCRIPT_DIR
 CATALOG_HELPER="$SCRIPT_DIR/tools/ppflight-template-bootstrap.py"
@@ -23,7 +23,14 @@ BALLOON="${BALLOON:-0}"
 FIREWALL="${FIREWALL:-1}"
 DISK_SSD="${DISK_SSD:-1}"
 DNS_SERVERS="${DNS_SERVERS-1.1.1.1 8.8.8.8}"
-TIMEZONE="${TIMEZONE:-UTC}"
+# TIMEZONE used to be written into the shared template vendor-data.  A
+# template is used by services in more than one region, and Cloud-Init can
+# reapply vendor-data when its datasource changes (for example after a
+# network Cloud-Init update).  Baking UTC there could therefore overwrite a
+# region timezone that the signed per-service delivery workflow had already
+# verified.  Keep accepting the legacy environment setting at the wrapper
+# boundary, but deliberately do not consume it here.  The Agent sets and
+# reads back the service region timezone only after Cloud-Init has settled.
 ALLOW_ROOT_PASSWORD_SSH="${ALLOW_ROOT_PASSWORD_SSH:-1}"
 ENABLE_QOS="${ENABLE_QOS:-1}"
 REPLACE_EXISTING="${REPLACE_EXISTING:-0}"
@@ -529,7 +536,6 @@ disable_root: false
 ssh_pwauth: $([[ "$ALLOW_ROOT_PASSWORD_SSH" == "1" ]] && echo true || echo false)
 ssh_deletekeys: true
 ssh_genkeytypes: [rsa, ecdsa, ed25519]
-timezone: $TIMEZONE
 ntp:
   enabled: true
 growpart:
@@ -586,7 +592,6 @@ disable_root: false
 ssh_pwauth: $([[ "$ALLOW_ROOT_PASSWORD_SSH" == "1" ]] && echo true || echo false)
 ssh_deletekeys: true
 ssh_genkeytypes: [rsa, ecdsa, ed25519]
-timezone: $TIMEZONE
 ntp:
   enabled: true
 growpart:

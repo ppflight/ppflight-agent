@@ -1,13 +1,13 @@
 {
   "schemaVersion": "ppflight.agent-vendor-manifest/v1",
-  "bundleVersion": "3.3.3",
+  "bundleVersion": "3.3.4",
   "catalogRevision": "2026-09-02.2",
   "catalogSha256": "a28236be654c53f2a309358764fe67fc61b167f9ea658b1bde3f8b06521a1944",
   "entrypoint": "tools/ppflight-template-bootstrap.py",
   "files": [
     {
       "path": "build-cloud-templates.sh",
-      "sha256": "161342332b519e4e89179f5a4bfbbc3e97b7e3a31ddab4d75a760d5bc7d59f75",
+      "sha256": "457d886a882c0718bbc76a81029f0a576c1b3493ec0f8cb96d75efa6d951ea3d",
       "requiredAtRuntime": true
     },
     {

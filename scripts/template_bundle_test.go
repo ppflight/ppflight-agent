@@ -94,7 +94,7 @@ func TestTemplateBundleVerifierRejectsTampering(t *testing.T) {
 }
 
 func TestVendoredTemplateBundleMatchesFrozenManifest(t *testing.T) {
-	const expectedManifestSHA256 = "14d0870708736912f176c78bcd9995e2141317b10c385a07b9693ce65d7e2fe0"
+	const expectedManifestSHA256 = "3caf0a7b15ec136ae57c684dc447274ec8df78bc83169a130d6e2390e158f29e"
 	root := filepath.Join("..", "bundles", "ppflight-cloudinit")
 	raw, err := os.ReadFile(filepath.Join(root, "agent-vendor-manifest.v1.json"))
 	if err != nil {
@@ -156,6 +156,9 @@ func TestTemplateBuilderPinsAndVerifiesSingleSocketAndQGABaselines(t *testing.T)
 	for _, forbidden := range []string{
 		"  - qemu-guest-agent\n",
 		"[systemctl, enable, --now, qemu-guest-agent]",
+		// The template must not pin one timezone. The signed service delivery
+		// action applies its region timezone only after Cloud-Init settles.
+		"timezone: $TIMEZONE",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("template builder must not defer QGA installation to first-boot Cloud-Init: %q", forbidden)
