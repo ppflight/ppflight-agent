@@ -104,6 +104,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.44` 在 rc.42 精确 IPFilter 删除基础上增加受签名约束的只读对账恢复：它只接受一条明确命名、无 UPID、结果为 `PVE_RESULT_INDETERMINATE` 的旧删除记录，并分别绑定官网 canonical payload 哈希与历史签名 wire body 哈希，以及旧 command、operation、digest、assignment revision、VM generation、IPSet 名称和 CIDR。Agent 重新读取真实 PVE IPSet、证明目标当前存在或不存在后只追加 Journal 退休证据，绝不清空或改写旧命令与回执；恢复命令成功落盘后才释放该 VM 的写锁，使精确删除可以继续。
 
+`0.1.1-rc.54` 修正备份删除：PVE backup volid 中的 `:` 和 `/` 会作为单个不透明路径段编码，且声明的备份存储必须与卷标识前缀一致，避免删除请求落到错误的 API 路径。
+
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 
 `0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。

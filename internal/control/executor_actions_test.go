@@ -1080,6 +1080,7 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 		{"delete explicit", "vm.delete", "qemu", `{"purge":true,"destroyUnreferencedDisks":false}`, http.MethodDelete, "/api2/json/nodes/pve1/qemu/101", url.Values{"purge": {"1"}, "destroy-unreferenced-disks": {"0"}}},
 		{"snapshot", "snapshot.create", "lxc", `{"name":"before","description":"safe","includeRam":false}`, http.MethodPost, "/api2/json/nodes/pve1/lxc/101/snapshot", url.Values{"snapname": {"before"}, "vmstate": {"0"}}},
 		{"backup", "backup.create", "qemu", `{"storage":"backup1","mode":"snapshot","compress":"zstd","notesTemplate":"before-upgrade"}`, http.MethodPost, "/api2/json/nodes/pve1/vzdump", url.Values{"storage": {"backup1"}, "mode": {"snapshot"}, "compress": {"zstd"}, "notes-template": {"before-upgrade"}}},
+		{"backup delete", "backup.delete", "qemu", `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst"}`, http.MethodDelete, "/api2/json/nodes/pve1/storage/backup1/content/backup1:backup/vzdump-qemu-101.vma.zst", nil},
 		{"firewall guest option legacy", "firewall.guest.set-options", "qemu", `{"enable":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/options", url.Values{"enable": {"1"}}},
 		{"firewall guest anti-spoof policy", "firewall.guest.set-options", "qemu", `{"enable":true,"policyIn":"ACCEPT","policyOut":"ACCEPT","macFilter":true}`, http.MethodPut, "/api2/json/nodes/pve1/qemu/101/firewall/options", url.Values{"enable": {"1"}, "policy_in": {"ACCEPT"}, "policy_out": {"ACCEPT"}, "macfilter": {"1"}}},
 		{"firewall node option", "firewall.node.set-options", "lxc", `{"enable":false}`, http.MethodPut, "/api2/json/nodes/pve1/firewall/options", url.Values{"enable": {"0"}}},
@@ -1095,6 +1096,9 @@ func TestExecutorControlledEndpointForms(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != tt.method || r.URL.Path != tt.path {
 					t.Fatalf("request=%s %s", r.Method, r.URL.Path)
+				}
+				if tt.action == "backup.delete" && r.URL.EscapedPath() != "/api2/json/nodes/pve1/storage/backup1/content/backup1%3Abackup%2Fvzdump-qemu-101.vma.zst" {
+					t.Fatalf("backup delete escaped path=%q", r.URL.EscapedPath())
 				}
 				_ = r.ParseForm()
 				gotForm := r.Form

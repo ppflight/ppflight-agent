@@ -22,7 +22,10 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/netpolicy"
 )
 
-var storageSegmentRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var (
+	storageSegmentRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	backupVolumeRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:(backup/)?[A-Za-z0-9][A-Za-z0-9._-]{0,191}$`)
+)
 
 const (
 	defaultTimeout      = 15 * time.Second
@@ -173,6 +176,22 @@ func (c *Client) DeleteSnippetVolume(ctx context.Context, node, storage, volume 
 	decodedPath := "/nodes/" + node + "/storage/" + storage + "/content/" + volume
 	escapedVolume := strings.ReplaceAll(url.PathEscape(volume), ":", "%3A")
 	escapedPath := "/nodes/" + url.PathEscape(node) + "/storage/" + url.PathEscape(storage) + "/content/" + escapedVolume
+	return c.do(ctx, http.MethodDelete, decodedPath, escapedPath, nil, nil, out)
+}
+
+// DeleteBackupVolume deletes exactly one validated backup volid.  PVE backup
+// volids contain both ':' and '/', so treating them as ordinary API-path text
+// changes the endpoint hierarchy. Keep the decoded path only for diagnostic
+// identity and send the opaque final segment percent-escaped on the wire.
+func (c *Client) DeleteBackupVolume(ctx context.Context, node, storage, volume string, out any) error {
+	if !storageSegmentRE.MatchString(node) || !storageSegmentRE.MatchString(storage) ||
+		!backupVolumeRE.MatchString(volume) || !strings.HasPrefix(volume, storage+":") || strings.Contains(volume, "..") {
+		return errors.New("invalid PVE backup volume identity")
+	}
+	decodedPath := "/nodes/" + node + "/storage/" + storage + "/content/" + volume
+	escapedVolume := strings.ReplaceAll(url.PathEscape(volume), ":", "%3A")
+	escapedPath := "/nodes/" + url.PathEscape(node) + "/storage/" + url.PathEscape(storage) + "/content/" + escapedVolume
+
 	return c.do(ctx, http.MethodDelete, decodedPath, escapedPath, nil, nil, out)
 }
 

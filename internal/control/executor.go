@@ -1227,11 +1227,17 @@ func validateParameters(c Command) error {
 		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || !validBackupVolume(p.Volume) {
 			return errors.New("invalid backup parameters")
 		}
+		if !strings.HasPrefix(p.Volume, p.Storage+":") {
+			return errors.New("backup volume does not belong to the declared storage")
+		}
 		return nil
 	case "backup.restore":
 		var p backupRestoreP
 		if strictParameters(c.Parameters, &p) != nil || p.Force == nil || !storageRE.MatchString(p.Storage) || !validBackupVolume(p.Volume) {
 			return errors.New("invalid backup parameters")
+		}
+		if !strings.HasPrefix(p.Volume, p.Storage+":") {
+			return errors.New("backup volume does not belong to the declared storage")
 		}
 		return nil
 	case "backup.list":
@@ -1490,7 +1496,21 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 	case "backup.delete":
 		var p backupVolumeP
 		_ = strictParameters(c.Parameters, &p)
-		method, path = http.MethodDelete, node+"/storage/"+p.Storage+"/content/"+p.Volume
+		var result json.RawMessage
+		if err := client.DeleteBackupVolume(ctx, c.Identity.NodeRef, p.Storage, p.Volume, &result); err != nil {
+			return "", nil, err
+		}
+		var text string
+		if json.Unmarshal(result, &text) == nil && strings.HasPrefix(text, "UPID:") {
+			if !upidRE.MatchString(text) {
+				return "", nil, errors.New("PVE returned an invalid task UPID")
+			}
+			return text, result, nil
+		}
+		if len(result) > 4096 {
+			result = nil
+		}
+		return "", result, nil
 	case "backup.restore":
 		var p backupRestoreP
 		_ = strictParameters(c.Parameters, &p)
