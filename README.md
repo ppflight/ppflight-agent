@@ -116,6 +116,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.2` 将 QEMU suspend/resume 的停机边界改为严格收敛：suspend 预读 stopped 时直接以已验证、零 mutation 成功返回，不会发送 POST；PVE 8/9 并发窗口只有限接受绑定当前 VMID 的 `VM <vmid> not running` 与 `VM <vmid> (is )?already stopped`（直接错误或终态 UPID），且第二次 scoped `/status/current` 已确认 stopped 才归一化。resume 按真实状态选择 stopped→start、paused→resume、running→已验证零 mutation 成功；paused→stopped 竞态只补发一次 start、等待任务并回读 running，绝不循环。不同 VMID、其他错误或读回不匹配均继续失败。
 
+`0.1.3` 为模板克隆增加 Agent 侧最终身份边界：签名命令中的目标 VMID 必须与源模板 VMID 不同。相同编号会在任何 PVE 读取、clone POST 或 Journal mutation 之前被拒绝；执行层保留同样的防御检查，不能依赖 PVE 自己报冲突。
+
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 
 `0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。

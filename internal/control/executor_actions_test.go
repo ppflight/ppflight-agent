@@ -64,6 +64,33 @@ func TestCloneRequiresFreshTemplateBaselineHash(t *testing.T) {
 	}
 }
 
+func TestCloneRejectsSourceTemplateVMIDAsTargetBeforePVEReadOrWrite(t *testing.T) {
+	command := controlCommand(
+		"vm.clone",
+		"qemu",
+		`{"sourceVmid":101,"templateRef":"ubuntu-24.04","name":"vm101","target":"pve1","storage":"local-lvm","full":true,"sourceConfigSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+	)
+	if err := validateParameters(command); err == nil || err.Error() != "invalid clone parameters" {
+		t.Fatalf("same source and target VMID validation err=%v", err)
+	}
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		requests++
+	}))
+	defer server.Close()
+	client := controlTestClient(t, server)
+	if _, _, err := executePVE(context.Background(), client, command); err == nil || err.Error() != "invalid clone parameters" {
+		t.Fatalf("same source and target VMID execution err=%v", err)
+	}
+	if err := verifyCloneSource(context.Background(), client, command, cloneP{SourceVMID: 101}); err == nil || err.Error() != "clone target VMID must differ from source template VMID" {
+		t.Fatalf("same source and target VMID defensive source verification err=%v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("same source and target VMID reached PVE %d times", requests)
+	}
+}
+
 func controlTestClient(t *testing.T, server *httptest.Server) *pve.Client {
 	t.Helper()
 	c, err := pve.NewClient(pve.Config{Endpoint: server.URL, TokenID: "root@pam!control", TokenSecret: "secret"})

@@ -1143,7 +1143,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "vm.clone":
 		var p cloneP
-		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || p.SourceVMID > 999999999 || !nameRE.MatchString(p.TemplateRef) || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
+		if strictParameters(c.Parameters, &p) != nil || p.Full == nil || !*p.Full || p.SourceVMID < 100 || p.SourceVMID > 999999999 || p.SourceVMID == c.Identity.VMID || !nameRE.MatchString(p.TemplateRef) || !nameRE.MatchString(p.Name) || !nodeRE.MatchString(p.Target) || !storageRE.MatchString(p.Storage) || !bodyHashRE.MatchString(p.SourceConfigSHA256) {
 			return errors.New("invalid clone parameters")
 		}
 		return nil
@@ -1821,6 +1821,9 @@ func guestConfig(ctx context.Context, c *pve.Client, cmd Command) (pve.GuestConf
 	return c.GuestConfig(ctx, cmd.Identity.GuestType, cmd.Identity.NodeRef, cmd.Identity.VMID)
 }
 func verifyCloneSource(ctx context.Context, c *pve.Client, cmd Command, parameters cloneP) error {
+	if parameters.SourceVMID == cmd.Identity.VMID {
+		return errors.New("clone target VMID must differ from source template VMID")
+	}
 	resources, err := c.ClusterResources(ctx)
 	if err != nil {
 		return err
