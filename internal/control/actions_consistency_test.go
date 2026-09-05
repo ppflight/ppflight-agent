@@ -74,6 +74,7 @@ func validActionParameterFixtures() map[string]string {
 		"vm.set-disk-io":                      `{"disk":"scsi0","limits":{"iopsRead":1000,"iopsWrite":1000,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":100,"mbpsReadMax":null,"mbpsWriteMax":null}}`,
 		"vm.set-network":                      `{"interface":"net0","bridge":"vmbr1"}`,
 		"vm.set-rate":                         `{"interface":"net0","rateMbps":"10"}`,
+		"vm.verify-rate":                      `{"interface":"net0","rateMbps":"10"}`,
 		"vm.set-cloud-init":                   `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":["ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="],"qgaEnabled":true}`,
 		"vm.cloud-init-snippet.delete":        `{"volume":"local:snippets/example.yaml","attachment":"network","deleteUnreferenced":true}`,
 		"vm.set-timezone":                     `{"timezone":"UTC"}`,

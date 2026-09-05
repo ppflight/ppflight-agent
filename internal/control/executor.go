@@ -362,6 +362,24 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "vm.verify-rate" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, verifyErr := verifyRate(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if verifyErr != nil {
+			r.State, r.Code = "failed", "RATE_NOT_READY"
+			return finish(verifyErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if command.Action == "firewall.guest.verify-ipfilter" {
 		client := e.ReadClient
 		if client == nil {
@@ -1133,6 +1151,12 @@ func validateParameters(c Command) error {
 			return errors.New("invalid network rate parameters")
 		}
 		return nil
+	case "vm.verify-rate":
+		var p rateP
+		if strictParameters(c.Parameters, &p) != nil || !netRE.MatchString(p.Interface) || !validRate(p.RateMbps) {
+			return errors.New("invalid network rate parameters")
+		}
+		return nil
 	case "vm.set-cloud-init":
 		var p cloudInitP
 		if strictParameters(c.Parameters, &p) != nil || p.QGAEnabled == nil || c.Identity.GuestType != "qemu" || !validCloudInit(p) {
@@ -1257,6 +1281,9 @@ func validateParameters(c Command) error {
 		var p backupGetP
 		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || !validBackupVolume(p.Volume) {
 			return errors.New("invalid backup get parameters")
+		}
+		if !strings.HasPrefix(p.Volume, p.Storage+":") {
+			return errors.New("backup volume does not belong to the declared storage")
 		}
 		return nil
 	case "vm.console.create-session":
@@ -1874,6 +1901,31 @@ func setRate(ctx context.Context, c *pve.Client, cmd Command, base string) (stri
 		form.Set("digest", current.Digest)
 	}
 	return doPVE(ctx, c, http.MethodPut, base+"/config", form)
+}
+
+// verifyRate performs the post-task PVE config readback for traffic
+// enforcement. PVE omits rate=0, so absence is the only accepted unlimited
+// representation; duplicate or malformed rate values fail closed.
+func verifyRate(ctx context.Context, c *pve.Client, cmd Command) (json.RawMessage, error) {
+	var p rateP
+	_ = strictParameters(cmd.Parameters, &p)
+	current, err := guestConfig(ctx, c, cmd)
+	if err != nil {
+		return nil, err
+	}
+	network, ok := configString(current.Raw, p.Interface)
+	if !ok {
+		return nil, errors.New("target network interface does not exist")
+	}
+	actual, ok := networkRate(network)
+	if !ok || actual != normalizedRate(p.RateMbps) {
+		return nil, errors.New("PVE network rate does not match requested value")
+	}
+	return json.Marshal(map[string]any{
+		"interface": p.Interface,
+		"rateMbps":  actual,
+		"verified":  true,
+	})
 }
 func setNetwork(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p networkP
@@ -3441,4 +3493,28 @@ func replaceRate(network, rate string) (string, error) {
 		out = append(out, "rate="+rate)
 	}
 	return strings.Join(out, ","), nil
+}
+
+func networkRate(network string) (string, bool) {
+	if strings.ContainsAny(network, "\r\n\x00") || len(network) > 4096 {
+		return "", false
+	}
+	found := false
+	rate := "0"
+	for _, part := range strings.Split(network, ",") {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "rate=") {
+			continue
+		}
+		if found {
+			return "", false
+		}
+		candidate := strings.TrimPrefix(part, "rate=")
+		if !validRate(candidate) {
+			return "", false
+		}
+		found = true
+		rate = normalizedRate(candidate)
+	}
+	return rate, true
 }

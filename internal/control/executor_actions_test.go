@@ -1467,3 +1467,41 @@ func TestExecutorFreezesPasswordResetWhenQGAUnavailableOrUnsupported(t *testing.
 		})
 	}
 }
+
+func TestVerifyRateRequiresExactPVEConfigReadback(t *testing.T) {
+	for name, network := range map[string]string{
+		"configured rate": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,rate=22.5",
+		"unlimited rate":  "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/api2/json/nodes/pve1/qemu/101/config" {
+					t.Fatalf("unexpected PVE read: %s %s", r.Method, r.URL.Path)
+				}
+				_, _ = w.Write([]byte(`{"data":{"net0":"` + network + `"}}`))
+			}))
+			defer server.Close()
+			rate := "22.5"
+			if name == "unlimited rate" {
+				rate = "0"
+			}
+			receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(
+				context.Background(), controlCommand("vm.verify-rate", "qemu", `{"interface":"net0","rateMbps":"`+rate+`"}`), time.Now(),
+			)
+			if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"verified":true`) {
+				t.Fatalf("receipt=%#v err=%v", receipt, err)
+			}
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,rate=10"}}`))
+	}))
+	defer server.Close()
+	receipt, err := (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(
+		context.Background(), controlCommand("vm.verify-rate", "qemu", `{"interface":"net0","rateMbps":"22.5"}`), time.Now(),
+	)
+	if err == nil || receipt.State != "failed" || receipt.Code != "RATE_NOT_READY" {
+		t.Fatalf("receipt=%#v err=%v", receipt, err)
+	}
+}

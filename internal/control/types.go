@@ -95,6 +95,7 @@ var protocolActions = map[string]actionSpec{
 	"vm.set-disk-io":                      {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-network":                      {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-rate":                         {scopes: map[string]bool{ScopeVM: true}},
+	"vm.verify-rate":                      {scopes: map[string]bool{ScopeVM: true}, readOnly: true},
 	"vm.set-cloud-init":                   {scopes: map[string]bool{ScopeVM: true}},
 	"vm.cloud-init-snippet.delete":        {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-timezone":                     {scopes: map[string]bool{ScopeVM: true}},
