@@ -164,6 +164,9 @@ type ControlConfig struct {
 	MaxCommandsPerPoll     int      `json:"maxCommandsPerPoll"`
 	AllowedActions         []string `json:"allowedActions"`
 	ProductionExecution    bool     `json:"productionExecution"`
+	// LegacyPollIntervalNormalized records an in-memory compatibility
+	// migration. It is never accepted from or written to agent.yaml.
+	LegacyPollIntervalNormalized bool `json:"-"`
 }
 
 // Secrets is populated from environment variables after config validation.
@@ -272,6 +275,15 @@ func Parse(contents []byte) (Config, error) {
 	}
 	if err := ensureEOF(decoder); err != nil {
 		return Config{}, err
+	}
+	// Website self-upgrade atomically replaces only the Agent binary. It does
+	// not run the installer and the unprivileged service cannot rewrite the
+	// root-owned configuration. Normalize the exact historical 30s default in
+	// memory so remotely upgraded nodes receive the current latency default;
+	// every other explicit administrator value remains unchanged.
+	if result.Control.PollInterval.Duration == 30*time.Second {
+		result.Control.PollInterval = Duration{5 * time.Second}
+		result.Control.LegacyPollIntervalNormalized = true
 	}
 	if err := result.Validate(); err != nil {
 		return Config{}, err

@@ -41,6 +41,28 @@ func TestParseAppliesSafeDefaults(t *testing.T) {
 	}
 }
 
+func TestParseNormalizesHistoricalControlPollDefaultInMemory(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"pollInterval":"30s","enabled":true`, 1)
+	cfg, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Control.PollInterval.String() != "5s" || !cfg.Control.LegacyPollIntervalNormalized {
+		t.Fatalf("historical control interval was not normalized: %#v", cfg.Control)
+	}
+}
+
+func TestParsePreservesCustomControlPollInterval(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"pollInterval":"7s","enabled":true`, 1)
+	cfg, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Control.PollInterval.String() != "7s" || cfg.Control.LegacyPollIntervalNormalized {
+		t.Fatalf("custom control interval was changed: %#v", cfg.Control)
+	}
+}
+
 func TestRejectsUnknownField(t *testing.T) {
 	input := strings.Replace(validTestConfig(), `"mode": "test"`, `"mode": "test", "typo": true`, 1)
 	if _, err := Parse([]byte(input)); err == nil || !strings.Contains(err.Error(), "unknown field") {

@@ -109,6 +109,9 @@ func run() int {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
+	if cfg.Control.LegacyPollIntervalNormalized {
+		logger.Info("legacy control poll interval normalized in memory", "from", "30s", "to", cfg.Control.PollInterval.String())
+	}
 	if cfg.Control.ProductionExecution {
 		logger.Warn("PVE production control execution is enabled", "allowedActions", cfg.Control.AllowedActions)
 	}

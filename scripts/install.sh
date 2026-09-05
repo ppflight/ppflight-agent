@@ -423,7 +423,7 @@ if control_poll_interval == "30s":
     document["control"]["pollInterval"] = "5s"
     changed = True
 if changed:
-    replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc45.", dir=directory)
+    replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc46.", dir=directory)
     try:
         os.fchmod(replacement, 0o640)
         os.fchown(replacement, metadata.st_uid, metadata.st_gid)
