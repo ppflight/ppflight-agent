@@ -17,7 +17,7 @@
   },
   "collection": {
     "sampleInterval": "10s",
-    "monitoringInterval": "30s",
+    "monitoringInterval": "1m",
     "meteringInterval": "1m",
     "inventoryInterval": "5m",
     "guestInterval": "2m",

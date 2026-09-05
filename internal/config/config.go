@@ -223,7 +223,10 @@ func defaults() Config {
 			ShutdownGrace: Duration{15 * time.Second}, LogLevel: "info",
 		},
 		Collection: CollectionConfig{
-			SampleInterval: Duration{10 * time.Second}, MonitoringInterval: Duration{30 * time.Second},
+			// Resource collection stays lightweight and frequent for freshness,
+			// while the public telemetry upload is one minute as sized for up to
+			// 384 VPS on one Agent. Metering has the same one-minute cadence.
+			SampleInterval: Duration{10 * time.Second}, MonitoringInterval: Duration{time.Minute},
 			MeteringInterval: Duration{time.Minute}, InventoryInterval: Duration{5 * time.Minute},
 			GuestInterval: Duration{2 * time.Minute}, SMARTInterval: Duration{5 * time.Minute},
 			RequestConcurrency: 8, GuestRequestConcurrency: 4,
@@ -306,6 +309,13 @@ func Parse(contents []byte) (Config, error) {
 	// agent.yaml.  Any other administrator-selected timeout remains explicit.
 	if result.Control.RequestTimeout.Duration == 10*time.Second {
 		result.Control.RequestTimeout = Duration{30 * time.Second}
+	}
+	// The original public telemetry default was 30s. For an Agent sized to
+	// 350 typical / 384 maximum VPS, normalize that exact historical default
+	// to the one-minute resource reporting cadence without rewriting the
+	// root-owned configuration during a signed binary-only upgrade.
+	if result.Collection.MonitoringInterval.Duration == 30*time.Second {
+		result.Collection.MonitoringInterval = Duration{time.Minute}
 	}
 	if err := result.Validate(); err != nil {
 		return Config{}, err

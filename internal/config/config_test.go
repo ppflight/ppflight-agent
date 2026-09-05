@@ -33,11 +33,22 @@ func TestParseAppliesSafeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" || cfg.Control.LongPollWait.String() != "25s" || cfg.Control.RequestTimeout.String() != "30s" || cfg.Control.MaxCommandsPerPoll != 1 || cfg.Control.MaxActiveConsoleSessions != 8 {
+	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Collection.MonitoringInterval.String() != "1m0s" || cfg.Control.PollInterval.String() != "5s" || cfg.Control.LongPollWait.String() != "25s" || cfg.Control.RequestTimeout.String() != "30s" || cfg.Control.MaxCommandsPerPoll != 1 || cfg.Control.MaxActiveConsoleSessions != 8 {
 		t.Fatalf("defaults not applied: %#v", cfg)
 	}
 	if cfg.PVE.Source != "disabled" || cfg.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" {
 		t.Fatalf("unexpected source defaults: %#v", cfg.PVE)
+	}
+}
+
+func TestParseNormalizesTheExactHistoricalThirtySecondTelemetryDefault(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"pve":`, `"collection":{"monitoringInterval":"30s"},"pve":`, 1)
+	cfg, err := Parse([]byte(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Collection.MonitoringInterval.String() != "1m0s" {
+		t.Fatalf("historical telemetry interval was not normalized: %s", cfg.Collection.MonitoringInterval.String())
 	}
 }
 
