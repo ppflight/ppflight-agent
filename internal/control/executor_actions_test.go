@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -443,6 +444,38 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"America/Los_Angeles"}`), time.Now())
 		if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" || !strings.Contains(string(receipt.Result), `"verified":true`) {
 			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+	})
+
+	t.Run("timezone inspection returns only a versioned IANA observation", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_ = r.ParseForm()
+				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl|show|--property=Timezone|--value" || r.Form.Get("capture-output") != "1" {
+					t.Fatalf("timezone inspection command: %v", r.Form)
+				}
+				_, _ = w.Write([]byte(`{"data":{"result":{"pid":12}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				if r.URL.Query().Get("pid") != "12" {
+					t.Fatalf("pid query: %v", r.URL.Query())
+				}
+				out := base64.StdEncoding.EncodeToString([]byte("America/Los_Angeles\n"))
+				_, _ = w.Write([]byte(`{"data":{"result":{"exited":true,"exitcode":0,"out-data":"` + out + `"}}}`))
+			default:
+				t.Fatalf("unexpected request: %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(
+			context.Background(), controlCommand("vm.inspect-timezone", "qemu", `{"notBefore":"2026-01-01T00:00:00Z"}`), time.Now(),
+		)
+		if err != nil || receipt.State != "succeeded" || receipt.Code != "SUCCEEDED" {
+			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		}
+		var result TimezoneInspectionResult
+		if err := json.Unmarshal(receipt.Result, &result); err != nil || result.ObservationSchema != "qga-timezone-v1" || result.ObservedTimezone != "America/Los_Angeles" || result.ObservedAt.IsZero() {
+			t.Fatalf("unexpected timezone observation=%s err=%v", receipt.Result, err)
 		}
 	})
 

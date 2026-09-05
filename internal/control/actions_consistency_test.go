@@ -78,6 +78,7 @@ func validActionParameterFixtures() map[string]string {
 		"vm.set-cloud-init":                   `{"hostname":"vm101","username":"root","password":"secret-value","passwordFormat":"plain","sshAuthorizedKeys":["ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE="],"qgaEnabled":true}`,
 		"vm.cloud-init-snippet.delete":        `{"volume":"local:snippets/example.yaml","attachment":"network","deleteUnreferenced":true}`,
 		"vm.set-timezone":                     `{"timezone":"UTC"}`,
+		"vm.inspect-timezone":                 `{"notBefore":"2026-01-01T00:00:00Z"}`,
 		"vm.verify-delivery":                  `{"notBefore":"2026-01-01T00:00:00Z","expected":{"cores":2,"sockets":1,"memoryMiB":1024,"disk":{"interface":"scsi0","minimumGiB":20,"limits":{"iopsRead":1000,"iopsWrite":null,"iopsReadMax":null,"iopsWriteMax":null,"iopsReadMaxLength":null,"iopsWriteMaxLength":null,"mbpsRead":100,"mbpsWrite":null,"mbpsReadMax":null,"mbpsWriteMax":null}},"networks":[{"interface":"net0","bridge":"vmbr0","mac":"AA:BB:CC:DD:EE:FF","vlan":null,"mtu":1500,"firewall":true,"rateMbps":"100","ipv4":"192.0.2.10/24","ipv6":"2001:db8::10/64","ipFilterCidrs":["192.0.2.10/32","2001:db8::10/128"]}],"timezone":"UTC"}}`,
 		"vm.delete":                           `{"purge":true,"destroyUnreferencedDisks":false}`,
 		"vm.reset-password":                   `{"username":"root","password":"secret-value","crypted":false}`,

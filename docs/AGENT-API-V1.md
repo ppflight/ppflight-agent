@@ -437,6 +437,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `vm.set-cloud-init` | QEMU only；`hostname/username/password/passwordFormat/sshAuthorizedKeys/qgaEnabled`，且 `qgaEnabled=true`。secret 不进入 result/receipt/audit。 |
 | vm | `vm.cloud-init-snippet.delete` | Linux QEMU only、修改类且必须审批。exact 参数为 `volume/attachment/deleteUnreferenced`；attachment 只能是 `network`，bool 只能为 true，volume 只能是 `<storage>:snippets/<filename>`。执行前精确证明目标 `cicustom.network` 引用并无任何其他 QEMU/LXC 引用，使用 config digest 只解除 network，再删除一个 URL-encoded storage content；同步或 UPID 终态后均回读目标 config 与 storage。Journal 只保存 storage ID、volume SHA-256 和 `validated → reference_proven → detached → delete_submitted → deleted → verified → succeeded` 阶段，不保存 volume/config/PVE response。成功 result 固定为 `detached/deleted/alreadyAbsent` 三个 bool。 |
 | vm | `vm.set-timezone` | QEMU only；IANA `timezone`，固定执行 QGA `timedatectl set-timezone`、兼容解码 PVE 8/9 的 direct 或 `{result:...}` guest-exec/exec-status 数据、等待 exit code 0，并用固定只读 `guest-get-timezone` 回验。未知/null 响应仍失败关闭；若旧 Agent 因解码问题留下无 UPID 的不确定记录，后续签名迁移可在已迁移 clone 谱系上仅退役显式列出的新记录，同时保留首次 clone 迁移标记。 |
+| vm | `vm.inspect-timezone` | QEMU read-only；exact 参数仅为 UTC `notBefore`。固定 QGA `timedatectl show --property=Timezone --value`，要求 exit 0、单行且为 IANA 名称；成功 result 精确为 `{observationSchema:"qga-timezone-v1",observedAt,observedTimezone}`，且时间不得早于 `notBefore`。不返回 QGA 原始输出。该独立 action/schema 才可建立 guest timezone baseline；旧 `vm.verify-delivery.timezoneMatched` 与 `vm.reinstall.verified` 不能替代或伪造此观测。 |
 | vm | `vm.verify-delivery` | QEMU read-only；`notBefore` 与完整 `expected` 资源/磁盘 IO/多网卡/IPFilter/时区合同。重新读取 PVE config、QGA interfaces/timezone 和 guest firewall；全部匹配才返回 ready。失败时仍只返回固定安全诊断 `{ready:false,observedAt,failedCheck}`；`failedCheck` 是 power/config/disk/QGA/network/firewall/timezone/provider_read 等冻结枚举，不返回原始 PVE/QGA 错误、配置或来宾数据。 |
 | vm | `vm.delete` | 必须显式提供 `purge` 与 `destroyUnreferencedDisks`。 |
 | vm | `vm.reset-password` | `username/password/crypted/osFamily`；QEMU Linux/Windows/非 root 账户在提交前检查 QGA `guest-set-user-password`；LXC 仅 Linux、`crypted=false`，通过固定 config password 字段重置 root。secret 不进入 receipt/audit/log。 |
@@ -496,7 +497,7 @@ volume 只接受 canonical `<storage>:snippets/<filename>`；filename 不能为�
 `internal/control/testdata/agent-v1-firewall-verify-ipfilter-result.json`
 锁定。新官网流程的两种回验都必须携带每张 NIC 的 `macAddress`；旧调用省略该字段时，Agent 为协议兼容不会在结果中添加该字段。
 
-当前共有 54 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot/snippet 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 与安全 snippet 删除的 exact JSON shape、回执及服务端接入边界见本节和 `PROVISIONING-ACTIONS-V1.md`。
+当前共有 55 个 known actions，一致性测试会枚举并锁住 registry、strict parameter validator、Executor dispatch 与 fixture，避免出现“协议允许但执行分支缺失”。动作原语存在也不表示 storage/template/archive/snapshot/snippet 的业务授权集合、审批 UI 或官网路由已经完成。`agent.upgrade` 是 node scope mutation，严格参数、manifest、root helper、回验/回滚合同见 `SELF-UPGRADE-V1.md`；它不能接收任意 URL/命令，也不能复用本地模板 helper。新增 provisioning action 与安全 snippet 删除的 exact JSON shape、回执及服务端接入边界见本节和 `PROVISIONING-ACTIONS-V1.md`。
 
 ## 8. NIC 角色、IP 切换、防盗用与 QGA capability
 
@@ -552,7 +553,7 @@ Firewall discovery 始终显式投影有效 `options.enable`。PVE API 对仍处
 
 Agent telemetry 已区分 `qga.availability.available`、`observedAt`、`freshUntil` 和 `unavailableReason`，并列出各 QGA read capability。APP 必须展示 availability 和 freshness，不能只显示最后一次成功结果，也不能把“已安装但已停止”和新鲜可用混为一谈。
 
-QEMU 的 `vm.reset-password`、`vm.set-timezone`、`vm.verify-delivery` 与重装最终回验依赖 QGA。新启动来宾的 `vm.set-timezone` 在首次 capability unavailable 后有固定 60 秒、每 2 秒一次的有界启动宽限期，并为 90 秒命令租约保留回执余量；宽限期结束仍不可用、QGA 被卸载/停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable，不得把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。LXC root password 使用 PVE 固定 config password 字段，不经过 QGA；Windows 和 QEMU 非 root 账户仍走 typed QGA password API。
+QEMU 的 `vm.reset-password`、`vm.set-timezone`、`vm.inspect-timezone`、`vm.verify-delivery` 与重装最终回验依赖 QGA。新启动来宾的 `vm.set-timezone` 在首次 capability unavailable 后有固定 60 秒、每 2 秒一次的有界启动宽限期，并为 90 秒命令租约保留回执余量；宽限期结束仍不可用、QGA 被卸载/停止、对应命令未支持或 freshness 过期时，这些步骤必须冻结/拒绝并显示 capability unavailable，不得把 PVE/QGA 错误伪装成成功。`vm.start`、`vm.shutdown`、`vm.stop`、`vm.reboot` 等纯 PVE 生命周期动作不依赖 QGA，应继续可用。LXC root password 使用 PVE 固定 config password 字段，不经过 QGA；Windows 和 QEMU 非 root 账户仍走 typed QGA password API。
 
 website guest telemetry 已携带 QGA availability/freshness，并输出 `capabilities.lifecycle/rootPasswordReset/guestNetworkVerify/metering`。QGA 缺失或过期会让依赖 capability unavailable，lifecycle 保持 available；capability 带 `observedAt/freshUntil/reason/executionPreflight`。Executor 已在 `vm.reset-password` 提交前只读查询 PVE QGA `agent/info` 并检查 `guest-set-user-password`；APP 消费/展示和 operation 中的 guest-network verify 仍属于远端待合并项。
 
@@ -597,7 +598,7 @@ payment_authorized
 | 操作线程/UPID | command/receipt 含 `operationId`；journal 保存 submitted/waiting UPID，runtime 在 command cycle 前后调用 reconcile 并查询原 UPID。 | Agent 与官网端到端恢复矩阵通过前不得称生产就绪。 |
 | watchdog/previousExit | systemd notify/watchdog、请求级采集 progress deadline、自动重启所需 unit 设置、`lifecycle-state.json` 和按 destination 启用的 website/monitoring 不可淘汰 lifecycle outbox 已实现并有 Linux/重启测试；未启用域保持 pending。 | 这是本地恢复与补报原语，不是远端 SLA；官网/监控接收、展示/告警以及真实故障演练仍需验收。 |
 | Agent 离线命令 | Agent 主动 poll、领取后的 journal/UPID/receipt durable recovery 已实现。 | 官网持久离线命令队列与 command `wait` 尚待实现/联调；任何离线场景都禁止自动回退官网直连 PVE。 |
-| 固定动作 Executor | 第 7 节 54 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console、snippet 删除等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
+| 固定动作 Executor | 第 7 节 55 个 known actions 的 registry/validator/dispatch/fixture 已有 AST 一致性测试，生产 mutation 要求 approval；新增合同见 `PROVISIONING-ACTIONS-V1.md`。 | 只是 Agent 原语；`agent.upgrade`、重装、console、snippet 删除等仍需独立产品 rollout 与真实 PVE 验收，业务 flag 默认关闭。 |
 | VPS 升级/IP Saga | 资源、网络、IPFilter/firewall 原语存在。 | 复合编排、回读、IPAM/账务提交未因这些原语自动完成。 |
 | NIC role/多 NIC 计费 | strict `nicBindings`、PVE config policy matching 与 signed netN/MAC/generation 到宿主 tap/veth counter 的逐公网 NIC 计量已实现；private NIC 不计费。 | 官网向导/assignment 签发与账本消费仍待远端合并；多 NIC guest aggregate 永远不能 active。 |
 | QGA 展示/门禁 | telemetry 已输出 availability/freshness 和四类 guest capability；Executor 在 QEMU password reset 前做 QGA command capability 读取。 | APP freshness/capability 展示与组合流程的 guest-network verify 仍待远端合并；QGA stats 不作计费。 |

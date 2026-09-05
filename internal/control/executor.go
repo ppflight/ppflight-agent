@@ -362,6 +362,24 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
 		return finish(nil)
 	}
+	if command.Action == "vm.inspect-timezone" {
+		client := e.ReadClient
+		if client == nil {
+			client = e.Client
+		}
+		if client == nil {
+			r.State, r.Code, r.FinishedAt = "failed", "EXECUTOR_NOT_CONFIGURED", time.Now().UTC()
+			return finish(errors.New("PVE read client is unavailable"))
+		}
+		result, inspectErr := inspectGuestTimezone(ctx, client, command)
+		r.FinishedAt = time.Now().UTC()
+		if inspectErr != nil {
+			r.State, r.Code = "failed", "TIMEZONE_OBSERVATION_NOT_READY"
+			return finish(inspectErr)
+		}
+		r.State, r.Code, r.Result = "succeeded", "SUCCEEDED", result
+		return finish(nil)
+	}
 	if command.Action == "vm.verify-rate" {
 		client := e.ReadClient
 		if client == nil {
@@ -917,6 +935,9 @@ type cloudInitP struct {
 type timezoneP struct {
 	Timezone string `json:"timezone"`
 }
+type timezoneInspectionP struct {
+	NotBefore time.Time `json:"notBefore"`
+}
 type deliveryP struct {
 	NotBefore time.Time        `json:"notBefore"`
 	Expected  deliveryExpected `json:"expected"`
@@ -1173,6 +1194,12 @@ func validateParameters(c Command) error {
 		var p timezoneP
 		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || !validTimezone(p.Timezone) {
 			return errors.New("invalid guest timezone parameters")
+		}
+		return nil
+	case "vm.inspect-timezone":
+		var p timezoneInspectionP
+		if strictParameters(c.Parameters, &p) != nil || c.Identity.GuestType != "qemu" || p.NotBefore.IsZero() || p.NotBefore.Location() != time.UTC {
+			return errors.New("invalid guest timezone inspection parameters")
 		}
 		return nil
 	case "vm.verify-delivery":
@@ -2066,6 +2093,74 @@ func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, ar
 	}
 }
 
+// readGuestTimezoneIANA runs one fixed, read-only argv through QGA.  QGA's
+// guest-get-timezone endpoint commonly returns an abbreviation (PDT/PST),
+// which cannot identify a single IANA zone.  timedatectl's configured
+// Timezone value is the authoritative IANA identity required by the website
+// delivery contract.  stdout is validated locally and only that bounded IANA
+// value is returned in the signed receipt.
+func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (string, error) {
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{
+		"command":        {"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"},
+		"capture-output": {"1"},
+	})
+	if err != nil {
+		return "", err
+	}
+	var pid int
+	if decodeQGACommandResult(raw, &pid) != nil {
+		var result struct {
+			PID int `json:"pid"`
+		}
+		if decodeQGACommandResult(raw, &result) != nil || result.PID < 1 {
+			return "", errors.New("QGA timezone inspection returned an invalid pid")
+		}
+		pid = result.PID
+	}
+	if pid < 1 {
+		return "", errors.New("QGA timezone inspection returned an invalid pid")
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var rawStatus json.RawMessage
+		var status struct {
+			Exited   json.RawMessage `json:"exited"`
+			ExitCode int             `json:"exitcode"`
+			OutData  string          `json:"out-data"`
+		}
+		if err := c.Do(ctx, http.MethodGet, base+"/agent/exec-status", url.Values{"pid": {strconv.Itoa(pid)}}, nil, &rawStatus); err != nil {
+			return "", err
+		}
+		if err := decodeQGACommandResult(rawStatus, &status); err != nil {
+			return "", errors.New("QGA timezone inspection returned an invalid status")
+		}
+		exited, valid := boolish(status.Exited)
+		if !valid {
+			return "", errors.New("QGA timezone inspection returned an invalid status")
+		}
+		if exited {
+			if status.ExitCode != 0 {
+				return "", fmt.Errorf("guest timezone inspection failed with exit code %d", status.ExitCode)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(status.OutData)
+			if err != nil {
+				return "", errors.New("QGA timezone inspection returned invalid output")
+			}
+			zone := strings.TrimSuffix(strings.TrimSuffix(string(decoded), "\n"), "\r")
+			if zone == "" || strings.ContainsAny(zone, "\x00\r\n") || !validTimezone(zone) {
+				return "", errors.New("QGA timezone inspection returned an invalid IANA timezone")
+			}
+			return zone, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // PVE's guest-agent proxy has returned both direct command results and a
 // nested {"result": ...} QMP envelope across supported PVE/QGA versions.
 // Decode only that single documented wrapper and never infer success from an
@@ -2480,6 +2575,16 @@ type DeliveryVerificationResult struct {
 	TimezoneMatched     bool      `json:"timezoneMatched"`
 }
 
+// TimezoneInspectionResult is intentionally a distinct, versioned result
+// schema.  It is not an extension of vm.verify-delivery: old boolean
+// timezoneMatched receipts must never be reinterpreted as an observed IANA
+// timezone by the website.
+type TimezoneInspectionResult struct {
+	ObservationSchema string    `json:"observationSchema"`
+	ObservedAt        time.Time `json:"observedAt"`
+	ObservedTimezone  string    `json:"observedTimezone"`
+}
+
 type DeliveryVerificationFailureResult struct {
 	Ready       bool                           `json:"ready"`
 	ObservedAt  time.Time                      `json:"observedAt"`
@@ -2634,6 +2739,30 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 	}
 	result, err := json.Marshal(DeliveryVerificationResult{Ready: true, ObservedAt: observedAt, PowerState: "running", ConfigMatched: true, DiskIOMatched: true, NetworkMatched: true, FirewallMatched: true, QGAFresh: true, GuestAddressMatched: true, TimezoneMatched: true})
 	return result, err
+}
+
+func inspectGuestTimezone(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, error) {
+	var p timezoneInspectionP
+	if err := strictParameters(command.Parameters, &p); err != nil {
+		return nil, err
+	}
+	if strings.ToLower(command.Identity.GuestType) != "qemu" {
+		return nil, errors.New("guest timezone inspection requires QEMU")
+	}
+	base := fmt.Sprintf("/nodes/%s/qemu/%d", command.Identity.NodeRef, command.Identity.VMID)
+	zone, err := readGuestTimezoneIANA(ctx, client, base)
+	if err != nil {
+		return nil, err
+	}
+	observedAt := time.Now().UTC().Truncate(time.Second)
+	if observedAt.Before(p.NotBefore) {
+		return nil, errors.New("timezone observation predates the command boundary")
+	}
+	return json.Marshal(TimezoneInspectionResult{
+		ObservationSchema: "qga-timezone-v1",
+		ObservedAt:        observedAt,
+		ObservedTimezone:  zone,
+	})
 }
 func diskLimitsMatch(drive string, expected diskIOLimits) bool {
 	actual := map[string]string{}

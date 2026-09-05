@@ -99,6 +99,7 @@ var protocolActions = map[string]actionSpec{
 	"vm.set-cloud-init":                   {scopes: map[string]bool{ScopeVM: true}},
 	"vm.cloud-init-snippet.delete":        {scopes: map[string]bool{ScopeVM: true}},
 	"vm.set-timezone":                     {scopes: map[string]bool{ScopeVM: true}},
+	"vm.inspect-timezone":                 {scopes: map[string]bool{ScopeVM: true}, readOnly: true},
 	"vm.verify-delivery":                  {scopes: map[string]bool{ScopeVM: true}, readOnly: true},
 	"vm.delete":                           {scopes: map[string]bool{ScopeVM: true}},
 	"vm.reset-password":                   {scopes: map[string]bool{ScopeVM: true}},
