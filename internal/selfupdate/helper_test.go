@@ -489,7 +489,7 @@ func helperPostflightFixtureWithRotation(t *testing.T, rotate bool) (HelperConfi
 			KeyID: "new-key-02", PublicKey: base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")),
 		}
 	}
-	parameters.Artifact.DownloadURL = "https://www.example.com" + upgradecontract.ArtifactPath(parameters.ReleaseTag, runtime.GOARCH)
+	parameters.Artifact.DownloadURL = "https://example.com" + upgradecontract.ArtifactPath(parameters.ReleaseTag, runtime.GOARCH)
 	manifest := upgradecontract.Manifest{
 		SchemaVersion: upgradecontract.SchemaVersion, ReleaseTag: parameters.ReleaseTag, Version: parameters.ReleaseTag,
 		AgentCommitSHA: parameters.AgentCommitSHA, InstallerCommitSHA: strings.Repeat("c", 64), Prerelease: true,
@@ -589,7 +589,7 @@ func helperPostflightFixtureWithRotation(t *testing.T, rotate bool) (HelperConfi
 	}
 	return HelperConfig{
 		StateDirectory: stateDirectory, BinaryPath: binaryPath, ServiceName: "ppflight-agent.service", StatusURL: statusServer.URL,
-		WebsiteEndpoint: "https://www.example.com/internal/v1/commands", CurrentVersion: "0.1.0-rc.9", Verify: verify,
+		WebsiteEndpoint: "https://example.com/internal/v1/commands", CurrentVersion: "0.1.0-rc.9", Verify: verify,
 		Journal: journal, HTTPClient: httpClient, Now: func() time.Time { return now },
 		ValidateUpgradeRoot:      func(string) error { return nil },
 		RunHostFirewallPreflight: func(context.Context, string) error { return nil },
@@ -606,10 +606,10 @@ func helperPostflightFixtureWithRotation(t *testing.T, rotate bool) (HelperConfi
 func helperBindingState(now time.Time, bindingID, deviceID string, credentialEpoch uint64, signingKeyID string) bindstate.State {
 	secret := enrollment.Secret(base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")))
 	credential := enrollment.HMACCredential{KeyID: "hmac-key-01", Secret: secret}
-	return bindstate.FromResponse("https://www.example.com/api/pve-agent/v1/enrollments/redeem", deviceID, enrollment.Response{
+	return bindstate.FromResponse("https://example.com/api/pve-agent/v1/enrollments/redeem", deviceID, enrollment.Response{
 		SchemaVersion: enrollment.SchemaVersion, BindingID: bindingID, DeviceID: deviceID,
 		AgentRef: "agent-01", CollectorRef: "collector-01", SourceRef: "source-01", ClusterRef: "cluster-01", NodeRef: "pve1", Site: "site-01",
-		Endpoints:                enrollment.Endpoints{Metering: "https://www.example.com/metering", Telemetry: "https://www.example.com/telemetry", Assignments: "https://www.example.com/assignments", Commands: "https://www.example.com/commands", Receipts: "https://www.example.com/receipts"},
+		Endpoints:                enrollment.Endpoints{Metering: "https://example.com/metering", Telemetry: "https://example.com/telemetry", Assignments: "https://example.com/assignments", Commands: "https://example.com/commands", Receipts: "https://example.com/receipts"},
 		HMACCredentials:          enrollment.HMACCredentials{Metering: credential, Telemetry: credential, Assignments: credential, Commands: credential, Receipts: credential},
 		CommandSigningCredential: enrollment.CommandSigningCredential{KeyID: signingKeyID, Algorithm: "ed25519", PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32))},
 		AllowedActions:           []string{"agent.upgrade"}, AssignmentDocument: json.RawMessage(`{"schemaVersion":1,"revision":"rev-01","issuedAt":"2026-08-30T00:00:00Z","assignments":[]}`),
