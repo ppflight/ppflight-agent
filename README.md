@@ -110,6 +110,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.56` 增加 `vm.inspect-timezone`：它只读执行固定 QGA `timedatectl show --property=Timezone --value`，只接受一个 IANA 区域并回传 versioned exact observation。该新 action/result schema 是独立能力门；历史 `vm.verify-delivery` 的 `timezoneMatched` 布尔值和重装 receipt 都不能建立或迁移官网时区基线。
 
+`0.1.1-rc.57` 修复 PVE 8.4 的 QGA `agent/exec` 参数编码：可执行文件只写入单个 `command`，其余固定参数写入重复 `extra-args`。这恢复了只读 `vm.inspect-timezone` 的真实 PVE 调用，并同步修复既有固定 QGA 命令；来宾输出仍只在本地严格校验，绝不进入回执或日志。
+
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 
 `0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。

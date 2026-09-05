@@ -74,6 +74,27 @@ func controlTestClient(t *testing.T, server *httptest.Server) *pve.Client {
 	return c
 }
 
+func TestQGAExecFormUsesPVE84CommandAndExtraArgsFields(t *testing.T) {
+	form, err := qgaExecForm([]string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(form["command"], "|"); got != "/usr/bin/timedatectl" {
+		t.Fatalf("command=%q", got)
+	}
+	if got := strings.Join(form["extra-args"], "|"); got != "show|--property=Timezone|--value" {
+		t.Fatalf("extra-args=%q", got)
+	}
+	if form.Get("capture-output") != "1" {
+		t.Fatalf("capture-output=%q", form.Get("capture-output"))
+	}
+	for _, argv := range [][]string{nil, {""}, {"/usr/bin/timedatectl", "bad\nvalue"}} {
+		if _, err := qgaExecForm(argv, false); err == nil {
+			t.Fatalf("unsafe argv accepted: %#v", argv)
+		}
+	}
+}
+
 func controlCommand(action, guest string, parameters string) Command {
 	command := Command{
 		OperationID: "operation-1", Scope: ScopeVM, Action: action, Parameters: json.RawMessage(parameters),
@@ -400,7 +421,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_ = r.ParseForm()
-				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl|set-timezone|Asia/Shanghai" {
+				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl" || strings.Join(r.Form["extra-args"], "|") != "set-timezone|Asia/Shanghai" {
 					t.Fatalf("timezone command: %v", r.Form)
 				}
 				_, _ = w.Write([]byte(`{"data":{"pid":7}}`))
@@ -452,7 +473,10 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 			switch {
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
 				_ = r.ParseForm()
-				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl|show|--property=Timezone|--value" || r.Form.Get("capture-output") != "1" {
+				// PVE 8.4 validates command as one scalar parameter.  The rest of
+				// the argv must use its repeated extra-args field; repeated command
+				// values are rejected before QGA is reached.
+				if strings.Join(r.Form["command"], "|") != "/usr/bin/timedatectl" || strings.Join(r.Form["extra-args"], "|") != "show|--property=Timezone|--value" || r.Form.Get("capture-output") != "1" {
 					t.Fatalf("timezone inspection command: %v", r.Form)
 				}
 				_, _ = w.Write([]byte(`{"data":{"result":{"pid":12}}}`))

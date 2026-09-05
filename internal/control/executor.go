@@ -2047,7 +2047,11 @@ func runGuestCommandWithExitCodes(ctx context.Context, c *pve.Client, base, labe
 // stdout/stderr remains private to the node and is never copied into logs or
 // signed receipts.
 func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, argv ...string) (int, error) {
-	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{"command": argv})
+	form, err := qgaExecForm(argv, false)
+	if err != nil {
+		return 0, err
+	}
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", form)
 	if err != nil {
 		return 0, err
 	}
@@ -2100,10 +2104,11 @@ func runGuestCommandExitCode(ctx context.Context, c *pve.Client, base string, ar
 // delivery contract.  stdout is validated locally and only that bounded IANA
 // value is returned in the signed receipt.
 func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (string, error) {
-	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", url.Values{
-		"command":        {"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"},
-		"capture-output": {"1"},
-	})
+	form, err := qgaExecForm([]string{"/usr/bin/timedatectl", "show", "--property=Timezone", "--value"}, true)
+	if err != nil {
+		return "", err
+	}
+	_, raw, err := doPVE(ctx, c, http.MethodPost, base+"/agent/exec", form)
 	if err != nil {
 		return "", err
 	}
@@ -2159,6 +2164,33 @@ func readGuestTimezoneIANA(ctx context.Context, c *pve.Client, base string) (str
 		case <-ticker.C:
 		}
 	}
+}
+
+// qgaExecForm encodes the documented PVE agent/exec form shape.  In
+// particular, command is one executable string and argv[1:] are repeated
+// extra-args fields.  Sending argv as repeated command fields happens to work
+// with permissive test fixtures but PVE 8.4 rejects it during parameter
+// validation, before it forwards anything to QGA.
+//
+// The executor only supplies fixed command paths and independently validated
+// signed values.  This helper nevertheless refuses control characters and an
+// empty executable so a future caller cannot accidentally turn it into an
+// arbitrary form builder.
+func qgaExecForm(argv []string, captureOutput bool) (url.Values, error) {
+	if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" || strings.ContainsAny(argv[0], "\x00\r\n") {
+		return nil, errors.New("QGA exec requires one safe command")
+	}
+	form := url.Values{"command": {argv[0]}}
+	for _, arg := range argv[1:] {
+		if strings.ContainsAny(arg, "\x00\r\n") {
+			return nil, errors.New("QGA exec argument is unsafe")
+		}
+		form.Add("extra-args", arg)
+	}
+	if captureOutput {
+		form.Set("capture-output", "1")
+	}
+	return form, nil
 }
 
 // PVE's guest-agent proxy has returned both direct command results and a

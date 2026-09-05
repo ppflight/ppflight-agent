@@ -507,7 +507,7 @@ func TestReinstallUsesFixedTemplateCompensationAndFinalReadback(t *testing.T) {
 			}
 			if strings.HasSuffix(r.URL.Path, "/agent/exec") {
 				_ = r.ParseForm()
-				guestCommand := strings.Join(r.Form["command"], "|")
+				guestCommand := strings.Join(append(append([]string{}, r.Form["command"]...), r.Form["extra-args"]...), "|")
 				guestCommands = append(guestCommands, guestCommand)
 				if guestCommand == "/usr/bin/cloud-init|status|--wait" {
 					cloudInitAttempts++
