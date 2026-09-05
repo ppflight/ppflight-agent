@@ -184,7 +184,8 @@ func (j *Journal) validateLegacyMigrationClaimLocked(command Command, parameters
 }
 
 func legacyCloneEligibilityError(record journalRecord, command Command, parameters legacyJournalMigrationP, resourceKey string) error {
-	if record.CommandID != parameters.LegacyCloneCommandID || record.OperationID != parameters.LegacyCloneOperationID || record.ResourceKey != resourceKey {
+	if record.CommandID != parameters.LegacyCloneCommandID || record.OperationID != parameters.LegacyCloneOperationID ||
+		(record.ResourceKey != resourceKey && !migratedCloneAncestorIdentityMatches(record, command)) {
 		return ErrCloneResourceIdentityMismatch
 	}
 	action, actionOK := legacyRecordAction(record)
@@ -230,14 +231,28 @@ func migratedCloneAuthorityMatches(record journalRecord, command Command, legacy
 		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&
 		record.ServiceRef == command.Identity.ServiceRef && record.InstanceUUID == command.Identity.InstanceUUID &&
 		record.GuestType == command.Identity.GuestType && record.VMID == command.Identity.VMID &&
-		uint64(record.Generation) == command.Identity.Generation
+		record.Generation > 0 && uint64(record.Generation) <= command.Identity.Generation
+}
+
+// A successful clone remains the immutable lineage root when a reinstall
+// advances an instance generation.  Once that clone has already passed the
+// signed migration ceremony, a later generation may use it as an ancestor
+// proof only when every stable resource identity matches and the generation
+// moves strictly forward.  This does not relax the current-generation check
+// on the explicitly listed indeterminate record.
+func migratedCloneAncestorIdentityMatches(record journalRecord, command Command) bool {
+	return record.MigratedAt != nil && !record.MigratedAt.IsZero() && record.MigratedByCommandID != "" &&
+		record.ClusterRef == command.Identity.ClusterRef && record.NodeRef == command.Identity.NodeRef &&
+		record.ServiceRef == command.Identity.ServiceRef && record.InstanceUUID == command.Identity.InstanceUUID &&
+		record.GuestType == command.Identity.GuestType && record.VMID == command.Identity.VMID &&
+		record.Generation > 0 && uint64(record.Generation) < command.Identity.Generation
 }
 
 func legacyIndeterminateEligible(record journalRecord, command Command, legacyAssignmentRevision protocol.Counter, resourceKey, commandID string) bool {
 	action, actionOK := legacyRecordAction(record)
 	if !actionOK || record.CommandID != commandID || record.ResourceKey != resourceKey || !record.Mutating || action == "vm.migrate-legacy-journal" ||
 		record.State != "indeterminate" || record.PVETaskUPID != "" || record.AgentUpgradeID != "" || record.Receipt == nil ||
-		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code) ||
+		record.Receipt.State != "indeterminate" || !legacyIndeterminateReceiptCode(record.Receipt.Code, action) ||
 		record.Receipt.CommandID != record.CommandID || record.Receipt.OperationID != record.OperationID ||
 		record.Receipt.AgentRef != record.AgentRef || record.Receipt.PVETaskUPID != "" || record.Receipt.AgentUpgradeID != "" {
 		return false
@@ -325,8 +340,19 @@ func optionalCounterMatches(value, expected protocol.Counter) bool {
 	return value == 0 || value == expected
 }
 
-func legacyIndeterminateReceiptCode(code string) bool {
-	return code == "EXECUTION_INDETERMINATE" || code == "PVE_RESULT_INDETERMINATE"
+func legacyIndeterminateReceiptCode(code, action string) bool {
+	if code == "EXECUTION_INDETERMINATE" || code == "PVE_RESULT_INDETERMINATE" {
+		return true
+	}
+	if code != "PVE_ACTION_INDETERMINATE" {
+		return false
+	}
+	switch action {
+	case "vm.start", "vm.shutdown", "vm.stop", "vm.reboot", "vm.suspend", "vm.resume":
+		return true
+	default:
+		return false
+	}
 }
 
 func validJournalMigrationMarkers(record journalRecord) bool {
@@ -345,7 +371,7 @@ func validJournalMigrationMarkers(record journalRecord) bool {
 	if record.RetiredByCommandID != "" {
 		validLegacyRetirement := record.Action != "vm.migrate-legacy-journal" && record.State == "indeterminate" &&
 			record.PVETaskUPID == "" && record.AgentUpgradeID == "" && record.Receipt != nil &&
-			record.Receipt.State == "indeterminate" && legacyIndeterminateReceiptCode(record.Receipt.Code) &&
+			record.Receipt.State == "indeterminate" && legacyIndeterminateReceiptCode(record.Receipt.Code, record.Action) &&
 			record.Receipt.PVETaskUPID == "" && record.Receipt.AgentUpgradeID == ""
 		if !validLegacyRetirement && !knownDelete501RetirementShape(record) {
 			return false

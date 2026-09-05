@@ -118,6 +118,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.3` 为模板克隆增加 Agent 侧最终身份边界：签名命令中的目标 VMID 必须与源模板 VMID 不同。相同编号会在任何 PVE 读取、clone POST 或 Journal mutation 之前被拒绝；执行层保留同样的防御检查，不能依赖 PVE 自己报冲突。
 
+`0.1.4` 修复重装递增 VM generation 后，已由官网真实状态恢复完成的电源命令仍永久占用 Agent Journal 资源锁的问题。已迁移且身份完全一致的原始 clone 可作为后续 generation 的祖先证明；退役仍仅接受明确列出的、无 PVE UPID 的不确定记录，`PVE_ACTION_INDETERMINATE` 只允许受控电源动作，跨实例、跨绑定及反向代际继续拒绝。
+
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 
 `0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。

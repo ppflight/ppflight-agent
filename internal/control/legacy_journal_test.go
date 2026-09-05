@@ -590,6 +590,57 @@ func TestLegacyJournalMigrationAcceptsCompleteHistoricalAuthorityProductionShape
 	}
 }
 
+func TestLegacyJournalMigrationRetiresLaterGenerationPowerRecordFromMigratedCloneAncestor(t *testing.T) {
+	journal, clone, firstMigration, firstParameters, now := legacyMigrationFixture(t)
+	if _, duplicate, err := journal.ClaimWithAudit(firstMigration, now.Add(2*time.Second), "0.1.3"); err != nil || duplicate {
+		t.Fatalf("first migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	firstResult, err := journal.MigrateLegacyVMJournal(firstMigration, firstParameters, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRaw, _ := json.Marshal(firstResult)
+	firstReceipt := Receipt{SchemaVersion: 1, ReceiptID: "99999999-9999-4999-8999-999999999999", CommandID: firstMigration.CommandID,
+		OperationID: firstMigration.OperationID, AgentRef: firstMigration.AgentRef, State: "succeeded", Code: "SUCCEEDED",
+		ExecutionMode: "production", StartedAt: now.Add(2 * time.Second), FinishedAt: now.Add(3 * time.Second), Result: firstRaw}
+	if err := journal.Complete(firstMigration, firstReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	power := legacyAuthorityCommand("vm.suspend", `{}`, "later-generation-power-command", "later-generation-power-operation")
+	power.AssignmentRevision = 46
+	power.Identity = firstMigration.Identity
+	power.Identity.Generation = 4
+	if _, duplicate, err := journal.ClaimWithAudit(power, now.Add(4*time.Second), "0.1.3"); err != nil || duplicate {
+		t.Fatalf("power claim duplicate=%t err=%v", duplicate, err)
+	}
+	powerReceipt := Receipt{SchemaVersion: 1, ReceiptID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", CommandID: power.CommandID,
+		OperationID: power.OperationID, AgentRef: power.AgentRef, State: "indeterminate", Code: "PVE_ACTION_INDETERMINATE",
+		ExecutionMode: "production", StartedAt: now.Add(4 * time.Second), FinishedAt: now.Add(5 * time.Second)}
+	if err := journal.Complete(power, powerReceipt); err != nil {
+		t.Fatal(err)
+	}
+
+	parameters := firstParameters
+	parameters.LegacyAssignmentRevision = 46
+	parameters.RetireIndeterminateCommandIDs = []string{power.CommandID}
+	raw, _ := json.Marshal(parameters)
+	migration := legacyAuthorityCommand("vm.migrate-legacy-journal", string(raw), "later-generation-migration-command", "later-generation-migration-operation")
+	migration.AssignmentRevision = 47
+	migration.Identity = power.Identity
+	if _, duplicate, err := journal.ClaimWithAudit(migration, now.Add(6*time.Second), "0.1.4"); err != nil || duplicate {
+		t.Fatalf("later migration claim duplicate=%t err=%v", duplicate, err)
+	}
+	result, err := journal.MigrateLegacyVMJournal(migration, parameters, now.Add(7*time.Second))
+	if err != nil || len(result.RetiredIndeterminateCommandIDs) != 1 || result.RetiredIndeterminateCommandIDs[0] != power.CommandID {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	cloneRecord, err := readJournal(journal.path(clone.CommandID))
+	if err != nil || cloneRecord.Generation != 1 {
+		t.Fatalf("clone lineage generation changed: record=%#v err=%v", cloneRecord, err)
+	}
+}
+
 // This reproduces the older production records observed on VMID 100: the
 // record-level action and clone source identity were absent, while the signed
 // audit projection retained the exact action, revision, signer and VM target.
