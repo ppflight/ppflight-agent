@@ -44,6 +44,7 @@ type HelperConfig struct {
 	RunHostFirewallPreflight  func(context.Context, string) error
 	RunHostFirewallPostflight func(context.Context, string) error
 	SaveResult                func(string, Result) error
+	ValidateUpgradeRoot       func(string) error
 }
 
 const (
@@ -108,11 +109,14 @@ func RunHelper(ctx context.Context, cfg HelperConfig) error {
 	if cfg.SaveResult == nil {
 		cfg.SaveResult = saveResult
 	}
+	if cfg.ValidateUpgradeRoot == nil {
+		cfg.ValidateUpgradeRoot = validateUpgradeRoot
+	}
 	coordinator, err := New(Config{StateDirectory: cfg.StateDirectory, WebsiteEndpoint: cfg.WebsiteEndpoint, CurrentVersion: cfg.CurrentVersion, HTTPClient: cfg.HTTPClient, Now: cfg.Now})
 	if err != nil {
 		return err
 	}
-	if err := validateUpgradeRoot(filepath.Join(cfg.StateDirectory, "upgrades")); err != nil {
+	if err := cfg.ValidateUpgradeRoot(filepath.Join(cfg.StateDirectory, "upgrades")); err != nil {
 		return err
 	}
 	requestPath, request, err := nextRequest(cfg.StateDirectory)

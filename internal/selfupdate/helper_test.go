@@ -591,6 +591,7 @@ func helperPostflightFixtureWithRotation(t *testing.T, rotate bool) (HelperConfi
 		StateDirectory: stateDirectory, BinaryPath: binaryPath, ServiceName: "ppflight-agent.service", StatusURL: statusServer.URL,
 		WebsiteEndpoint: "https://www.example.com/internal/v1/commands", CurrentVersion: "0.1.0-rc.9", Verify: verify,
 		Journal: journal, HTTPClient: httpClient, Now: func() time.Time { return now },
+		ValidateUpgradeRoot:      func(string) error { return nil },
 		RunHostFirewallPreflight: func(context.Context, string) error { return nil },
 		RunSystemctl: func(context.Context, ...string) error {
 			state, err := bindstate.Load(stateDirectory)
