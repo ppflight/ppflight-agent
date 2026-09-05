@@ -284,6 +284,54 @@ func TestControlAuditGateClosesOnPostPollReconcileFailureAndRecovers(t *testing.
 	}
 }
 
+func TestControlAuditGateOpensWhileCommandLongPollIsIdle(t *testing.T) {
+	directory := t.TempDir()
+	poller := &blockingGatePoller{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service := newGateTestService(t, directory, poller)
+	app := &App{
+		control: service,
+		health:  health.New("test", "test", "agent-ha", "cluster-ha", "node-ha", true, true, false, time.Now().UTC()),
+		logger:  discardedLogger(),
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		app.runControlLogged(context.Background())
+	}()
+	select {
+	case <-poller.started:
+	case <-time.After(time.Second):
+		t.Fatal("control poll did not begin")
+	}
+	if !app.controlAuditReady.Load() {
+		close(poller.release)
+		<-done
+		t.Fatal("audit gate did not open after pre-poll reconciliation")
+	}
+	readerAcquired := make(chan struct{})
+	go func() {
+		app.controlAuditGate.RLock()
+		close(readerAcquired)
+		app.controlAuditGate.RUnlock()
+	}()
+	select {
+	case <-readerAcquired:
+	case <-time.After(200 * time.Millisecond):
+		close(poller.release)
+		<-done
+		t.Fatal("an idle command long-poll held the audit delivery gate")
+	}
+	close(poller.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("control cycle did not complete")
+	}
+}
+
 func TestControlAuditGateSerializesTheEntireUpload(t *testing.T) {
 	requestStarted := make(chan struct{}, 1)
 	releaseResponse := make(chan struct{})
@@ -379,6 +427,17 @@ type gateTestPoller struct {
 	response control.PollResponse
 	onPoll   func()
 	calls    int
+}
+
+type blockingGatePoller struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *blockingGatePoller) Poll(context.Context, string) (control.PollResponse, error) {
+	close(p.started)
+	<-p.release
+	return control.PollResponse{SchemaVersion: 1, Cursor: "cursor-1", Commands: []control.Command{}}, nil
 }
 
 func (p *gateTestPoller) Poll(context.Context, string) (control.PollResponse, error) {

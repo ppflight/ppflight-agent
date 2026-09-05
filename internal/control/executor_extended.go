@@ -596,6 +596,19 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	}
 	var parameters consoleCreateP
 	_ = strictParameters(command.Parameters, &parameters)
+	sessionRef, err := protocol.NewID()
+	if err != nil {
+		return nil, err
+	}
+	if err := sink.Reserve(sessionRef); err != nil {
+		return nil, fmt.Errorf("console session capacity: %w", err)
+	}
+	published := false
+	defer func() {
+		if !published {
+			sink.Release(sessionRef)
+		}
+	}()
 	var response struct {
 		Ticket string         `json:"ticket"`
 		Port   pveConsolePort `json:"port"`
@@ -614,10 +627,6 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 			ticket[index] = 0
 		}
 	}()
-	sessionRef, err := protocol.NewID()
-	if err != nil {
-		return nil, err
-	}
 	// The website console registration contract uses canonical RFC3339 UTC
 	// seconds. time.Time would otherwise preserve the executor clock's
 	// fractional nanoseconds and PVE would succeed only for the broker to reject
@@ -633,6 +642,7 @@ func executeConsoleSession(ctx context.Context, client *pve.Client, sink Console
 	if publication.SessionRef != sessionRef || publication.State != "ready" || publication.ExpiresAt.After(expiresAt) || publication.ExpiresAt.Before(now.UTC()) || publication.BrowserPath == "" || len(publication.BrowserPath) > 512 || strings.ContainsAny(publication.BrowserPath, "\x00\r\n") || !strings.HasPrefix(publication.BrowserPath, "/") {
 		return nil, errors.New("console broker returned invalid publication")
 	}
+	published = true
 	return json.Marshal(publication)
 }
 

@@ -20,6 +20,11 @@ import (
 
 const maxPollResponseBytes = 1 << 20
 
+const (
+	defaultLongPollWait     = 25 * time.Second
+	longPollTimeoutHeadroom = 5 * time.Second
+)
+
 type PollResponse struct {
 	SchemaVersion int       `json:"schemaVersion"`
 	Cursor        string    `json:"cursor"`
@@ -38,8 +43,12 @@ type ClientConfig struct {
 	KeyID       string
 	Secret      []byte
 	BearerToken string
-	Timeout     time.Duration
-	HTTPClient  *http.Client
+	// Wait is the maximum server-side command long-poll duration. It is sent
+	// as an authenticated query parameter, so an intermediary cannot extend a
+	// request after the Agent has signed it.
+	Wait       time.Duration
+	Timeout    time.Duration
+	HTTPClient *http.Client
 	// ServerIPv4Allowlist is deprecated and ignored. Transport is tcp4-only.
 	ServerIPv4Allowlist []string
 	Now                 func() time.Time
@@ -53,6 +62,7 @@ type Client struct {
 	keyID       string
 	secret      []byte
 	bearerToken string
+	wait        time.Duration
 	http        *http.Client
 	now         func() time.Time
 }
@@ -64,6 +74,15 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if cfg.Limit < 1 || cfg.Limit > 100 {
 		return nil, errors.New("control poll limit must be 1-100")
+	}
+	if cfg.Limit != 1 {
+		return nil, errors.New("control poll limit must be exactly 1")
+	}
+	if cfg.Wait == 0 {
+		cfg.Wait = defaultLongPollWait
+	}
+	if cfg.Wait < 0 || cfg.Wait > defaultLongPollWait {
+		return nil, errors.New("control long-poll wait must be between 0s and 25s")
 	}
 	switch cfg.AuthMode {
 	case uploader.AuthHMACSHA256:
@@ -79,7 +98,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		return nil, errors.New("unsupported control authentication mode")
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 10 * time.Second
+		cfg.Timeout = cfg.Wait + longPollTimeoutHeadroom
+	}
+	if cfg.Timeout < cfg.Wait+longPollTimeoutHeadroom {
+		return nil, errors.New("control request timeout must exceed long-poll wait by at least 5s")
 	}
 	if cfg.HTTPClient == nil {
 		transport := netpolicy.ApplyIPv4Only(http.DefaultTransport.(*http.Transport).Clone())
@@ -117,7 +139,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	return &Client{
 		endpoint: cfg.Endpoint, agentRef: cfg.AgentRef, limit: cfg.Limit,
 		authMode: cfg.AuthMode, keyID: cfg.KeyID, secret: append([]byte(nil), cfg.Secret...),
-		bearerToken: cfg.BearerToken, http: cfg.HTTPClient, now: cfg.Now,
+		bearerToken: cfg.BearerToken, wait: cfg.Wait, http: cfg.HTTPClient, now: cfg.Now,
 	}, nil
 }
 
@@ -129,6 +151,7 @@ func (c *Client) Poll(ctx context.Context, after string) (PollResponse, error) {
 	query := endpoint.Query()
 	query.Set("agentRef", c.agentRef)
 	query.Set("limit", strconv.Itoa(c.limit))
+	query.Set("wait", strconv.FormatInt(int64(c.wait/time.Second), 10))
 	if after != "" {
 		query.Set("after", after)
 	}

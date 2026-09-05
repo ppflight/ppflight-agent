@@ -22,7 +22,7 @@ import (
 func TestClientSignsExactPollQuery(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("agentRef") != "agent-1" || r.URL.Query().Get("after") != "cursor-1" || r.URL.Query().Get("limit") != "7" {
+		if r.URL.Query().Get("agentRef") != "agent-1" || r.URL.Query().Get("after") != "cursor-1" || r.URL.Query().Get("limit") != "1" || r.URL.Query().Get("wait") != "25" {
 			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
 		}
 		if err := protocol.VerifyRequest(r, nil, func(keyID string) ([]byte, error) {
@@ -36,13 +36,22 @@ func TestClientSignsExactPollQuery(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(PollResponse{SchemaVersion: 1, Cursor: "cursor-2", Commands: []Command{}})
 	}))
 	defer server.Close()
-	client, err := NewClient(ClientConfig{Endpoint: server.URL, AgentRef: "agent-1", Limit: 7, AuthMode: uploader.AuthHMACSHA256, KeyID: "key-1", Secret: []byte("secret"), Now: func() time.Time { return now }, HTTPClient: server.Client(), ServerIPv4Allowlist: []string{"127.0.0.1"}})
+	client, err := NewClient(ClientConfig{Endpoint: server.URL, AgentRef: "agent-1", Limit: 1, AuthMode: uploader.AuthHMACSHA256, KeyID: "key-1", Secret: []byte("secret"), Now: func() time.Time { return now }, HTTPClient: server.Client(), ServerIPv4Allowlist: []string{"127.0.0.1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, err := client.Poll(context.Background(), "cursor-1")
 	if err != nil || result.Cursor != "cursor-2" {
 		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestClientRejectsBatchClaimsAndTimeoutsThatCannotCarryTheWait(t *testing.T) {
+	if _, err := NewClient(ClientConfig{Endpoint: "https://127.0.0.1:8443/commands", AgentRef: "agent-1", Limit: 2, AuthMode: uploader.AuthNone}); err == nil {
+		t.Fatal("batch claim limit was accepted")
+	}
+	if _, err := NewClient(ClientConfig{Endpoint: "https://127.0.0.1:8443/commands", AgentRef: "agent-1", Limit: 1, Wait: 25 * time.Second, Timeout: 25 * time.Second, AuthMode: uploader.AuthNone}); err == nil {
+		t.Fatal("timeout without long-poll headroom was accepted")
 	}
 }
 

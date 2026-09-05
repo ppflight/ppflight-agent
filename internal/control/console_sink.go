@@ -25,6 +25,11 @@ import (
 
 const maxConsoleBrokerResponseBytes = 64 << 10
 
+// DefaultMaxActiveConsoleSessions is intentionally small: each session holds
+// a local PVE VNC socket and a reverse WSS tunnel. Operators may configure a
+// value from 1 through 64 in control.maxActiveConsoleSessions.
+const DefaultMaxActiveConsoleSessions = 8
+
 // HTTPSConsoleSessionSink registers only secret-free identity metadata, then
 // opens an Agent-originated WSS tunnel to the same website origin. The PVE
 // ticket is consumed locally during the RFB authentication handshake and is
@@ -38,6 +43,8 @@ type HTTPSConsoleSessionSink struct {
 	now          func() time.Time
 	mu           sync.Mutex
 	active       map[string]*activeConsoleSession
+	reserved     map[string]struct{}
+	maxActive    int
 }
 
 type activeConsoleSession struct {
@@ -48,8 +55,12 @@ type activeConsoleSession struct {
 }
 
 func NewHTTPSConsoleSessionSink(receiptURL, keyID string, secret []byte, timeout time.Duration) (*HTTPSConsoleSessionSink, error) {
+	return NewHTTPSConsoleSessionSinkWithLimit(receiptURL, keyID, secret, timeout, DefaultMaxActiveConsoleSessions)
+}
+
+func NewHTTPSConsoleSessionSinkWithLimit(receiptURL, keyID string, secret []byte, timeout time.Duration, maxActive int) (*HTTPSConsoleSessionSink, error) {
 	parsed, err := url.Parse(receiptURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || netpolicy.ValidateIPv4URL(parsed) != nil || keyID == "" || len(secret) < 16 {
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || netpolicy.ValidateIPv4URL(parsed) != nil || keyID == "" || len(secret) < 16 || maxActive < 1 || maxActive > 64 {
 		return nil, errors.New("console broker configuration is invalid")
 	}
 	if timeout <= 0 {
@@ -74,8 +85,49 @@ func NewHTTPSConsoleSessionSink(receiptURL, keyID string, secret []byte, timeout
 		},
 		tunnelClient: &http.Client{Transport: transport, CheckRedirect: redirect},
 		keyID:        keyID, secret: append([]byte(nil), secret...), now: time.Now,
-		active: make(map[string]*activeConsoleSession),
+		active: make(map[string]*activeConsoleSession), reserved: make(map[string]struct{}), maxActive: maxActive,
 	}, nil
+}
+
+// Reserve makes capacity enforcement happen before a PVE vncproxy call. A
+// reservation is promoted to active by Publish, or released on every error.
+func (s *HTTPSConsoleSessionSink) Reserve(sessionRef string) error {
+	if s == nil || sessionRef == "" || len(sessionRef) > 128 {
+		return errors.New("console broker is unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active == nil {
+		s.active = make(map[string]*activeConsoleSession)
+	}
+	if s.reserved == nil {
+		s.reserved = make(map[string]struct{})
+	}
+	if _, exists := s.active[sessionRef]; exists {
+		return errors.New("console session is already active")
+	}
+	if _, exists := s.reserved[sessionRef]; exists {
+		return errors.New("console session is already reserved")
+	}
+	limit := s.maxActive
+	if limit == 0 { // Directly constructed legacy test sinks retain safe default.
+		limit = DefaultMaxActiveConsoleSessions
+	}
+	if len(s.active)+len(s.reserved) >= limit {
+		return errors.New("active console session limit reached")
+	}
+	s.reserved[sessionRef] = struct{}{}
+
+	return nil
+}
+
+func (s *HTTPSConsoleSessionSink) Release(sessionRef string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.reserved, sessionRef)
+	s.mu.Unlock()
 }
 
 func (s *HTTPSConsoleSessionSink) Publish(ctx context.Context, registration ConsoleTunnelRegistration, local ConsoleLocalEndpoint) (ConsoleSessionPublication, error) {
@@ -83,12 +135,26 @@ func (s *HTTPSConsoleSessionSink) Publish(ctx context.Context, registration Cons
 		zeroBytes(local.Ticket)
 		return ConsoleSessionPublication{}, errors.New("console broker is unavailable")
 	}
+	// Executor callers have already reserved a slot. Keep direct sink callers
+	// safe too (the latter are used by protocol tests and diagnostics only).
 	s.mu.Lock()
 	_, alreadyActive := s.active[registration.SessionRef]
+	_, reserved := s.reserved[registration.SessionRef]
 	s.mu.Unlock()
 	if alreadyActive {
 		zeroBytes(local.Ticket)
 		return ConsoleSessionPublication{}, errors.New("console session is already active")
+	}
+	reservedHere := false
+	if !reserved {
+		if err := s.Reserve(registration.SessionRef); err != nil {
+			zeroBytes(local.Ticket)
+			return ConsoleSessionPublication{}, err
+		}
+		reservedHere = true
+	}
+	if reservedHere {
+		defer s.Release(registration.SessionRef)
 	}
 	localConn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(local.Port)))
 	if err != nil {
@@ -134,6 +200,7 @@ func (s *HTTPSConsoleSessionSink) Publish(ctx context.Context, registration Cons
 		_ = tunnelConn.Close()
 		return ConsoleSessionPublication{}, errors.New("console session is already active")
 	}
+	delete(s.reserved, registration.SessionRef)
 	s.active[registration.SessionRef] = session
 	s.mu.Unlock()
 	cleanupLocal = false
@@ -177,6 +244,11 @@ func (s *HTTPSConsoleSessionSink) serve(session *activeConsoleSession) {
 			delete(s.active, session.registration.SessionRef)
 		}
 		s.mu.Unlock()
+		// Tell the website to revoke the published session as soon as the
+		// browser or local PVE stream ends. This releases the next website FIFO
+		// waiter without waiting for the 120-second ticket expiry. Failure is
+		// intentionally non-fatal: the bounded website sweeper is the backstop.
+		s.notifyClosed(session.registration)
 	}()
 	if establishBrowserRFB(session.tunnel, session.local) != nil {
 		return
@@ -189,6 +261,33 @@ func (s *HTTPSConsoleSessionSink) serve(session *activeConsoleSession) {
 	go copyStream(session.local, session.tunnel)
 	go copyStream(session.tunnel, session.local)
 	<-done
+}
+
+func (s *HTTPSConsoleSessionSink) notifyClosed(registration ConsoleTunnelRegistration) {
+	if s == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = s.Revoke(ctx, ConsoleSessionRevoke{
+		SchemaVersion:      1,
+		SessionRef:         registration.SessionRef,
+		CommandID:          registration.CommandID,
+		IdempotencyKey:     registration.IdempotencyKey,
+		OperationID:        registration.OperationID,
+		BindingID:          registration.BindingID,
+		DeviceID:           registration.DeviceID,
+		CredentialEpoch:    registration.CredentialEpoch,
+		AssignmentRevision: registration.AssignmentRevision,
+		AgentRef:           registration.AgentRef,
+		ClusterRef:         registration.ClusterRef,
+		ServiceRef:         registration.ServiceRef,
+		InstanceUUID:       registration.InstanceUUID,
+		Generation:         registration.Generation,
+		NodeRef:            registration.NodeRef,
+		GuestType:          registration.GuestType,
+		VMID:               registration.VMID,
+	})
 }
 
 func (s *HTTPSConsoleSessionSink) Revoke(ctx context.Context, revoke ConsoleSessionRevoke) error {
@@ -204,6 +303,7 @@ func (s *HTTPSConsoleSessionSink) Revoke(ctx context.Context, revoke ConsoleSess
 	if session != nil {
 		delete(s.active, revoke.SessionRef)
 	}
+	delete(s.reserved, revoke.SessionRef)
 	s.mu.Unlock()
 	if session != nil {
 		session.cancel()
@@ -228,6 +328,7 @@ func (s *HTTPSConsoleSessionSink) Invalidate() {
 		sessions = append(sessions, session)
 		delete(s.active, ref)
 	}
+	clear(s.reserved)
 	s.mu.Unlock()
 	for _, session := range sessions {
 		session.cancel()

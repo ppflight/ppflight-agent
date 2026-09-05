@@ -177,6 +177,11 @@ type IPFilterDeleteJournalReconciler interface {
 }
 
 type ConsoleSessionSink interface {
+	// Reserve claims one bounded local console slot before the executor asks
+	// PVE for a vncproxy ticket. It prevents a burst from creating tickets or
+	// sockets beyond the Agent's configured capacity.
+	Reserve(sessionRef string) error
+	Release(sessionRef string)
 	Publish(context.Context, ConsoleTunnelRegistration, ConsoleLocalEndpoint) (ConsoleSessionPublication, error)
 	Revoke(context.Context, ConsoleSessionRevoke) error
 	Invalidate()

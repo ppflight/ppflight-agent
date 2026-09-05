@@ -325,6 +325,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 			Endpoint: cfg.Control.PollURL, AgentRef: cfg.Identity.AgentRef, Limit: cfg.Control.MaxCommandsPerPoll,
 			AuthMode: uploader.AuthMode(cfg.Control.Auth.Mode), KeyID: secrets.ControlAPI.KeyID,
 			Secret: secrets.ControlAPI.Secret, BearerToken: secrets.ControlAPI.Bearer,
+			Wait:    cfg.Control.LongPollWait.Duration,
 			Timeout: cfg.Control.RequestTimeout.Duration,
 		})
 		if clientErr != nil {
@@ -351,7 +352,7 @@ func New(cfg config.Config, secrets config.Secrets, version string, logger *slog
 		if upgradeErr != nil {
 			return nil, fmt.Errorf("create self-update coordinator: %w", upgradeErr)
 		}
-		consoleSink, consoleErr := control.NewHTTPSConsoleSessionSink(cfg.Control.ResultURL, secrets.ControlReceipts.KeyID, secrets.ControlReceipts.Secret, cfg.Control.RequestTimeout.Duration)
+		consoleSink, consoleErr := control.NewHTTPSConsoleSessionSinkWithLimit(cfg.Control.ResultURL, secrets.ControlReceipts.KeyID, secrets.ControlReceipts.Secret, cfg.Control.RequestTimeout.Duration, cfg.Control.MaxActiveConsoleSessions)
 		if consoleErr != nil {
 			return nil, fmt.Errorf("create console session broker: %w", consoleErr)
 		}
@@ -1086,19 +1087,34 @@ func (a *App) controlLoop(ctx context.Context) {
 }
 func (a *App) runControlLogged(ctx context.Context) {
 	a.controlAuditGate.Lock()
-	defer a.controlAuditGate.Unlock()
 	a.controlAuditReady.Store(false)
 	reconciledBefore, reconcileBeforeErr := a.control.ReconcileOnce(ctx)
 	if reconcileBeforeErr != nil {
+		a.controlAuditGate.Unlock()
 		a.health.ControlPoll(time.Now(), reconcileBeforeErr)
 		a.logger.Warn("control journal reconciliation failed; command polling remains paused", "error", safeLogError(reconcileBeforeErr))
 		return
 	}
+	// A command long-poll can deliberately block for 25 seconds.  The journal
+	// is now reconciled, so monitoring-audit delivery may proceed while the
+	// Agent is idle; keeping this writer lock across the wait would otherwise
+	// starve audit delivery forever on a healthy empty queue.
+	a.controlAuditReady.Store(true)
+	a.controlAuditGate.Unlock()
+
 	processed, pollErr := a.control.PollOnce(ctx)
+
+	// Re-close the admission gate only for the short post-poll reconciliation.
+	// If it fails, the uploader is fail-closed again until a later successful
+	// pre-poll reconciliation reopens it.
+	a.controlAuditGate.Lock()
 	reconciledAfter, reconcileAfterErr := a.control.ReconcileOnce(ctx)
 	if reconcileAfterErr == nil {
 		a.controlAuditReady.Store(true)
+	} else {
+		a.controlAuditReady.Store(false)
 	}
+	a.controlAuditGate.Unlock()
 	err := errors.Join(reconcileBeforeErr, pollErr, reconcileAfterErr)
 	a.health.ControlPoll(time.Now(), err)
 	if err != nil {

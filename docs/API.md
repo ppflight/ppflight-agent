@@ -232,11 +232,11 @@ Agent 用 `<stateDirectory>/lifecycle-state.json` 区分 clean exit 和上一进
 目标端点：
 
 ```text
-GET  /internal/v1/agents/commands?agentRef=...&after=...&limit=20&wait=25
+GET  /internal/v1/agents/commands?agentRef=...&after=...&limit=1&wait=25
 POST /internal/v1/agents/{agentRef}/command-receipts
 ```
 
-transport 使用 commands/receipts 各自 HMAC；命令内容在生产环境另用官网 Ed25519 私钥签名，Agent 只持公钥。生产 command authority 还必须签入匹配本机状态的 `bindingId/deviceId/credentialEpoch`、remote Bundle 的 uint64 decimal `assignmentRevision` 和稳定 `idempotencyKey`；该 revision 不是 assignment document 的文本 revision。当前 command client 已发送 `agentRef/after/limit`，尚未发送 `wait`；不要把目标长轮询写成已接线。
+transport 使用 commands/receipts 各自 HMAC；命令内容在生产环境另用官网 Ed25519 私钥签名，Agent 只持公钥。生产 command authority 还必须签入匹配本机状态的 `bindingId/deviceId/credentialEpoch`、remote Bundle 的 uint64 decimal `assignmentRevision` 和稳定 `idempotencyKey`；该 revision 不是 assignment document 的文本 revision。命令客户端发送并 HMAC 签入 `agentRef/after/limit=1/wait=25`；服务端在没有可交付命令时最多保持该请求 25 秒。认证和 nonce 只在开始时验证一次，空闲等待不持有数据库锁或命令租约；两端均拒绝批量领取，避免慢 PVE 任务使后续命令租约过期。
 
 Agent 离线时，官网必须把尚未过期的命令持久排队，恢复后仍通过上述主动 poll 交付；官网自身不可达时，Agent 只重试轮询。两种离线场景都禁止自动回退为官网直连 PVE 8006。命令被 Agent 领取后，才由本地 journal、UPID reconcile 和 receipt queue 负责恢复。官网离线队列和 command `wait` 都属于远端待实现/联调能力，本仓不能证明服务端已经部署；旧客户兼容写路径也只能经逐资产 feature flag/cutover 显式选择，不能作为故障 fallback。
 

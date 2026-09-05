@@ -149,21 +149,28 @@ type AuthConfig struct {
 }
 
 type ControlConfig struct {
-	Enabled        bool       `json:"enabled"`
-	PollURL        string     `json:"pollUrl"`
-	ResultURL      string     `json:"resultUrl"`
-	Auth           AuthConfig `json:"auth"`
-	PollInterval   Duration   `json:"pollInterval"`
-	RequestTimeout Duration   `json:"requestTimeout"`
+	Enabled      bool       `json:"enabled"`
+	PollURL      string     `json:"pollUrl"`
+	ResultURL    string     `json:"resultUrl"`
+	Auth         AuthConfig `json:"auth"`
+	PollInterval Duration   `json:"pollInterval"`
+	// LongPollWait is the authenticated server-side wait for an empty command
+	// poll.  It is deliberately bounded by the public Agent v1 API maximum.
+	LongPollWait   Duration `json:"longPollWait"`
+	RequestTimeout Duration `json:"requestTimeout"`
 	// CommandSecretEnv is a legacy HMAC verifier accepted only in test mode.
-	CommandSecretEnv       string   `json:"commandSecretEnv"`
-	CommandSigningKeyIDEnv string   `json:"commandSigningKeyIdEnv"`
-	CommandPublicKeyEnv    string   `json:"commandPublicKeyEnv"`
-	PVETokenIDEnv          string   `json:"pveTokenIdEnv"`
-	PVETokenSecretEnv      string   `json:"pveTokenSecretEnv"`
-	MaxCommandsPerPoll     int      `json:"maxCommandsPerPoll"`
-	AllowedActions         []string `json:"allowedActions"`
-	ProductionExecution    bool     `json:"productionExecution"`
+	CommandSecretEnv       string `json:"commandSecretEnv"`
+	CommandSigningKeyIDEnv string `json:"commandSigningKeyIdEnv"`
+	CommandPublicKeyEnv    string `json:"commandPublicKeyEnv"`
+	PVETokenIDEnv          string `json:"pveTokenIdEnv"`
+	PVETokenSecretEnv      string `json:"pveTokenSecretEnv"`
+	MaxCommandsPerPoll     int    `json:"maxCommandsPerPoll"`
+	// MaxActiveConsoleSessions bounds reverse noVNC tunnels (and their local
+	// PVE sockets) for this Agent. Website admission enforces the same default
+	// per binding; this local cap is the authoritative second line of defense.
+	MaxActiveConsoleSessions int      `json:"maxActiveConsoleSessions"`
+	AllowedActions           []string `json:"allowedActions"`
+	ProductionExecution      bool     `json:"productionExecution"`
 	// LegacyPollIntervalNormalized records an in-memory compatibility
 	// migration. It is never accepted from or written to agent.yaml.
 	LegacyPollIntervalNormalized bool `json:"-"`
@@ -237,8 +244,8 @@ func defaults() Config {
 			MonitoringAudit:  defaultDestination(512<<20, "audit-v1"),
 		},
 		Control: ControlConfig{
-			Enabled: false, PollInterval: Duration{5 * time.Second}, RequestTimeout: Duration{10 * time.Second},
-			MaxCommandsPerPoll: 1, ProductionExecution: false,
+			Enabled: false, PollInterval: Duration{5 * time.Second}, LongPollWait: Duration{25 * time.Second}, RequestTimeout: Duration{30 * time.Second},
+			MaxCommandsPerPoll: 1, MaxActiveConsoleSessions: 8, ProductionExecution: false,
 			Auth:           AuthConfig{Mode: "hmac-sha256"},
 			AllowedActions: []string{"vm.start", "vm.shutdown", "vm.reboot"},
 		},
@@ -292,6 +299,13 @@ func Parse(contents []byte) (Config, error) {
 	if result.Control.MaxCommandsPerPoll == 20 {
 		result.Control.MaxCommandsPerPoll = 1
 		result.Control.LegacyMaxCommandsNormalized = true
+	}
+	// The prior 10s default predates command long polling.  It cannot carry a
+	// 25s server wait, so released installations which retain that exact
+	// historical default are upgraded in memory without rewriting root-owned
+	// agent.yaml.  Any other administrator-selected timeout remains explicit.
+	if result.Control.RequestTimeout.Duration == 10*time.Second {
+		result.Control.RequestTimeout = Duration{30 * time.Second}
 	}
 	if err := result.Validate(); err != nil {
 		return Config{}, err
@@ -409,6 +423,18 @@ func (c Config) Validate() error {
 	if c.Control.Enabled {
 		if c.Control.MaxCommandsPerPoll < 1 || c.Control.MaxCommandsPerPoll > 100 {
 			return errors.New("control.maxCommandsPerPoll must be 1-100")
+		}
+		if c.Control.MaxCommandsPerPoll != 1 {
+			return errors.New("control.maxCommandsPerPoll must be exactly 1")
+		}
+		if c.Control.LongPollWait.Duration < 0 || c.Control.LongPollWait.Duration > 25*time.Second {
+			return errors.New("control.longPollWait must be between 0s and 25s")
+		}
+		if c.Control.RequestTimeout.Duration < c.Control.LongPollWait.Duration+5*time.Second {
+			return errors.New("control.requestTimeout must exceed longPollWait by at least 5s")
+		}
+		if c.Control.MaxActiveConsoleSessions < 1 || c.Control.MaxActiveConsoleSessions > 64 {
+			return errors.New("control.maxActiveConsoleSessions must be 1-64")
 		}
 		if c.Control.ProductionExecution && c.Mode != "production" {
 			return errors.New("control.productionExecution requires production mode")

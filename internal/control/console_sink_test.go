@@ -214,6 +214,50 @@ func TestConsoleSinkConstructorDerivesSameOriginWSSAndForbidsProxyRedirect(t *te
 	}
 }
 
+func TestConsoleSinkReservesConfiguredCapacityBeforeOpeningPVEConnections(t *testing.T) {
+	sink, err := NewHTTPSConsoleSessionSinkWithLimit("https://www.example/api/control/receipts", "key-1", []byte("0123456789abcdef"), time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Reserve("session-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Reserve("session-2"); err == nil || err.Error() != "active console session limit reached" {
+		t.Fatalf("second reservation error=%v", err)
+	}
+	sink.Release("session-1")
+	if err := sink.Reserve("session-2"); err != nil {
+		t.Fatalf("released console slot was not reusable: %v", err)
+	}
+	if _, err := NewHTTPSConsoleSessionSinkWithLimit("https://www.example/api/control/receipts", "key-1", []byte("0123456789abcdef"), time.Second, 65); err == nil {
+		t.Fatal("unsafe console capacity was accepted")
+	}
+}
+
+func TestConsoleSinkNotifiesWebsiteWhenTunnelCloses(t *testing.T) {
+	now := time.Now().UTC()
+	registration := consoleRegistration(now)
+	notified := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/control/console-sessions/"+registration.SessionRef+"/revoke" {
+			t.Errorf("close notification=%s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		notified <- struct{}{}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	endpoint, _ := url.Parse(server.URL + "/api/control/console-sessions")
+	sink := &HTTPSConsoleSessionSink{endpoint: endpoint, client: server.Client(), keyID: "key-1", secret: []byte("0123456789abcdef"), now: func() time.Time { return now }, active: make(map[string]*activeConsoleSession), reserved: make(map[string]struct{}), maxActive: 1}
+	sink.notifyClosed(registration)
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("closed tunnel did not notify website")
+	}
+}
+
 func TestConsolePublishRejectsDuplicateSessionBeforeOpeningAnotherSocket(t *testing.T) {
 	now := time.Now().UTC()
 	registration := consoleRegistration(now)

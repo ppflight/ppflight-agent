@@ -113,13 +113,15 @@
     "resultUrl": "",
     "auth": { "mode": "hmac-sha256", "keyIdEnv": "", "secretEnv": "" },
     "pollInterval": "5s",
-    "requestTimeout": "10s",
+    "longPollWait": "25s",
+    "requestTimeout": "30s",
     "commandSecretEnv": "",
     "commandSigningKeyIdEnv": "",
     "commandPublicKeyEnv": "",
     "pveTokenIdEnv": "PVE_CONTROL_TOKEN_ID",
     "pveTokenSecretEnv": "PVE_CONTROL_TOKEN_SECRET",
     "maxCommandsPerPoll": 1,
+    "maxActiveConsoleSessions": 8,
     "allowedActions": ["vm.start", "vm.shutdown", "vm.reboot"],
     "productionExecution": false
   }

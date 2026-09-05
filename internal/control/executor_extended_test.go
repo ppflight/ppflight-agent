@@ -30,7 +30,21 @@ type memoryConsoleSink struct {
 	local        ConsoleLocalEndpoint
 	revoked      ConsoleSessionRevoke
 	invalidated  bool
+	capacity     int
+	reserved     map[string]struct{}
 }
+
+func (s *memoryConsoleSink) Reserve(sessionRef string) error {
+	if s.reserved == nil {
+		s.reserved = make(map[string]struct{})
+	}
+	if s.capacity > 0 && len(s.reserved) >= s.capacity {
+		return errors.New("active console session limit reached")
+	}
+	s.reserved[sessionRef] = struct{}{}
+	return nil
+}
+func (s *memoryConsoleSink) Release(sessionRef string) { delete(s.reserved, sessionRef) }
 
 func (s *memoryConsoleSink) Publish(_ context.Context, registration ConsoleTunnelRegistration, local ConsoleLocalEndpoint) (ConsoleSessionPublication, error) {
 	s.registration = registration
@@ -355,6 +369,24 @@ func TestConsoleTicketNeverEntersReceipt(t *testing.T) {
 				t.Fatalf("console secret leaked in receipt: %s", raw)
 			}
 		})
+	}
+}
+
+func TestConsoleCapacityRejectsBeforeRequestingPVEVNCProxy(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte(`{"data":{"ticket":"PVE:ticket","port":5901}}`))
+	}))
+	defer server.Close()
+	command := controlCommand("vm.console.create-session", "qemu", `{"ttlSeconds":60,"webSocket":true}`)
+	command.CommandID, command.AgentRef, command.BindingID, command.DeviceID, command.CredentialEpoch, command.AssignmentRevision = "console-command", "agent-1", "11111111-1111-4111-8111-111111111111", "device-1", 1, 1
+	sink := &memoryConsoleSink{capacity: 1, reserved: map[string]struct{}{"already-open": {}}}
+	if _, err := (Executor{Client: controlTestClient(t, server), ConsoleSessions: sink, Mode: "production", ProductionExecution: true}).Execute(context.Background(), command, time.Now()); err == nil || !strings.Contains(err.Error(), "console session capacity") {
+		t.Fatalf("capacity error=%v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("capacity rejection requested PVE vncproxy %d times", requests)
 	}
 }
 

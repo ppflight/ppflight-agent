@@ -138,7 +138,7 @@ func TestInstalledStateOwnershipContract(t *testing.T) {
 	}
 }
 
-func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
+func TestInstallerMigratesControlForSingleCommandLongPoll(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("installer migration requires the same root ownership contract as production")
 	}
@@ -155,10 +155,10 @@ func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
 	}
 	migration := installer[start : start+end]
 
-	run := func(name, interval string, maxCommands int) string {
+	run := func(name, interval string, maxCommands int, requestTimeout string) string {
 		t.Helper()
 		target := filepath.Join(t.TempDir(), name)
-		raw := fmt.Sprintf(`{"mode":"production","pve":{"source":"api"},"control":{"pollInterval":"%s","maxCommandsPerPoll":%d}}`, interval, maxCommands) + "\n"
+		raw := fmt.Sprintf(`{"mode":"production","pve":{"source":"api"},"control":{"pollInterval":"%s","maxCommandsPerPoll":%d,"requestTimeout":"%s"}}`, interval, maxCommands, requestTimeout) + "\n"
 		if err := os.WriteFile(target, []byte(raw), 0o640); err != nil {
 			t.Fatal(err)
 		}
@@ -178,11 +178,11 @@ func TestInstallerMigratesOnlyLegacyDefaultControlPollInterval(t *testing.T) {
 		return string(updated)
 	}
 
-	if updated := run("legacy-default.json", "30s", 20); !strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"maxCommandsPerPoll": 1`) {
+	if updated := run("legacy-default.json", "30s", 20, "10s"); !strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"maxCommandsPerPoll": 1`) || !strings.Contains(updated, `"requestTimeout": "30s"`) {
 		t.Fatalf("legacy default was not migrated: %s", updated)
 	}
-	if updated := run("operator-custom.json", "7s", 7); strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"pollInterval":"7s"`) || !strings.Contains(updated, `"maxCommandsPerPoll":7`) {
-		t.Fatalf("operator custom interval was modified: %s", updated)
+	if updated := run("operator-custom.json", "7s", 7, "45s"); strings.Contains(updated, `"pollInterval": "5s"`) || !strings.Contains(updated, `"pollInterval": "7s"`) || !strings.Contains(updated, `"maxCommandsPerPoll": 1`) || !strings.Contains(updated, `"requestTimeout": "45s"`) {
+		t.Fatalf("operator custom controls were not normalized/preserved correctly: %s", updated)
 	}
 }
 

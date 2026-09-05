@@ -290,12 +290,15 @@ storage discovery 若给出 content remediation，管理 CLI 只在 `program=pve
 目标端点全部由 Agent 主动出站：
 
 ```text
-GET  /internal/v1/agents/commands?agentRef=...&after=...&limit=...&wait=25
+GET  /internal/v1/agents/commands?agentRef=...&after=...&limit=1&wait=25
 POST /internal/v1/agents/{agentRef}/command-receipts
 GET  /internal/v1/agents/{agentRef}/assignments?afterRevision=...&wait=25
 ```
 
-`wait` 最大 25 秒。assignment 客户端当前已实现该上限；command 客户端当前只发送 `agentRef + after + limit`，尚未发送 `wait`，因此命令长轮询仍是目标契约，不能写成已接线。
+`wait` 最大 25 秒。assignment 与 command 客户端都实现该上限；command
+request 以 `agentRef + after + limit=1 + wait=25` 共同作为 HMAC 认证的
+精确 query。官网只在认证后进行空闲等待，并在每次检查间释放数据库事务；
+任何一次 command poll 最多领取一条命令和一个租约。
 
 新 assignment authority 的 `assignmentDocument` 顶层 exact shape 为 `schemaVersion/revision/issuedAt/allowedActions/assignments`。`allowedActions` 是 1..64 个不重复 action name，并与 inventory 一起被 bundle 的 exact content SHA-256 和 Ed25519 signature 覆盖。Agent 只接受本地 compiled known-action registry 中的名称；远端不能借此发明任意 action。
 

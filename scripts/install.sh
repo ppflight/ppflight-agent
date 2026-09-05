@@ -406,12 +406,15 @@ try:
     source = document["pve"]["source"]
     control_poll_interval = document["control"]["pollInterval"]
     control_max_commands = document["control"].get("maxCommandsPerPoll", 20)
+    control_request_timeout = document["control"].get("requestTimeout", "10s")
 except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
     raise SystemExit("agent config cannot be safely parsed") from error
 if not isinstance(control_poll_interval, str):
     raise SystemExit("agent control.pollInterval cannot be safely parsed")
 if not isinstance(control_max_commands, int) or isinstance(control_max_commands, bool):
     raise SystemExit("agent control.maxCommandsPerPoll cannot be safely parsed")
+if not isinstance(control_request_timeout, str):
+    raise SystemExit("agent control.requestTimeout cannot be safely parsed")
 changed = False
 if source == "simulator" or mode == "test":
     document["mode"] = "production"
@@ -425,11 +428,17 @@ if source == "simulator" or mode == "test":
 if control_poll_interval == "30s":
     document["control"]["pollInterval"] = "5s"
     changed = True
-# Twenty was the released batch default. Agent command execution is serial,
-# so claiming twenty leases can let later commands expire behind one slow PVE
-# task. Migrate only the exact historical default; preserve operator tuning.
-if control_max_commands == 20:
+# Agent command execution is serial.  A batch can let later leases expire
+# behind one slow PVE task, so the v1 wire contract now has an exact one-command
+# invariant. Normalize every historical/custom batch value during installation
+# rather than deploying a binary that would reject its root-owned config.
+if control_max_commands != 1:
     document["control"]["maxCommandsPerPoll"] = 1
+    changed = True
+# Ten seconds was the old request timeout and cannot carry the 25s command
+# long-poll plus transport headroom. Keep other explicit operator timeouts.
+if control_request_timeout == "10s":
+    document["control"]["requestTimeout"] = "30s"
     changed = True
 if changed:
     replacement, temporary = tempfile.mkstemp(prefix=".agent.yaml.rc48.", dir=directory)

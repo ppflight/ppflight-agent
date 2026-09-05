@@ -33,11 +33,18 @@ func TestParseAppliesSafeDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" || cfg.Control.MaxCommandsPerPoll != 1 {
+	if !cfg.Control.Enabled || cfg.Collection.SampleInterval.String() != "10s" || cfg.Control.PollInterval.String() != "5s" || cfg.Control.LongPollWait.String() != "25s" || cfg.Control.RequestTimeout.String() != "30s" || cfg.Control.MaxCommandsPerPoll != 1 || cfg.Control.MaxActiveConsoleSessions != 8 {
 		t.Fatalf("defaults not applied: %#v", cfg)
 	}
 	if cfg.PVE.Source != "disabled" || cfg.Exporters.Node.URL != "http://127.0.0.1:9100/metrics" {
 		t.Fatalf("unexpected source defaults: %#v", cfg.PVE)
+	}
+}
+
+func TestRejectsInvalidConsoleCapacity(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"maxActiveConsoleSessions":65,"enabled":true`, 1)
+	if _, err := Parse([]byte(input)); err == nil || !strings.Contains(err.Error(), "maxActiveConsoleSessions") {
+		t.Fatalf("unsafe console capacity accepted: %v", err)
 	}
 }
 
@@ -52,14 +59,28 @@ func TestParseNormalizesHistoricalControlBatchDefaultInMemory(t *testing.T) {
 	}
 }
 
-func TestParsePreservesCustomControlBatchLimit(t *testing.T) {
+func TestParseRejectsControlBatchLimit(t *testing.T) {
 	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"maxCommandsPerPoll":7,"enabled":true`, 1)
+	if _, err := Parse([]byte(input)); err == nil || !strings.Contains(err.Error(), "exactly 1") {
+		t.Fatalf("batch command limit was accepted: %v", err)
+	}
+}
+
+func TestParseNormalizesHistoricalControlRequestTimeoutForLongPolling(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"requestTimeout":"10s","enabled":true`, 1)
 	cfg, err := Parse([]byte(input))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Control.MaxCommandsPerPoll != 7 || cfg.Control.LegacyMaxCommandsNormalized {
-		t.Fatalf("custom command batch limit was changed: %#v", cfg.Control)
+	if cfg.Control.RequestTimeout.String() != "30s" {
+		t.Fatalf("historical timeout was not normalized: %#v", cfg.Control)
+	}
+}
+
+func TestParseRejectsControlTimeoutBelowLongPollHeadroom(t *testing.T) {
+	input := strings.Replace(validTestConfig(), `"control": {"enabled":true`, `"control": {"longPollWait":"25s","requestTimeout":"25s","enabled":true`, 1)
+	if _, err := Parse([]byte(input)); err == nil || !strings.Contains(err.Error(), "longPollWait") {
+		t.Fatalf("short control timeout was accepted: %v", err)
 	}
 }
 
