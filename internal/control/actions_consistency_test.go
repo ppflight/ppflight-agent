@@ -89,7 +89,7 @@ func validActionParameterFixtures() map[string]string {
 		"snapshot.rollback":                   `{"name":"before"}`,
 		"snapshot.list":                       `{"limit":50}`,
 		"snapshot.get":                        `{"name":"before"}`,
-		"backup.create":                       `{"storage":"backup1","mode":"snapshot"}`,
+		"backup.create":                       `{"storage":"backup1","mode":"snapshot","notesTemplate":""}`,
 		"backup.delete":                       `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst"}`,
 		"backup.restore":                      `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst","force":false}`,
 		"backup.list":                         `{"storage":"backup1","limit":50}`,

@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/ppflight/ppflight-agent/internal/discovery"
 	"github.com/ppflight/ppflight-agent/internal/protocol"
@@ -921,9 +923,10 @@ type snapshotGetP struct {
 	Name string `json:"name"`
 }
 type backupCreateP struct {
-	Storage  string `json:"storage"`
-	Mode     string `json:"mode"`
-	Compress string `json:"compress,omitempty"`
+	Storage       string `json:"storage"`
+	Mode          string `json:"mode"`
+	Compress      string `json:"compress,omitempty"`
+	NotesTemplate string `json:"notesTemplate"`
 }
 type backupVolumeP struct {
 	Storage string `json:"storage"`
@@ -1201,7 +1204,7 @@ func validateParameters(c Command) error {
 		return nil
 	case "backup.create":
 		var p backupCreateP
-		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || (p.Mode != "snapshot" && p.Mode != "suspend" && p.Mode != "stop") || !validCompress(p.Compress) {
+		if strictParameters(c.Parameters, &p) != nil || !storageRE.MatchString(p.Storage) || (p.Mode != "snapshot" && p.Mode != "suspend" && p.Mode != "stop") || !validCompress(p.Compress) || !validBackupNotesTemplate(p.NotesTemplate) {
 			return errors.New("invalid backup parameters")
 		}
 		return nil
@@ -1465,6 +1468,9 @@ func executePVE(ctx context.Context, client *pve.Client, c Command) (string, jso
 		form = url.Values{"vmid": {strconv.Itoa(c.Identity.VMID)}, "storage": {p.Storage}, "mode": {p.Mode}}
 		if p.Compress != "" {
 			form.Set("compress", p.Compress)
+		}
+		if p.NotesTemplate != "" {
+			form.Set("notes-template", p.NotesTemplate)
 		}
 		method, path = http.MethodPost, node+"/vzdump"
 	case "backup.delete":
@@ -2990,6 +2996,20 @@ func validTemplate(v string) bool {
 }
 func validCompress(v string) bool {
 	return v == "" || v == "zstd" || v == "lzo" || v == "gzip" || v == "0"
+}
+func validBackupNotesTemplate(v string) bool {
+	// Keep operator-provided backup notes human-readable and single-line.
+	// This is deliberately not a general vzdump template language: the
+	// website supplies literal customer text, never variables or newlines.
+	if utf8.RuneCountInString(v) > 120 || strings.TrimSpace(v) != v {
+		return false
+	}
+	for _, r := range v {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 func validBackupVolume(v string) bool {
 	return regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:(backup/)?[A-Za-z0-9][A-Za-z0-9._-]{0,191}$`).MatchString(v) && !strings.Contains(v, "..")

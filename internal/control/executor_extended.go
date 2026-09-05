@@ -117,6 +117,7 @@ type BackupInventoryItem struct {
 	Generation  protocol.Counter `json:"vmGeneration"`
 	Restorable  bool             `json:"restorable"`
 	Compression string           `json:"compression,omitempty"`
+	Notes       string           `json:"notes,omitempty"`
 }
 
 type BackupInventoryResult struct {
@@ -401,6 +402,7 @@ func readBackups(ctx context.Context, client *pve.Client, command Command) (json
 		Volume      string          `json:"volid"`
 		Content     string          `json:"content"`
 		Format      string          `json:"format"`
+		Notes       string          `json:"notes"`
 		VMID        int             `json:"vmid"`
 		Size        json.RawMessage `json:"size"`
 		CreatedTime json.RawMessage `json:"ctime"`
@@ -417,7 +419,10 @@ func readBackups(ctx context.Context, client *pve.Client, command Command) (json
 		if !ok {
 			return nil, errors.New("PVE returned an invalid backup size")
 		}
-		item := BackupInventoryItem{Storage: storage, Volume: row.Volume, SizeBytes: protocol.Counter(size), State: "ready", GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, Generation: protocol.Counter(command.Identity.Generation), Restorable: size > 0, Compression: safeBackupFormat(row.Format)}
+		if !validBackupNotesTemplate(row.Notes) {
+			return nil, errors.New("PVE returned invalid backup notes")
+		}
+		item := BackupInventoryItem{Storage: storage, Volume: row.Volume, SizeBytes: protocol.Counter(size), State: "ready", GuestType: command.Identity.GuestType, VMID: command.Identity.VMID, Generation: protocol.Counter(command.Identity.Generation), Restorable: size > 0, Compression: safeBackupFormat(row.Format), Notes: row.Notes}
 		if stamp, ok := boundedUnixTime(row.CreatedTime); ok {
 			item.CreatedAt = &stamp
 		}

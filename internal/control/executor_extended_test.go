@@ -323,7 +323,7 @@ func TestSnapshotAndBackupInventoryAreTypedAndBounded(t *testing.T) {
 			if r.URL.Query().Get("content") != "backup" || r.URL.Query().Get("vmid") != "101" {
 				t.Fatalf("backup query=%v", r.URL.Query())
 			}
-			_, _ = w.Write([]byte(`{"data":[{"volid":"backup1:backup/vzdump-qemu-101.vma.zst","content":"backup","format":"zst","vmid":101,"size":9007199254740993,"ctime":1788300000},{"volid":"other:iso/unsafe.iso","content":"iso","vmid":101,"size":1,"ctime":1}]}`))
+			_, _ = w.Write([]byte(`{"data":[{"volid":"backup1:backup/vzdump-qemu-101.vma.zst","content":"backup","format":"zst","notes":"before-upgrade","vmid":101,"size":9007199254740993,"ctime":1788300000},{"volid":"other:iso/unsafe.iso","content":"iso","vmid":101,"size":1,"ctime":1}]}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -335,7 +335,7 @@ func TestSnapshotAndBackupInventoryAreTypedAndBounded(t *testing.T) {
 		t.Fatalf("snapshots=%s err=%v", snapshots.Result, err)
 	}
 	backups, err := executor.Execute(context.Background(), controlCommand("backup.get", "qemu", `{"storage":"backup1","volume":"backup1:backup/vzdump-qemu-101.vma.zst"}`), time.Now())
-	if err != nil || !strings.Contains(string(backups.Result), `"sizeBytes":"9007199254740993"`) || strings.Contains(string(backups.Result), "unsafe.iso") {
+	if err != nil || !strings.Contains(string(backups.Result), `"sizeBytes":"9007199254740993"`) || !strings.Contains(string(backups.Result), `"notes":"before-upgrade"`) || strings.Contains(string(backups.Result), "unsafe.iso") {
 		t.Fatalf("backups=%s err=%v", backups.Result, err)
 	}
 }

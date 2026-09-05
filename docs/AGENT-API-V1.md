@@ -444,7 +444,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | vm | `snapshot.create` | `name`、必填 bool `includeRam`，可选 `description`；LXC 的 `includeRam` 只能为 false。 |
 | vm | `snapshot.delete`, `snapshot.rollback` | `name`。 |
 | vm | `snapshot.list`, `snapshot.get` | 只读；list 接受 `limit=1..100`，get 接受 `name`；返回 stable snapshot ID/name/time/state/parent/RAM state 与 decimal-string VM generation。 |
-| vm | `backup.create` | `storage`, `mode=snapshot|suspend|stop`, 可选 `compress`。 |
+| vm | `backup.create` | `storage`, `mode=snapshot|suspend|stop`, 可选 `compress`，以及必填的单行 `notesTemplate`（可为空，最多120字节）；Agent 仅将其写入 PVE `notes-template`。 |
 | vm | `backup.delete`, `backup.restore` | `storage`, `volume`；restore 另要求必填 bool `force`。 |
 | vm | `backup.list`, `backup.get` | 只读；固定查询签名 `storage` 的 backup content 和当前 VMID；返回 storage/volume/time/decimal-string size/state/guest identity/generation/restorable，不返回路径或凭据。 |
 | cluster/node | `firewall.cluster.set-options`, `firewall.node.set-options` | typed 参数仅 `enable`。 |
