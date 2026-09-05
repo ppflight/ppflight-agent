@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -611,6 +612,94 @@ func powerActionAlreadyDesiredError(err error, action string) bool {
 	return errors.As(err, &taskErr) && powerActionAlreadyDesiredMessage(taskErr.exitStatus, action)
 }
 
+func powerActionAlreadyDesiredForVMError(err error, action string, vmid int) bool {
+	wanted, supported := powerActionDesiredState(action)
+	if !supported || vmid < 1 || !powerActionAlreadyDesiredError(err, action) {
+		return false
+	}
+	quotedVMID := regexp.QuoteMeta(strconv.Itoa(vmid))
+	return regexp.MustCompile(`(?i)\bvm\s+` + quotedVMID + `\s+(?:is\s+)?already\s+` + regexp.QuoteMeta(wanted) + `\b`).MatchString(powerActionErrorText(err))
+}
+
+func powerActionErrorText(err error) string {
+	message := ""
+	var httpErr *pve.HTTPError
+	if errors.As(err, &httpErr) {
+		message = httpErr.Reason + " " + httpErr.Body
+	}
+	var taskErr *pveTaskExitError
+	if errors.As(err, &taskErr) {
+		message += " " + taskErr.exitStatus
+	}
+	return message
+}
+
+// vmStoppedCandidateError is deliberately narrower than a generic power
+// error. PVE 8 and PVE 9 can report a race with suspend either directly from
+// the POST or as the terminal UPID error, but only these exact, VMID-bound
+// stopped conditions are safe to converge. The caller must still read the
+// same guest afterwards and prove it is stopped.
+func vmStoppedCandidateError(err error, vmid int) bool {
+	if vmid < 1 {
+		return false
+	}
+	quotedVMID := regexp.QuoteMeta(strconv.Itoa(vmid))
+	return regexp.MustCompile(`(?i)\bvm\s+` + quotedVMID + `\s+(?:not\s+running|(?:is\s+)?already\s+stopped)\b`).MatchString(powerActionErrorText(err))
+}
+
+func suspendStoppedConvergence(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, bool) {
+	current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil || !guestHasPowerState(current, "stopped") {
+		return nil, false
+	}
+	return lifecyclePowerResult("stopped"), true
+}
+
+func resumeRunningConvergence(ctx context.Context, client *pve.Client, command Command) (json.RawMessage, bool) {
+	current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+	if err != nil || !guestHasResumedState(current) {
+		return nil, false
+	}
+	return lifecyclePowerResult("running"), true
+}
+
+// resumeStoppedWithVerifiedStart is a one-shot compensation for the only
+// valid resume race: a guest was paused at preflight but became stopped before
+// PVE handled /resume. It deliberately does not recurse into resume: one
+// start is issued, its UPID is awaited, and the same scoped guest must then
+// prove running before the command succeeds.
+func resumeStoppedWithVerifiedStart(ctx context.Context, client *pve.Client, command Command, base string) (string, json.RawMessage, error) {
+	upid, _, err := doPVE(ctx, client, http.MethodPost, base+"/status/start", nil)
+	if err != nil {
+		if powerActionAlreadyDesiredForVMError(err, "start", command.Identity.VMID) {
+			if result, converged := resumeRunningConvergence(ctx, client, command); converged {
+				return "", result, nil
+			}
+		}
+		return upid, nil, err
+	}
+	if upid != "" {
+		if err := waitPVEUPID(ctx, client, command.Identity.NodeRef, upid); err != nil {
+			if powerActionAlreadyDesiredForVMError(err, "start", command.Identity.VMID) {
+				if result, converged := resumeRunningConvergence(ctx, client, command); converged {
+					return "", result, nil
+				}
+			}
+			return upid, nil, err
+		}
+	}
+	if result, converged := resumeRunningConvergence(ctx, client, command); converged {
+		result, _ = json.Marshal(map[string]any{"powerState": "running", "verified": true})
+		return "", result, nil
+	}
+	return upid, nil, errors.New("resume start power-state readback does not match")
+}
+
+func guestHasResumedState(current pve.GuestCurrent) bool {
+	qmpStatus, _ := configString(current.Raw, "qmpstatus")
+	return guestHasPowerState(current, "running") && !strings.EqualFold(qmpStatus, "paused")
+}
+
 // executeLifecyclePowerTransition protects start/shutdown/stop from stale
 // website state. The PVE read is authoritative: an already-reached target is
 // a verified no-op rather than a failing task. Reboot is not convergent: it is
@@ -631,7 +720,7 @@ func executeLifecyclePowerTransition(ctx context.Context, client *pve.Client, co
 	}
 
 	upid, result, err := doPVE(ctx, client, http.MethodPost, base+"/status/"+action, nil)
-	if err == nil || !powerActionAlreadyDesiredError(err, action) {
+	if err == nil || !powerActionAlreadyDesiredForVMError(err, action, command.Identity.VMID) {
 		return upid, result, err
 	}
 	// The state can legitimately change between the authoritative pre-read and
@@ -661,7 +750,7 @@ func ensureDesiredPowerState(ctx context.Context, client *pve.Client, command Co
 		return nil
 	}
 	if err := mutate(); err != nil {
-		if !powerActionAlreadyDesiredError(err, action) {
+		if !powerActionAlreadyDesiredForVMError(err, action, command.Identity.VMID) {
 			return err
 		}
 		observed, readErr := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
@@ -678,12 +767,65 @@ func executePowerTransition(ctx context.Context, client *pve.Client, command Com
 		return "", nil, errors.New("suspend and resume are unavailable for LXC")
 	}
 	wanted := strings.TrimPrefix(command.Action, "vm.")
+	// Suspending a guest that is already stopped is a completed lifecycle
+	// boundary, not a failed mutation. This authoritative preflight is also
+	// important for PVE 8, which rejects the POST outright for that state.
+	if wanted == "suspend" {
+		if result, converged := suspendStoppedConvergence(ctx, client, command); converged {
+			return "", result, nil
+		}
+	} else if wanted == "resume" {
+		current, err := client.GuestCurrent(ctx, command.Identity.GuestType, command.Identity.NodeRef, command.Identity.VMID)
+		if err != nil {
+			return "", nil, err
+		}
+		if guestHasPowerState(current, "stopped") {
+			// A stopped QEMU cannot be resumed. Reuse the lifecycle start path so
+			// this state transition retains rc.60's already-running race proof.
+			start := command
+			start.Action = "vm.start"
+			return executeLifecyclePowerTransition(ctx, client, start, base)
+		}
+		if guestHasResumedState(current) {
+			return "", lifecyclePowerResult("running"), nil
+		}
+	}
 	upid, _, err := doPVE(ctx, client, http.MethodPost, base+"/status/"+wanted, nil)
 	if err != nil {
+		if wanted == "suspend" && vmStoppedCandidateError(err, command.Identity.VMID) {
+			if result, converged := suspendStoppedConvergence(ctx, client, command); converged {
+				return "", result, nil
+			}
+		}
+		if wanted == "resume" && powerActionAlreadyDesiredError(err, "start") {
+			if result, converged := resumeRunningConvergence(ctx, client, command); converged {
+				return "", result, nil
+			}
+		}
+		if wanted == "resume" && vmStoppedCandidateError(err, command.Identity.VMID) {
+			if _, stopped := suspendStoppedConvergence(ctx, client, command); stopped {
+				return resumeStoppedWithVerifiedStart(ctx, client, command, base)
+			}
+		}
 		return upid, nil, err
 	}
 	if upid != "" {
 		if err := waitPVEUPID(ctx, client, command.Identity.NodeRef, upid); err != nil {
+			if wanted == "suspend" && vmStoppedCandidateError(err, command.Identity.VMID) {
+				if result, converged := suspendStoppedConvergence(ctx, client, command); converged {
+					return "", result, nil
+				}
+			}
+			if wanted == "resume" && powerActionAlreadyDesiredError(err, "start") {
+				if result, converged := resumeRunningConvergence(ctx, client, command); converged {
+					return "", result, nil
+				}
+			}
+			if wanted == "resume" && vmStoppedCandidateError(err, command.Identity.VMID) {
+				if _, stopped := suspendStoppedConvergence(ctx, client, command); stopped {
+					return resumeStoppedWithVerifiedStart(ctx, client, command, base)
+				}
+			}
 			return upid, nil, err
 		}
 	}
@@ -695,7 +837,7 @@ func executePowerTransition(ctx context.Context, client *pve.Client, command Com
 	if wanted == "suspend" && !strings.EqualFold(qmpStatus, "paused") {
 		return upid, nil, errors.New("suspend power-state readback does not match")
 	}
-	if wanted == "resume" && (strings.ToLower(strings.TrimSpace(current.Status)) != "running" || strings.EqualFold(qmpStatus, "paused")) {
+	if wanted == "resume" && !guestHasResumedState(current) {
 		return upid, nil, errors.New("resume power-state readback does not match")
 	}
 	powerState := "running"

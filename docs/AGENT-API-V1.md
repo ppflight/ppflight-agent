@@ -423,7 +423,7 @@ POST /internal/v1/monitoring/audit-events/batches
 | node | `task.status` | `upid`，格式必须以 `UPID:<identity.nodeRef>:` 开头。 |
 | node | `agent.upgrade` | strict 固定 manifest 制品参数；需要 approval、独立 root helper、重启回验与回滚，详见 `SELF-UPGRADE-V1.md`。 |
 | vm | `vm.start`, `vm.shutdown`, `vm.stop`, `vm.reboot` | `parameters` 必须是空对象。 |
-| vm | `vm.suspend`, `vm.resume` | QEMU only；空对象；Agent 等待 UPID 并回读 `qmpstatus=paused` 或 running，LXC 明确拒绝。 |
+| vm | `vm.suspend`, `vm.resume` | QEMU only；空对象。suspend 遇 stopped 以已验证零 mutation 成功收敛，候选 PVE 错误必须精确绑定当前 VMID；resume 按真实状态选择 stopped→start、paused→resume、running→已验证零 mutation 成功，paused→stopped 竞态仅一次 start 并回读 running。其余路径等待 UPID 并回读 `qmpstatus`；LXC 明确拒绝。 |
 | vm | `vm.create` | `name`, `cores`, `memoryMiB`, `storage`, `diskGiB` 和必填 bool `start`；LXC 必须有 `template`，QEMU 禁止 `template`。 |
 | vm | `vm.clone` | `sourceVmid`, `templateRef`, `name`, `target`, `storage`, `sourceConfigSha256` 和必填且只能为 true 的 `full`；执行前重新读取模板基线并校验 SHA-256，Journal 固化 templateRef/sourceVmid 供后续 lineage 使用。 |
 | vm | `vm.set-resources` | 可选 `cores/sockets/memoryMiB`，至少一项；实现会读取现值且只允许增加。 |

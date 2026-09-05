@@ -416,8 +416,16 @@ golden 位于
 
 ## suspend / resume 与密码
 
-- `vm.suspend` / `vm.resume` parameters 均为 `{}`，仅 QEMU；Agent 等待 UPID 并回读
-  qmpstatus，成功 result 为 `{"powerState":"suspended|running","verified":true}`。
+- `vm.suspend` / `vm.resume` parameters 均为 `{}`，仅 QEMU。suspend 预读 stopped 时不发送
+  POST，返回 `{"powerState":"stopped","verified":true,"alreadyDesired":true,"mutation":false}`；
+  只有精确且绑定当前 VMID 的 PVE `not running` 或 `already stopped`，并且二次 scoped
+  读回仍为 stopped 的竞态也可同样收敛。
+  resume 预读 stopped 时改走 `/status/start`（沿用 start 的提交/UPID 合同），paused 时走
+  `/status/resume`，已 running 时零 mutation 成功；paused→stopped 后收到上述受限 PVE
+  错误时，只会补发一次 start、等待 UPID 并读回 running，绝不回到 resume 循环。resume POST
+  仍等待 UPID 并严格回读 qmpstatus。成功 result 为
+  `{"powerState":"suspended|running","verified":true}`，收敛 no-op 另包含
+  `alreadyDesired=true,mutation=false`。
 - `vm.reset-password` parameters 为
   `{"username":"root","password":"<secret>","crypted":false,"osFamily":"linux"}`。
   QEMU 支持 `linux|windows` 和受限账户名，经 QGA fixed password endpoint；LXC 只允许

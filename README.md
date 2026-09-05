@@ -114,6 +114,8 @@ Executor 不接受任意 URL、PVE path、shell、`qm`、`pct` 或 `pvesh`。代
 
 `0.1.1-rc.60` 将电源动作改为基于真实 `/status/current` 的收敛式执行：已经 running 的 `vm.start` 与已经 stopped 的 `vm.shutdown`/`vm.stop` 返回带 `alreadyDesired=true`、`verified=true`、`mutation=false` 的成功结果，不再因编排中的重复恢复步骤误报失败。若状态在预读后发生竞态，只有 PVE 返回精确 already-running/already-stopped 且第二次 scoped 状态读取证明目标状态时才归一化；锁冲突或其他错误仍原样失败。`vm.reboot` 只允许 running guest，stopped 时明确返回 `POWER_STATE_PRECONDITION_REJECTED` 且不发送 POST。同版还把短任务拆为 critical 与 normal 有界 lane，并修复 lane 满时先写 running journal、随后入队失败造成无人执行命令的风险。
 
+`0.1.2` 将 QEMU suspend/resume 的停机边界改为严格收敛：suspend 预读 stopped 时直接以已验证、零 mutation 成功返回，不会发送 POST；PVE 8/9 并发窗口只有限接受绑定当前 VMID 的 `VM <vmid> not running` 与 `VM <vmid> (is )?already stopped`（直接错误或终态 UPID），且第二次 scoped `/status/current` 已确认 stopped 才归一化。resume 按真实状态选择 stopped→start、paused→resume、running→已验证零 mutation 成功；paused→stopped 竞态只补发一次 start、等待任务并回读 running，绝不循环。不同 VMID、其他错误或读回不匹配均继续失败。
+
 `0.1.1-rc.53` 增加仅含 guest 类型、节点和 VMID 的签名 PVE inventory 发现阶段。官网在每个新建 VPS 分配 VMID 前必须先获得这份不超过两分钟的实际库存；未知旧 VM、容器和并发之外的占用都会被排除，绝不再依据官网映射表猜测空闲 VMID。
 
 `0.1.1-rc.52` 在 rc.51 的长轮询与 noVNC 容量控制上补齐备份备注的严格端到端合同，并移除模板 vendor cloud-config 中固定的 `timezone: UTC`，避免后续 cloud-init 网络变更再次覆盖每台 VPS 已签名设置并回读验证的时区。
