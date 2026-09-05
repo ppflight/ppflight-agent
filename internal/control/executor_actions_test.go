@@ -593,6 +593,19 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	if json.Unmarshal(receipt.Result, &failure) != nil || failure.FailedCheck != "timezone" || failure.Timezone == nil || failure.Timezone.ExpectedIANA != "UTC" || failure.Timezone.ObservedZone != "CST" || failure.Timezone.ObservedOffsetSeconds != 28800 {
 		t.Fatalf("timezone failure diagnostic is incomplete: %s", receipt.Result)
 	}
+
+	// QGA can fail before it reports a zone. The receipt must still identify
+	// the expected safe IANA timezone, while explicitly saying that no actual
+	// observation is available rather than fabricating one.
+	timezoneResult = `{"data":{"result":{"offset":0}}}`
+	receipt, err = (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.Code != "DELIVERY_NOT_READY" {
+		t.Fatalf("timezone unavailable receipt=%#v err=%v", receipt, err)
+	}
+	failure = DeliveryVerificationFailureResult{}
+	if json.Unmarshal(receipt.Result, &failure) != nil || failure.FailedCheck != "timezone" || failure.Timezone == nil || failure.Timezone.ExpectedIANA != "UTC" || failure.Timezone.ObservedState != "unavailable" || failure.Timezone.ObservedZone != "" || failure.Timezone.ObservedOffsetSeconds != 0 {
+		t.Fatalf("timezone unavailable diagnostic is unsafe or incomplete: %s", receipt.Result)
+	}
 }
 
 func TestDeliveryMakeBeforeBreakFilterContractIsNarrow(t *testing.T) {

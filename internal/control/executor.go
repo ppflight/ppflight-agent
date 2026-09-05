@@ -349,6 +349,13 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 					ObservedOffsetSeconds: timezoneMismatch.ObservedOffsetSeconds,
 				}
 			}
+			var timezoneUnavailable *deliveryTimezoneUnavailableError
+			if errors.As(verifyErr, &timezoneUnavailable) {
+				failure.Timezone = &DeliveryTimezoneFailureResult{
+					ExpectedIANA:  timezoneUnavailable.ExpectedIANA,
+					ObservedState: "unavailable",
+				}
+			}
 			r.Result, _ = json.Marshal(failure)
 			return finish(verifyErr)
 		}
@@ -2430,8 +2437,9 @@ type DeliveryVerificationFailureResult struct {
 
 type DeliveryTimezoneFailureResult struct {
 	ExpectedIANA          string `json:"expectedIana"`
-	ObservedZone          string `json:"observedZone"`
-	ObservedOffsetSeconds int64  `json:"observedOffsetSeconds"`
+	ObservedState         string `json:"observedState,omitempty"`
+	ObservedZone          string `json:"observedZone,omitempty"`
+	ObservedOffsetSeconds int64  `json:"observedOffsetSeconds,omitempty"`
 }
 
 type deliveryTimezoneMismatchError struct {
@@ -2442,6 +2450,17 @@ type deliveryTimezoneMismatchError struct {
 
 func (e *deliveryTimezoneMismatchError) Error() string {
 	return "guest timezone does not match delivery contract"
+}
+
+// deliveryTimezoneUnavailableError preserves only the expected IANA location
+// when QGA cannot provide an observation. It deliberately does not invent a
+// zone or offset: unavailable is diagnostically useful but not an observation.
+type deliveryTimezoneUnavailableError struct {
+	ExpectedIANA string
+}
+
+func (e *deliveryTimezoneUnavailableError) Error() string {
+	return "guest timezone observation is unavailable"
 }
 
 // deliveryFailureCheck maps only Agent-authored error text to a frozen safe
@@ -2542,7 +2561,7 @@ func verifyDelivery(ctx context.Context, client *pve.Client, command Command) (j
 	}
 	timezone, err := client.ReadGuestTimezone(ctx, command.Identity.NodeRef, command.Identity.VMID)
 	if err != nil {
-		return nil, errors.New("guest timezone does not match delivery contract")
+		return nil, &deliveryTimezoneUnavailableError{ExpectedIANA: p.Expected.Timezone}
 	}
 	if !guestTimezoneMatches(timezone, p.Expected.Timezone, time.Now().UTC()) {
 		zone := strings.TrimSpace(timezone.Zone)
