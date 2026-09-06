@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/control"
@@ -53,10 +54,12 @@ const (
 	LegacyUpgradeUnitTimeout      = 180 * time.Second
 	UpgradeHelperOverallTimeout   = 140 * time.Second
 	hostFirewallPreflightTimeout  = 30 * time.Second
-	hostFirewallPostflightTimeout = 55 * time.Second
-	hostFirewallTransientTimeout  = 50 * time.Second
+	hostFirewallPostflightTimeout = 115 * time.Second
+	hostFirewallTransientTimeout  = 110 * time.Second
 	helperRollbackTimeout         = 30 * time.Second
 	installedAgentBinary          = "/usr/local/bin/ppflight-agent"
+	maxHelperDiagnosticBytes      = 512
+	helperDiagnosticHeadBytes     = 160
 )
 
 var transientUpgradeIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$`)
@@ -718,15 +721,46 @@ func saveResult(stateDirectory string, result Result) error {
 }
 
 func safeHelperText(value []byte) string {
-	text := strings.TrimSpace(string(value))
-	if len(text) > 256 {
-		text = text[:256]
-	}
-	text = strings.Map(func(r rune) rune {
+	// Helper subprocesses emit controlled progress before their terminal
+	// diagnostic. Preserve both ends: retaining only the first bytes hid the
+	// actual systemd/UFW failure behind INFO lines on slower PVE hosts.
+	clean := strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
-			return -1
+			return ' '
 		}
 		return r
-	}, text)
-	return text
+	}, string(value))
+	text := strings.Join(strings.Fields(clean), " ")
+	if len(text) <= maxHelperDiagnosticBytes {
+		return text
+	}
+	const separator = " ... "
+	head := utf8SafePrefix(text, helperDiagnosticHeadBytes)
+	tail := utf8SafeSuffix(text, maxHelperDiagnosticBytes-len(head)-len(separator))
+
+	return head + separator + tail
+}
+
+func utf8SafePrefix(value string, maximumBytes int) string {
+	if len(value) <= maximumBytes {
+		return value
+	}
+	end := maximumBytes
+	for end > 0 && !utf8.ValidString(value[:end]) {
+		end--
+	}
+
+	return value[:end]
+}
+
+func utf8SafeSuffix(value string, maximumBytes int) string {
+	if len(value) <= maximumBytes {
+		return value
+	}
+	start := len(value) - maximumBytes
+	for start < len(value) && !utf8.ValidString(value[start:]) {
+		start++
+	}
+
+	return value[start:]
 }

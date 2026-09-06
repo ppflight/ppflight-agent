@@ -780,7 +780,7 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 	if receipt.AgentUpgradeID != "" {
 		record.AgentUpgradeID = receipt.AgentUpgradeID
 	}
-	if record.AuditContext != nil {
+	if record.AuditContext != nil && shouldQueueReceiptAudit(*record, receipt) {
 		event, err := auditEventFromReceipt(*record.AuditContext, receipt)
 		if err != nil {
 			return err
@@ -788,6 +788,15 @@ func (j *Journal) completeLocked(filename string, record *journalRecord, receipt
 		record.AuditPending = &event
 	}
 	return writeJournal(filename, *record)
+}
+
+// The website needs every fresh asynchronous status receipt so it can keep
+// task progress current. Monitoring, however, records durable state changes,
+// not each poll observation. An upgrade already emitted its submitted audit
+// before entering reconciliation, so subsequent waiting observations would
+// otherwise upload the same submitted phase once per poll.
+func shouldQueueReceiptAudit(record journalRecord, receipt Receipt) bool {
+	return record.Action != "agent.upgrade" || receipt.State != "waiting"
 }
 
 func validSnippetDeleteJournalResult(record *journalRecord, raw json.RawMessage) bool {

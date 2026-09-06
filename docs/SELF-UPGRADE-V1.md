@@ -37,6 +37,8 @@ helper 重启 `ppflight-agent.service` 后，必须从 loopback `/status` 同时
 
 同版本重跑仅用于上述 postflight、恢复或显式强制校验；降级（包括 stable 到 prerelease 或更低 prerelease）在制品下载前拒绝。新 helper 的前向工作有小于旧 `ppflight-agent-upgrade.service` 180 秒上限的硬预算，各子阶段使用同一可取消 context；必要的独立回滚另有短预算。发布包可提高后续节点的 unit 上限，但绝不能依赖先更新 unit 才避免第一跳被 PID 1 强杀。
 
+`0.1.7` 起，host-firewall transient worker 使用 110 秒预算，外层 postflight 使用 115 秒预算，总 helper 仍为 140 秒并为旧 180 秒 unit 保留独立回滚空间。受控 helper 诊断最多 512 字节，并同时保留开头与结尾，避免阶段日志遮蔽最终 systemd、dpkg 或 netfilter 错误。官网仍接收每次升级等待状态用于刷新进度，但 monitoring audit 只记录一次已提交阶段与最终成功、失败或回滚，不再随每轮轮询重复上传相同日志。
+
 ## Bootstrap 边界
 
 RC.8 及更早版本没有 `agent.upgrade` 和 root helper，因此不能被官网安全地远程升级。部署首个支持自升级的版本需要一次人工执行 README 的固定 SHA 一键安装。该版本安装、服务回验、官网重新绑定/授权 `agent.upgrade` 完成之前，官网必须保持 `upgradeDeliveryEnabled=false`，不得显示“已下发”或“升级成功”。

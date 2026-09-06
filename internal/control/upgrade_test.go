@@ -128,6 +128,83 @@ func TestJournalAuthorizesOnlyExactSubmittedUpgrade(t *testing.T) {
 	}
 }
 
+func TestUpgradeWaitingReceiptsDoNotRepeatMonitoringAudit(t *testing.T) {
+	journal, err := OpenJournal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := controlCommand("agent.upgrade", "qemu", upgradeFixture())
+	command.SchemaVersion = 1
+	command.CommandID = "command-upgrade-01"
+	command.OperationID = "operation-upgrade-01"
+	command.AgentRef = "agent-01"
+	command.OperatorRef = "operator-01"
+	command.IdempotencyKey = "idempotency-upgrade-01"
+	command.AssignmentRevision = 19
+	command.SigningKeyID = "website-signing-01"
+	command.BodySHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	command.Parameters = json.RawMessage(upgradeFixture())
+	now := time.Date(2026, 9, 6, 8, 0, 0, 0, time.UTC)
+	if _, duplicate, err := journal.ClaimWithAudit(command, now, "0.1.7"); err != nil || duplicate {
+		t.Fatalf("claim duplicate=%v err=%v", duplicate, err)
+	}
+	submitted := Receipt{
+		SchemaVersion: 1, ReceiptID: "11111111-1111-4111-8111-111111111111",
+		CommandID: command.CommandID, OperationID: command.OperationID, AgentRef: command.AgentRef,
+		State: "submitted", Code: "AGENT_UPGRADE_SUBMITTED", ExecutionMode: "production",
+		StartedAt: now, FinishedAt: now, AgentUpgradeID: "upgrade-01", OperatorRef: command.OperatorRef,
+	}
+	if err := journal.Complete(command, submitted); err != nil {
+		t.Fatal(err)
+	}
+	event, pending, err := journal.PendingAuditForReceipt(command.CommandID, submitted.ReceiptID)
+	if err != nil || !pending || event.Outcome != "submitted" {
+		t.Fatalf("submitted audit=%#v pending=%v err=%v", event, pending, err)
+	}
+	if err := journal.MarkAuditQueued(command.CommandID, event.EventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.MarkReceiptQueued(command.CommandID, submitted.ReceiptID); err != nil {
+		t.Fatal(err)
+	}
+
+	for index := 0; index < 2; index++ {
+		tasks, err := journal.SubmittedWaiting()
+		if err != nil || len(tasks) != 1 {
+			t.Fatalf("waiting tasks=%#v err=%v", tasks, err)
+		}
+		waiting := tasks[0].Receipt
+		waiting.ReceiptID = fmt.Sprintf("22222222-2222-4222-8222-22222222222%d", index)
+		waiting.State, waiting.Code = "waiting", "AGENT_UPGRADE_WAITING"
+		waiting.FinishedAt = now.Add(time.Duration(index+1) * time.Second)
+		if err := journal.CompleteSubmitted(tasks[0], waiting); err != nil {
+			t.Fatal(err)
+		}
+		if _, pending, err := journal.PendingAuditForReceipt(command.CommandID, waiting.ReceiptID); err != nil || pending {
+			t.Fatalf("waiting audit iteration=%d pending=%v err=%v", index, pending, err)
+		}
+		if err := journal.MarkReceiptQueued(command.CommandID, waiting.ReceiptID); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tasks, err := journal.SubmittedWaiting()
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("terminal task=%#v err=%v", tasks, err)
+	}
+	terminal := tasks[0].Receipt
+	terminal.ReceiptID = "33333333-3333-4333-8333-333333333333"
+	terminal.State, terminal.Code = "succeeded", AgentUpgradeHostFirewallSuccessCode
+	terminal.FinishedAt = now.Add(3 * time.Second)
+	if err := journal.CompleteSubmitted(tasks[0], terminal); err != nil {
+		t.Fatal(err)
+	}
+	event, pending, err = journal.PendingAuditForReceipt(command.CommandID, terminal.ReceiptID)
+	if err != nil || !pending || event.Outcome != "succeeded" {
+		t.Fatalf("terminal audit=%#v pending=%v err=%v", event, pending, err)
+	}
+}
+
 func TestAgentUpgradeAuditGoldenMapping(t *testing.T) {
 	now := time.Date(2026, 8, 30, 8, 0, 0, 0, time.UTC)
 	command := controlCommand("agent.upgrade", "qemu", upgradeFixture())

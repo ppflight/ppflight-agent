@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ppflight/ppflight-agent/internal/bindstate"
 	"github.com/ppflight/ppflight-agent/internal/control"
@@ -150,7 +151,7 @@ func TestHostFirewallPostflightCommandIsUniqueAndExact(t *testing.T) {
 	for _, required := range []string{
 		"--wait", "--pipe", "--collect", "--no-ask-password",
 		"--unit=ppflight-agent-upgrade-postflight-upgrade-01.service",
-		"--property=User=root", "--property=TimeoutStartSec=50s",
+		"--property=User=root", "--property=TimeoutStartSec=110s",
 		"--property=PartOf=ppflight-agent-upgrade.service",
 		installedAgentBinary + "\nhost-firewall\nreconcile",
 	} {
@@ -173,8 +174,27 @@ func TestHelperBudgetsFitLegacyUpgradeUnit(t *testing.T) {
 	if UpgradeHelperOverallTimeout+helperRollbackTimeout >= LegacyUpgradeUnitTimeout {
 		t.Fatalf("overall %v + recovery %v must fit legacy unit %v", UpgradeHelperOverallTimeout, helperRollbackTimeout, LegacyUpgradeUnitTimeout)
 	}
-	if hostFirewallPreflightTimeout > 35*time.Second || hostFirewallPostflightTimeout > 60*time.Second || hostFirewallTransientTimeout > hostFirewallPostflightTimeout {
+	if hostFirewallPreflightTimeout > 35*time.Second || hostFirewallPostflightTimeout >= UpgradeHelperOverallTimeout || hostFirewallTransientTimeout >= hostFirewallPostflightTimeout {
 		t.Fatalf("unsafe phase budgets: preflight=%v postflight=%v transient=%v", hostFirewallPreflightTimeout, hostFirewallPostflightTimeout, hostFirewallTransientTimeout)
+	}
+	if hostFirewallTransientTimeout < 2*50*time.Second {
+		t.Fatalf("transient firewall budget regressed below the observed slow-host requirement: %v", hostFirewallTransientTimeout)
+	}
+}
+
+func TestSafeHelperTextPreservesTerminalDiagnosticWithinWireLimit(t *testing.T) {
+	raw := "progress-start\x00\x7f\n" + strings.Repeat("中间日志 ", 100) + "\nterminal-error: systemd worker timed out"
+	got := safeHelperText([]byte(raw))
+	if len(got) > maxHelperDiagnosticBytes || !utf8.ValidString(got) {
+		t.Fatalf("diagnostic is not bounded valid UTF-8: bytes=%d value=%q", len(got), got)
+	}
+	if strings.ContainsAny(got, "\r\n\x00\x7f") {
+		t.Fatalf("diagnostic retained control characters: %q", got)
+	}
+	for _, required := range []string{"progress-start", "terminal-error: systemd worker timed out", " ... "} {
+		if !strings.Contains(got, required) {
+			t.Fatalf("diagnostic omitted %q: %q", required, got)
+		}
 	}
 }
 
