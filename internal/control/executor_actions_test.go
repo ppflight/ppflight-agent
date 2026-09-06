@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -1226,6 +1227,16 @@ func TestDeliveryVerificationRequiresCompleteFreshReadback(t *testing.T) {
 	var failure DeliveryVerificationFailureResult
 	if json.Unmarshal(receipt.Result, &failure) != nil || failure.FailedCheck != "timezone" || failure.Timezone == nil || failure.Timezone.ExpectedIANA != "UTC" || failure.Timezone.ObservedZone != "CST" || failure.Timezone.ObservedOffsetSeconds != 28800 {
 		t.Fatalf("timezone failure diagnostic is incomplete: %s", receipt.Result)
+	}
+
+	// A mismatched zone can legitimately have a zero UTC offset. Keep the
+	// integer in the exact JSON contract: omitting it makes the website reject
+	// the otherwise valid terminal receipt and leaves the provisioning command
+	// stuck at COMMAND_STARTED until expiry.
+	timezoneResult = `{"data":{"result":{"zone":"Etc/UTC","offset":0}}}`
+	receipt, err = (Executor{ReadClient: controlTestClient(t, server), Mode: "test"}).Execute(context.Background(), command, time.Now())
+	if err == nil || receipt.Code != "DELIVERY_NOT_READY" || !bytes.Contains(receipt.Result, []byte(`"observedOffsetSeconds":0`)) {
+		t.Fatalf("zero-offset timezone failure diagnostic is incomplete: %s", receipt.Result)
 	}
 
 	// QGA can fail before it reports a zone. The receipt must still identify

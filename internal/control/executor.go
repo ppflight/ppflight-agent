@@ -2673,7 +2673,7 @@ type DeliveryTimezoneFailureResult struct {
 	ExpectedIANA          string `json:"expectedIana"`
 	ObservedState         string `json:"observedState,omitempty"`
 	ObservedZone          string `json:"observedZone,omitempty"`
-	ObservedOffsetSeconds int64  `json:"observedOffsetSeconds,omitempty"`
+	ObservedOffsetSeconds int64  `json:"observedOffsetSeconds"`
 }
 
 type deliveryTimezoneMismatchError struct {
