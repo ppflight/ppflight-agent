@@ -996,9 +996,10 @@ func (j *Journal) MarkReceiptQueued(commandID, receiptID string) error {
 	return writeJournal(filename, record)
 }
 
-// RecoverIncomplete marks claims which survived a crash before Complete as
-// indeterminate. Such a record has no UPID, so retrying its mutation would be
-// unsafe; a terminal receipt is the only honest recovery outcome.
+// RecoverIncomplete turns claims which survived a crash before Complete into
+// terminal receipts. Mutations remain indeterminate because replay would be
+// unsafe. Read-only work fails explicitly so the website may safely issue a
+// fresh signed command instead of waiting until command expiry.
 func (j *Journal) RecoverIncomplete(now time.Time, mode string) ([]Receipt, error) {
 	return j.recoverIncomplete(now, mode, nil)
 }
@@ -1028,7 +1029,14 @@ func (j *Journal) recoverIncomplete(now time.Time, mode string, active func(stri
 			return nil, err
 		}
 		if !((record.State == "received" && record.Receipt == nil) || (record.State == "running" && record.Receipt != nil && record.Receipt.State == "running")) ||
-			!record.Mutating || record.Action == "vm.cloud-init-snippet.delete" || (active != nil && active(record.CommandID)) {
+			record.Action == "vm.cloud-init-snippet.delete" || (active != nil && active(record.CommandID)) {
+			continue
+		}
+		// A read-only claim with no running receipt has not crossed the durable
+		// execution boundary and remains safely redeliverable by Claim. Once a
+		// running receipt was emitted, however, the website cursor may already
+		// have advanced, so recovery must publish a terminal failure.
+		if !record.Mutating && record.State != "running" {
 			continue
 		}
 		id, err := protocol.NewID()
@@ -1039,6 +1047,16 @@ func (j *Journal) recoverIncomplete(now time.Time, mode string, active func(stri
 			SchemaVersion: SchemaVersion, ReceiptID: id, CommandID: record.CommandID, OperationID: record.OperationID,
 			AgentRef: record.AgentRef, State: "indeterminate", Code: "EXECUTION_INDETERMINATE",
 			ExecutionMode: mode, StartedAt: record.CreatedAt.UTC(), FinishedAt: now.UTC(), OperatorRef: record.OperatorRef,
+		}
+		if !record.Mutating {
+			receipt.State, receipt.Code = "failed", "AGENT_EXECUTION_INTERRUPTED"
+			receipt.Error = executionError(record.Action, errors.New("agent restarted before the read-only command produced a terminal receipt"))
+			if record.Action == "vm.verify-delivery" {
+				receipt.Code = "DELIVERY_NOT_READY"
+				receipt.Result, _ = json.Marshal(DeliveryVerificationFailureResult{
+					Ready: false, ObservedAt: now.UTC().Truncate(time.Second), FailedCheck: "provider_read",
+				})
+			}
 		}
 		ApplyReceiptCompatibility(&receipt)
 		record.State, record.UpdatedAt, record.Receipt, record.ReceiptPending = receipt.State, now.UTC(), &receipt, true

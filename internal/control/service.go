@@ -53,6 +53,11 @@ const (
 	// AgentUpgradeHostFirewallSuccessCode proves both candidate health and the
 	// privileged host-firewall reconciliation completed successfully.
 	AgentUpgradeHostFirewallSuccessCode = "AGENT_UPGRADE_SUCCEEDED_HOST_FIREWALL_V1"
+	// Read-only commands may be abandoned safely after a bounded deadline: no
+	// provider mutation can still be in flight. This is deliberately shorter
+	// than the website command expiry so a lost PVE/QGA read returns a signed
+	// terminal receipt instead of occupying the provisioning lane until expiry.
+	defaultReadOnlyExecutionTimeout = 4 * time.Minute
 )
 
 // TaskResolution is intentionally a small PVE-neutral task view. Status is
@@ -120,6 +125,8 @@ type Service struct {
 	cursor               string
 	now                  func() time.Time
 	dispatcher           *commandDispatcher
+	executeCommand       func(context.Context, Command, time.Time) (Receipt, error)
+	readOnlyTimeout      time.Duration
 }
 
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -186,6 +193,8 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		return nil, err
 	}
 	service.dispatcher = newCommandDispatcher(service.executeDispatched)
+	service.executeCommand = service.executor.Execute
+	service.readOnlyTimeout = defaultReadOnlyExecutionTimeout
 	return service, nil
 }
 
@@ -436,7 +445,7 @@ func (s *Service) executeDispatched(ctx context.Context, command Command) {
 		"action", command.Action,
 		"scope", command.Scope,
 	)
-	receipt, err := s.executor.Execute(ctx, command, now)
+	receipt, err := s.executeDispatchedCommand(ctx, command, now)
 	receipt.OperationID = command.OperationID
 	ApplyReceiptCompatibility(&receipt)
 	if completeErr := s.journal.Complete(command, receipt); completeErr != nil {
@@ -451,6 +460,95 @@ func (s *Service) executeDispatched(ctx context.Context, command Command) {
 	if err := s.enqueueJournaled(command.CommandID, receipt); err != nil {
 		slog.Error("control command receipt delivery deferred", "commandId", command.CommandID, "error", safeControlLogError(err))
 	}
+}
+
+type dispatchedCommandResult struct {
+	receipt  Receipt
+	err      error
+	panicked bool
+}
+
+// executeDispatchedCommand gives every read-only operation a whole-command
+// deadline in addition to the PVE client's per-request timeout. The executor
+// runs in a separate goroutine only for read-only actions, where returning a
+// terminal timeout cannot race a provider mutation. Mutating commands remain
+// synchronous and fail closed as indeterminate if an unexpected panic reaches
+// this boundary.
+func (s *Service) executeDispatchedCommand(ctx context.Context, command Command, startedAt time.Time) (Receipt, error) {
+	if requiresApproval(command.Action) {
+		result := s.invokeDispatchedExecutor(ctx, command, startedAt)
+		if result.panicked {
+			return s.interruptedReceipt(command, startedAt, false, "agent command executor stopped unexpectedly")
+		}
+		return result.receipt, result.err
+	}
+
+	timeout := s.readOnlyTimeout
+	if timeout <= 0 {
+		timeout = defaultReadOnlyExecutionTimeout
+	}
+	executionCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	completed := make(chan dispatchedCommandResult, 1)
+	go func() {
+		completed <- s.invokeDispatchedExecutor(executionCtx, command, startedAt)
+	}()
+
+	select {
+	case result := <-completed:
+		if result.panicked {
+			return s.interruptedReceipt(command, startedAt, true, "agent read-only executor stopped unexpectedly")
+		}
+		return result.receipt, result.err
+	case <-executionCtx.Done():
+		reason := "agent read-only command execution was interrupted"
+		if errors.Is(executionCtx.Err(), context.DeadlineExceeded) {
+			reason = "agent read-only command exceeded its execution deadline"
+		}
+		return s.interruptedReceipt(command, startedAt, true, reason)
+	}
+}
+
+func (s *Service) invokeDispatchedExecutor(ctx context.Context, command Command, startedAt time.Time) (result dispatchedCommandResult) {
+	defer func() {
+		if recover() != nil {
+			result = dispatchedCommandResult{panicked: true}
+		}
+	}()
+	execute := s.executeCommand
+	if execute == nil {
+		execute = s.executor.Execute
+	}
+	result.receipt, result.err = execute(ctx, command, startedAt)
+	return result
+}
+
+func (s *Service) interruptedReceipt(command Command, startedAt time.Time, readOnly bool, reason string) (Receipt, error) {
+	id, err := protocol.NewID()
+	if err != nil {
+		return Receipt{}, err
+	}
+	finishedAt := s.now().UTC()
+	if finishedAt.Before(startedAt) {
+		finishedAt = startedAt
+	}
+	receipt := Receipt{
+		SchemaVersion: SchemaVersion, ReceiptID: id, CommandID: command.CommandID, OperationID: command.OperationID,
+		AgentRef: command.AgentRef, State: "indeterminate", Code: "EXECUTION_INDETERMINATE", ExecutionMode: s.mode,
+		StartedAt: startedAt, FinishedAt: finishedAt, OperatorRef: command.OperatorRef,
+		Error: executionError(command.Action, errors.New(reason)),
+	}
+	if readOnly {
+		receipt.State, receipt.Code = "failed", "AGENT_EXECUTION_INTERRUPTED"
+	}
+	if readOnly && command.Action == "vm.verify-delivery" {
+		receipt.Code = "DELIVERY_NOT_READY"
+		receipt.Result, _ = json.Marshal(DeliveryVerificationFailureResult{
+			Ready: false, ObservedAt: finishedAt.Truncate(time.Second), FailedCheck: "provider_read",
+		})
+	}
+	ApplyReceiptCompatibility(&receipt)
+	return receipt, errors.New(reason)
 }
 
 func safeControlLogError(err error) string {
