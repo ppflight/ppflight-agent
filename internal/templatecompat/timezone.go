@@ -33,6 +33,7 @@ var (
 	managedVendorVolume = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_.-]*):snippets/(ppflight-(?:debian|rpm)-)([a-f0-9]{64})\.yaml$`)
 	topLevelTimezone    = regexp.MustCompile(`^timezone:[ \t]+[^#\r\n]+(?:[ \t]+#.*)?(?:\r?\n)?$`)
 	vmConfigName        = regexp.MustCompile(`^[1-9][0-9]*\.conf$`)
+	pveNodeName         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 )
 
 type Report struct {
@@ -120,7 +121,11 @@ func (m *migrator) migrate(ctx context.Context) (Report, error) {
 }
 
 func (m *migrator) plan(ctx context.Context) ([]migration, int, error) {
-	entries, err := os.ReadDir(m.configDirectory)
+	configDirectory, err := resolvePVEQEMUConfigDirectory(m.configDirectory)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve PVE QEMU config directory: %w", err)
+	}
+	entries, err := os.ReadDir(configDirectory)
 	if err != nil {
 		return nil, 0, fmt.Errorf("read PVE QEMU config directory: %w", err)
 	}
@@ -131,7 +136,7 @@ func (m *migrator) plan(ctx context.Context) ([]migration, int, error) {
 		if entry.IsDir() || !vmConfigName.MatchString(entry.Name()) {
 			continue
 		}
-		configPath := filepath.Join(m.configDirectory, entry.Name())
+		configPath := filepath.Join(configDirectory, entry.Name())
 		raw, err := readLimitedRegular(configPath, maximumPVEConfigBytes)
 		if err != nil {
 			return nil, 0, fmt.Errorf("read QEMU config %s: %w", entry.Name(), err)
@@ -203,6 +208,48 @@ func (m *migrator) plan(ctx context.Context) ([]migration, int, error) {
 		plans = append(plans, migration{vmid: vmid, oldCICustom: cicustom, newCICustom: newCICustom, newVolume: newVolume, newPath: filepath.Join(filepath.Dir(resolved), newName), newContent: sanitized})
 	}
 	return plans, scanned, nil
+}
+
+// PVE exposes /etc/pve/qemu-server as the relative compatibility symlink
+// nodes/<node>/qemu-server. The no-follow reader intentionally rejects that
+// symlink, so resolve only this exact pmxcfs shape before opening config files.
+// Absolute targets, traversal, nested links, and non-directories remain
+// rejected.
+func resolvePVEQEMUConfigDirectory(directory string) (string, error) {
+	info, err := os.Lstat(directory)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		if !info.IsDir() {
+			return "", errors.New("QEMU config path is not a directory")
+		}
+		return directory, nil
+	}
+	target, err := os.Readlink(directory)
+	if err != nil {
+		return "", err
+	}
+	if filepath.IsAbs(target) || filepath.Clean(target) != target {
+		return "", errors.New("QEMU config symlink target is not a clean relative path")
+	}
+	parts := strings.Split(filepath.ToSlash(target), "/")
+	if len(parts) != 3 || parts[0] != "nodes" || !pveNodeName.MatchString(parts[1]) || parts[2] != "qemu-server" {
+		return "", errors.New("QEMU config symlink does not match the PVE pmxcfs layout")
+	}
+	root := filepath.Dir(directory)
+	resolved := root
+	for _, component := range parts {
+		resolved = filepath.Join(resolved, component)
+		resolvedInfo, err := os.Lstat(resolved)
+		if err != nil {
+			return "", err
+		}
+		if resolvedInfo.Mode()&os.ModeSymlink != 0 || !resolvedInfo.IsDir() {
+			return "", fmt.Errorf("resolved PVE QEMU config component %q is not a direct directory", component)
+		}
+	}
+	return resolved, nil
 }
 
 func (m *migrator) verify(ctx context.Context, vmid int, expected string) error {

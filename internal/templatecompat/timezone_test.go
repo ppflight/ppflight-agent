@@ -110,6 +110,85 @@ func TestMigrateLegacyTemplateTimezonesCreatesContentAddressedSuccessor(t *testi
 	}
 }
 
+func TestMigrateLegacyTemplateTimezonesAcceptsPVECompatibilitySymlink(t *testing.T) {
+	fixture := newMigrationFixture(t)
+	root := filepath.Dir(fixture.configDir)
+	realConfigDir := filepath.Join(root, "nodes", "pve", "qemu-server")
+	if err := os.MkdirAll(realConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nodes/pve/qemu-server", fixture.configDir); err != nil {
+		t.Fatal(err)
+	}
+	fixture.add(9000, []byte("#cloud-config\ntimezone: UTC\n"))
+
+	report, err := (&migrator{configDirectory: fixture.configDir, run: fixture.run}).migrate(context.Background())
+	if err != nil {
+		t.Fatalf("migrate through PVE compatibility symlink: %v", err)
+	}
+	if report.Migrated != 1 || len(report.VMIDs) != 1 || report.VMIDs[0] != 9000 {
+		t.Fatalf("unexpected report: %#v", report)
+	}
+}
+
+func TestResolvePVEQEMUConfigDirectoryRejectsUnexpectedSymlink(t *testing.T) {
+	for name, target := range map[string]string{
+		"absolute":       "/etc/pve/nodes/pve/qemu-server",
+		"traversal":      "nodes/../pve/qemu-server",
+		"wrong prefix":   "local/pve/qemu-server",
+		"wrong basename": "nodes/pve/lxc",
+		"invalid node":   "nodes/pve node/qemu-server",
+	} {
+		t.Run(name, func(t *testing.T) {
+			link := filepath.Join(t.TempDir(), "qemu-server")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := resolvePVEQEMUConfigDirectory(link); err == nil {
+				t.Fatalf("unexpected symlink target %q was accepted", target)
+			}
+		})
+	}
+}
+
+func TestResolvePVEQEMUConfigDirectoryRejectsIntermediateSymlink(t *testing.T) {
+	root := t.TempDir()
+	realNodes := filepath.Join(root, "real-nodes")
+	if err := os.MkdirAll(filepath.Join(realNodes, "pve", "qemu-server"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real-nodes", filepath.Join(root, "nodes")); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "qemu-server")
+	if err := os.Symlink("nodes/pve/qemu-server", link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolvePVEQEMUConfigDirectory(link); err == nil {
+		t.Fatal("intermediate symlink was accepted")
+	}
+}
+
+func TestMigrateLegacyTemplateTimezonesRejectsConfigSymlinkBeforeMutation(t *testing.T) {
+	fixture := newMigrationFixture(t)
+	if err := os.MkdirAll(fixture.configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.conf")
+	if err := os.WriteFile(outside, []byte("template: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(fixture.configDir, "9000.conf")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&migrator{configDirectory: fixture.configDir, run: fixture.run}).migrate(context.Background()); err == nil {
+		t.Fatal("symlink QEMU config was accepted")
+	}
+	if len(fixture.setCalls) != 0 {
+		t.Fatalf("unsafe migration mutated templates: %v", fixture.setCalls)
+	}
+}
+
 func TestMigrateLegacyTemplateTimezonesRejectsHashMismatchBeforeMutation(t *testing.T) {
 	fixture := newMigrationFixture(t)
 	_, source := fixture.add(9000, []byte("#cloud-config\ntimezone: UTC\n"))
