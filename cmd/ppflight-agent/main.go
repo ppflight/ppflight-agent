@@ -5,11 +5,13 @@ import (
 	"crypto/ed25519"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/ppflight/ppflight-agent/internal/admincli"
 	"github.com/ppflight/ppflight-agent/internal/agent"
@@ -20,9 +22,15 @@ import (
 	"github.com/ppflight/ppflight-agent/internal/hostfirewall"
 	"github.com/ppflight/ppflight-agent/internal/inventory"
 	"github.com/ppflight/ppflight-agent/internal/selfupdate"
+	"github.com/ppflight/ppflight-agent/internal/templatecompat"
 )
 
 var version = "dev"
+
+var (
+	runHostFirewall                = hostfirewall.Run
+	migrateLegacyTemplateTimezones = templatecompat.MigrateLegacyTemplateTimezones
+)
 
 func main() {
 	os.Exit(run())
@@ -33,7 +41,7 @@ func run() int {
 	// hidden from the ordinary AG menu and cannot be reached through a signed
 	// website command.
 	if len(os.Args) > 1 && os.Args[1] == "host-firewall" {
-		return hostfirewall.Run(os.Args[2:], os.Stdout, os.Stderr)
+		return runHostFirewallPostflight(os.Args[2:], os.Stdout, os.Stderr)
 	}
 	if base := filepath.Base(os.Args[0]); base == "ag-pve" || base == "ag" || base == "AG" {
 		return admincli.Run(os.Args[1:], version, os.Stdout, os.Stderr)
@@ -125,6 +133,22 @@ func run() int {
 		logger.Error("agent stopped with error", "error", err.Error())
 		return 1
 	}
+	return 0
+}
+
+func runHostFirewallPostflight(args []string, out, errOut io.Writer) int {
+	code := runHostFirewall(args, out, errOut)
+	if code != 0 || len(args) != 1 || args[0] != "reconcile" {
+		return code
+	}
+	migrationContext, migrationCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer migrationCancel()
+	report, err := migrateLegacyTemplateTimezones(migrationContext)
+	if err != nil {
+		fmt.Fprintf(errOut, "legacy template timezone reconciliation failed: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "PPFlight legacy template timezone reconciliation: scanned=%d migrated=%d unchanged=%d\n", report.Scanned, report.Migrated, report.Scanned-report.Migrated)
 	return 0
 }
 

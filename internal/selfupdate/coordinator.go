@@ -168,7 +168,14 @@ func (c *Coordinator) Prepare(ctx context.Context, command control.Command) (str
 		_ = os.Remove(artifactPath)
 		return "", err
 	}
-	if err := fsutil.AtomicWriteFile(filepath.Join(directory, upgradeID+".request.json"), payload, 0o600, false); err != nil {
+	// Do not expose the request to the root path unit until the unprivileged
+	// control service has durably recorded AGENT_UPGRADE_SUBMITTED.  Older
+	// releases wrote the watched *.request.json here, allowing the helper to
+	// race the journal transition and fail after 15 seconds with
+	// "upgrade journal handoff was not durably submitted".  ResolveUpgrade is
+	// called only from reconciliation of that submitted journal record; it
+	// performs the one-way activation rename below.
+	if err := fsutil.AtomicWriteFile(filepath.Join(directory, upgradeID+".prepared.json"), payload, 0o600, false); err != nil {
 		_ = os.Remove(artifactPath)
 		return "", err
 	}
@@ -253,6 +260,9 @@ func (c *Coordinator) ResolveUpgrade(_ context.Context, upgradeID string) (contr
 	filename := filepath.Join(c.cfg.StateDirectory, "upgrades", "results", upgradeID+".json")
 	body, err := os.ReadFile(filename)
 	if errors.Is(err, os.ErrNotExist) {
+		if activateErr := activatePreparedRequest(c.cfg.StateDirectory, upgradeID); activateErr != nil {
+			return control.UpgradeResolution{}, activateErr
+		}
 		return control.UpgradeResolution{Status: "pending"}, nil
 	}
 	if err != nil || len(body) == 0 || len(body) > 64<<10 {
@@ -270,6 +280,40 @@ func (c *Coordinator) ResolveUpgrade(_ context.Context, upgradeID string) (contr
 		return control.UpgradeResolution{}, errors.New("upgrade result status is invalid")
 	}
 	return control.UpgradeResolution{Status: result.Status, Version: result.Version, Code: result.Code, Error: result.Error}, nil
+}
+
+func activatePreparedRequest(stateDirectory, upgradeID string) error {
+	directory := filepath.Join(stateDirectory, "upgrades", "pending")
+	prepared := filepath.Join(directory, upgradeID+".prepared.json")
+	request := filepath.Join(directory, upgradeID+".request.json")
+	preparedInfo, err := os.Lstat(prepared)
+	if errors.Is(err, os.ErrNotExist) {
+		// The helper may already own or have consumed the activated request.
+		return nil
+	}
+	if err != nil || !preparedInfo.Mode().IsRegular() || preparedInfo.Mode()&os.ModeSymlink != 0 || preparedInfo.Size() < 1 || preparedInfo.Size() > 2<<20 {
+		return errors.New("prepared upgrade request is unsafe")
+	}
+	if requestInfo, requestErr := os.Lstat(request); requestErr == nil {
+		if !requestInfo.Mode().IsRegular() || requestInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("active upgrade request is unsafe")
+		}
+		return errors.New("prepared and active upgrade requests both exist")
+	} else if !errors.Is(requestErr, os.ErrNotExist) {
+		return errors.New("active upgrade request is unavailable")
+	}
+	if err := os.Rename(prepared, request); err != nil {
+		return fmt.Errorf("activate prepared upgrade request: %w", err)
+	}
+	handle, err := os.Open(directory)
+	if err != nil {
+		return fmt.Errorf("open upgrade request directory: %w", err)
+	}
+	defer handle.Close()
+	if err := handle.Sync(); err != nil {
+		return fmt.Errorf("sync upgrade request directory: %w", err)
+	}
+	return nil
 }
 
 func validResultError(value *control.ExecutionError) bool {

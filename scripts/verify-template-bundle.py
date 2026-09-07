@@ -225,8 +225,8 @@ def pve_apply_template_migrations(migrations: list[TemplateMigration]) -> None:
     try:
         for migration in migrations:
             pve_run("qm", "set", str(migration.vmid), "--cicustom", migration.new_cicustom)
-            pve_verify_template(migration, migration.new_cicustom)
             applied.append(migration)
+            pve_verify_template(migration, migration.new_cicustom)
     except Exception as error:
         rollback_errors: list[str] = []
         for migration in reversed(applied):

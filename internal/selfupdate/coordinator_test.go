@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,7 +50,8 @@ func TestCoordinatorStagesOnlyExactEnabledManifestArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestPath := filepath.Join(coordinator.cfg.StateDirectory, "upgrades", "pending", id+".request.json")
+	pendingDirectory := filepath.Join(coordinator.cfg.StateDirectory, "upgrades", "pending")
+	requestPath := filepath.Join(pendingDirectory, id+".prepared.json")
 	requestRaw, err := os.ReadFile(requestPath)
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +62,19 @@ func TestCoordinatorStagesOnlyExactEnabledManifestArtifact(t *testing.T) {
 	info, err := os.Stat(filepath.Join(filepath.Dir(requestPath), id+".tar.gz"))
 	if err != nil || info.Size() != int64(len(artifactBody)) {
 		t.Fatalf("staged artifact invalid: %v %#v", err, info)
+	}
+	if _, err := os.Stat(filepath.Join(pendingDirectory, id+".request.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("watched request became visible before journal submission: %v", err)
+	}
+	resolution, err := coordinator.ResolveUpgrade(context.Background(), id)
+	if err != nil || resolution.Status != "pending" {
+		t.Fatalf("activate prepared request: resolution=%#v err=%v", resolution, err)
+	}
+	if _, err := os.Stat(filepath.Join(pendingDirectory, id+".request.json")); err != nil {
+		t.Fatalf("submitted reconciliation did not activate request: %v", err)
+	}
+	if _, err := os.Stat(requestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prepared request remained after activation: %v", err)
 	}
 }
 

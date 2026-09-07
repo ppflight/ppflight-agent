@@ -1048,7 +1048,15 @@ func (j *Journal) recoverIncomplete(now time.Time, mode string, active func(stri
 			AgentRef: record.AgentRef, State: "indeterminate", Code: "EXECUTION_INDETERMINATE",
 			ExecutionMode: mode, StartedAt: record.CreatedAt.UTC(), FinishedAt: now.UTC(), OperatorRef: record.OperatorRef,
 		}
-		if !record.Mutating {
+		if record.Action == "agent.upgrade" && record.State == "running" && record.AgentUpgradeID == "" {
+			// The root helper refuses to mutate the binary until this journal
+			// contains a submitted receipt with the same upgrade ID. Therefore a
+			// restart with only COMMAND_STARTED is provably a pre-mutation
+			// handoff failure, not an indeterminate host mutation. Publishing a
+			// terminal preparation failure releases the node lane safely.
+			receipt.State, receipt.Code = "failed", "UPGRADE_PREPARE_FAILED"
+			receipt.Error = &ExecutionError{Source: "agent", Stage: "upgrade_handoff", Reason: "agent restarted before the upgrade handoff was durably submitted"}
+		} else if !record.Mutating {
 			receipt.State, receipt.Code = "failed", "AGENT_EXECUTION_INTERRUPTED"
 			receipt.Error = executionError(record.Action, errors.New("agent restarted before the read-only command produced a terminal receipt"))
 			if record.Action == "vm.verify-delivery" {

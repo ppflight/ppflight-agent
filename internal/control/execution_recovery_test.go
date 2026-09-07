@@ -80,6 +80,45 @@ func TestReadOnlyRunningJournalRecoversWithTerminalDeliveryFailure(t *testing.T)
 	assertDeliveryInterruption(t, replayed)
 }
 
+func TestUpgradeRunningWithoutSubmittedHandoffRecoversAsPreMutationFailure(t *testing.T) {
+	now := time.Date(2026, 9, 7, 3, 44, 50, 0, time.UTC)
+	journal, err := OpenJournal(t.TempDir() + "/journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, _ := signedCommand(t, now)
+	command.Action = "agent.upgrade"
+	command.Scope = ScopeNode
+	command.Identity = Identity{ClusterRef: "cluster-1", NodeRef: "pve-1"}
+	command.Parameters = json.RawMessage(upgradeFixture())
+	command.BodySHA256 = protocol.BodyHash(command.Parameters)
+	command.Signature = SignCommand(command, []byte("secret"))
+	if _, duplicate, err := journal.Claim(command, now); err != nil || duplicate {
+		t.Fatalf("claim duplicate=%t err=%v", duplicate, err)
+	}
+	running := Receipt{
+		SchemaVersion: SchemaVersion, ReceiptID: "running-upgrade", CommandID: command.CommandID, OperationID: command.OperationID,
+		AgentRef: command.AgentRef, State: "running", Code: "COMMAND_STARTED", ExecutionMode: "production",
+		Accepted: true, Asynchronous: true, StartedAt: now, FinishedAt: now, OperatorRef: command.OperatorRef,
+	}
+	if err := journal.BeginRunning(command, running); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := journal.RecoverIncomplete(now.Add(time.Minute), "production")
+	if err != nil || len(recovered) != 1 {
+		t.Fatalf("recovered=%#v err=%v", recovered, err)
+	}
+	receipt := recovered[0]
+	if receipt.State != "failed" || receipt.Code != "UPGRADE_PREPARE_FAILED" || receipt.AgentUpgradeID != "" || receipt.MutationMayHaveSucceeded || receipt.Error == nil || receipt.Error.Stage != "upgrade_handoff" {
+		t.Fatalf("unsafe upgrade recovery receipt=%#v", receipt)
+	}
+	second := command
+	second.CommandID, second.OperationID, second.IdempotencyKey = "command-2", "operation-2", "idempotency-2"
+	if _, duplicate, err := journal.Claim(second, now.Add(2*time.Minute)); err != nil || duplicate {
+		t.Fatalf("terminal handoff failure did not release node lane: duplicate=%t err=%v", duplicate, err)
+	}
+}
+
 func TestReadOnlyDeliveryExecutionAlwaysProducesTerminalReceipt(t *testing.T) {
 	for _, name := range []string{"deadline", "panic"} {
 		t.Run(name, func(t *testing.T) {
