@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).with_name("migrate-legacy-template-timezone.py")
+SCRIPT = Path(__file__).with_name("verify-template-bundle.py")
 SPEC = importlib.util.spec_from_file_location("ppflight_timezone_migration", SCRIPT)
 assert SPEC and SPEC.loader
 MIGRATOR = importlib.util.module_from_spec(SPEC)
@@ -25,15 +25,15 @@ class LegacyTemplateTimezoneMigrationTest(unittest.TestCase):
         self.snippets = self.root / "snippets"
         self.configs.mkdir()
         self.snippets.mkdir()
-        MIGRATOR.CONFIG_DIR = self.configs
-        self.original_run = MIGRATOR.run
+        MIGRATOR.PVE_CONFIG_DIR = self.configs
+        self.original_run = MIGRATOR.pve_run
         self.original_fchown = MIGRATOR.os.fchown
         MIGRATOR.os.fchown = lambda *_: None
         self.fail_set_vmid: int | None = None
-        MIGRATOR.run = self.fake_run
+        MIGRATOR.pve_run = self.fake_run
 
     def tearDown(self) -> None:
-        MIGRATOR.run = self.original_run
+        MIGRATOR.pve_run = self.original_run
         MIGRATOR.os.fchown = self.original_fchown
         self.temporary.cleanup()
 
@@ -64,7 +64,7 @@ class LegacyTemplateTimezoneMigrationTest(unittest.TestCase):
         if argv[:2] == ("qm", "set"):
             vmid = int(argv[2])
             if vmid == self.fail_set_vmid:
-                raise MIGRATOR.MigrationError("injected qm set failure")
+                raise MIGRATOR.TemplateMigrationError("injected qm set failure")
             path = self.configs / f"{vmid}.conf"
             lines = path.read_text(encoding="utf-8").splitlines()
             replacement = argv[4]
@@ -82,34 +82,34 @@ class LegacyTemplateTimezoneMigrationTest(unittest.TestCase):
     def test_migrates_without_changing_or_deleting_original(self) -> None:
         source, old_volume = self.create_template(9000)
         original = source.read_bytes()
-        migrations, scanned = MIGRATOR.plan_migrations()
+        migrations, scanned = MIGRATOR.pve_plan_template_migrations()
         self.assertEqual((scanned, len(migrations)), (1, 1))
-        MIGRATOR.apply_migrations(migrations)
+        MIGRATOR.pve_apply_template_migrations(migrations)
 
         config = (self.configs / "9000.conf").read_text(encoding="utf-8")
         self.assertNotIn(old_volume, config)
         self.assertNotIn(b"timezone:", migrations[0].new_path.read_bytes())
         self.assertEqual(source.read_bytes(), original)
 
-        migrations, scanned = MIGRATOR.plan_migrations()
+        migrations, scanned = MIGRATOR.pve_plan_template_migrations()
         self.assertEqual((scanned, len(migrations)), (1, 0))
 
     def test_hash_mismatch_fails_before_template_mutation(self) -> None:
         source, _ = self.create_template(9001)
         source.write_text("#cloud-config\ntimezone: UTC\ntampered: true\n", encoding="utf-8")
         before = (self.configs / "9001.conf").read_text(encoding="utf-8")
-        with self.assertRaisesRegex(MIGRATOR.MigrationError, "hash mismatch"):
-            MIGRATOR.plan_migrations()
+        with self.assertRaisesRegex(MIGRATOR.TemplateMigrationError, "hash mismatch"):
+            MIGRATOR.pve_plan_template_migrations()
         self.assertEqual((self.configs / "9001.conf").read_text(encoding="utf-8"), before)
 
     def test_rolls_back_prior_template_switch_when_later_switch_fails(self) -> None:
         _, first_volume = self.create_template(9002)
         _, second_volume = self.create_template(9003, "America/Los_Angeles")
-        migrations, scanned = MIGRATOR.plan_migrations()
+        migrations, scanned = MIGRATOR.pve_plan_template_migrations()
         self.assertEqual((scanned, len(migrations)), (2, 2))
         self.fail_set_vmid = 9003
-        with self.assertRaisesRegex(MIGRATOR.MigrationError, "prior template switches rolled back"):
-            MIGRATOR.apply_migrations(migrations)
+        with self.assertRaisesRegex(MIGRATOR.TemplateMigrationError, "prior template switches rolled back"):
+            MIGRATOR.pve_apply_template_migrations(migrations)
         self.assertIn(first_volume, (self.configs / "9002.conf").read_text(encoding="utf-8"))
         self.assertIn(second_volume, (self.configs / "9003.conf").read_text(encoding="utf-8"))
 
