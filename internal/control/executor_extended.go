@@ -1187,7 +1187,7 @@ func waitForReinstallReadiness(ctx context.Context, client, readClient *pve.Clie
 			cloudInitReady = true
 		}
 		if !timezoneVerified {
-			if _, _, err := setGuestTimezone(readinessCtx, client, timezoneCommand, targetBase); err != nil {
+			if _, _, err := setGuestTimezoneAfterCloudInit(readinessCtx, client, timezoneCommand, targetBase); err != nil {
 				return err
 			}
 			timezoneVerified = true

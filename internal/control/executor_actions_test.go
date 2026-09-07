@@ -157,6 +157,7 @@ func TestQGAExecFormUsesVersionedPVEForms(t *testing.T) {
 
 func TestPVE9QGAExecTransportCoversFixedGuestCommands(t *testing.T) {
 	t.Run("set timezone", func(t *testing.T) {
+		execCalls := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api2/json/version":
@@ -164,8 +165,13 @@ func TestPVE9QGAExecTransportCoversFixedGuestCommands(t *testing.T) {
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
 				_, _ = w.Write([]byte(`{"data":{"result":{"supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				execCalls++
 				_ = r.ParseForm()
-				assertPVE9QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "set-timezone", "UTC"})
+				expected := []string{"/usr/bin/cloud-init", "status", "--wait"}
+				if execCalls == 2 {
+					expected = []string{"/usr/bin/timedatectl", "set-timezone", "UTC"}
+				}
+				assertPVE9QGAExecForm(t, r.Form, expected)
 				_, _ = w.Write([]byte(`{"data":{"pid":1}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
 				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":0}}`))
@@ -179,8 +185,8 @@ func TestPVE9QGAExecTransportCoversFixedGuestCommands(t *testing.T) {
 		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(
 			context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"UTC"}`), time.Now(),
 		)
-		if err != nil || receipt.State != "succeeded" {
-			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		if err != nil || receipt.State != "succeeded" || execCalls != 2 {
+			t.Fatalf("receipt=%#v err=%v execCalls=%d", receipt, err, execCalls)
 		}
 	})
 
@@ -887,6 +893,7 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 	})
 
 	t.Run("timezone waits for QGA command completion", func(t *testing.T) {
+		execCalls := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch {
 			case r.URL.Path == "/api2/json/version":
@@ -894,11 +901,16 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 			case strings.HasSuffix(r.URL.Path, "/agent/info"):
 				_, _ = w.Write([]byte(`{"data":{"result":{"version":"9.0","supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
 			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				execCalls++
 				_ = r.ParseForm()
 				if r.Method != http.MethodPost {
 					t.Fatalf("timezone method: %s", r.Method)
 				}
-				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/timedatectl", "set-timezone", "Asia/Shanghai"})
+				expected := []string{"/usr/bin/cloud-init", "status", "--wait"}
+				if execCalls == 2 {
+					expected = []string{"/usr/bin/timedatectl", "set-timezone", "Asia/Shanghai"}
+				}
+				assertPVE8QGAExecForm(t, r.Form, expected)
 				if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
 					t.Fatalf("timezone command: %v", r.Form)
 				}
@@ -916,8 +928,36 @@ func TestProvisioningActionsUseTypedFormsAndReadback(t *testing.T) {
 		}))
 		defer server.Close()
 		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"Asia/Shanghai"}`), time.Now())
-		if err != nil || receipt.State != "succeeded" || !strings.Contains(string(receipt.Result), `"verified":true`) {
-			t.Fatalf("receipt=%#v err=%v", receipt, err)
+		if err != nil || receipt.State != "succeeded" || execCalls != 2 || !strings.Contains(string(receipt.Result), `"verified":true`) {
+			t.Fatalf("receipt=%#v err=%v execCalls=%d", receipt, err, execCalls)
+		}
+	})
+
+	t.Run("timezone fails safely when cloud-init is not terminal", func(t *testing.T) {
+		timedatectlCalled := false
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/api2/json/version":
+				_, _ = w.Write([]byte(`{"data":{"version":"8.4.0"}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/info"):
+				_, _ = w.Write([]byte(`{"data":{"result":{"supported_commands":[{"name":"guest-exec","enabled":true}]}}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec"):
+				_ = r.ParseForm()
+				assertPVE8QGAExecForm(t, r.Form, []string{"/usr/bin/cloud-init", "status", "--wait"})
+				if strings.Contains(r.Form.Encode(), "timedatectl") {
+					timedatectlCalled = true
+				}
+				_, _ = w.Write([]byte(`{"data":{"pid":13}}`))
+			case strings.HasSuffix(r.URL.Path, "/agent/exec-status"):
+				_, _ = w.Write([]byte(`{"data":{"exited":1,"exitcode":3}}`))
+			default:
+				t.Fatalf("unexpected request: %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+		receipt, err := (Executor{Client: controlTestClient(t, server), Mode: "production", ProductionExecution: true}).Execute(context.Background(), controlCommand("vm.set-timezone", "qemu", `{"timezone":"UTC"}`), time.Now())
+		if err == nil || receipt.State != "failed" || receipt.Code != "CLOUD_INIT_NOT_READY" || receipt.MutationMayHaveSucceeded || timedatectlCalled {
+			t.Fatalf("receipt=%#v err=%v timedatectlCalled=%t", receipt, err, timedatectlCalled)
 		}
 	})
 

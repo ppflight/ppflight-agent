@@ -35,6 +35,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 readonly TEMPLATE_SOURCE="$REPO_DIR/bundles/ppflight-cloudinit"
 readonly TEMPLATE_VERIFIER="$REPO_DIR/scripts/verify-template-bundle.py"
+readonly LEGACY_TEMPLATE_TIMEZONE_MIGRATOR="$REPO_DIR/scripts/migrate-legacy-template-timezone.py"
 TMP_DIR=''
 TEMPLATE_STAGE=''
 TEMPLATE_LINK_STAGE=''
@@ -175,6 +176,7 @@ verify_sha256() {
 
 TMP_DIR="$(mktemp -d /tmp/ppflight-agent-install.XXXXXX)"
 [[ -f "$TEMPLATE_VERIFIER" && ! -L "$TEMPLATE_VERIFIER" ]] || die 'template bundle verifier is missing or unsafe'
+[[ -f "$LEGACY_TEMPLATE_TIMEZONE_MIGRATOR" && ! -L "$LEGACY_TEMPLATE_TIMEZONE_MIGRATOR" ]] || die 'legacy template timezone migrator is missing or unsafe'
 [[ -d "$TEMPLATE_SOURCE" && ! -L "$TEMPLATE_SOURCE" ]] || die 'vendored template bundle is missing or unsafe'
 python3 -I "$TEMPLATE_VERIFIER" verify "$TEMPLATE_SOURCE" >/dev/null || die 'vendored template bundle verification failed'
 TEMPLATE_BUNDLE_ID="$(python3 -I "$TEMPLATE_VERIFIER" bundle-id "$TEMPLATE_SOURCE")" || die 'cannot identify vendored template bundle'
@@ -262,6 +264,13 @@ if systemctl is-active --quiet ppflight-agent.service; then
   SERVICE_WAS_ACTIVE=1
   systemctl stop ppflight-agent.service
 fi
+# Templates created by releases before 0.1.10 can reference content-addressed
+# vendor-data with a fixed top-level timezone. Cloud-Init may reapply that file
+# after the delivery workflow sets a region timezone. Migrate only hash-verified
+# PPFlight template snippets while command execution is stopped; the migrator
+# preserves the original snippet and rolls back config switches on failure.
+python3 -I "$LEGACY_TEMPLATE_TIMEZONE_MIGRATOR" \
+  || die 'cannot safely migrate legacy PPFlight template timezone vendor-data'
 install -d -o root -g ppflight-agent -m 0750 "$STATE_DIR"
 install -d -o ppflight-agent -g ppflight-agent -m 0700 "$AGENT_STATE_DIR"
 

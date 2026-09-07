@@ -111,6 +111,7 @@ readonly -a RELEASE_FILES=(
   'scripts/uninstall.sh'
   'scripts/create-pve-tokens.sh'
   'scripts/remove-pve-credentials.sh'
+  'scripts/migrate-legacy-template-timezone.py'
   'scripts/verify-template-bundle.py'
 )
 

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,6 +34,7 @@ var (
 	ErrQGAUnavailable         = errors.New("QEMU guest agent is unavailable")
 	ErrQGACommandUnsupported  = errors.New("QEMU guest agent command is unsupported")
 	ErrPowerStatePrecondition = errors.New("PVE power action precondition is not met")
+	ErrGuestCloudInitNotReady = errors.New("guest Cloud-Init is not ready")
 )
 
 const maxControlResultBytes = 1 << 20
@@ -714,6 +716,8 @@ func (e Executor) Execute(ctx context.Context, command Command, now time.Time) (
 		var httpErr *pve.HTTPError
 		if errors.Is(err, ErrReinstallPreflight) {
 			r.State, r.Code = "failed", "REINSTALL_PREFLIGHT_REJECTED"
+		} else if errors.Is(err, ErrGuestCloudInitNotReady) {
+			r.State, r.Code = "failed", "CLOUD_INIT_NOT_READY"
 		} else if errors.Is(err, ErrPowerStatePrecondition) {
 			r.State, r.Code = "failed", "POWER_STATE_PRECONDITION_REJECTED"
 		} else if errors.Is(err, ErrReinstallRolledBack) {
@@ -2046,6 +2050,29 @@ func setCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) 
 	return "", result, nil
 }
 func setGuestTimezone(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
+	exitCode, err := runGuestCommandExitCode(ctx, c, base, "/usr/bin/cloud-init", "status", "--wait")
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: wait before timezone: %v", ErrGuestCloudInitNotReady, err)
+	}
+	cloudInitHadError, statusErr := cloudInitTerminalStatus(exitCode)
+	if statusErr != nil {
+		return "", nil, fmt.Errorf("%w: %v", ErrGuestCloudInitNotReady, statusErr)
+	}
+	if cloudInitHadError {
+		slog.Warn("cloud-init settled with an error before timezone configuration; continuing strict timezone readback",
+			"operationId", cmd.OperationID,
+			"node", cmd.Identity.NodeRef,
+			"vmid", cmd.Identity.VMID,
+			"exitCode", exitCode,
+		)
+	}
+	return setGuestTimezoneAfterCloudInit(ctx, c, cmd, base)
+}
+
+// setGuestTimezoneAfterCloudInit applies the signed per-service timezone only
+// after the boot's Cloud-Init process is terminal.  Reinstall already performs
+// that wait as part of its shared readiness loop and calls this helper directly.
+func setGuestTimezoneAfterCloudInit(ctx context.Context, c *pve.Client, cmd Command, base string) (string, json.RawMessage, error) {
 	var p timezoneP
 	_ = strictParameters(cmd.Parameters, &p)
 	if err := runGuestCommand(ctx, c, base, "timezone", "/usr/bin/timedatectl", "set-timezone", p.Timezone); err != nil {
